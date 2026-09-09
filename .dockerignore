@@ -1,0 +1,21 @@
+# Keep docker build contexts small and keep runtime-only, sensitive, or
+# submodule trees out of images unless a specific build needs them.
+
+# VCS
+.git
+.gitmodules
+.gitignore
+
+# The user-provided game assets are only ever mounted read-only at runtime;
+# they must never enter the build context or an image layer.
+original/GameData
+
+# Reference sources (only needed when a build explicitly uses them as context).
+original/jedi-academy
+original/jedi-academy-sdk
+original/jampgame-proxy
+
+# Build outputs / working notes
+rust/target
+artifacts
+docs

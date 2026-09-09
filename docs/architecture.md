@@ -64,7 +64,7 @@
 
   Purpose:
 
-  Original Linux game-server binaries used as binary/runtime reference material. `jampgamei386.so` is the SDK build output to replace/forward to; `linuxjampded` is the engine to patch/call into, built from `original/jedi-academy/codemp/` (the shipped binary wins where source and binary diverge, e.g. `AutoVersion.h` drift). The SDK contains no engine implementation.
+  Original Linux game-server binaries used as binary/runtime reference material. `jampgamei386.so` is the SDK build output to replace/forward to; `linuxjampded` is the engine to patch/call into, built from `original/jedi-academy/codemp/` (the shipped binary wins where source and binary diverge, e.g. `AutoVersion.h` drift). `libcxa.so.1` in the same directory is NOT an investigation target: it is the Intel C++ runtime both binaries `NEEDED`-depend on (provides `__vec_*`/`__ex_*`/`__eh_*`), shipped because modern systems lack it. The SDK contains no engine implementation.
 
   Evidence type:
 
@@ -95,15 +95,37 @@ New implementation.
 
 ## Current understanding
 
-This document will be updated as the original implementation is investigated.
+See `docs/reverse-engineering.md` (R-001…R-016) for evidence-backed findings
+and `docs/uncertainties.md` for the tracked open items.
 
 ## Unknowns
 
-- Exact runtime loading sequence.
-- Exact exported ABI.
-- Complete list of hooks.
-- Runtime address requirements.
-- Which behavior is implemented by the proxy versus the original game code.
-- Which binary interfaces must remain compatible.
+Resolved since the initial skeleton (2026-09-09):
 
-Notice that we're deliberately **not pretending we know things yet**.
+- Exact exported ABI — 13-int `vmMain` (decided), cdecl `dllEntry`, fixed-arity
+  forwarders (TESTED), `Navigator_Load` shape (STATIC).
+- Struct layouts — proxy `src/sdk/` ≡ pristine SDK (TESTED) and match binary
+  sizes.
+- Engine address table — detour-safe mechanically (sweep TESTED).
+- `Q_stricmp` misbinding — benign-in-practice, fix decided (RUNTIME).
+- Original-library load path — CWD-relative `dlopen` (RUNTIME).
+- Detour page-protection primitives — container-verified (RUNTIME).
+- Engine var/cvar slots, live hook identity, and the full proxy attach — the
+  original proxy builds and runs end-to-end in the i386 container under the
+  real engine (RUNTIME, R-018): every memory-layer address read back,
+  connectionless/query/rcon hook addresses fire on the correct traffic, all
+  detours/inline patches applied on the real engine `.text`, server still
+  answers queries.
+
+Still open:
+
+- Per-hook semantic audit (observe/mutate/block) — source-level, tracked as
+  U-001; the R-018 container stack is the differential harness for it.
+- Semantic identity of the remaining engine hook addresses (download/snapshot/
+  userinfo/Navigator families) — folded into U-001 per-hook tests (U-005
+  remainder).
+- `CNavigator::Load` hook misfire impact — INFERRED, unobserved because
+  `mp/duel1` does not use the navigator (U-006 remainder).
+
+Notice that we're deliberately **not pretending we know things yet** — items
+above are only as strong as their evidence labels.
