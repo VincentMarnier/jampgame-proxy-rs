@@ -1,0 +1,37 @@
+# Rust rewrite of jampgame_proxy — passthrough skeleton.
+#
+# ABI target: the proxy is loaded by the 2003 i386 engine (linuxjampded) as
+# `base/jampgamei386.so`. It must be a 32-bit ELF shared object exporting the
+# two symbols the engine dlsym()s (`dllEntry`, `vmMain`) and forward every call
+# to the pristine game module loaded from `jampgame_original.so`.
+#
+# Build target: i686-unknown-linux-gnu (see Dockerfile for the toolchain).
+# Cargo names a cdylib `lib<lib.name>.so`; the build script renames the result
+# to `jampgamei386.so` (the filename the engine's Sys_LoadDll looks for).
+
+[package]
+name = "jampgame-proxy-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Passthrough skeleton of the jampgame proxy, Rust rewrite"
+license = "GPL-2.0-only"
+
+[lib]
+name = "jampgamei386"
+# cdylib is the shipped artifact; rlib is only so `cargo test` can build a
+# test harness out of the same crate.
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+cc = "1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = "none"

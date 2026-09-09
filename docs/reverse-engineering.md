@@ -1193,3 +1193,65 @@ evidence):
   0x87d14 0x133b44 0x16e564 0x11c4c4 0x194c24 0x86034 0x85f14 (+var 0x99b640)`.
 
 Gate: `JAmp: v1.0.1.1 linux-i386 Nov 10 2003` + `jampgame_original.so`.
+
+---
+
+## R-019 — Rust passthrough proxy loads and forwards end-to-end under the real engine
+
+### Finding
+
+The first Rust milestone — a pure passthrough skeleton (`rust/`): a 32-bit Rust
+`cdylib` exporting only the two engine entry symbols, which `dlopen`s the
+pristine module as `jampgame_original.so`, hands it its own syscall forwarder,
+and forwards every `vmMain` word unchanged — loads and runs end-to-end under the
+real 2003 engine. The dedicated server starts, the original module's `GAME_INIT`
+executes through the proxy, and the server answers protocol-26 queries. This
+closes the "Rust module can actually sit in this slot" question with live
+evidence.
+
+### Evidence
+
+**RUNTIME** (container `jampgame-investigation:i386-bookworm`, engine
+`linuxjampded` `JAmp: v1.0.1.1 linux-i386 Nov 10 2003`; proxy
+`rust/jampgamei386.so`, an `ELF 32-bit i386` cdylib cross-built from x86_64
+with the `rust:Dockerfile` dev image; rerun with `rust/scripts/engine-test.sh`):
+
+1. **Engine loads the proxy**: `Sys_LoadDll(/srv/jka/base/jampgamei386.so)…`
+   then `Sys_LoadDll(jampgame) found **vmMain** at 0xeef19fd0` — matches
+   `nm -D` file offset `vmMain 0x3fd0` against the runtime base
+   (`0xeef16000`, i.e. the loaded-range math used in R-017 holds for a Rust
+   module too).
+2. **Proxy `dllEntry` prints on load**: `----- proxy-rs 0.1.0: dllEntry, engine
+   syscall registered` (stderr; unbuffered, no `fflush` dance needed).
+3. **GAME_INIT path mirrors the original ordering** (R-014): `passthrough
+   skeleton loaded` → `loading original game library jampgame_original.so
+   ("base/jampgame_original.so")` — the CWD-relative `fs_game`/`base` path
+   construction of `Proxy_Files.cpp` works from a Rust caller too — →
+   `jampgame_original.so properly loaded`.
+4. **Forwarding is live**: `------- Game Initialization -------` +
+   `gamename: basejka` prove the pristine module received `GAME_INIT` through
+   the proxy's 13-word `vmMain`; the engine-side `InitGame` print proves the
+   game's traps reached the engine through the proxy's C variadic shim
+   (`csrc/syscall_shim.c`) → Rust fixed-arity forwarder → engine syscall
+   pointer.
+5. **Server stays up and answers** `getchallenge`/`getinfo`/`getstatus` with
+   `\protocol\26\mapname\mp/duel1` ⇒ the whole trap round-trip remains intact.
+
+### Confidence
+
+`High` for "the Rust passthrough skeleton runs in the game-module slot and
+forwards engine↔game traffic unchanged". Scope note: this is the *skeleton*
+only — no version gate, no `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` interception,
+no engine patches — so it does not yet reproduce the original proxy's
+observe/mutate hooks (U-001).
+
+### Remaining questions
+
+- Export hygiene: the cdylib currently exports `jampgame_syscall_forward` in
+  addition to `dllEntry`/`vmMain` (harmless — the engine dlsym()s by name);
+  tightening to exactly two exports (R-004) is deferred.
+- Dev/build workflow is dockerised (`rust/dev.sh`, `rust/Dockerfile`); the
+  i686 artifact is produced by cross-compilation, so any Rust change that
+  affects the *host* test build vs the i686 target build is covered only when
+  the target build is re-run (scripts/build.sh does).
+
