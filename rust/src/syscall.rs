@@ -15,20 +15,21 @@
 //! - Stable Rust cannot *define* a C-variadic function body, so receiving the
 //!   variadic trap call happens in C (`jampgame_vm_dllsyscall`); it calls back
 //!   into the fixed-arity `jampgame_syscall_forward` below.
+//! - The proxy's *own* trap helpers (`trap_Cvar_*`, `trap_Argv`, …) call the
+//!   engine with the exact arity each trap needs, exactly like
+//!   `Proxy_Translate_SystemCalls.cpp`.
 
-use core::ffi::c_int;
+use core::ffi::{CStr, c_int};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::sdk::{
+    G_ARGV, G_CVAR_REGISTER, G_CVAR_UPDATE, G_CVAR_VARIABLE_INTEGER_VALUE,
+    G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT, G_GET_USERCMD, G_GET_USERINFO,
+    G_LOCATE_GAME_DATA, G_SEND_SERVER_COMMAND, G_SET_USERINFO, VmCvar,
+};
 
 /// The engine syscall pointer as handed to `dllEntry`.
 pub type EngineSyscall = unsafe extern "C" fn(c_int, ...) -> c_int;
-
-/// System trap ordinals the game module passes as `command` to the syscall
-/// pointer. Values are from the SDK `gameImport_t` enum
-/// (`original/jedi-academy-sdk/codemp/game/g_public.h`), verified consecutive
-/// from `G_PRINT = 0` up to the `G_MEMSET = 100` re-anchor. Only the traps the
-/// passthrough skeleton itself uses are listed.
-/// `(const char *var_name, char *buffer, int bufsize)`
-pub const G_CVAR_VARIABLE_STRING_BUFFER: c_int = 9;
 
 /// Stored engine syscall pointer, set once by `dllEntry` before any `vmMain`
 /// call. Read-only afterwards; only the single engine thread reaches it.
@@ -81,7 +82,10 @@ pub unsafe fn call_engine(command: c_int, args: &[c_int]) -> c_int {
 }
 
 /// Fixed-arity continuation of the C variadic shim: forward one harvested trap
-/// call (command + up to 16 words) to the engine unchanged.
+/// call (command + up to 16 words) to the engine unchanged — except for the
+/// two traps the proxy intercepts (`Proxy_OriginalAPI_Wrappers.cpp:24-45`):
+/// `G_LOCATE_GAME_DATA` is recorded, `G_GET_USERCMD` is mutated after the
+/// engine fills the cmd. Both are then forwarded normally.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jampgame_syscall_forward(
     command: c_int,
@@ -102,6 +106,34 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
     a14: c_int,
     a15: c_int,
 ) -> c_int {
+    match command {
+        // `G_LOCATE_GAME_DATA(sharedEntity_t*, int, int, playerState_t*, int)`:
+        // record where the game put its data (later hooks read it), then pass
+        // the trap through to the engine.
+        G_LOCATE_GAME_DATA => {
+            crate::shared_api::locate_game_data(a0 as usize, a1, a2, a3 as usize, a4);
+        }
+        // `G_GET_USERCMD(int clientNum, usercmd_t* cmd)`: forward first (the
+        // engine writes the usercmd into *cmd), then sanitise it before the
+        // game reads it.
+        G_GET_USERCMD => {
+            // SAFETY: engine syscall registered (dllEntry ran first); the game
+            // passes a valid usercmd pointer it wants filled.
+            let response = unsafe {
+                engine_syscall_call(
+                    command,
+                    [
+                        a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+                    ],
+                )
+            };
+            // SAFETY: a1 is the game's usercmd buffer, just filled by the engine.
+            unsafe { crate::shared_api::get_usercmd(a0, a1 as *mut crate::sdk::Usercmd) };
+            return response;
+        }
+        _ => {}
+    }
+
     match engine_syscall() {
         Some(syscall) => unsafe {
             syscall(
@@ -113,6 +145,167 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             -1
         }
     }
+}
+
+/// Call the engine syscall pointer with exactly the given words (used by the
+/// `G_GET_USERCMD` forwarding path and by nothing else directly).
+///
+/// # Safety
+///
+/// The engine syscall pointer must have been delivered via `dllEntry`.
+#[inline]
+unsafe fn engine_syscall_call(command: c_int, words: [c_int; 16]) -> c_int {
+    let syscall = engine_syscall().expect("engine syscall not registered");
+    unsafe {
+        syscall(
+            command, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+            words[7], words[8], words[9], words[10], words[11], words[12], words[13], words[14],
+            words[15],
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proxy-side trap helpers (Proxy_Translate_SystemCalls.cpp subset)
+// ---------------------------------------------------------------------------
+
+/// Fill `buffer` with the value of cvar `name`
+/// (`G_CVAR_VARIABLE_STRING_BUFFER`, `trap_Cvar_VariableStringBuffer`).
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `buffer` is written by the
+/// engine and NUL-terminated.
+pub unsafe fn cvar_variable_string_buffer(name: &CStr, buffer: &mut [u8]) {
+    unsafe {
+        call_engine(
+            G_CVAR_VARIABLE_STRING_BUFFER,
+            &[
+                name.as_ptr() as c_int,
+                buffer.as_mut_ptr() as c_int,
+                buffer.len() as c_int,
+            ],
+        );
+    }
+}
+
+/// Integer value of cvar `name` (`trap_Cvar_VariableIntegerValue`).
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered.
+pub unsafe fn cvar_variable_integer_value(name: &CStr) -> c_int {
+    unsafe { call_engine(G_CVAR_VARIABLE_INTEGER_VALUE, &[name.as_ptr() as c_int]) }
+}
+
+/// `trap_Cvar_Register` — register/re-sync a `vmCvar_t` mirror.
+///
+/// # Safety
+///
+/// `cvar` must point to a live `VmCvar` the engine writes through; `name` and
+/// `default_value` must be NUL-terminated.
+pub unsafe fn cvar_register(cvar: *mut VmCvar, name: &CStr, default_value: &CStr, flags: u32) {
+    unsafe {
+        call_engine(
+            G_CVAR_REGISTER,
+            &[
+                cvar as usize as c_int,
+                name.as_ptr() as c_int,
+                default_value.as_ptr() as c_int,
+                flags as c_int,
+            ],
+        );
+    }
+}
+
+/// `trap_Cvar_Update` — refresh a `vmCvar_t` mirror from the engine.
+///
+/// # Safety
+///
+/// `cvar` must point to a live `VmCvar` the engine writes through.
+pub unsafe fn cvar_update(cvar: *mut VmCvar) {
+    unsafe {
+        call_engine(G_CVAR_UPDATE, &[cvar as usize as c_int]);
+    }
+}
+
+/// `trap_Argv` — copy command argument `n` into `buffer`.
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `buffer` is written by the
+/// engine and NUL-terminated.
+pub unsafe fn argv(n: c_int, buffer: &mut [u8]) {
+    unsafe {
+        call_engine(
+            G_ARGV,
+            &[n, buffer.as_mut_ptr() as c_int, buffer.len() as c_int],
+        );
+    }
+}
+
+/// `trap_DropClient` — kick `client_num` with `reason`.
+///
+/// # Safety
+///
+/// `reason` must be NUL-terminated; the engine syscall pointer must be
+/// registered.
+pub unsafe fn drop_client(client_num: c_int, reason: &CStr) {
+    unsafe {
+        call_engine(G_DROP_CLIENT, &[client_num, reason.as_ptr() as c_int]);
+    }
+}
+
+/// `trap_SendServerCommand` — reliably send `text` to `client_num` (`-1` = all),
+/// skipping messages longer than 1022 chars (guard from
+/// `Proxy_Translate_SystemCalls.cpp:102-107`).
+///
+/// # Safety
+///
+/// `text` must be NUL-terminated; the engine syscall pointer must be
+/// registered.
+pub unsafe fn send_server_command(client_num: c_int, text: &CStr) {
+    let bytes = text.to_bytes();
+    if bytes.len() > 1022 {
+        return;
+    }
+    unsafe {
+        call_engine(G_SEND_SERVER_COMMAND, &[client_num, text.as_ptr() as c_int]);
+    }
+}
+
+/// `trap_GetUserinfo` — copy client `num`'s userinfo into `buffer`.
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `buffer` is written by the
+/// engine and NUL-terminated.
+pub unsafe fn get_userinfo(num: c_int, buffer: &mut [u8]) {
+    unsafe {
+        call_engine(
+            G_GET_USERINFO,
+            &[num, buffer.as_mut_ptr() as c_int, buffer.len() as c_int],
+        );
+    }
+}
+
+/// `trap_SetUserinfo` — replace client `num`'s userinfo.
+///
+/// # Safety
+///
+/// `buffer` must be NUL-terminated; the engine syscall pointer must be
+/// registered.
+pub unsafe fn set_userinfo(num: c_int, buffer: &CStr) {
+    unsafe {
+        call_engine(G_SET_USERINFO, &[num, buffer.as_ptr() as c_int]);
+    }
+}
+
+/// Read a NUL-terminated string the engine wrote into `buffer`, returning the
+/// bytes before the terminator.
+pub fn read_engine_string(buffer: &[u8]) -> &[u8] {
+    let n = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    &buffer[..n]
 }
 
 #[cfg(test)]

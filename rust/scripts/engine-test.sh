@@ -85,7 +85,19 @@ printf '%s\n' "$logs" | head -60
 
 if [ "$fail" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
   echo "== probing server (protocol 26 query) =="
-  if python3 "$ROOT/tools/q3_udp_query.py" 127.0.0.1 "$PORT"; then
+  # The proxy's own load markers appear before the map/UDP listener is fully
+  # ready, so retry the probe until the server answers (or give up).
+  probe_fail=1
+  j=0
+  while [ "$j" -lt 20 ]; do
+    if python3 "$ROOT/tools/q3_udp_query.py" 127.0.0.1 "$PORT" >/dev/null 2>&1; then
+      probe_fail=0
+      break
+    fi
+    j=$((j + 1))
+    sleep 1
+  done
+  if [ "$probe_fail" -eq 0 ]; then
     echo "== server answered the query: PASS =="
     exit 0
   else

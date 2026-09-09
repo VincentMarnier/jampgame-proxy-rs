@@ -28,6 +28,9 @@ extern int jampgame_syscall_forward(
 
 /* Max handled: 1 (command) + 16 args, as in the original proxy. */
 int jampgame_vm_dllsyscall(int command, ...)
+	__attribute__((force_align_arg_pointer));
+
+int jampgame_vm_dllsyscall(int command, ...)
 {
 	va_list ap;
 	int args[16];

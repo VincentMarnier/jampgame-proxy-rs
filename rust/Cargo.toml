@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
-description = "Passthrough skeleton of the jampgame proxy, Rust rewrite"
+description = "Bootstrap core + trap interceptions of the jampgame proxy, Rust rewrite"
 license = "GPL-2.0-only"
 
 [lib]

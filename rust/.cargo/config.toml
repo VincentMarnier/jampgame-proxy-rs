@@ -1,0 +1,12 @@
+# i686 build configuration for the game-module cdylib.
+#
+# The 2003 engine (`linuxjampded`) enters the module with a 4-byte-aligned
+# stack (pre-SSE i386 ABI). Rust i686 codegen assumes 16-byte alignment at
+# function entry and emits SSE moves (movaps/movups) which fault on that
+# misaligned stack — the "x86 vm will crash without -mstackrealign" quirk the
+# original proxy documents (CMakeLists.txt:130-134). Disabling SSE on this
+# target makes the emitted code free of 16-byte-aligned instructions, so the
+# 4-byte-aligned entry is safe. The C shim (csrc/syscall_shim.c) is compiled
+# with -mstackrealign in build.rs for the same reason.
+[target.i686-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=-sse,-sse2"]

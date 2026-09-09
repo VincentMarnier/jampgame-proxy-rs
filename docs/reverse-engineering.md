@@ -1255,3 +1255,56 @@ observe/mutate hooks (U-001).
   affects the *host* test build vs the i686 target build is covered only when
   the target build is re-run (scripts/build.sh does).
 
+---
+
+## R-020 — Rust proxy: bootstrap core + trap interceptions run end-to-end
+
+### Finding
+
+The second Rust milestone (`rust/`) — the version gate, original-module symbol
+binding (`dllEntry`/`vmMain`/`level`/`g_entities` + `dladdr` base), the engine
+memory layer (svs/sv + cvar-pointer slots, R-018-verified addresses), the proxy
+cvar mirror, the `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` trap interceptions, and
+the client-event `vmMain` dispatch — loads and runs under the real 2003 engine,
+and the patched-flow server answers protocol-26 queries.
+
+### Evidence
+
+**RUNTIME** (container `jampgame-investigation:i386-bookworm`, engine
+`linuxjampded` `JAmp: v1.0.1.1 linux-i386 Nov 10 2003`; rerun with
+`rust/scripts/engine-test.sh`):
+
+1. Engine loads the proxy and the full init sequence runs:
+   `bootstrap core loaded` → `loading original game library jampgame_original.so`
+   → `jampgame_original.so properly loaded` → `Original engine detected` →
+   `Initializing memory layer` → `Memory layer properly initialized` →
+   `------- Game Initialization -------` / `gamename: basejka` /
+   `gamedate: Nov 10 2003` → `InitGame: \...\version\JAmp: v1.0.1.1 ...`.
+   The version gate passes on the pristine engine and the memory-layer cvar
+   slot reads do not fault.
+2. The pristine module's `GAME_INIT` traps flow through the proxy's C shim
+   (its `G_LOCATE_GAME_DATA` is recorded, `G_GET_USERCMD` sanitised); the
+   server stays up and answers `getchallenge`/`getinfo`/`getstatus` with
+   `\protocol\26\mapname\mp/duel1\...`.
+3. **Stack-alignment quirk reproduced and solved**: the 2003 engine enters the
+   module with a 4-byte-aligned stack; the first build's Rust `vmMain` faulted
+   with `SIGSEGV` at `movaps %xmm0,0x480(%esp)` (gdb backtrace) — the
+   `-mstackrealign` quirk the original proxy documents
+   (`CMakeLists.txt:130-134`). Solution (decision D-001): the i686 target
+   disables SSE (`rust/.cargo/config.toml`) so no 16-byte-aligned instruction
+   can be emitted, and the C shim is built with `-mstackrealign`.
+
+### Confidence
+
+`High` (directly observed; `rust/scripts/engine-test.sh` is the reproducible
+harness, exit 0).
+
+### Remaining questions
+
+- The `netStatus`/`showNet` command handler (`Proxy_Engine_ClientCommand_NetStatus`)
+  is not ported; while `proxy_sv_enableNetStatus` is non-zero those commands are
+  forwarded to the game (documented divergence, `src/shared_api.rs`).
+- The engine/game hook patch layer (detours, download/snapshot/userinfo/
+  Navigator hooks) remains a later milestone; `Q_stricmp` is bound to the
+  correct `0x1a5304` (U-007) when the hooks needing it land.
+

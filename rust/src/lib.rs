@@ -1,57 +1,65 @@
-//! jampgame-proxy-rs — passthrough skeleton.
+//! jampgame-proxy-rs — the Rust rewrite of `jampgame_proxy`.
 //!
-//! A Rust re-implementation of the `jampgame_proxy` game-module proxy, in its
-//! initial "forward everything" stage.
+//! Milestone: bootstrap core + trap interceptions (docs `R-020`). The module
+//! loads in the game-module slot, runs the version gate, loads and wires the
+//! pristine game module, initialises the engine memory layer, and intercepts
+//! the `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` traps plus the `vmMain` events
+//! that feed the proxy's own state. The engine hook/patch layer (detours,
+//! download/snapshot/userinfo/Navigator hooks) is a later milestone.
 //!
 //! Loading model (see `docs/reverse-engineering.md` R-014):
 //!
 //! 1. The 2003 i386 engine (`linuxjampded`) `dlopen`s this module as
 //!    `base/jampgamei386.so` and dlsym()s `dllEntry` + `vmMain`.
-//! 2. The engine calls `dllEntry(engineSyscall)`: we store the engine syscall
-//!    pointer (nothing heavier — syscalls that need game state are not usable
-//!    yet).
-//! 3. At `vmMain(GAME_INIT, ...)` we print the banner, `dlopen` the pristine
-//!    module as `jampgame_original.so` (CWD-relative, `fs_game`/`base` path),
-//!    resolve its `dllEntry`/`vmMain`, and hand it our own syscall forwarder
-//!    (`csrc/syscall_shim.c`) as its syscall pointer.
-//! 4. Every `vmMain` word is then forwarded unchanged to the original module;
-//!    every trap the original module issues goes through our shim and is
-//!    forwarded unchanged to the engine.
-//! 5. `GAME_SHUTDOWN` forwards the shutdown, closes the original module and
-//!    resets.
+//! 2. `dllEntry(engineSyscall)` stores the engine syscall pointer.
+//! 3. At `vmMain(GAME_INIT, ...)`: banner → version gate → `dlopen` the
+//!    pristine module as `jampgame_original.so` → bind its symbols + base →
+//!    hand it our syscall forwarder → initialise the engine memory layer →
+//!    forward `GAME_INIT` → register the proxy's own cvars.
+//! 4. Every later `vmMain` word is forwarded to the original module; every
+//!    trap it issues goes through the C shim (`csrc/syscall_shim.c`) into
+//!    `syscall::jampgame_syscall_forward`, where the two intercepted traps run
+//!    before the passthrough.
+//! 5. `GAME_SHUTDOWN` closes the engine redirect, forwards the shutdown, and
+//!    unloads the original module.
 //!
 //! ABI: i386 System V cdecl, ILP32. `vmMain` is 13 `int`s (command + 12), the
 //! syscall interface is variadic cdecl with up to 1 (command) + 16 words —
-//! both mirroring the original proxy's fixed-arity forwarders. See
-//! `src/syscall.rs` and `src/original.rs`.
+//! both mirroring the original proxy's forwarders. See `src/syscall.rs`,
+//! `src/original.rs`, `src/sdk.rs`.
 
+mod engine;
+mod jampgame;
 mod original;
+mod sdk;
+mod shared_api;
+mod state;
 mod syscall;
+mod utils;
 
 use core::ffi::c_int;
-use std::ffi::CString;
 
-use syscall::{EngineSyscall, G_CVAR_VARIABLE_STRING_BUFFER};
-
-/// Name the pristine game module is installed under next to this proxy.
-const ORIGINAL_LIBRARY_NAME: &str = "jampgame_original.so";
-/// Subdirectory the engine loads game modules from when `fs_game` is unset.
-const DEFAULT_BASE_GAME_FOLDER_NAME: &str = "base";
-
-// vmMain export enum (SDK `gameExport_t`): commands this skeleton handles
-// specially. All other commands are forwarded verbatim.
-const GAME_INIT: c_int = 0;
-const GAME_SHUTDOWN: c_int = 1;
+use sdk::{
+    DEFAULT_BASE_GAME_FOLDER_NAME, GAME_CLIENT_BEGIN, GAME_CLIENT_COMMAND, GAME_CLIENT_CONNECT,
+    GAME_CLIENT_DISCONNECT, GAME_CLIENT_USERINFO_CHANGED, GAME_INIT, GAME_RUN_FRAME, GAME_SHUTDOWN,
+    ORIGINAL_ENGINE_VERSION, ORIGINAL_LIBRARY_NAME,
+};
+use state::PROXY_CVARS;
 
 // ---------------------------------------------------------------------------
 // Exported API (the only two symbols the engine dlsym()s)
+//
+// Alignment: the 2003 engine enters game modules with a 4-byte-aligned stack.
+// Rust i686 codegen normally assumes 16-byte entry alignment and emits SSE
+// moves that fault there; the i686 target therefore disables SSE
+// (rust/.cargo/config.toml) so no 16-byte-aligned instruction can be emitted.
+// The C syscall shim is compiled with -mstackrealign (build.rs) for the same
+// reason on its entry from the game module.
 // ---------------------------------------------------------------------------
 
-/// The engine calls this once at load time, before any `vmMain`.
-///
-/// It only records the engine syscall pointer. Heavy work is deferred to
-/// `GAME_INIT`, after the engine's subsystems (cvars, etc.) exist — same
-/// ordering as the original proxy (R-014).
+/// The engine calls this once at load time, before any `vmMain`. It only
+/// records the engine syscall pointer; heavy work is deferred to `GAME_INIT`
+/// (same ordering as the original proxy, R-014).
 ///
 /// # Safety
 ///
@@ -59,19 +67,19 @@ const GAME_SHUTDOWN: c_int = 1;
 /// `syscall` must be a valid cdecl variadic function pointer that stays valid
 /// for the process lifetime.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dllEntry(syscall: EngineSyscall) {
+pub unsafe extern "C" fn dllEntry(syscall: syscall::EngineSyscall) {
     syscall::set_engine_syscall(syscall);
     eprintln!("----- proxy-rs {VERSION}: dllEntry, engine syscall registered");
 }
 
-/// 13-word `vmMain`, matching the SDK signature `int vmMain(int command,
-/// int arg0 … int arg11)` (SDK `g_main.c:503`). All 13 words are forwarded to
-/// the original module.
+/// 13-word `vmMain` (SDK signature `int vmMain(int command, int arg0 … int
+/// arg11)`, `g_main.c:503`). All 13 words are forwarded to the original module
+/// after the proxy's own event handling runs.
 ///
 /// # Safety
 ///
-/// Called by the engine exactly like any game module `vmMain`. The caller must
-/// pass exactly 13 cdecl words; the function itself only forwards them.
+/// Called by the engine exactly like any game module `vmMain`; the caller must
+/// pass exactly 13 cdecl words.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vmMain(
     command: c_int,
@@ -92,6 +100,35 @@ pub unsafe extern "C" fn vmMain(
     match command {
         GAME_INIT => game_init(&args),
         GAME_SHUTDOWN => game_shutdown(&args),
+        // The server is going to activate its new frame: track the time and
+        // refresh our cvar mirrors, then pass the frame on.
+        GAME_RUN_FRAME => {
+            state::set_svs_time(a0);
+            update_proxy_cvars();
+            forward(GAME_RUN_FRAME, &args)
+        }
+        GAME_CLIENT_CONNECT => {
+            shared_api::client_connect(a0, a1 != 0, a2 != 0);
+            forward(command, &args)
+        }
+        GAME_CLIENT_DISCONNECT => {
+            shared_api::client_disconnect(a0);
+            forward(command, &args)
+        }
+        GAME_CLIENT_BEGIN => {
+            shared_api::client_begin(a0, a1 != 0);
+            forward(command, &args)
+        }
+        GAME_CLIENT_COMMAND => {
+            if !shared_api::client_command(a0) {
+                return 0;
+            }
+            forward(command, &args)
+        }
+        GAME_CLIENT_USERINFO_CHANGED => {
+            shared_api::client_userinfo_changed(a0);
+            forward(command, &args)
+        }
         _ => forward(command, &args),
     }
 }
@@ -102,12 +139,21 @@ pub unsafe extern "C" fn vmMain(
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `vmMain(GAME_INIT, levelTime, randomSeed, restart)`: load and wire the
-/// original module, then forward the init so the pristine game initialises.
+/// `vmMain(GAME_INIT, levelTime, randomSeed, restart)` — mirrors
+/// `Proxy_Main.cpp:88-126` (without the patch attach, which is a later
+/// milestone).
 fn game_init(args: &[c_int; 12]) -> c_int {
     eprintln!("========================================================================");
-    eprintln!("----- proxy-rs {VERSION}: passthrough skeleton loaded");
+    eprintln!("----- proxy-rs {VERSION}: bootstrap core loaded");
     eprintln!("========================================================================");
+
+    // Version gate: only run on the pristine engine (R-009).
+    if !engine_version_matches() {
+        eprintln!("========================================================================");
+        eprintln!("----- Trying to run jampgame-proxy-rs on a modified engine, exiting");
+        eprintln!("========================================================================");
+        std::process::exit(1);
+    }
 
     let path = original_library_path();
     eprintln!("----- proxy-rs: loading original game library {ORIGINAL_LIBRARY_NAME} ({path:?})");
@@ -121,17 +167,31 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // issues passes through the proxy (mirrors Proxy_GetOriginalGameAPI).
     // SAFETY: original::load just succeeded.
     unsafe {
-        original::wire_original_dll_entry(jampgame_vm_dllsyscall as EngineSyscall);
+        original::wire_original_dll_entry(jampgame_vm_dllsyscall as syscall::EngineSyscall);
     }
     eprintln!("----- proxy-rs: {ORIGINAL_LIBRARY_NAME} properly loaded");
+    eprintln!("----- proxy-rs: Original engine detected");
+
+    // Read the engine's variable/cvar slots (R-018 live-verified addresses).
+    engine::init_memory_layer();
 
     // Forward GAME_INIT itself: the pristine game must initialise.
-    forward(GAME_INIT, args)
+    let response = forward(GAME_INIT, args);
+
+    // The original proxy registers its cvars inside the game's G_RegisterCvars
+    // (a game detour, later milestone); we register them here, after the game
+    // has run its own registration, which is idempotent on the engine side.
+    register_proxy_cvars();
+
+    response
 }
 
-/// `vmMain(GAME_SHUTDOWN, restart)`: forward the shutdown, then unload the
-/// original module (reverse of `game_init`, same as the original proxy).
+/// `vmMain(GAME_SHUTDOWN, restart)`: close any engine redirect left open by an
+/// rcon map change, forward the shutdown, then unload the original module
+/// (`Proxy_Main.cpp:128-160`).
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
+    // SAFETY: engine redirect globals are valid; no-op when no redirect open.
+    unsafe { engine::com_end_redirect() };
     let response = forward(GAME_SHUTDOWN, args);
     if original::is_loaded() {
         eprintln!("----- proxy-rs: unloading original game library {ORIGINAL_LIBRARY_NAME}");
@@ -153,6 +213,54 @@ fn forward(command: c_int, args: &[c_int; 12]) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Version gate
+// ---------------------------------------------------------------------------
+
+/// `strncmp(version, ORIGINAL_ENGINE_VERSION, len(ORIGINAL_ENGINE_VERSION))`
+/// gate (`Proxy_Main.cpp:96-105`): pass only when the `version` cvar starts
+/// with the pristine engine version string.
+fn engine_version_matches() -> bool {
+    let mut buffer = [0u8; sdk::MAX_STRING_CHARS];
+    // SAFETY: engine syscall registered (dllEntry ran) and buffer is writable.
+    unsafe { syscall::cvar_variable_string_buffer(c"version", &mut buffer) };
+    let version = syscall::read_engine_string(&buffer);
+    version.len() >= ORIGINAL_ENGINE_VERSION.len()
+        && version[..ORIGINAL_ENGINE_VERSION.len()] == *ORIGINAL_ENGINE_VERSION.as_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Proxy cvar mirror (register at GAME_INIT, refresh every GAME_RUN_FRAME)
+// ---------------------------------------------------------------------------
+
+fn register_proxy_cvars() {
+    // The vmCvar_t mirrors live inside the mutex-protected proxy state; their
+    // addresses are stable for the process lifetime, so the engine can write
+    // through them across calls.
+    state::with_state(|s| {
+        for (i, (name, default)) in PROXY_CVARS.iter().enumerate() {
+            let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
+            // SAFETY: name/default are static literals; cvar is stable.
+            unsafe {
+                syscall::cvar_register(cvar, name, default, sdk::CVAR_ARCHIVE);
+            }
+        }
+    });
+}
+
+fn update_proxy_cvars() {
+    if !original::is_loaded() {
+        return;
+    }
+    state::with_state(|s| {
+        for (i, _) in PROXY_CVARS.iter().enumerate() {
+            let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
+            // SAFETY: cvar is stable within the state.
+            unsafe { syscall::cvar_update(cvar) };
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Original module location
 // ---------------------------------------------------------------------------
 
@@ -160,35 +268,20 @@ fn forward(command: c_int, args: &[c_int; 12]) -> c_int {
 /// where an empty `fs_game` means `base` — identical to the original proxy's
 /// path construction (`Proxy_Files.cpp`).
 fn original_library_path() -> CString {
-    let mut buffer = [0u8; 1024];
-    // SAFETY: G_CVAR_VARIABLE_STRING_BUFFER expects
-    // (const char *name, char *buf, int bufsize); buffer is 1024 bytes and
-    // engine syscall pointer is set (dllEntry ran before any vmMain).
+    let mut buffer = [0u8; sdk::MAX_OSPATH];
+    // SAFETY: engine syscall pointer is set (dllEntry ran before any vmMain).
     unsafe {
-        syscall::call_engine(
-            G_CVAR_VARIABLE_STRING_BUFFER,
-            &[
-                c"fs_game".as_ptr() as c_int,
-                buffer.as_mut_ptr() as c_int,
-                buffer.len() as c_int,
-            ],
-        );
+        syscall::cvar_variable_string_buffer(c"fs_game", &mut buffer);
     }
-    let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-    let fs_game = String::from_utf8_lossy(&buffer[..len]);
-    let fs_game = fs_game.trim();
+    let fs_game = syscall::read_engine_string(&buffer);
+    let fs_game = String::from_utf8_lossy(fs_game).trim().to_owned();
     let directory = if fs_game.is_empty() {
         DEFAULT_BASE_GAME_FOLDER_NAME
     } else {
-        fs_game
+        fs_game.as_str()
     };
-    match CString::new(format!("{directory}/{ORIGINAL_LIBRARY_NAME}")) {
-        Ok(path) => path,
-        Err(_) => CString::new(format!(
-            "{DEFAULT_BASE_GAME_FOLDER_NAME}/{ORIGINAL_LIBRARY_NAME}"
-        ))
-        .expect("static path has no interior NUL"),
-    }
+    CString::new(format!("{directory}/{ORIGINAL_LIBRARY_NAME}"))
+        .expect("derived library path has no interior NUL")
 }
 
 // ---------------------------------------------------------------------------
@@ -206,3 +299,5 @@ unsafe extern "C" {
 // directly from Rust), so keep the linker from dropping it.
 #[used]
 static KEEP_SHIM: unsafe extern "C" fn(c_int, ...) -> c_int = jampgame_vm_dllsyscall;
+
+use std::ffi::CString;

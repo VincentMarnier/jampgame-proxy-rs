@@ -3,8 +3,9 @@
 //! Mirrors `Proxy_Main.cpp:18-80` (`Proxy_GetOriginalGameAPI`) and
 //! `Proxy_Files.cpp` (`Proxy_LoadGameLibrary`): the original library is
 //! `dlopen`ed with `RTLD_NOW` from a CWD-relative path derived from the
-//! `fs_game` cvar (default `base`), then its `dllEntry` and `vmMain` are
-//! resolved and stored for the lifetime of the module.
+//! `fs_game` cvar (default `base`), then its `dllEntry`, `vmMain`, `level` and
+//! `g_entities` are resolved and its load base obtained via `dladdr`, all
+//! stored for the lifetime of the module.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -36,15 +37,33 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn dlerror() -> *mut c_char;
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// `struct Dl_info` from `<link.h>` (glibc, i386): four pointer-sized fields.
+#[repr(C)]
+struct DlInfo {
+    dli_fname: *const c_char,
+    dli_fbase: *mut c_void,
+    dli_sname: *const c_char,
+    dli_saddr: *mut c_void,
 }
 
 /// dlopen flag used by the engine (`unix_main.c`) and the original proxy.
 const RTLD_NOW: c_int = 2;
+const ORIGINAL_LIBRARY_NAME: &str = "jampgame_original.so";
 
 /// Handle of the loaded original module, `null_mut` once closed.
 static HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static VM_MAIN: AtomicUsize = AtomicUsize::new(0);
 static DLL_ENTRY: AtomicUsize = AtomicUsize::new(0);
+/// Load base of the original module (`dladdr(dli_fbase)`), used to rebase
+/// game offsets (`proxy.jampgameAddress`).
+static BASE: AtomicUsize = AtomicUsize::new(0);
+/// `level` (`level_locals_t *`) and `g_entities` (`gentity_t *`) as exported
+/// by the original module (R-004).
+static LEVEL: AtomicUsize = AtomicUsize::new(0);
+static G_ENTITIES: AtomicUsize = AtomicUsize::new(0);
 
 /// Look up a symbol, returning it as an opaque pointer or an error message.
 unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
@@ -75,7 +94,8 @@ fn last_error() -> String {
     }
 }
 
-/// dlopen the original module and resolve its `dllEntry`/`vmMain` symbols.
+/// dlopen the original module and resolve its `dllEntry`/`vmMain`/`level`/
+/// `g_entities` symbols plus its load base.
 ///
 /// `path` is CWD-relative (the proxy is launched from the install root, so
 /// `base/jampgame_original.so` — see docs/runtime-environment.md).
@@ -88,11 +108,13 @@ pub fn load(path: &CStr) -> Result<(), String> {
             last_error()
         ));
     }
-    // Roll back the open if either required symbol is missing.
-    let (dll_entry, vm_main) = match (|| {
+    // Roll back the open if any required symbol is missing.
+    let (dll_entry, vm_main, level, g_entities) = match (|| {
         let dll_entry = unsafe { symbol(handle, c"dllEntry")? };
         let vm_main = unsafe { symbol(handle, c"vmMain")? };
-        Ok::<_, String>((dll_entry, vm_main))
+        let level = unsafe { symbol(handle, c"level")? };
+        let g_entities = unsafe { symbol(handle, c"g_entities")? };
+        Ok::<_, String>((dll_entry, vm_main, level, g_entities))
     })() {
         Ok(v) => v,
         Err(e) => {
@@ -101,10 +123,48 @@ pub fn load(path: &CStr) -> Result<(), String> {
         }
     };
 
+    // Load base: `dladdr` on the module's own dllEntry gives `dli_fbase`
+    // (`Proxy_Main.cpp:35-43`); the proxy rebases all game offsets by it.
+    let mut info = DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    // SAFETY: dll_entry points into the just-loaded module.
+    let dladdr_ok = unsafe { dladdr(dll_entry, &mut info) } != 0;
+    if !dladdr_ok || info.dli_fbase.is_null() {
+        unsafe { dlclose(handle) };
+        return Err(format!(
+            "dladdr({ORIGINAL_LIBRARY_NAME}) failed: {}",
+            last_error()
+        ));
+    }
+
     HANDLE.store(handle, Ordering::Relaxed);
     DLL_ENTRY.store(dll_entry as usize, Ordering::Relaxed);
     VM_MAIN.store(vm_main as usize, Ordering::Relaxed);
+    BASE.store(info.dli_fbase as usize, Ordering::Relaxed);
+    LEVEL.store(level as usize, Ordering::Relaxed);
+    G_ENTITIES.store(g_entities as usize, Ordering::Relaxed);
     Ok(())
+}
+
+/// Load base of the original module, or 0 if none is loaded.
+pub fn base() -> usize {
+    BASE.load(Ordering::Relaxed)
+}
+
+/// Address of the original module's exported `level` symbol, or 0. Bound at
+/// load; read once the game-side `level_locals_t` handlers land.
+#[allow(dead_code)]
+pub fn level_address() -> usize {
+    LEVEL.load(Ordering::Relaxed)
+}
+
+/// Address of the original module's exported `g_entities` symbol, or 0.
+pub fn g_entities_address() -> usize {
+    G_ENTITIES.load(Ordering::Relaxed)
 }
 
 /// Hand the proxy's own syscall forwarder to the original module, exactly like
@@ -147,6 +207,9 @@ pub fn unload() {
     let handle = HANDLE.swap(core::ptr::null_mut(), Ordering::Relaxed);
     VM_MAIN.store(0, Ordering::Relaxed);
     DLL_ENTRY.store(0, Ordering::Relaxed);
+    BASE.store(0, Ordering::Relaxed);
+    LEVEL.store(0, Ordering::Relaxed);
+    G_ENTITIES.store(0, Ordering::Relaxed);
     if !handle.is_null() {
         unsafe { dlclose(handle) };
     }
