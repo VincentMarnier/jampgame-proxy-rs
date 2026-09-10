@@ -1,7 +1,10 @@
 # D-002 — Feature scope + minimal-alteration principle
 
 Date: 2026-09-09. Status: accepted (user directive). Evidence: source of the
-original proxy (`original/jampgame-proxy/src/jampgame_proxy/`); hook tables in
+original proxy (`original/jampgame-proxy/src/jampgame_proxy/` — removed
+2026-09-10, recover via
+`git clone https://github.com/VincentMarnier/jampgame_proxy <dir>`, pinned
+commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`); hook tables in
 `RuntimePatch/Engine/Proxy_Engine_Patch.cpp`; full per-feature map in
 `../inventory.md`. Source authority: AGENTS.md.
 

@@ -1,5 +1,14 @@
 # Reverse engineering — game libraries relevant to `jampgame_proxy`
 
+Note (2026-09-10): `original/jampgame-proxy/` was removed after the migration
+completed. Citations of its paths in this document are historical evidence
+records — recover the referenced source with
+`git clone https://github.com/VincentMarnier/jampgame_proxy <dir>` (pinned
+commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`; the submodule's git
+history is also retained locally in
+`.git/modules/original/jampgame-proxy`). Do not reinterpret the findings
+from the Rust code alone.
+
 Scope of this investigation (2026-09-09): identify every relevant ELF binary in
 `original/jalinuxded_1.011/`, describe its ELF/ABI properties with
 `file`/`nm`/`readelf`/`objdump`, and cross-reference every symbol, address and

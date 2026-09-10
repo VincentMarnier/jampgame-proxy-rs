@@ -1,6 +1,3 @@
 [submodule "original/jedi-academy"]
 	path = original/jedi-academy
 	url = https://github.com/grayj/Jedi-Academy
-[submodule "original/jampgame-proxy"]
-	path = original/jampgame-proxy
-	url = https://github.com/VincentMarnier/jampgame_proxy

@@ -8,9 +8,10 @@ After compatibility is established, the Rust implementation may introduce improv
 Repository structure
 original/jedi-academy-sdk/ — Raven Jedi Academy MP SDK 1.01 (game/cgame/ui + shared headers). Build source for `jampgamei386.so`. Authoritative for game-module ABI. Reference material only.
 original/jedi-academy/ — base Jedi Academy source (engine + game) used to build `linuxjampded`. Authoritative for engine behavior: `codemp/server/` (game-server), `codemp/qcommon/vm.cpp` + `codemp/unix/unix_main.c` (`Sys_LoadDll` loader), `codemp/server/sv_game.cpp` (`VM_Create("jampgame")`), `codemp/qcommon/common.cpp` (`version` cvar construction). NOT authoritative for game-module ABI where `codemp/game/` diverges from the SDK (same divergences as below). Reference material only.
-original/jampgame-proxy/ — proxy source (compiles against `src/sdk/`, a light subset derived from the SDK). Reference implementation. Reference material only.
 original/jalinuxded_1.011/ — shipped 2003 binaries (`linuxjampded`, `jampgamei386.so`). Binary/runtime reference. Reference material only.
-rust/ — new Rust implementation.
+rust/ — Rust implementation (the primary codebase).
+
+Note: the original C++ proxy source (`original/jampgame-proxy/`) was removed after the migration (2026-09-10). Historical docs citing its paths refer to the upstream repo — recover it with `git clone https://github.com/VincentMarnier/jampgame_proxy <dir>` (pinned source commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`; the submodule's git history is also retained locally in `.git/modules/original/jampgame-proxy`). Do not rebuild conclusions from the Rust code alone where a doc cites the original source.
 docs/ — reverse-engineering results, specifications, architecture documentation, and decisions.
 tests/ — compatibility, differential, integration, and regression tests.
 tools/ — scripts and tools used to analyze the original implementation and validate the Rust implementation.
@@ -18,7 +19,7 @@ tools/ — scripts and tools used to analyze the original implementation and val
 
 Source authority (game vs engine)
 
-For game-module ABI (trap ordinals, `vmMain`/`dllEntry` signatures, `level`/`g_entities`, `g_*` structs), `original/jedi-academy-sdk/` is authoritative. `original/jampgame-proxy/src/sdk/` shows proxy intent but must never override the SDK on ABI. `original/jedi-academy/codemp/` must not be used for game ABI where it diverges from the SDK (known divergences: commented-out `BOTLIB_AI_*CHAT*` block, missing `G_G2_COLLISIONDETECTCACHE`, missing `BOTLIB_EA_*` syscall wrappers, `g_entities` as pointer instead of array, older saber structs).
+For game-module ABI (trap ordinals, `vmMain`/`dllEntry` signatures, `level`/`g_entities`, `g_*` structs), `original/jedi-academy-sdk/` is authoritative (the former proxy `src/sdk/` was verified byte-identical to the pristine SDK for these types before the proxy source was removed). `original/jedi-academy/codemp/` must not be used for game ABI where it diverges from the SDK (known divergences: commented-out `BOTLIB_AI_*CHAT*` block, missing `G_G2_COLLISIONDETECTCACHE`, missing `BOTLIB_EA_*` syscall wrappers, `g_entities` as pointer instead of array, older saber structs).
 For engine behavior, `original/jedi-academy/codemp/` is the base source used to build `linuxjampded`: `codemp/server/` (game-server), `codemp/qcommon/vm.cpp:471-518` (`VM_Create` → `Sys_LoadDll` dynamic path used by PC/dedicated builds via `jk2mp.vcproj`/`WinDed.vcproj`), `codemp/unix/unix_main.c:323-434` (`Sys_LoadDll` implementation whose format strings match the shipped binary), `codemp/qcommon/common.cpp:1511-1512` (`version` cvar construction). `codemp/qcommon/vm_console.cpp` is the Xbox static-namespace path (`x_exe.vcproj:495`), not the PC/dedicated loader. The SDK contains no engine implementation and is not an engine reference. The shipped binary wins where source and binary diverge (e.g. `AutoVersion.h` drift, post-1.01 game-side changes).
 Critical rules
 Original source is immutable

@@ -32,11 +32,14 @@ then copy a script into the container (the `-v artifacts` mount above makes
 
 ## Building the original proxy (for U-002/U-005-hook runs)
 
-`original/` is immutable, so the proxy is built from a **copy** outside the
-workspace (build writes nothing under `original/`):
+The original proxy source (`original/jampgame-proxy/`) was removed from the
+workspace after the migration (2026-09-10). Clone the upstream repo outside
+the workspace (build writes nothing under `original/`) and check out the
+pinned source commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`:
 
     rm -rf /tmp/opencode/proxybuild
-    cp -r original/jampgame-proxy/. /tmp/opencode/proxybuild/
+    git clone https://github.com/VincentMarnier/jampgame_proxy /tmp/opencode/proxybuild
+    git -C /tmp/opencode/proxybuild checkout 687997412ea6e5ead93f5c7b25db552590a2eeb1
 
 The vendored Zydis (`src/third_party/zydis`) lacks its `zycore` submodule
 (empty `dependencies/zycore`). The proxy pins zydis at

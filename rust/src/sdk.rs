@@ -4,9 +4,9 @@
 //!   - an SDK enum ordinal (verified by compiling `g_public.h` with the i386
 //!     toolchain, `tools/` oracle), or
 //!   - a layout offset/size produced by the same compiler from the SDK headers
-//!     (`original/jampgame-proxy/src/sdk/`, which is byte-identical to the
-//!     pristine `original/jedi-academy-sdk/` for these types — see
-//!     `docs/architecture.md` and U-003).
+//!     (the pristine `original/jedi-academy-sdk/`; the former proxy `src/sdk/`
+//!     subset was verified byte-identical to it for these types before the
+//!     proxy source was removed — see `docs/architecture.md` and U-003).
 //!
 //! Do not change a value without re-running the layout oracle and updating the
 //! corresponding unit test.

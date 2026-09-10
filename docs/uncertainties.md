@@ -1,5 +1,10 @@
 # Uncertainties
 
+Note (2026-09-10): `original/jampgame-proxy/` was removed after the migration
+completed. Citations of its paths refer to the upstream repo
+(`git clone https://github.com/VincentMarnier/jampgame_proxy <dir>`, pinned
+commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`).
+
 This file tracks questions whose answers have not yet been verified. Evidence
 labels: **SOURCE** (source code), **STATIC** (binary/static analysis),
 **RUNTIME** (observed during execution), **TESTED** (automated test),

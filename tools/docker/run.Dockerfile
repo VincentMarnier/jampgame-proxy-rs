@@ -3,7 +3,7 @@
 #
 # Rationale / provenance
 # ----------------------
-# Inspired by `original/jampgame-proxy/test.Dockerfile`, which runs the 2003
+# Inspired by `original/jampgame-proxy/test.Dockerfile` (removed 2026-09-10; recover via `git clone https://github.com/VincentMarnier/jampgame_proxy <dir>`), which runs the 2003
 # binaries in a 32-bit (`i386/`) Debian userspace. Unlike that image we do not
 # download `jalinuxded` from the network at build time: the reference binaries
 # are COPYied unmodified from the repository's `original/jalinuxded_1.011/`

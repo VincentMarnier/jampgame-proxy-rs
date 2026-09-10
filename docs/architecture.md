@@ -20,7 +20,7 @@
 
   Authority:
 
-  Overrides `original/jedi-academy/codemp/` and `original/jampgame-proxy/src/sdk/` on any game-ABI divergence (verified 2026-09-09: identical 329-entry `gameImport_t` ordinals in SDK vs proxy `src/sdk/`; `BOTLIB_AI_*CHAT*` present, `G_G2_COLLISIONDETECTCACHE` present, `BOTLIB_EA_*` wrappers present, `g_entities[MAX_GENTITIES]` static array matching binary `B g_entities size 0x17b000`). Contains no engine implementation (headers only, no `sv_*.c`/`vm_*.c`), so it is not authoritative for `linuxjampded` loader/addresses.
+  Overrides `original/jedi-academy/codemp/` on any game-ABI divergence (verified 2026-09-09: identical 329-entry `gameImport_t` ordinals in SDK vs the former proxy `src/sdk/`, byte-identical to the pristine SDK — `BOTLIB_AI_*CHAT*` present, `G_G2_COLLISIONDETECTCACHE` present, `BOTLIB_EA_*` wrappers present, `g_entities[MAX_GENTITIES]` static array matching binary `B g_entities size 0x17b000`). Contains no engine implementation (headers only, no `sv_*.c`/`vm_*.c`), so it is not authoritative for `linuxjampded` loader/addresses.
 
  ---
 
@@ -40,19 +40,24 @@
 
 ---
 
-  ### Original jampgame\_proxy
+  ### Original jampgame\_proxy (removed)
 
   Location:
 
-  `original/jampgame-proxy/`
+  `original/jampgame-proxy/` — **removed 2026-09-10** after the migration
+  completed; recover with
+  `git clone https://github.com/VincentMarnier/jampgame_proxy <dir>` (pinned
+  source commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`; the submodule's
+  git history is also retained locally in
+  `.git/modules/original/jampgame-proxy`).
 
-  Purpose:
+  Purpose (historical):
 
-  Reference implementation of the existing proxy. Compiles against `src/sdk/`, a light subset derived from the SDK (verified: `g_public.h`/`server.h` differ only by `typedef enum` → `enum` spelling, `_XBOX` stripping keeping the Linux path, and dropped C++ `icarus.h` block — layouts identical on Linux; 329 `gameImport_t` ordinals identical). Shows proxy intent; never overrides the SDK on ABI.
+  Reference implementation the Rust port was built from. Compiles against `src/sdk/`, a light subset derived from the SDK (verified before removal: `g_public.h`/`server.h` differ only by `typedef enum` → `enum` spelling, `_XBOX` stripping keeping the Linux path, and dropped C++ `icarus.h` block — layouts identical on Linux; 329 `gameImport_t` ordinals identical). Its findings are preserved in `docs/reverse-engineering.md`, `docs/inventory.md`, and `docs/decisions/`; treat those docs as the surviving record, not the deleted tree.
 
   Evidence type:
 
-  **SOURCE**
+  **SOURCE** (historical; recovered only via git history)
 
 ---
 

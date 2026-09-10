@@ -21,13 +21,31 @@ import subprocess
 import sys
 
 HEADER = "original/jampgame-proxy/src/jampgame_proxy/RuntimePatch/Engine/Proxy_Engine_Wrappers.hpp"
+# The proxy source was removed from the workspace (2026-09-10); fall back to
+# the upstream repo (offline alternative: the retained submodule gitdir
+# `.git/modules/original/jampgame-proxy`) when the local file is absent.
+UPSTREAM = "https://github.com/VincentMarnier/jampgame_proxy"
+PIN = "687997412ea6e5ead93f5c7b25db552590a2eeb1"
 DED = "original/jalinuxded_1.011/linuxjampded"
 
 TEXT_START, TEXT_END = 0x0804A1E0, 0x08199494
 RW_START, RW_END = 0x0819A4E0, 0x08396BB4
 
-with open(HEADER) as f:
-    src = f.read()
+import pathlib
+try:
+    src = pathlib.Path(HEADER).read_text()
+    header_source = f"workspace copy: {HEADER}"
+except FileNotFoundError:
+    tmp = pathlib.Path("/tmp/opencode/proxy-src-sweep")
+    if not tmp.joinpath(".git").exists():
+        subprocess.run(["git", "clone", "-q", UPSTREAM, str(tmp)], check=True)
+        subprocess.run(["git", "-C", str(tmp), "checkout", "-q", PIN], check=True)
+    out = subprocess.run(
+        ["git", "-C", str(tmp), "show",
+         PIN + ":" + HEADER.removeprefix("original/jampgame-proxy/")],
+        capture_output=True, text=True, check=True)
+    src = out.stdout
+    header_source = f"upstream clone: {UPSTREAM} @ {PIN[:7]}"
 
 addrs = dict(re.findall(r"constexpr\s+intptr_t\s+(\w+)\s*=\s*(0x[0-9a-fA-F]+)", src))
 addrs = {k: int(v, 16) for k, v in addrs.items()}
@@ -41,7 +59,7 @@ PATCH_NAMES = {
     "func_SVC_RemoteCommand_Com_BeginRedirect_SV_OUTPUTBUF_LENGTH_addr",
 }
 var_names = sorted(n for n in addrs if n.startswith(("var_", "cvar_")))
-print(f"Header holds {len(addrs)} addresses ({len(func_names)} func/call).")
+print(f"Header holds {len(addrs)} addresses ({len(func_names)} func/call) [{header_source}].")
 
 
 def disasm(addr, window=48):

@@ -1,5 +1,10 @@
 # Migration report: jampgame-proxy (C++) → Rust
 
+Note (2026-09-10): `original/jampgame-proxy/` was removed after the migration
+completed. Citations of its paths refer to the upstream repo
+(`git clone https://github.com/VincentMarnier/jampgame_proxy <dir>`, pinned
+commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`).
+
 Date: 2026-09-10. Cross-checked `docs/inventory.md` (source of truth) against
 the actual Rust code (`rust/src/`) and the original proxy source. They are
 consistent. Status as of R-022 / D-003.
