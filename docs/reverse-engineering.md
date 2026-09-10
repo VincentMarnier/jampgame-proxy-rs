@@ -1308,3 +1308,253 @@ harness, exit 0).
   Navigator hooks) remains a later milestone; `Q_stricmp` is bound to the
   correct `0x1a5304` (U-007) when the hooks needing it land.
 
+
+---
+
+## R-021 — Rust proxy: D-002 hook layer runs end-to-end; two dropped detours verified no-op
+
+### Finding
+
+The D-002 keep set (rcon, q3infoboom, model length, downloads, anti-DDoS
+ipAuthorize, `SV_SvEntityForGentity`, `CNavigator::Load`, game stats / anti-HP /
+min-jump, netStatus) is ported as minimal-alteration detours / intra injections
+and runs under the real engine. Two of the original proxy's whole-function
+rewrites are provably no-ops against the shipped binary and were dropped; one
+Rust-specific codegen hazard (unrelocated direct calls to absolute engine
+addresses) was found and fixed.
+
+### Evidence
+
+**RUNTIME** (same container stack as R-017/R-018/R-020; `rust/scripts/engine-test.sh`
+exit 0; bot-filled FFA and duel servers stay up and answer protocol-26 queries):
+
+1. All 13 engine detours + 5 game detours attach, plus the intra patches and
+   call-site retargets (`----- proxy-rs: Engine properly patched`). The two rcon
+   inline patches, the `ipAuthorize` call NOP (`0x8056f64`), the RMG
+   `je`→`jmp` (`0x804d131`) and the two call-site retargets (`vsprintf` →
+   vsnprintf at `0x8072cca`, `SV_ClientThink` feed at `0x804e891`) apply
+   cleanly.
+2. UDP probes: `getchallenge`/`getinfo`/`getstatus` all answered; `rcon` with
+   correct password executes (`map: mp/duel1`), wrong password → `Bad
+   rconpassword.`, `writeconfig` non-`.cfg` blocked, cooldown
+   (`proxy_sv_enableRconCmdCooldown`) blocks rcons inside the 500 ms
+   `svs->time` window.
+3. Bot-filled FFA runs for minutes: bots connect (`SV_UserinfoChanged`,
+   `SV_SendClientGameState`), think (`ClientThink_real`, and the `SV_ClientThink`
+   feed with `proxy_sv_enableNetStatus 1`), die (`player_die`), pick items up
+   (`G_AddEvent`); an intermission (timelimit) triggers `BeginIntermission` and
+   the full detach→attach cycle on `GAME_SHUTDOWN`/`GAME_INIT` map restart —
+   server survives. `getstatus` shows the bots in game.
+4. `sv` is a global *struct*: `server.sv = (server_t*)0x8273ec0` binds the
+   **address** of the global, not the value at it (`0x8273ec0` holds the
+   struct's first field, `state`). The Rust `sv_ptr()` initially dereferenced
+   the slot and returned 2; fixed to return the global address.
+
+**STATIC (binary diff, why two detours are dropped)**:
+
+5. `SV_ExecuteClientMessage` (`0x804e8c4`) already contains both hack guards in
+   the shipped binary: `mov %eax,0x20414(%edi); test %eax,%eax; jl 0x804e9c5`
+   (`messageAcknowledge < 0` → early return) and
+   `mov 0x20408(%edi),%edx; lea -0x80(%edx),%ecx; cmp %ecx,%eax; jl 0x804e9d2`
+   (reliableAcknowledge range → clamp to `reliableSequence` + return). The
+   original proxy's full rewrite copied these verbatim; its only real additions
+   were the ping-fix (dropped, D-002) and the netStatus feed (now a call-site
+   retarget). **The detour is dropped.**
+6. `SV_PacketEvent`/`SV_ReadPackets` (`0x8057024`) already has both the
+   connectionless dispatch (`msg->cursize >= 4 && *(int*)msg->data == -1` →
+   `0x8057162`) and the translated-port qport fix (`movzwl %ax,%edx` on the
+   qport, then the `svs.clients`/`qport` walk). The proxy's rewrite is verbatim
+   → **dropped**.
+7. `SV_SendClientGameState` (`0x804cee4`) already has the "[ISM]" fragment-flush
+   loop (`client->state && client->netchan.unsentFragments`); the only real
+   diffs vs the proxy rewrite are the `CS_CONNECTED→CS_PRIMED` guard
+   (pristine sets `movl $0x3,(%esi)` unconditionally at `0x804cf54`) and the
+   unconditional `MSG_WriteShort(&msg, 0)` (pristine branches on
+   `TheRandomMissionManager` at `0x804d12a`). Ported as an entry wrapper + the
+   RMG intra patch.
+
+**STATIC/CODE (Rust codegen hazard, fixed)**:
+
+8. A Rust direct `call <absolute-engine-address>` (e.g. `engine_fn!` transmuting
+   `0x812c264` to a fn pointer) emits an **unrelocated** `rel32`: the .so has no
+   `.rel.text` `R_386_PC32` entries, so the loader leaves the linker's
+   link-time-base-relative displacement in place and the call lands at
+   `base+site + 0x812c6e7`-style addresses under ASLR (crash PC computed exactly
+   matches). Fixed by loading the address through a volatile `static` so the
+   call is indirect (`call *%reg`). The engine's absolute addresses are correct
+   as-is (non-PIE at 0x08048000); only the *encoding* of the call was wrong.
+   Game-module calls (`jampgame.functions.*`) were never affected (they use the
+   runtime `dladdr` base).
+
+### Confidence
+
+`High` for every numbered item (reproducible: `rust/scripts/engine-test.sh`,
+the container UDP/rcon probes, `objdump` diffs above).
+
+### Implications
+
+- The D-002 keep set is ported and running; the remaining per-hook
+  differential/observable tests (D-002 Tests section) still need the R-018
+  container stack plus a real client for the client-facing commands
+  (`netStatus`/`showNet`, downloads).
+- `SV_PacketEvent` and `SV_ExecuteClientMessage` are documented as dropped
+  no-ops against the shipped binary; the inventory (`docs/inventory.md`) and
+  this doc are the record.
+- Any future absolute engine-address call in Rust must go through the
+  `engine_fn!` volatile-load pattern, never a direct constant transmute.
+
+## R-022 — netStatus live diagnosis (A1/A1b); packet-identity fix; `with_state` stack bomb; tooling note
+
+### Finding
+
+The per-usercmd netStatus feed was **semantically exact but broken for real
+clients** on two counts, and carried a latent stack bomb:
+
+1. **Packet identity froze the `packets` column.** The Rust stub used
+   `cl->messageAcknowledge` as the `cmdStats` packet identity; a real client's
+   `messageAcknowledge` only advances when the *server* sends reliable
+   commands (rare during gameplay), so `CalcPacketsAndFPS` counted ~1 packet
+   forever and the table went stale between prints. Fixed (`netstatus.rs`):
+   the packet boundary is reconstructed from the engine's per-packet fields —
+   `deltaMessage` (`0x20908`, set per `SV_UserMove` call by the shipped
+   binary, objdump-verified) and `lastPacketTime` (`0x20910`, set per accepted
+   packet by `SV_ReadPackets`) — bumping a monotonic per-client counter
+   (`state.rs`). Same one-identity-per-packet semantics as the original's
+   pre-loop `cmdIndex` capture, exact except for same-frame bursts.
+2. **`state::with_state` stack bomb:** the inlined
+   `get_or_insert_with(ProxyState::default)` materialised
+   `Box<[ClientEntry; MAX_CLIENTS]>: Default` — the whole ~278 KiB per-client
+   array — **on the stack**, giving some call sites a ~278 KB stack-probing
+   prologue (observed live in `client_command_net_status` and, in another
+   build, in `sv_client_think_stub` — fatal on deep engine stacks). Fixed
+   (`state.rs`): `clients: Box<[ClientEntry]>` built element-wise on the heap;
+   `calc_packets_and_fps` no longer copies the 8 KiB `cmd_stats` array to the
+   stack either.
+3. The remaining live symptoms are faithful-to-the-original behavior: zero
+   columns until `SV_CalcPings` gives `ping >= 1`, and the all-zero-slot
+   window artifact (`fps = 1024`) while the client's `serverTime` is < 1000 ms
+   after a map load (the original's identical code does the same).
+
+### Evidence
+
+**RUNTIME** (A1/A1b harness, `tools/runtime/a1_netstatus.sh` +
+`a1_netstatus_semantic.py`: real engine + proxy in the i386 container under
+gdb; a bot client forced to `ping = 20`; `proxy_sv_enableNetStatus 1`):
+
+1. **A1 (semantics):** 40 direct `sv_client_think_stub` inferior calls
+   (serverTime +50 ms/call, one packet per two calls via
+   `lastPacketTime`/`deltaMessage` writes) → `client_command_net_status`
+   prints `fps=21 packets=11`, matching the Python mirror of
+   `UpdateUcmdStats`/`CalcPacketsAndFPS` over the exact injected sequence.
+2. **A1b (in-vivo retarget):** a crafted `clc_move` message (serverId/acks/
+   cmd stream written with the engine's own `MSG_WriteLong` `0x8077ad4`,
+   `MSG_WriteByte` `0x8077a24`, `MSG_WriteBits` `0x8077634`; explicit
+   serverTime branch, angles passthrough, `lastUsercmd` primed) run through
+   the real `SV_ExecuteClientMessage` `0x804e8c4` reaches the Rust stub via
+   the retargeted `call` at `0x804e891` (stub-entry breakpoint) and the table
+   updates to `fps=41 packets=21` — the engine's own `deltaMessage` write
+   bumped the packet counter, as designed.
+3. The engine's reliable-command bookkeeping: `SV_SendServerCommand`
+   increments `reliableSequence` **before** the `Q_strncpyz`
+   (sv_main.cpp:130-149), so the newest command is at
+   `[reliableSequence & (MAX_RELIABLE_COMMANDS-1)]`.
+4. Engine offsets confirmed by disassembly: `ping` `0x39424`,
+   `rate` `0x39428`, `snapshotMsec` `0x3942c` (SV_UserinfoChanged stores),
+   `netchan.remoteAddress` `0x3943c` (fixed the stale Rust constant
+   `OFFSET_NETCHAN_REMOTE_ADDRESS` 234548 → 234556), `deltaMessage`
+   `0x20908`, `lastPacketTime` `0x20910`, `lastUsercmd` `0x20420`,
+   `gamestateMessageNum` `0x20418`.
+
+**TOOLING:** `objdump -d` cannot decode this binary's `.text` (the whole text
+region is covered by a data-typed `$$eh_landing_pad…` symbol; objdump prints
+raw contents, no mnemonics). The working method is **gdb batch disassembly**:
+`disassemble /r start,end` (plain `disassemble start,end` returns empty).
+R-021's "objdump-verified" addresses were raw-byte reads; the conclusions
+stand, now backed by real disassembly.
+
+### Confidence
+
+`High` for 1-2 (reproducible harness), `High` for the tooling note.
+
+### Implications
+
+- The D-002 netStatus row is now live-verified end-to-end at the engine level
+  (no UDP client needed yet); the remaining differential-vs-original-proxy
+  comparison needs the A2 fake client or a real player session.
+- Milestone (pending): port the three upstream `SV_ExecuteClientMessage` gate
+  diffs as an entry wrapper (user decision 2026-09-10: yes) — it can also make
+  the packet identity exact by marking the packet start per `clc_move`
+  message, superseding the burst deviation.
+
+### R-022 follow-up — milestone B port (`SV_ExecuteClientMessage` entry wrapper)
+
+The three upstream gate diffs are ported as the 14th engine detour
+(`hooks/engine_sv.rs::sv_execute_client_message`, wrapper over the pristine
+body via a 6-byte-steal trampoline; the shipped prologue
+`55 8b ec 83 ec 20` is decoder-fixture-pinned). The wrapper:
+
+1. parses the header (serverId / messageAcknowledge / reliableAcknowledge +
+   the command byte) with the engine's own `MSG_Bitstream`/`MSG_ReadLong`/
+   `MSG_ReadByte` (0x80775d4/0x8077e74/0x8077df4) and restores the msg read
+   state before the body runs,
+2. applies the newer upstream gate: nextdl `strstr` tolerance (via a
+   proxy-local scan), the map_restart range check, and the
+   `state != CS_ACTIVE` resend guard (resend = the shipped
+   `Com_DPrintf` 0x8072ed4 with the shipped `"%s : dropped gamestate,
+   resending\n"` at 0x819b584 + pristine `SV_SendClientGameState`),
+3. marks the netStatus packet identity once per `clc_move`/`clc_moveNoDelta`
+   message (`netstatus::mark_packet_start` → per-client `packet_counter`),
+   the exact per-`SV_UserMove` capture point of the original's pre-loop
+   `cmdIndex` — superseding the interim per-packet-field heuristic.
+
+**RUNTIME (A1/A1b, `tools/runtime/a1_netstatus.sh`)**: the crafted
+`SV_ExecuteClientMessage` flow reaches the wrapper (detour attach logged,
+steal 6), marks the packet (the table's packets column increments through the
+real path: A1 direct-stub `fps=21 packets=0` with constant identity — the
+original's `lastPacketIndex=0` initial quirk preserved — then the wrapper's
+in-vivo message → `fps=41 packets=1`).
+
+**HARNESS NOTES (diff flow):** the differential runs
+(`tools/runtime/diff_netstatus.sh rust|original`) surfaced two facts:
+(1) the original proxy divides by `cl->snapshotMsec` unguarded once
+`ping >= 1` (SIGFPE for ping≥1/snapshotMsec=0 — the Rust printer guards
+that branch); (2) the crafted-message flow does not exercise the *original's*
+feed either (its detour early-returns on the crafted header), so crafted
+inputs cannot fully emulate real-client traffic for either proxy — live
+verification must use a real client or the A2 UDP driver.
+
+### R-022 follow-up 2 — localhost ping-0 blind spot (deviation)
+
+**Finding (user observation):** on a local server a real player's computed
+ping is 0 (`SV_CalcPings`: `messageAcked - messageSent` within one frame
+tick), so the original's `ping >= 1` gates — the per-usercmd feed
+(`Proxy_SV_UserMove`: `if (client->ping < 1) continue;`) and the table's
+stats branch (`Proxy_Engine_ClientCommand.cpp:56`) — excluded them: fps and
+packets stayed 0. The gate is a bot discriminator (`SV_CalcPings` writes ping
+0 for `gentity->r.svFlags & SVF_BOT`, binary-verified at `0x8057273-0x805727d`
+— loads `cl->gentity` (0x20844), tests bit 3 of `0x238(%eax)`, writes 0), not
+a deliberate localhost exclusion.
+
+**Structural note:** bots never reach the per-usercmd feed at all — they send
+no `clc_move`; their cmds arrive via the `BOTLIB_USER_COMMAND` syscall
+(sv_game.cpp:990) whose `SV_ClientThink` call site is *not* retargeted. So in
+the ported design the feed's ping gate could only ever exclude zero-ping real
+players.
+
+**Change (deliberate deviation):**
+- `sv_client_think_stub`: the feed's ping gate dropped (the cvar gate stays).
+- The printer discriminates bots with the engine's own check
+  (`gentity != 0 && r.svFlags & SVF_BOT`; new pins `OFFSET_SHARED_SVFLAGS =
+  0x238`, `SVF_BOT = 8`) instead of `ping >= 1`; bots keep the
+  `snapshotMsec = 1` hack and show no stats; zero-ping real players get live
+  fps/packets/timenudge.
+- Division hardening: `1000 / sv_fps` in `UpdateTimenudge` (SIGFPE at
+  sv_fps 0) and `1000 / cl->snapshotMsec` (the original's SIGFPE for
+  ping≥1/snapshotMsec 0) are guarded.
+
+**RUNTIME (A1/A1b, ping-0 path):** with the bot's natural ping 0 and
+`SVF_BOT` cleared (simulating a real localhost player), the feed records at
+ping 0 (timenudge computed) and the table shows `fps=21→41`, `packets=0→1`
+(direct-stub constant identity → the wrapper's in-vivo bump) — the exact
+localhost scenario. With `SVF_BOT` intact the row keeps fps/packets 0 and the
+snapshotMsec hack (bot behavior).

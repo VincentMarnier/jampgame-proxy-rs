@@ -8,6 +8,8 @@ This directory contains knowledge derived from the original implementation and t
 - `reverse-engineering.md` — discoveries about symbols, ABI, hooks, binaries, and runtime behavior.
 - `uncertainties.md` — unresolved questions and hypotheses.
 - `runtime-environment.md` — how to build and run the original binaries in a container for runtime investigation (Dockerfiles, layout, verified behaviour).
+- `inventory.md` — per-feature map of the original proxy: keep/drop decision
+  per D-002 and the implementation technique for each hook.
 - `decisions/` — important architectural decisions once the project becomes more mature.
 
 ## Evidence levels

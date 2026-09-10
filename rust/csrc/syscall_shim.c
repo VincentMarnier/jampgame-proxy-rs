@@ -13,10 +13,18 @@
  * This function is handed to the *original* game module's dllEntry as the
  * syscall pointer, so the original game's traps pass through the proxy.
  *
+ * Also hosts the two variadic *call* shims the hook layer needs:
+ *   - jampgame_proxy_vsnprintf_shim — the retarget for Com_Printf's internal
+ *     `call vsprintf` (engine calls it with the same 3 args as vsprintf; it
+ *     adds the fixed buffer size so vsnprintf can truncate).
+ *   - jampgame_proxy_com_printf — a forwarder for the proxy's own Com_Printf
+ *     calls (the engine's Com_Printf, hardened by the retarget above).
+ *
  * See rust/src/syscall.rs for the Rust side of the boundary.
  */
 
 #include <stdarg.h>
+#include <stdio.h>
 
 /* Implemented in Rust (rust/src/syscall.rs). */
 extern int jampgame_syscall_forward(
@@ -52,4 +60,39 @@ int jampgame_vm_dllsyscall(int command, ...)
 		args[12], args[13], args[14], args[15]);
 
 	return ret;
+}
+
+/*
+ * Com_Printf hardening (D-002 "Com_Printf" redesign row): the engine's
+ * Com_Printf formats into a 0x1100-byte stack buffer and calls vsprintf
+ * (0x8072cca -> vsprintf@plt). The call is retargeted here: same 3 args
+ * (buffer, fmt, va_list), plus a hard-coded truncation bound so an oversized
+ * "%f"-crasher format can no longer overflow the buffer. 4096 matches the
+ * original proxy's Proxy_Com_Printf `char msg[4096]` truncation and is strictly
+ * smaller than the engine's 4352-byte buffer, so no overflow is possible.
+ */
+int jampgame_proxy_vsnprintf_shim(char *buf, const char *fmt, va_list ap)
+{
+	return vsnprintf(buf, 4096, fmt, ap);
+}
+
+/*
+ * Forward a printf-style call to the engine's Com_Printf (0x8072ca4). The
+ * engine's Com_Printf is the hardened version after the retarget above, so
+ * this is what the original proxy reached through
+ * `server.common.functions.Com_Printf`.
+ */
+extern void jampgame_proxy_com_printf(const char *fmt, ...)
+	__attribute__((force_align_arg_pointer));
+
+void jampgame_proxy_com_printf(const char *fmt, ...)
+{
+	void (*engine_printf)(const char *, ...) = (void (*)(const char *, ...))0x08072ca4;
+	va_list ap;
+
+	va_start(ap, fmt);
+	/* The engine's Com_Printf is variadic cdecl: pass the va_list through
+	 * (it is just a char* on i386). */
+	((void (*)(const char *, char *))engine_printf)(fmt, (char *)ap);
+	va_end(ap);
 }

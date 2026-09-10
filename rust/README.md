@@ -166,7 +166,8 @@ scripts/run-server.sh   persistent bot-filled server for real-player testing
 
 ## Status / scope
 
-Milestone **bootstrap core + trap interceptions** (docs `R-020`). Implemented:
+Milestone **bootstrap core + trap interceptions + D-002 hook layer** (docs
+`R-020`, `R-021`). Implemented:
 
 - version gate (rejects non-pristine engines),
 - original-module load + symbol binding (`dllEntry`/`vmMain`/`level`/
@@ -174,17 +175,22 @@ Milestone **bootstrap core + trap interceptions** (docs `R-020`). Implemented:
 - engine memory layer: `svs`/`sv` + the 17 cvar-pointer slots read at
   `GAME_INIT` (R-018-verified addresses), plus the full reference address
   tables from `Proxy_Engine_Wrappers.hpp` as data,
-- proxy cvar mirror (`proxy_sv_*`) registered at `GAME_INIT` and refreshed each
-  `GAME_RUN_FRAME`,
+- proxy cvar mirror (`proxy_sv_*`, D-002 keep set) registered at `GAME_INIT`
+  and refreshed each `GAME_RUN_FRAME`,
 - `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` trap interception,
 - `vmMain` dispatch for `GAME_RUN_FRAME` / `GAME_CLIENT_CONNECT` / `BEGIN` /
   `DISCONNECT` / `COMMAND` / `USERINFO_CHANGED` with the proxy's command and
-  userinfo filtering, and `GAME_SHUTDOWN` with `Com_EndRedirect` + unload.
+  userinfo filtering, and `GAME_SHUTDOWN` with hook detach + `Com_EndRedirect`
+  + unload,
+- the D-002 hook layer (R-021): detour machinery (`rust/src/patch.rs`, a
+  whole-instruction length decoder regression-pinned against the real hook-site
+  bytes), the rcon + q3infoboom + model-length + download-validation +
+  `ipAuthorize` + `SV_SvEntityForGentity` + `CNavigator::Load` +
+  `SV_SendClientGameState` engine hooks, the game stats / anti-HP / min-jump
+  wrappers, and the netStatus feed + table printer. Two original whole-function
+  rewrites (`SV_PacketEvent`, `SV_ExecuteClientMessage`) are verified no-ops
+  against the shipped binary and dropped (R-021).
 
-Not yet implemented (later milestones): the engine/game hook patch layer
-(detours, download/snapshot/userinfo/Navigator hooks), and the `netStatus` /
-`showNet` command handler — while `proxy_sv_enableNetStatus` is non-zero those
-commands are forwarded to the game instead of intercepted (`src/shared_api.rs`).
-`Q_stricmp` is bound to its correct address `0x1a5304` (U-007) once the hooks
-that need it land. Runtime evidence for this milestone is recorded as finding
-**R-020** in `../docs/reverse-engineering.md`.
+Not yet runtime-verified (needs a real client / scenario): the `netStatus`/
+`showNet` table rendering, downloads end-to-end, `CNavigator::Load` on a
+nav-using map. `Q_stricmp` is bound to the correct `0x1a5304` (U-007).

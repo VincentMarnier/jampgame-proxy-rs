@@ -127,6 +127,46 @@ pub fn c_strlen(bytes: &[u8]) -> usize {
     bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())
 }
 
+/// `Q_StripColor` (`Proxy_Utils.cpp:49-83`): repeatedly remove `^[0-9]` color
+/// escapes from `text` in place.
+pub fn strip_color(text: &mut [u8]) {
+    let mut do_pass = true;
+    while do_pass {
+        do_pass = false;
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read < text.len() && text[read] != 0 {
+            if is_color_string_ext(&text[read..]) {
+                do_pass = true;
+                read += 2;
+            } else {
+                if write != read {
+                    text[write] = text[read];
+                }
+                write += 1;
+                read += 1;
+            }
+        }
+        if write < read && write < text.len() {
+            text[write] = 0;
+        }
+    }
+}
+
+/// `calcRatio` (`Proxy_Utils.cpp:85-103`): K/D or damage ratio used by the
+/// intermission stats tables.
+pub fn calc_ratio(kill: i32, death: i32) -> f32 {
+    if kill == 0 && death == 0 {
+        1.00
+    } else if kill < 1 && death >= 1 {
+        0.00
+    } else if kill >= 1 && death <= 1 {
+        kill as f32
+    } else {
+        kill as f32 / death as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

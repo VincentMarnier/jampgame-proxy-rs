@@ -1,11 +1,12 @@
 //! jampgame-proxy-rs — the Rust rewrite of `jampgame_proxy`.
 //!
-//! Milestone: bootstrap core + trap interceptions (docs `R-020`). The module
-//! loads in the game-module slot, runs the version gate, loads and wires the
-//! pristine game module, initialises the engine memory layer, and intercepts
-//! the `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` traps plus the `vmMain` events
-//! that feed the proxy's own state. The engine hook/patch layer (detours,
-//! download/snapshot/userinfo/Navigator hooks) is a later milestone.
+//! The module loads in the game-module slot, runs the version gate, loads and
+//! wires the pristine game module, initialises the engine memory layer,
+//! intercepts the `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` traps, runs the
+//! `vmMain` event handlers that feed the proxy's own state, and attaches the
+//! engine/game hook layer (D-002 keep set: rcon + download + userinfo +
+//! netStatus + game stats/anti-HP/min-jump, all as minimal-alteration
+//! detours / intra injections).
 //!
 //! Loading model (see `docs/reverse-engineering.md` R-014):
 //!
@@ -29,8 +30,10 @@
 //! `src/original.rs`, `src/sdk.rs`.
 
 mod engine;
+mod hooks;
 mod jampgame;
 mod original;
+mod patch;
 mod sdk;
 mod shared_api;
 mod state;
@@ -183,13 +186,19 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // has run its own registration, which is idempotent on the engine side.
     register_proxy_cvars();
 
+    // Attach the engine/game hook layer (D-002 keep set) after the game is up
+    // and the memory layer is populated.
+    unsafe { hooks::attach_all() };
+
     response
 }
 
-/// `vmMain(GAME_SHUTDOWN, restart)`: close any engine redirect left open by an
-/// rcon map change, forward the shutdown, then unload the original module
-/// (`Proxy_Main.cpp:128-160`).
+/// `vmMain(GAME_SHUTDOWN, restart)`: detach the hooks, close any engine
+/// redirect left open by an rcon map change, forward the shutdown, then unload
+/// the original module (`Proxy_Main.cpp:128-160`).
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
+    // SAFETY: hooks were attached at GAME_INIT; must run before dlclose.
+    unsafe { hooks::detach_all() };
     // SAFETY: engine redirect globals are valid; no-op when no redirect open.
     unsafe { engine::com_end_redirect() };
     let response = forward(GAME_SHUTDOWN, args);

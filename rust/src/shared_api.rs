@@ -5,11 +5,8 @@
 //! - String helpers (`Q_stricmpn`, `Info_*`, `ConcatArgs`) come from the
 //!   *original game module* (`jampgame.functions.*`), exactly as the original
 //!   proxy does, so edge-case semantics are the game's, not ours.
-//! - The `netStatus`/`showNet` command handler (`Proxy_Engine_ClientCommand_NetStatus`)
-//!   is not ported yet (it needs the `client_t`/`playerState_t` struct surface
-//!   of a later milestone); while `proxy_sv_enableNetStatus` is non-zero the
-//!   command is forwarded to the game instead of being intercepted — see
-//!   `docs/`.
+//! - `netStatus`/`showNet` are intercepted here and handled by
+//!   `crate::hooks::netstatus` (D-001.2 lifted).
 
 use core::ffi::{CStr, c_char, c_int};
 
@@ -21,8 +18,7 @@ use crate::sdk::{
     FP_LEVITATION, MAX_INFO_STRING, MAX_NETNAME, MAX_TOKEN_CHARS, NUM_FORCE_POWERS, ROLL, Usercmd,
 };
 use crate::state::{
-    self, CVAR_DISABLE_KILL_CMD, CVAR_ENABLE_NET_STATUS, CVAR_MAX_CALLVOTE_MAPRESTART,
-    CVAR_MODEL_PATH_LENGTH,
+    self, CVAR_ENABLE_NET_STATUS, CVAR_MAX_CALLVOTE_MAPRESTART, CVAR_MODEL_PATH_LENGTH,
 };
 use crate::syscall;
 use crate::utils;
@@ -195,12 +191,6 @@ pub fn client_command(client_num: c_int) -> bool {
         return false;
     }
 
-    if state::with_state(|s| s.cvars[CVAR_DISABLE_KILL_CMD].integer != 0)
-        && unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"kill".as_ptr(), 4) } == 0
-    {
-        return false;
-    }
-
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"callvote".as_ptr(), 8) } == 0 {
         let cmd_arg2_number_value = utils::atoi(cmd_arg2);
         let mut min_arg2 = 0i32;
@@ -255,10 +245,8 @@ pub fn client_command(client_num: c_int) -> bool {
         && (unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"netStatus".as_ptr(), 9) } == 0
             || unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"showNet".as_ptr(), 7) } == 0)
     {
-        // Not yet ported (needs client_t/playerState_t layout from a later
-        // milestone); forward the command to the game instead of intercepting.
-        eprintln!("----- proxy-rs: netStatus/showNet not yet ported; forwarding");
-        return true;
+        crate::hooks::netstatus::client_command_net_status(client_num);
+        return false;
     }
 
     true

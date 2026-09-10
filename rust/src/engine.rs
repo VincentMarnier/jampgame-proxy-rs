@@ -12,6 +12,7 @@
 //! address tables: function-pointer *calls* (besides `Com_EndRedirect`) arrive
 //! with the hook milestones.
 
+use core::ffi::{c_char, c_int};
 use std::sync::{Mutex, MutexGuard};
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,11 @@ pub mod vars {
     pub const SVS: usize = 0x0831_21e0;
     pub const SVSCLIENTS: usize = 0x0831_21ec;
     pub const SV: usize = 0x0827_3ec0;
+    /// `server.sv.serverId` (binary: `SV_ExecuteClientMessage` compares the
+    /// message serverId against `0x8273ec8`).
+    pub const SV_SERVER_ID: usize = 0x0827_3ec8;
+    /// `server.sv.restartedServerId` (`0x8273ecc`, same compare site).
+    pub const SV_RESTARTED_SERVER_ID: usize = 0x0827_3ecc;
     pub const RD_BUFFER: usize = 0x081e_90c0;
     pub const RD_BUFFERSIZE: usize = 0x081e_90c4;
     pub const RD_FLUSH: usize = 0x081e_90c8;
@@ -256,6 +262,36 @@ pub fn init_memory_layer() {
     eprintln!("----- proxy-rs: Memory layer properly initialized");
 }
 
+// ---------------------------------------------------------------------------
+// Engine call layer (`server.functions.*` / `server.common.functions.*` /
+// `server.common.vars.*` — the subset the ported hooks call)
+// ---------------------------------------------------------------------------
+
+/// Re-type an engine function address as `$fn_ty`.
+///
+/// The address is loaded with a **volatile** read (which the optimizer cannot
+/// fold) so the call is **indirect**: a direct relative `call <absolute>`
+/// would be patched by the linker relative to the .so's link-time base and
+/// land wrong under ASLR, because the loader applies no text relocation for it
+/// (the .so has no `.rel.text` `R_386_PC32` entries). The engine is a fixed
+/// non-PIE at 0x08048000, so the absolute value in the data slot is correct
+/// as-is.
+///
+/// # Safety
+///
+/// `$fn_ty` must describe the actual cdecl signature of the engine function
+/// at `$addr` (version-swept table, R-010).
+macro_rules! engine_fn {
+    ($fn_ty:ty, $addr:expr) => {{
+        static ADDR: usize = $addr;
+        // SAFETY: volatile read of a static; the loaded value is a validated
+        // engine function entry (R-010).
+        let a = unsafe { core::ptr::read_volatile(&ADDR) };
+        // SAFETY: usize and fn pointers are both pointer-sized.
+        unsafe { core::mem::transmute::<usize, $fn_ty>(a) }
+    }};
+}
+
 /// `server.common.functions.Com_EndRedirect()` (0x8072c74): flush and close the
 /// engine's current redirect. Called at `GAME_SHUTDOWN` because an `rcon map`
 /// change leaves a redirect open (`Proxy_Main.cpp:135`); no-op if none is open.
@@ -264,8 +300,298 @@ pub fn init_memory_layer() {
 ///
 /// Engine-only; the engine's redirect globals must be valid.
 pub unsafe fn com_end_redirect() {
-    let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(functions::COM_END_REDIRECT) };
+    let f: unsafe extern "C" fn() = engine_fn!(unsafe extern "C" fn(), functions::COM_END_REDIRECT);
     unsafe { f() };
+}
+
+/// `playerState_t* SV_GameClientNum(int)` (0x8054754) — the game module's
+/// playerState for a client (the proxy's `server.functions.SV_GameClientNum`).
+///
+/// # Safety
+///
+/// Engine-internal; `client_num` must be in range.
+pub unsafe fn sv_game_client_num(client_num: c_int) -> usize {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(c_int) -> usize = engine_fn!(
+        unsafe extern "C" fn(c_int) -> usize,
+        functions::SV_GAME_CLIENT_NUM
+    );
+    unsafe { f(client_num) }
+}
+
+/// `char* Cmd_Argv(int)` (0x812c264) — the engine's argv table.
+///
+/// # Safety
+///
+/// `n` must index the tokenized command; the returned pointer is valid until
+/// the next tokenization.
+pub unsafe fn cmd_argv(n: c_int) -> *const c_char {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(c_int) -> *const c_char = engine_fn!(
+        unsafe extern "C" fn(c_int) -> *const c_char,
+        functions::CMD_ARGV
+    );
+    unsafe { f(n) }
+}
+
+/// `const char* FS_ReferencedPakNames(void)` (0x8131024).
+///
+/// # Safety
+///
+/// Engine filesystem must be initialised; pointer valid until the next call.
+pub unsafe fn fs_referenced_pak_names() -> *const c_char {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn() -> *const c_char = engine_fn!(
+        unsafe extern "C" fn() -> *const c_char,
+        functions::FS_REFERENCED_PAK_NAMES
+    );
+    unsafe { f() }
+}
+
+/// `void FS_FCloseFile(fileHandle_t)` (0x812d1b4).
+///
+/// # Safety
+///
+/// `handle` must be a valid open file handle or 0.
+pub unsafe fn fs_fclose_file(handle: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(c_int) =
+        engine_fn!(unsafe extern "C" fn(c_int), functions::FS_FCLOSE_FILE);
+    unsafe { f(handle) };
+}
+
+/// `void MSG_WriteByte(msg_t*, int)` (0x8077a24).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written.
+pub unsafe fn msg_write_byte(msg: usize, c: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, c_int),
+        functions::MSG_WRITE_BYTE
+    );
+    unsafe { f(msg, c) };
+}
+
+/// `void MSG_WriteShort(msg_t*, int)` (0x8077aa4).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written.
+pub unsafe fn msg_write_short(msg: usize, c: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, c_int),
+        functions::MSG_WRITE_SHORT
+    );
+    unsafe { f(msg, c) };
+}
+
+/// `void MSG_WriteLong(msg_t*, int)` (0x8077ad4).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written.
+pub unsafe fn msg_write_long(msg: usize, c: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, c_int),
+        functions::MSG_WRITE_LONG
+    );
+    unsafe { f(msg, c) };
+}
+
+/// `void MSG_WriteString(msg_t*, const char*)` (0x8077b34).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written; `s` NUL-terminated.
+pub unsafe fn msg_write_string(msg: usize, s: *const c_char) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, *const c_char) = engine_fn!(
+        unsafe extern "C" fn(usize, *const c_char),
+        functions::MSG_WRITE_STRING
+    );
+    unsafe { f(msg, s) };
+}
+
+/// `void SV_ClientThink(client_t*, usercmd_t*)` (0x804e634) — the original
+/// target of the retargeted usercmd-loop call site.
+///
+/// # Safety
+///
+/// `cl`/`ucmd` must be valid engine pointers.
+pub unsafe fn sv_client_think(cl: usize, ucmd: usize) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, usize) = engine_fn!(
+        unsafe extern "C" fn(usize, usize),
+        functions::SV_CLIENT_THINK
+    );
+    unsafe { f(cl, ucmd) };
+}
+
+/// `void MSG_Bitstream(msg_t*)` (0x80775d4) — switch a message to bitstream
+/// reading (sets `oob = qfalse`; does not reset readcount/bit).
+///
+/// # Safety
+///
+/// `msg` must be a valid engine `msg_t*`.
+pub unsafe fn msg_bitstream(msg: usize) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize) =
+        engine_fn!(unsafe extern "C" fn(usize), functions::MSG_BITSTREAM);
+    unsafe { f(msg) };
+}
+
+/// `int MSG_ReadLong(msg_t*)` (0x8077e74).
+///
+/// # Safety
+///
+/// `msg` must be a valid engine `msg_t*` positioned for reading.
+pub unsafe fn msg_read_long(msg: usize) -> c_int {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize) -> c_int = engine_fn!(
+        unsafe extern "C" fn(usize) -> c_int,
+        functions::MSG_READ_LONG
+    );
+    unsafe { f(msg) }
+}
+
+/// `int MSG_ReadByte(msg_t*)` (0x8077df4).
+///
+/// # Safety
+///
+/// `msg` must be a valid engine `msg_t*` positioned for reading.
+pub unsafe fn msg_read_byte(msg: usize) -> c_int {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize) -> c_int = engine_fn!(
+        unsafe extern "C" fn(usize) -> c_int,
+        functions::MSG_READ_BYTE
+    );
+    unsafe { f(msg) }
+}
+
+/// `void Com_DPrintf(const char *fmt, ...)` (0x8072ed4) — developer-only
+/// printf; called with the exact `(fmt, one arg)` word list the gate uses
+/// (cdecl variadic with two words ≡ the fixed two-arg form).
+///
+/// # Safety
+///
+/// The engine must be initialised; `arg` must match the format string.
+pub unsafe fn com_dprintf(fmt: usize, arg: usize) {
+    // SAFETY: pointer from the fixed engine table; a cdecl call with exactly
+    // two words is ABI-identical to the variadic call with one %s argument.
+    let f: unsafe extern "C" fn(usize, usize) =
+        engine_fn!(unsafe extern "C" fn(usize, usize), functions::COM_DPRINTF);
+    unsafe { f(fmt, arg) };
+}
+
+/// `void SV_SendClientGameState(client_t*)` (0x804cee4) — pristine body call
+/// (used by the `SV_ExecuteClientMessage` wrapper's resend arm).
+///
+/// # Safety
+///
+/// `cl` must be a valid engine `client_t*`.
+pub unsafe fn sv_send_client_game_state(cl: usize) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize) = engine_fn!(
+        unsafe extern "C" fn(usize),
+        functions::SV_SEND_CLIENT_GAME_STATE
+    );
+    unsafe { f(cl) };
+}
+
+/// `void SV_SendMessageToClient(msg_t*, client_t*)` (0x8058c84).
+///
+/// # Safety
+///
+/// `msg`/`cl` must be valid engine pointers.
+#[allow(dead_code)] // mirrors the wrappers table; the pristine body uses it via trampoline
+pub unsafe fn sv_send_message_to_client(msg: usize, cl: usize) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, usize) = engine_fn!(
+        unsafe extern "C" fn(usize, usize),
+        functions::SV_SEND_MESSAGE_TO_CLIENT
+    );
+    unsafe { f(msg, cl) };
+}
+
+/// Read the engine `cmd_argc` var (int @ 0x8260e20).
+///
+/// # Safety
+///
+/// Engine data address from the fixed table.
+pub unsafe fn cmd_argc() -> c_int {
+    // SAFETY: validated engine RW address (R-010/R-018).
+    unsafe { *(vars::CMD_ARGC as *const c_int) }
+}
+
+/// Read engine `cmd_argv[n]` (char* table @ 0x8260e40).
+///
+/// # Safety
+///
+/// `n < MAX_STRING_TOKENS`; engine data address from the fixed table.
+pub unsafe fn cmd_argv_ptr(n: usize) -> *const c_char {
+    // SAFETY: validated engine RW address; argv is char*[MAX_STRING_TOKENS].
+    unsafe { *((vars::CMD_ARGV as *const *const c_char).add(n)) }
+}
+
+/// Write engine `cmd_argc` (used by the `Cmd_TokenizeString2` local helper).
+///
+/// # Safety
+///
+/// Engine data address from the fixed table.
+pub unsafe fn set_cmd_argc(n: c_int) {
+    // SAFETY: validated engine RW address.
+    unsafe { *(vars::CMD_ARGC as *mut c_int) = n };
+}
+
+/// Write one token into the engine `cmd_argv`/`cmd_tokenized` buffers
+/// (used by the `Cmd_TokenizeString2` local helper).
+///
+/// # Safety
+///
+/// `index < MAX_STRING_TOKENS`; `dst` must point into `cmd_tokenized`.
+pub unsafe fn set_cmd_argv(index: usize, dst: *const c_char) {
+    // SAFETY: validated engine RW addresses.
+    unsafe { *(vars::CMD_ARGV as *mut *const c_char).add(index) = dst };
+}
+
+/// The engine `cmd_tokenized` buffer base (char @ 0x8264440).
+pub const CMD_TOKENIZED_BASE: usize = vars::CMD_TOKENIZED;
+
+// ---------------------------------------------------------------------------
+// cvar_t offsets (oracle)
+// ---------------------------------------------------------------------------
+
+/// `offsetof(cvar_t, string)`.
+#[allow(dead_code)]
+pub const OFFSET_CVAR_STRING: usize = 4;
+/// `offsetof(cvar_t, integer)`.
+pub const OFFSET_CVAR_INTEGER: usize = 32;
+
+/// Read an engine `cvar_t`'s `integer` field (`cvar_t.integer` @ 32, oracle).
+///
+/// # Safety
+///
+/// `cvar_ptr` must be a live `cvar_t*` from the engine cvar slots.
+pub unsafe fn cvar_integer(cvar_ptr: usize) -> c_int {
+    // SAFETY: validated slot dereferenced at init; integer is a plain int.
+    unsafe { core::ptr::read_unaligned((cvar_ptr + OFFSET_CVAR_INTEGER) as *const i32) }
+}
+
+/// Read an engine `cvar_t`'s `string` field (`cvar_t.string` @ 4, oracle),
+/// returning a NUL-terminated C string pointer.
+///
+/// # Safety
+///
+/// `cvar_ptr` must be a live `cvar_t*`; the returned pointer is valid while
+/// the cvar exists.
+#[allow(dead_code)] // mirrors the wrappers table; not needed by the current hook set
+pub unsafe fn cvar_string_ptr(cvar_ptr: usize) -> *const u8 {
+    // SAFETY: validated slot dereferenced at init; string is a char array.
+    unsafe { core::ptr::read_unaligned((cvar_ptr + OFFSET_CVAR_STRING) as *const *const u8) }
 }
 
 #[cfg(test)]
