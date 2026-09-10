@@ -442,7 +442,7 @@ pub unsafe extern "C" fn begin_intermission() {
                 });
                 let kd = printf_str(&format_score(killed, killed_by), 28, 28);
                 let dmg = printf_str(&format_score(given, taken), 39, 39);
-                let row = format!("print \"{}{}{}\n\"", printf_str(&name, 36, 15), kd, dmg);
+                let row = format!("print \"{} {} {}\n\"", printf_str(&name, 36, 15), kd, dmg);
                 send_server_command(viewer, row.as_bytes());
             }
         }
@@ -506,7 +506,7 @@ pub unsafe extern "C" fn begin_intermission() {
             let tk = printf_str(&format!("{team_kills}/{team_killed}"), 9, 9);
             let tdmg = printf_str(&format!("{team_dmg_given}/{team_dmg_taken}"), 13, 13);
             let row = format!(
-                "print \"{}{}{}{}{}\n\"",
+                "print \"{} {} {} {} {}\n\"",
                 printf_str(&name, 36, 15),
                 kd,
                 dmg,
