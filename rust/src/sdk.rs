@@ -98,6 +98,7 @@ pub const DEFAULT_BASE_GAME_FOLDER_NAME: &str = "base";
 
 pub const G_CVAR_REGISTER: i32 = 5;
 pub const G_CVAR_UPDATE: i32 = 6;
+pub const G_CVAR_SET: i32 = 7;
 pub const G_CVAR_VARIABLE_INTEGER_VALUE: i32 = 8;
 pub const G_CVAR_VARIABLE_STRING_BUFFER: i32 = 9;
 pub const G_ARGV: i32 = 11;
@@ -390,6 +391,7 @@ mod tests {
         // the module docs); pin them so a header re-read cannot silently drift.
         assert_eq!(G_CVAR_REGISTER, 5);
         assert_eq!(G_CVAR_UPDATE, 6);
+        assert_eq!(G_CVAR_SET, 7);
         assert_eq!(G_CVAR_VARIABLE_INTEGER_VALUE, 8);
         assert_eq!(G_CVAR_VARIABLE_STRING_BUFFER, 9);
         assert_eq!(G_ARGV, 11);

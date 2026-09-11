@@ -11,3 +11,6 @@
   deviation.
 - `0004-team-lock.md` — Rust-only `proxy_sv_lockTeams` (TDM/CTF): reconnect-burst
   snapshot, even/>=2 lock rule, `SetTeam` enforcement, and the TDM/CTF scope.
+- `0005-team-size-rules.md` — Rust-only `proxy_sv_teamSizeRules`: per-team-size
+  `timelimit`/`fraglimit`/`capturelimit` overrides at round start, nearest
+  smaller size fallback, independent of the lock boolean.

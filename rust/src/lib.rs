@@ -34,6 +34,7 @@ mod hooks;
 mod jampgame;
 mod original;
 mod patch;
+mod rules;
 mod sdk;
 mod shared_api;
 mod state;
@@ -114,6 +115,7 @@ pub unsafe extern "C" fn vmMain(
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
             if state::proxy_enabled() {
                 teamlock::on_run_frame();
+                rules::on_run_frame();
             }
             forward(GAME_RUN_FRAME, &args)
         }
@@ -216,6 +218,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 /// redirect left open by an rcon map change, forward the shutdown, then unload
 /// the original module (`Proxy_Main.cpp:128-160`).
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
+    // Undo any team-size rule override before the module is unloaded: game cvars
+    // persist across maps, so a rule value would otherwise leak into the next
+    // round (no-op when no rule is applied).
+    rules::restore_on_shutdown();
     // SAFETY: hooks were attached at GAME_INIT; must run before dlclose.
     unsafe { hooks::detach_all() };
     // SAFETY: engine redirect globals are valid; no-op when no redirect open.

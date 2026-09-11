@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 9] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 10] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -29,6 +29,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 9] = [
     (c"proxy_sv_minJumpTime", c"0"),
     (c"proxy_sv_enableEndGameStats", c"1"),
     (c"proxy_sv_lockTeams", c"0"),
+    (c"proxy_sv_teamSizeRules", c""),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -42,6 +43,9 @@ pub const CVAR_ANTI_HP_TELLER: usize = 5;
 pub const CVAR_MIN_JUMP_TIME: usize = 6;
 pub const CVAR_ENABLE_END_GAME_STATS: usize = 7;
 pub const CVAR_LOCK_TEAMS: usize = 8;
+/// Per-team-size `timelimit`/`fraglimit`/`capturelimit` rules (reconciled every
+/// frame with the roster, independent of `proxy_sv_lockTeams`).
+pub const CVAR_TEAM_SIZE_RULES: usize = 9;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -161,6 +165,12 @@ pub struct ProxyState {
     pub cvars: [VmCvar; PROXY_CVARS.len()],
     pub jump_start_time: [i32; MAX_CLIENTS],
     pub team_lock: TeamLock,
+    /// The `proxy_sv_teamSizeRules` rule most recently written, so the per-frame
+    /// reconciler only re-applies the limits when the effective rule changes.
+    pub last_team_rule: Option<crate::rules::Rule>,
+    /// The `timelimit`/`fraglimit`/`capturelimit` captured before the proxy
+    /// first overrode them, restored when the roster falls below every rule.
+    pub base_limits: Option<crate::rules::BaseLimits>,
 }
 
 static STATE: Mutex<Option<ProxyState>> = Mutex::new(None);
@@ -197,6 +207,8 @@ impl ProxyState {
             cvars: core::array::from_fn(|_| VmCvar::default()),
             jump_start_time: [0; MAX_CLIENTS],
             team_lock: TeamLock::default(),
+            last_team_rule: None,
+            base_limits: None,
         }
     }
 }
@@ -260,6 +272,7 @@ mod tests {
         );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_TEAM_SIZE_RULES].1.to_bytes(), b"");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

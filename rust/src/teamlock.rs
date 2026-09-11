@@ -103,7 +103,7 @@ pub fn on_run_frame() {
 
 /// Count a team exactly like the game's `TeamCount` (`g_client.c:1237`): every
 /// connected client whose `sess.sessionTeam` matches.
-fn team_count(team: i32) -> i32 {
+pub(crate) fn team_count(team: i32) -> i32 {
     let base = state::with_state(|s| s.located_game_data.g_entities);
     if base == 0 {
         return 0;

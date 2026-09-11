@@ -47,8 +47,8 @@ IMAGE=${JAMP_IMAGE:-jampgame-investigation:i386-bookworm}
 GAMEDATA=${JAMP_GAMEDATA:-"$ROOT/original/GameData"}
 PORT=${JAMP_PORT:-29070}
 BIND=${JAMP_BIND:-0.0.0.0}
-MAP=${JAMP_MAP:-mp/ffa1}
-GAMETYPE=${JAMP_GAMETYPE:-0}
+MAP=${JAMP_MAP:-mp/duel1}
+GAMETYPE=${JAMP_GAMETYPE:-6}
 BOTS=${JAMP_BOTS:-4}
 MAXCLIENTS=${JAMP_MAXCLIENTS:-16}
 NAME=${JAMP_NAME:-jka-proxy-rs-server}
@@ -106,6 +106,7 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
   -v "$GAMEDATA":/srv/jka/gamedata:ro \
   "$IMAGE" \
   ./linuxjampded \
+    +set rconpassword "proxy" \
     +set dedicated 1 +set net_port "$PORT" \
     +set fs_cdpath /srv/jka/gamedata \
     +set sv_pure 0 +set sv_maxclients "$MAXCLIENTS" \
@@ -113,5 +114,11 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
     +set g_gametype "$GAMETYPE" \
     +set sv_hostname "^7proxy-rs^7 ^5test server" \
     +set timelimit 0 +set fraglimit 0 \
+    +set proxy_sv_teamSizeRules "2:1:0:0,3:0:1:0" \
+    +set proxy_sv_enableNetStatus 1 \
+    +set g_forcepowerdisable 163837 \
+    +set g_weaponDisable 524279 \
+    +set g_friendlyFire 1 \
+    +set g_friendlySaber 1 \
     +map "$MAP" \
     ${JAMP_EXTRA:-}

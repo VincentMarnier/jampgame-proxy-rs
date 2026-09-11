@@ -23,7 +23,7 @@ use core::ffi::{CStr, c_int};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sdk::{
-    G_ARGV, G_CVAR_REGISTER, G_CVAR_UPDATE, G_CVAR_VARIABLE_INTEGER_VALUE,
+    G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE, G_CVAR_VARIABLE_INTEGER_VALUE,
     G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT, G_GET_USERCMD, G_GET_USERINFO,
     G_LOCATE_GAME_DATA, G_SEND_SERVER_COMMAND, G_SET_USERINFO, VmCvar,
 };
@@ -230,6 +230,22 @@ pub unsafe fn cvar_register(cvar: *mut VmCvar, name: &CStr, default_value: &CStr
 pub unsafe fn cvar_update(cvar: *mut VmCvar) {
     unsafe {
         call_engine(G_CVAR_UPDATE, &[cvar as usize as c_int]);
+    }
+}
+
+/// `trap_Cvar_Set` — set cvar `name` to `value` engine-side
+/// (`G_CVAR_SET`, `trap_Cvar_Set`).
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `name` and `value` must be
+/// NUL-terminated.
+pub unsafe fn cvar_set(name: &CStr, value: &CStr) {
+    unsafe {
+        call_engine(
+            G_CVAR_SET,
+            &[name.as_ptr() as c_int, value.as_ptr() as c_int],
+        );
     }
 }
 

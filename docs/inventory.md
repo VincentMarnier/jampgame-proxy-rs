@@ -221,6 +221,7 @@ The D-002 keep set is ported as minimal-alteration detours / intra injections
 | feature | cvar | address | technique |
 |---|---|---|---|
 | round-start team lock (TDM/CTF) | `proxy_sv_lockTeams` | game `+0x0012ada4` (`SetTeam`) | entry wrapper + `GAME_CLIENT_CONNECT`/`GAME_RUN_FRAME` bookkeeping |
+| per-team-size limits | `proxy_sv_teamSizeRules` | — (`G_CVAR_SET` = 7) | per-frame reconcile of the roster, `trap_Cvar_Set`s `timelimit`/`fraglimit`/`capturelimit` when the effective rule changes (nearest smaller size; restores the captured server limits below the smallest rule) |
 
 `SetTeam(gentity_t*, char*)` is nm-verified (`SetTeam__FP9gentity_sPc`) and its
 prologue (`55 8b ec 83 ec 38`, 6 bytes) is detour-safe. The wrapper drops
