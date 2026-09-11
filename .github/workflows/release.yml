@@ -58,6 +58,12 @@ jobs:
           # owner, so Git's "dubious ownership" check rejects the repository.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Run regression tests
+        working-directory: rust
+        # `--locked` also fails if the committed Cargo.lock is stale. This gates
+        # the release: a failure stops the job before any bump, tag or publish.
+        run: cargo test --locked
+
       - name: Compute next version
         id: version
         run: |
