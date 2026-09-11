@@ -71,12 +71,12 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
 /// proxy to first-time non-bot connects.
 pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
     if first_time && !is_bot {
-        // Same bytes as the original proxy's
+        // Same shape as the original proxy's
         // `va("print \"^5%s (^7%s^5)^7\n\"", JAMPGAMEPROXY_NAME, VERSION)`, with
-        // the version taken from the crate (`Cargo.toml`) so releases only bump
-        // it in one place.
+        // the name renamed to `jampgame-proxy-rs` and the version taken from the
+        // crate (`Cargo.toml`) so releases only bump it in one place.
         let banner = CString::new(format!(
-            "print \"^5jampgame_proxy (^7{}^5)^7\n\"",
+            "print \"^5jampgame-proxy-rs (^7{}^5)^7\n\"",
             crate::VERSION
         ))
         .expect("static banner contains no interior NUL");
