@@ -1552,11 +1552,11 @@ players.
 
 **Change (deliberate deviation):**
 - `sv_client_think_stub`: the feed's ping gate dropped (the cvar gate stays).
-- The printer discriminates bots with the engine's own check
+- The printer excludes bots using the engine's own check
   (`gentity != 0 && r.svFlags & SVF_BOT`; new pins `OFFSET_SHARED_SVFLAGS =
-  0x238`, `SVF_BOT = 8`) instead of `ping >= 1`; bots keep the
-  `snapshotMsec = 1` hack and show no stats; zero-ping real players get live
-  fps/packets/timenudge.
+  0x238`, `SVF_BOT = 8`) instead of `ping >= 1`; bot rows are skipped entirely
+  (the original's `snapshotMsec = 1` hack is therefore gone); zero-ping real
+  players get live fps/packets/timenudge.
 - Division hardening: `1000 / sv_fps` in `UpdateTimenudge` (SIGFPE at
   sv_fps 0) and `1000 / cl->snapshotMsec` (the original's SIGFPE for
   ping≥1/snapshotMsec 0) are guarded.
@@ -1565,8 +1565,8 @@ players.
 `SVF_BOT` cleared (simulating a real localhost player), the feed records at
 ping 0 (timenudge computed) and the table shows `fps=21→41`, `packets=0→1`
 (direct-stub constant identity → the wrapper's in-vivo bump) — the exact
-localhost scenario. With `SVF_BOT` intact the row keeps fps/packets 0 and the
-snapshotMsec hack (bot behavior).
+localhost scenario. With `SVF_BOT` intact the bot row is excluded from the
+table (bot behavior).
 
 ---
 

@@ -18,9 +18,11 @@
 //! whose computed ping is 0, i.e. every localhost/LAN player. Bots can never
 //! reach this feed anyway (they send no `clc_move`; their cmds arrive via the
 //! `BOTLIB_USER_COMMAND` syscall, sv_game.cpp:990, a call site that is not
-//! retargeted), so the feed runs for every client that reaches it, and the
-//! printer discriminates bots with the engine's own
-//! `gentity->r.svFlags & SVF_BOT` check instead of ping.
+//! retargeted), so the feed runs for every client that reaches it. The
+//! printer identifies bots with the engine's own
+//! `gentity->r.svFlags & SVF_BOT` check instead of ping and skips their rows,
+//! so only real players appear in the table (zero-ping localhost/LAN players
+//! included).
 
 use core::ffi::{c_char, c_int};
 
@@ -55,7 +57,8 @@ fn sv_fps() -> c_int {
 /// Whether the client is a bot — the same discriminator `SV_CalcPings` uses
 /// (`cl->gentity != 0 && gentity->r.svFlags & SVF_BOT`, binary-verified at
 /// `0x8057264-0x805727d`). Replaces the original's `ping >= 1` check, which
-/// conflated bots with real players whose computed ping is 0 (localhost/LAN).
+/// conflated bots with real players whose computed ping is 0 (localhost/LAN),
+/// and excludes bots from the printed table.
 ///
 /// # Safety
 ///
@@ -247,6 +250,11 @@ pub fn client_command_net_status(client_num: c_int) {
         if state == 0 {
             continue;
         }
+        // Exclude bots from the table (engine's own SVF_BOT discriminator).
+        // SAFETY: cl is a valid client_t.
+        if unsafe { is_bot(cl) } {
+            continue;
+        }
         // SAFETY: engine SV_GameClientNum is valid.
         let ps = unsafe { engine::sv_game_client_num(i) };
         let score = if ps != 0 {
@@ -269,15 +277,7 @@ pub fn client_command_net_status(client_num: c_int) {
 
         let mut fps = 0i32;
         let mut packets = 0i32;
-        // SAFETY: cl is a valid client_t.
-        if !unsafe { is_bot(cl) } {
-            calc_packets_and_fps(i as usize, &mut packets, &mut fps);
-        } else {
-            // If a bot then snapshotMsec will = 0, which is bad for
-            // "1000 / cl->snapshotMsec".
-            // SAFETY: cl is a valid client_t.
-            unsafe { *((cl + OFFSET_CLIENT_SNAPSHOT_MSEC) as *mut c_int) = 1 };
-        }
+        calc_packets_and_fps(i as usize, &mut packets, &mut fps);
 
         // SAFETY: cl is a valid client_t.
         let snapshot_msec = unsafe { read_i32(cl + OFFSET_CLIENT_SNAPSHOT_MSEC) };

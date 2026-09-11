@@ -205,9 +205,10 @@ The D-002 keep set is ported as minimal-alteration detours / intra injections
   deviation (R-022):** the original's `ping >= 1` gate was a bot discriminator
   (`SV_CalcPings` writes ping 0 for `svFlags & SVF_BOT`) that also excluded
   localhost/LAN real players; the port drops the feed's ping gate (bots never
-  reach it — no `clc_move`) and discriminates bots in the printer with the
-  engine's own `gentity->r.svFlags & SVF_BOT` check (`0x238`/bit 3,
-  objdump-verified at `0x8057273-0x805727d`). Division hardening: the
+  reach it — no `clc_move`) and skips bots in the printer using the engine's
+  own `gentity->r.svFlags & SVF_BOT` check (`0x238`/bit 3, objdump-verified at
+  `0x8057273-0x805727d`), so bot rows are excluded from the table. Division
+  hardening: the
   original's unguarded `1000 / sv_fps` (SIGFPE at sv_fps 0) and
   `1000 / cl->snapshotMsec` (SIGFPE for ping≥1/snapshotMsec 0) are guarded.
 - `SV_SendClientGameState` redesign: entry wrapper (CS_CONNECTED→CS_PRIMED
