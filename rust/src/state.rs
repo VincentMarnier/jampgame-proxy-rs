@@ -18,13 +18,14 @@ use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 6] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 7] = [
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
     (c"proxy_sv_modelPathLength", c"64"),
     (c"proxy_sv_antiHpTeller", c"0"),
     (c"proxy_sv_minJumpTime", c"0"),
+    (c"proxy_sv_enableEndGameStats", c"1"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -35,6 +36,7 @@ pub const CVAR_MAX_CALLVOTE_MAPRESTART: usize = 2;
 pub const CVAR_MODEL_PATH_LENGTH: usize = 3;
 pub const CVAR_ANTI_HP_TELLER: usize = 4;
 pub const CVAR_MIN_JUMP_TIME: usize = 5;
+pub const CVAR_ENABLE_END_GAME_STATS: usize = 6;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -203,6 +205,7 @@ mod tests {
             PROXY_CVARS[CVAR_ENABLE_RCON_CMD_COOLDOWN].1.to_bytes(),
             b"0"
         );
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
     }
 
     #[test]

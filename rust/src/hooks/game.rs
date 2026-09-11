@@ -21,6 +21,12 @@ use crate::state;
 use crate::syscall;
 use crate::utils;
 
+/// `proxy_sv_enableEndGameStats` (default on): gates the end-of-game stats
+/// feature — damage/death accounting and the intermission tables.
+fn end_game_stats_enabled() -> bool {
+    state::with_state(|s| s.cvars[crate::state::CVAR_ENABLE_END_GAME_STATS].integer != 0)
+}
+
 /// `EV_PAIN` event number (SDK `bg_public.h:851`, oracle-verified).
 const EV_PAIN: c_int = 89;
 
@@ -416,6 +422,10 @@ pub unsafe extern "C" fn begin_intermission() {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_begin_intermission);
     unsafe { original() };
+
+    if !end_game_stats_enabled() {
+        return;
+    }
 
     // Print per-client stats.
     for viewer in 0..MAX_CLIENTS as c_int {

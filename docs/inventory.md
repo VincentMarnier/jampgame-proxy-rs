@@ -72,13 +72,14 @@ be ported without duplicating the original function body (D-002.1).
 
 Accumulates per-client `GameStats_t` (killed/killedBy/damagesGiven/
 damagesTaken + team tallies) and prints personal, global and best-player tables
-at intermission.
+at intermission. Gated by `proxy_sv_enableEndGameStats` (default on; a Rust
+addition — the original proxy always printed them).
 
-| piece | original implementation | address | technique |
-|---|---|---|---|
-| damage accounting | `Proxy_G_Damage`, `Patches/game/Proxy_g_combat.cpp:6-33` | game `+0x00138554` | entry wrapper |
-| death accounting (incl. teamkills) | `Proxy_player_die`, `Proxy_g_combat.cpp:35-55` | game `+0x00133b44` | entry wrapper |
-| print tables | `Proxy_BeginIntermission`, `Patches/game/Proxy_g_cmds.cpp:9-144` | game `+0x00087d14` | entry wrapper |
+| piece | cvar | original implementation | address | technique |
+|---|---|---|---|---|
+| damage accounting | `proxy_sv_enableEndGameStats` | `Proxy_G_Damage`, `Patches/game/Proxy_g_combat.cpp:6-33` | game `+0x00138554` | entry wrapper |
+| death accounting (incl. teamkills) | `proxy_sv_enableEndGameStats` | `Proxy_player_die`, `Proxy_g_combat.cpp:35-55` | game `+0x00133b44` | entry wrapper |
+| print tables | `proxy_sv_enableEndGameStats` | `Proxy_BeginIntermission`, `Patches/game/Proxy_g_cmds.cpp:9-144` | game `+0x00087d14` | entry wrapper |
 
 All three are additive entry wrappers over pristine game functions; no body
 duplication. Game-state deps: `proxy.clientData`, `proxy.g_entities` (from

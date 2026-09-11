@@ -29,6 +29,7 @@ and adds features and security hardening on top.
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
 | `proxy_sv_enableNetStatus`            | 0       | compute and make accessible the players network status (`netStatus`/`showNet` commands)         |
+| `proxy_sv_enableEndGameStats`         | 1       | print the personal/global/best-player stats tables at the end of a game                         |
 | `proxy_sv_antiHpTeller`               | 0       | prevents HP tellers usage                                                                       |
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 
