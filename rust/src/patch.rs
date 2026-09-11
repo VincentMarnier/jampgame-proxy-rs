@@ -553,13 +553,19 @@ pub unsafe fn inline_fetch(addr: usize) -> usize {
     ((addr + 5) as i64 + i64::from(rel)) as usize
 }
 
+/// Whether `bytes` begins a 6-byte `0F 8x rel32` long conditional branch, the
+/// only form `jcc_to_jmp` may convert.
+pub fn is_jcc_rel32(bytes: &[u8; 6]) -> bool {
+    bytes[0] == 0x0F && (0x80..=0x8F).contains(&bytes[1])
+}
+
 /// The 6-byte `0F 8x rel32` (long conditional jump) at `bytes` rewritten as a
 /// 5-byte `E9 rel32` plus a trailing NOP, landing on the *same* target: the
 /// `E9` operand starts one byte earlier than the `0F 8x` operand, so the
 /// rel32 grows by the one-byte opcode-length difference.
 pub fn jcc_to_jmp_bytes(bytes: &[u8; 6]) -> [u8; 6] {
     debug_assert!(
-        bytes[0] == 0x0F && (0x80..=0x8F).contains(&bytes[1]),
+        is_jcc_rel32(bytes),
         "jcc_to_jmp_bytes: not a 0F 8x rel32 branch"
     );
     let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
@@ -574,14 +580,30 @@ pub fn jcc_to_jmp_bytes(bytes: &[u8; 6]) -> [u8; 6] {
 /// place: `E9` over the `0F`, the adjusted rel32 at `addr+1`, and the
 /// leftover operand byte at `addr+5` NOP'd).
 ///
+/// Idempotent: a site that is already an `E9 rel32` is left untouched.
+///
+/// # Why
+///
+/// The intra patches are deliberately *not* reverted by `detach_all` (the
+/// original proxy leaves them in place too). A map change unloads and reloads
+/// the proxy module (`VM_Free`/`VM_Create`), so `GAME_INIT` — and thus
+/// `attach_all` — runs again with the engine code still flipped. Without this
+/// guard the second pass would read the jump's rel32 bytes as a `0F 8x`
+/// operand (`rel = bytes[2..6]`) and write a wild `E9` target, crashing the
+/// server the first time the patched branch executes.
+///
 /// # Safety
 ///
-/// `addr` must hold a `0F 8x rel32` instruction and be writable after
-/// `unprotect`.
+/// `addr` must point to at least 6 readable bytes and, when it holds a
+/// `0F 8x rel32`, be writable after `unprotect`.
 pub unsafe fn jcc_to_jmp(addr: usize) {
-    // SAFETY: caller guarantees a 0F 8x rel32 at addr (6 readable bytes).
+    // SAFETY: caller guarantees 6 readable bytes at addr.
     let mut bytes = [0u8; 6];
     unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, bytes.as_mut_ptr(), 6) };
+    if !is_jcc_rel32(&bytes) {
+        // Already converted (or not a conditional branch): leave it alone.
+        return;
+    }
     let patched = jcc_to_jmp_bytes(&bytes);
     // SAFETY: the 6-byte range is writable after unprotect.
     unsafe {
@@ -893,6 +915,26 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, ENGINE_SITES.len() + GAME_SITES.len());
+    }
+
+    #[test]
+    fn jcc_to_jmp_is_idempotent_across_map_change() {
+        // A map change re-runs attach_all without reverting the intra patches
+        // (detach_all leaves them in place), so the RMG site arrives already
+        // flipped the second time. `is_jcc_rel32` must reject it, otherwise
+        // the E9 rel32 would be misread as a 0F 8x operand and reprocessed
+        // into a wild jump target.
+        let pristine = [0x0f, 0x84, 0x6a, 0x02, 0x00, 0x00]; // je 0x804d3a1
+        assert!(is_jcc_rel32(&pristine));
+        let flipped = jcc_to_jmp_bytes(&pristine);
+        assert_eq!(flipped, [0xe9, 0x6b, 0x02, 0x00, 0x00, 0x90]);
+        assert!(
+            !is_jcc_rel32(&flipped),
+            "already-flipped site must be skipped on re-apply"
+        );
+        // The bogus conversion the guard prevents is what the old code wrote:
+        // rel = le(0x02,0x00,0x00,0x90) + 1 => E9 03 00 00 90 90, i.e.
+        // jmp 0x9804d139 — the post-map-change corruption observed live.
     }
 
     #[test]

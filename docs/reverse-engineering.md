@@ -1567,3 +1567,66 @@ ping 0 (timenudge computed) and the table shows `fps=21→41`, `packets=0→1`
 (direct-stub constant identity → the wrapper's in-vivo bump) — the exact
 localhost scenario. With `SVF_BOT` intact the row keeps fps/packets 0 and the
 snapshotMsec hack (bot behavior).
+
+---
+
+## R-023 — map change crash: non-idempotent RMG `je`→`jmp` intra patch
+
+### Finding
+
+Changing the map (`map <name>`) crashed the dedicated server because
+`attach_all` runs once per `GAME_INIT` and the engine reloads the game module
+on a map change, but the RMG `0F 8x`→`E9` intra patch at `0x804d131` is not
+idempotent: the second pass re-converted its own output and rewrote the branch
+into a wild jump.
+
+### Evidence
+
+**ENGINE SOURCE** (`original/jedi-academy/codemp/`, non-authoritative where
+the binary diverges, but the flow was also observed live):
+
+1. `SV_SpawnServer` (`sv_init.cpp:761`) → `SV_InitGameProgs` →
+   `VM_Create("jampgame", …)`; on a normal map change
+   `SV_ShutdownGameProgs` (`sv_game.cpp:1669-1676`) calls
+   `VM_Call(GAME_SHUTDOWN)` then `VM_Free` → `Sys_UnloadDll` → `dlclose` of
+   the proxy `.so`. `map_restart` (`sv_game.cpp:1711-1724`) uses `VM_Restart`,
+   which for a native module is also `VM_Free` + `VM_Create`
+   (`qcommon/vm.cpp:398-410`).
+
+**RUNTIME (live i386 container, this repo's `jampgamei386.so`):**
+
+2. Before a map change the engine holds `E9 6B 02 00 00 90` at `0x804d131`
+   (pristine `0F 84 6A 02 00 00`, `je 0x804d3a1`, forced to an unconditional
+   jump to the "old RMG" else path). After a map change — two
+   `Engine properly patched` banners, i.e. a second `attach_all` — a live
+   `gdb -p 1` `x/6xb 0x804d131` read `E9 03 00 00 90 90`, decoded by gdb as
+   `jmp 0x9804d139` (unmapped): the first time any real client reached
+   `SV_SendClientGameState` after the change (the outdated-gamestate resend,
+   `sv_client.cpp:1861-1864`) the server would fault.
+3. The arithmetic is exact: the second `jcc_to_jmp` read `bytes[2..6]` of the
+   already-converted site (`02 00 00 90`) as a `0F 8x` rel32, added the
+   opcode-length correction (+1) and wrote `E9 03 00 00 90 90`. The old
+   `debug_assert!` in `jcc_to_jmp_bytes` was compiled out in the release
+   build, so nothing caught it.
+
+**Why the earlier R-021 "detach→attach cycle survives" observation did not
+catch this:** bots are set `CS_ACTIVE` directly by `SV_SpawnServer`
+(`sv_init.cpp:811-819`) and never queue a stale `serverId` message, so they
+never enter `SV_SendClientGameState`'s resend path. Only real clients
+(`state = CS_CONNECTED`, `sv_init.cpp:806-810`) do. R-021's bot-filled server
+therefore never executed the corrupted branch.
+
+### Fix
+
+`patch::jcc_to_jmp` (and the pure `is_jcc_rel32`) now treat a site whose first
+byte is not `0F 8x` as already patched and leave it untouched — idempotent
+across the reload cycle, keeping the original proxy's "intra patches are never
+reverted" design. Regression coverage:
+`rust/scripts/map-change-test.sh` drives three map changes and asserts
+`0x804d131` stays `E9 6B 02 00 00 90`; unit test
+`patch::tests::jcc_to_jmp_is_idempotent_across_map_change` pins the byte math.
+
+### Confidence
+
+`High` (root cause proven by live byte read of the running engine; fix
+re-verified live across three map changes and by `engine-test.sh`).
