@@ -140,6 +140,11 @@ game_trampoline!(
     4,
     unsafe extern "C" fn(usize)
 );
+game_trampoline!(
+    game_hook_original_set_team,
+    5,
+    unsafe extern "C" fn(usize, *const core::ffi::c_char)
+);
 
 /// Thin alias kept for call-site readability (`original_call(f) == f()`).
 #[inline]
@@ -236,6 +241,7 @@ pub unsafe fn attach_all() {
         game::begin_intermission as usize,
         game::g_add_event as usize,
         game::client_think_real as usize,
+        crate::teamlock::set_team as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the

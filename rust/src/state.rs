@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 8] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 9] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -28,6 +28,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 8] = [
     (c"proxy_sv_antiHpTeller", c"0"),
     (c"proxy_sv_minJumpTime", c"0"),
     (c"proxy_sv_enableEndGameStats", c"1"),
+    (c"proxy_sv_lockTeams", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -40,6 +41,7 @@ pub const CVAR_MODEL_PATH_LENGTH: usize = 4;
 pub const CVAR_ANTI_HP_TELLER: usize = 5;
 pub const CVAR_MIN_JUMP_TIME: usize = 6;
 pub const CVAR_ENABLE_END_GAME_STATS: usize = 7;
+pub const CVAR_LOCK_TEAMS: usize = 8;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -75,6 +77,32 @@ pub struct GameStats {
     pub killed_by: i32,
     pub damages_given: i32,
     pub damages_taken: i32,
+}
+
+/// Team-lock feature state (`proxy_sv_lockTeams`).
+///
+/// The round-start roster snapshot caps each team. `red_max`/`blue_max` are
+/// `-1` while unlocked; `pending` waits for the reconnect burst that follows a
+/// map load/map_restart; `saw_reconnect` flips on the first `firstTime ==
+/// false` `GAME_CLIENT_CONNECT` of that round (the engine reconnects every
+/// retained client before the first frame that follows).
+#[derive(Debug, Clone, Copy)]
+pub struct TeamLock {
+    pub red_max: i32,
+    pub blue_max: i32,
+    pub pending: bool,
+    pub saw_reconnect: bool,
+}
+
+impl Default for TeamLock {
+    fn default() -> Self {
+        TeamLock {
+            red_max: -1,
+            blue_max: -1,
+            pending: true,
+            saw_reconnect: false,
+        }
+    }
 }
 
 /// Per-client bookkeeping (`Proxy_Header.hpp:87-106`).
@@ -132,6 +160,7 @@ pub struct ProxyState {
     pub clients: Box<[ClientEntry]>,
     pub cvars: [VmCvar; PROXY_CVARS.len()],
     pub jump_start_time: [i32; MAX_CLIENTS],
+    pub team_lock: TeamLock,
 }
 
 static STATE: Mutex<Option<ProxyState>> = Mutex::new(None);
@@ -167,6 +196,7 @@ impl ProxyState {
             clients: default_clients(),
             cvars: core::array::from_fn(|_| VmCvar::default()),
             jump_start_time: [0; MAX_CLIENTS],
+            team_lock: TeamLock::default(),
         }
     }
 }
@@ -229,6 +259,7 @@ mod tests {
             b"0"
         );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
+        assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

@@ -38,6 +38,7 @@ mod sdk;
 mod shared_api;
 mod state;
 mod syscall;
+mod teamlock;
 mod utils;
 
 use core::ffi::c_int;
@@ -111,11 +112,15 @@ pub unsafe extern "C" fn vmMain(
             update_proxy_cvars();
             // SAFETY: original module loaded, memory layer initialised.
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
+            if state::proxy_enabled() {
+                teamlock::on_run_frame();
+            }
             forward(GAME_RUN_FRAME, &args)
         }
         GAME_CLIENT_CONNECT => {
             if state::proxy_enabled() {
                 shared_api::client_connect(a0, a1 != 0, a2 != 0);
+                teamlock::on_client_connect(a1 != 0);
             }
             forward(command, &args)
         }

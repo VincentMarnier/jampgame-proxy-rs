@@ -9,3 +9,5 @@
   dropped (`SV_ExecuteClientMessage`, `SV_PacketEvent`), the indirect-call
   encoding fix for engine addresses, and the netStatus packet-identity
   deviation.
+- `0004-team-lock.md` — Rust-only `proxy_sv_lockTeams` (TDM/CTF): reconnect-burst
+  snapshot, even/>=2 lock rule, `SetTeam` enforcement, and the TDM/CTF scope.

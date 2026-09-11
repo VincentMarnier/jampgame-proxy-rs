@@ -694,7 +694,7 @@ pub static ENGINE_HOOKS: [Hook; 14] = [
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
 /// (`Proxy_Engine_Patch.cpp:61-70`) minus the dropped `WP_SaberPositionUpdate`
 /// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror).
-pub static GAME_HOOKS: [Hook; 5] = [
+pub static GAME_HOOKS: [Hook; 6] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -708,6 +708,7 @@ pub static GAME_HOOKS: [Hook; 5] = [
         crate::jampgame::FN_CLIENT_THINK_REAL,
         true,
     ),
+    Hook::new("SetTeam", crate::jampgame::FN_SET_TEAM, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -984,6 +985,11 @@ mod tests {
             name: "ClientThink_real",
             bytes: b"\x55\x8b\xec\x81\xec\x10\x03\x00\x00",
             want: 9,
+        },
+        Site {
+            name: "SetTeam",
+            bytes: b"\x55\x8b\xec\x83\xec\x38",
+            want: 6,
         },
     ];
 

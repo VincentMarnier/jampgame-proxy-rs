@@ -59,6 +59,13 @@ pub const TEAM_RED: i32 = 1;
 pub const TEAM_BLUE: i32 = 2;
 pub const TEAM_SPECTATOR: i32 = 3;
 
+// gametype_t (bg_public.h:183-198): the team modes the proxy features apply to.
+pub const GT_TEAM: i32 = 6;
+pub const GT_CTF: i32 = 8;
+
+// clientConnected_t (g_local.h:366-371): `pers.connected` values.
+pub const CON_DISCONNECTED: i32 = 0;
+
 // PERS_* (server.h:16-18), STAT_* (q_shared.h) used by the stats printer.
 pub const PERS_SCORE: usize = 0;
 pub const PERS_KILLED: usize = 8;
@@ -267,6 +274,9 @@ pub const OFFSET_GCLIENT_SESS: usize = 1708;
 
 /// `offsetof(clientPersistant_t, cmd)` — usercmd_t.
 pub const OFFSET_PERS_CMD: usize = 4;
+/// `offsetof(clientPersistant_t, connected)` — `clientConnected_t` (first
+/// field, `g_local.h:441`); `TeamCount` skips `CON_DISCONNECTED` clients.
+pub const OFFSET_PERS_CONNECTED: usize = 0;
 
 /// `offsetof(clientSession_t, sessionTeam)` — team_t.
 pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
@@ -410,6 +420,15 @@ mod tests {
             ORIGINAL_ENGINE_VERSION.as_bytes(),
             b"JAmp: v1.0.1.1 linux-i386 Nov 10 2003"
         );
+    }
+
+    #[test]
+    fn team_mode_and_pers_connected_constants_match_sdk() {
+        // gametype_t ordinals (bg_public.h) and the TeamCount skip value.
+        assert_eq!(GT_TEAM, 6);
+        assert_eq!(GT_CTF, 8);
+        assert_eq!(CON_DISCONNECTED, 0);
+        assert_eq!(OFFSET_PERS_CONNECTED, 0);
     }
 
     #[test]

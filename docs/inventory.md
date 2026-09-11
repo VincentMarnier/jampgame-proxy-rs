@@ -216,6 +216,22 @@ The D-002 keep set is ported as minimal-alteration detours / intra injections
   not re-applied.
 - Dropped cvars and the `disableKillCmd` arm removed.
 
+## Rust-only additions (not in the original proxy)
+
+| feature | cvar | address | technique |
+|---|---|---|---|
+| round-start team lock (TDM/CTF) | `proxy_sv_lockTeams` | game `+0x0012ada4` (`SetTeam`) | entry wrapper + `GAME_CLIENT_CONNECT`/`GAME_RUN_FRAME` bookkeeping |
+
+`SetTeam(gentity_t*, char*)` is nm-verified (`SetTeam__FP9gentity_sPc`) and its
+prologue (`55 8b ec 83 ec 38`, 6 bytes) is detour-safe. The wrapper drops
+explicit `red`/`blue` joins to a locked, full team with a message, and also
+drops an auto pick (`team free`/empty, which the game routes through `PickTeam`)
+once both locked teams are full; spectator/follow/scoreboard requests and the
+game's internal `SetTeam` calls pass. The round-start snapshot is taken on the
+`GAME_RUN_FRAME` that follows the engine's map-load/map-restart reconnect burst
+(`GAME_CLIENT_CONNECT` with `firstTime == qfalse`), when the game has restored
+the session teams (see `rust/src/teamlock.rs`, decision 0004).
+
 ## Verified no-op / dropped (R-021, corrected R-022)
 
 - `SV_PacketEvent` — the pristine shipped `SV_ReadPackets` (`0x8057024`) already

@@ -35,6 +35,10 @@ pub const FN_PLAYER_DIE: usize = 0x0013_3b44;
 pub const FN_BEGIN_INTERMISSION: usize = 0x0008_7d14;
 pub const FN_G_ADD_EVENT: usize = 0x0016_e564;
 pub const FN_CLIENT_THINK_REAL: usize = 0x0011_c4c4;
+/// `void SetTeam(gentity_t*, char*)` (nm-verified `SetTeam__FP9gentity_sPc`),
+/// the single choke point every team change funnels through. Hooked by
+/// `proxy_sv_lockTeams` to enforce the round-start caps.
+pub const FN_SET_TEAM: usize = 0x0012_ada4;
 
 /// Re-type a game-module function at `base + offset` as `$fn_ty`.
 ///
@@ -178,6 +182,7 @@ mod tests {
             FN_BEGIN_INTERMISSION,
             FN_G_ADD_EVENT,
             FN_CLIENT_THINK_REAL,
+            FN_SET_TEAM,
         ] {
             assert!(off >= text_lo && off < text_hi, "0x{off:x} out of .text");
         }
