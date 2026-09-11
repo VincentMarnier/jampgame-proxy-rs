@@ -71,10 +71,19 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
 /// proxy to first-time non-bot connects.
 pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
     if first_time && !is_bot {
-        // SAFETY: static welcome text (same bytes as the original proxy's
-        // `va("print \"^5%s (^7%s^5)^7\n\"", JAMPGAMEPROXY_NAME, VERSION)`).
+        // Same bytes as the original proxy's
+        // `va("print \"^5%s (^7%s^5)^7\n\"", JAMPGAMEPROXY_NAME, VERSION)`, with
+        // the version taken from the crate (`Cargo.toml`) so releases only bump
+        // it in one place.
+        let banner = CString::new(format!(
+            "print \"^5jampgame_proxy (^7{}^5)^7\n\"",
+            crate::VERSION
+        ))
+        .expect("static banner contains no interior NUL");
+        // SAFETY: `banner` is a NUL-terminated C string that outlives the call;
+        // the engine syscall pointer is registered.
         unsafe {
-            syscall::send_server_command(client_num, c"print \"^5jampgame_proxy (^70.0.7^5)^7\n\"");
+            syscall::send_server_command(client_num, &banner);
         }
     }
 }

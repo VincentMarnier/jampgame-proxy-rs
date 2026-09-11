@@ -140,7 +140,7 @@ pub unsafe extern "C" fn vmMain(
 // vmMain handling
 // ---------------------------------------------------------------------------
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `vmMain(GAME_INIT, levelTime, randomSeed, restart)` — mirrors
 /// `Proxy_Main.cpp:88-126` (without the patch attach, which is a later

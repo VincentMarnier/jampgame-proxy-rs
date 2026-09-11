@@ -1,0 +1,138 @@
+name: Release
+
+# Every push to main produces a release:
+#   1. bump the crate version from the conventional-commit history,
+#   2. commit the bump and tag it,
+#   3. build the 32-bit jampgamei386.so,
+#   4. publish a GitHub Release with the tag and the .so attached.
+on:
+  push:
+    branches: [main]
+
+# Needed to push the bump commit + tag and to create the release.
+permissions:
+  contents: write
+
+# Serialise releases so two pushes cannot race for the same version number.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # The bump commit is pushed with GITHUB_TOKEN; skip the run it would spawn.
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    # Pin the same environment the project's Dockerfile builds with, so the
+    # artifact is reproducible between CI and `rust/dev.sh`.
+    container:
+      image: rust:1.85-bookworm
+    # Steps in a container default to `sh`; the version step uses bash only.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install i686 build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils \
+            file \
+            gcc-multilib \
+            libc6-dev-i386
+          rm -rf /var/lib/apt/lists/*
+          rustup target add i686-unknown-linux-gnu
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Track the tip of main (a queued run may start after an earlier
+          # release advanced it) and fetch full history so the version step
+          # can see every tag and commit.
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Trust checked-out workspace for git
+        run: |
+          # The job runs in a container as a different UID than the checkout
+          # owner, so Git's "dubious ownership" check rejects the repository.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          last_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [ -z "$last_tag" ]; then
+            last="0.0.0"
+            range="HEAD"
+          else
+            last="${last_tag#v}"
+            range="${last_tag}..HEAD"
+          fi
+
+          IFS=. read -r major minor patch <<< "$last"
+
+          # Conventional commits: breaking -> major, feat -> minor, else patch
+          # (fix, chore, docs, ...).
+          if git log --format=%B "$range" \
+              | grep -Eq '(^|[[:space:]])BREAKING[ -]CHANGE|^[a-zA-Z]+(\([^)]*\))?!:'; then
+            bump="major"
+          elif git log --format=%B "$range" \
+              | grep -Eq '^feat(\([^)]*\))?:'; then
+            bump="minor"
+          else
+            bump="patch"
+          fi
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          new_version="${major}.${minor}.${patch}"
+          echo "v${last} -> v${new_version} (${bump} bump)"
+          {
+            echo "last=${last}"
+            echo "new=${new_version}"
+            echo "bump=${bump}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump crate version
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          sed -i -E \
+            "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"${NEW_VERSION}\"/" \
+            rust/Cargo.toml
+          grep -n '^version' rust/Cargo.toml
+
+      - name: Build jampgamei386.so
+        working-directory: rust
+        run: sh ./scripts/build.sh
+
+      - name: Commit version bump and tag
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rust/Cargo.toml rust/Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v${NEW_VERSION} [skip ci]"
+          fi
+          git tag -a "v${NEW_VERSION}" -m "v${NEW_VERSION}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v${NEW_VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.new }}
+          name: v${{ steps.version.outputs.new }}
+          generate_release_notes: true
+          files: rust/jampgamei386.so
