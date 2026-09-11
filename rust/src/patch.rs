@@ -737,6 +737,95 @@ pub const CALL_IP_AUTHORIZE: usize = 0x0805_6f64;
 pub const RMG_BRANCH: usize = 0x0804_d131;
 
 // ---------------------------------------------------------------------------
+// Pristine bytes of the intra patches (for `revert_inline_patches`)
+//
+// Captured from the shipped engine `linuxjampded` (`JAmp: v1.0.1.1
+// linux-i386 Nov 10 2003`), where the first LOAD segment maps file offset ==
+// vaddr - 0x08048000. Kept as constants so the master disable switch can
+// restore pristine code deterministically, independent of whether the proxy
+// module instance that applied the patch is still loaded (a map change
+// reloads the proxy, but the engine `.text` — and its patches — persist).
+// ---------------------------------------------------------------------------
+
+/// `SVC_RemoteCommand` timer block @ `0x8056b26`, 25 bytes.
+pub const PRISTINE_SVC_REMOTE_COMMAND_TIMER: [u8; 25] = [
+    0xE8, 0xB9, 0xD9, 0x01, 0x00, 0x8B, 0x15, 0x64, 0xC4, 0x1D, 0x08, 0x81, 0xC2, 0xF4, 0x01, 0x00,
+    0x00, 0x3B, 0xC2, 0x0F, 0x82, 0x11, 0x02, 0x00, 0x00,
+];
+
+/// `Com_BeginRedirect` buffer-size immediate (middle byte of `0xbff0`) @
+/// `0x8056c7d`: `0xbf` (49136) pristine, patched to `0x03` (1008).
+pub const PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE: u8 = 0xBF;
+
+/// `call SV_AuthorizeIpPacket` inside `SV_ConnectionlessPacket` @ `0x8056f64`.
+pub const PRISTINE_CALL_IP_AUTHORIZE: [u8; 5] = [0xE8, 0x5B, 0x4C, 0xFF, 0xFF];
+
+/// `je 0x804d3a1` inside `SV_SendClientGameState` @ `0x804d131`.
+pub const PRISTINE_RMG_BRANCH: [u8; 6] = [0x0F, 0x84, 0x6A, 0x02, 0x00, 0x00];
+
+/// Write `bytes` into engine/game code at `addr` (RWE window).
+///
+/// # Safety
+///
+/// `addr..addr+bytes.len()` must be a readable/writable code range.
+unsafe fn write_code_bytes(addr: usize, bytes: &[u8]) {
+    // SAFETY: caller contract; unprotect makes the range writable.
+    unsafe {
+        unprotect(addr, bytes.len());
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+        reprotect(addr, bytes.len());
+    }
+}
+
+/// Restore `bytes` at `addr` only when the code currently differs (avoids an
+/// `mprotect`/write pair on every reconcile while the proxy stays disabled).
+///
+/// # Safety
+///
+/// `addr..addr+bytes.len()` must be a readable code range.
+unsafe fn restore_code_if_changed(addr: usize, bytes: &[u8]) {
+    let mut same = true;
+    for (i, &b) in bytes.iter().enumerate() {
+        // SAFETY: caller guarantees the range is readable.
+        if unsafe { *(addr as *const u8).add(i) } != b {
+            same = false;
+            break;
+        }
+    }
+    if !same {
+        // SAFETY: same range; caller guarantees writability window.
+        unsafe { write_code_bytes(addr, bytes) };
+    }
+}
+
+/// Restore the pristine bytes of every intra (byte/NOP/branch) patch applied
+/// by `attach_all`. The call-site retargets (`Com_Printf`/`SV_ClientThink`) are
+/// restored separately by `restore_calls`.
+///
+/// Idempotent, and cheap when already pristine (`restore_code_if_changed`), so
+/// it can be called on every reconcile while the master switch is off. Does
+/// **not** touch the detour trampolines.
+///
+/// # Safety
+///
+/// Every address must be a validated engine intra-patch site (R-010).
+pub unsafe fn revert_inline_patches() {
+    // SAFETY: verified whole-instruction tile sites (R-010).
+    unsafe {
+        restore_code_if_changed(
+            crate::engine::patches::SVC_REMOTE_COMMAND_TIMER_NOP_ADDR,
+            &PRISTINE_SVC_REMOTE_COMMAND_TIMER,
+        );
+        restore_code_if_changed(
+            crate::engine::patches::SVC_REMOTE_COMMAND_REDIRECT_LEN_ADDR,
+            &[PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE],
+        );
+        restore_code_if_changed(CALL_IP_AUTHORIZE, &PRISTINE_CALL_IP_AUTHORIZE);
+        restore_code_if_changed(RMG_BRANCH, &PRISTINE_RMG_BRANCH);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry bookkeeping
 // ---------------------------------------------------------------------------
 
@@ -915,6 +1004,26 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, ENGINE_SITES.len() + GAME_SITES.len());
+    }
+
+    #[test]
+    fn pristine_patch_bytes_are_consistent() {
+        // The pristine RMG bytes must be exactly the `0F 8x rel32` branch that
+        // `jcc_to_jmp` converts (revert symmetry with apply).
+        assert!(is_jcc_rel32(&PRISTINE_RMG_BRANCH));
+        // The timer NOP region must tile whole instructions so the revert
+        // restores instruction boundaries, not a partial opcode.
+        let mut off = 0usize;
+        while off < PRISTINE_SVC_REMOTE_COMMAND_TIMER.len() {
+            let l = instr_len(&PRISTINE_SVC_REMOTE_COMMAND_TIMER[off..]);
+            assert!(l > 0, "pristine timer: undecodable at {off}");
+            off += l;
+        }
+        assert_eq!(off, PRISTINE_SVC_REMOTE_COMMAND_TIMER.len());
+        // The call/IP sites are `E8 rel32` calls; the redirect immediate is the
+        // pristine (non-patched) byte.
+        assert_eq!(PRISTINE_CALL_IP_AUTHORIZE[0], 0xE8);
+        assert_ne!(PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE, 0x03);
     }
 
     #[test]

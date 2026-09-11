@@ -128,7 +128,11 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 )
             };
             // SAFETY: a1 is the game's usercmd buffer, just filled by the engine.
-            unsafe { crate::shared_api::get_usercmd(a0, a1 as *mut crate::sdk::Usercmd) };
+            // Only mutate it while the proxy is enabled (master switch); the
+            // recording trap above stays active so a runtime re-enable works.
+            if crate::state::proxy_enabled() {
+                unsafe { crate::shared_api::get_usercmd(a0, a1 as *mut crate::sdk::Usercmd) };
+            }
             return response;
         }
         _ => {}

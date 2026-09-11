@@ -45,6 +45,11 @@ pub fn set_attached() {
     HOOKS_ATTACHED.store(true, Ordering::Relaxed);
 }
 
+/// Clear the attached flag (the master disable switch / `detach_all`).
+pub fn set_detached() {
+    HOOKS_ATTACHED.store(false, Ordering::Relaxed);
+}
+
 #[allow(dead_code)] // guard for the wrappers; consumed by future debugging paths
 pub fn attached() -> bool {
     HOOKS_ATTACHED.load(Ordering::Relaxed)

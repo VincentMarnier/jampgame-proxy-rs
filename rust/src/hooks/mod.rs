@@ -264,4 +264,37 @@ pub unsafe fn detach_all() {
         unsafe { patch::detach(hook) };
     }
     patch::restore_calls();
+    engine_sv::set_detached();
+}
+
+/// Reconcile the hook layer with the master `proxy_sv_enable` switch.
+///
+/// Enabled → attach everything (idempotent; no-op when already attached).
+/// Disabled → detach the detours, restore the call-site retargets and rewrite
+/// the intra patches back to their pristine engine bytes, so the engine and
+/// game module run exactly as if the proxy were absent. The proxy's `vmMain`
+/// dispatch and trap interceptions stay installed but become pure passthrough
+/// (gated on the same switch), so the switch can be flipped back on at runtime.
+///
+/// # Safety
+///
+/// Must only run once the memory layer is initialised and the original module
+/// is loaded (i.e. from `GAME_RUN_FRAME`/`GAME_INIT`).
+pub unsafe fn set_enabled(enabled: bool) {
+    if enabled {
+        if !engine_sv::attached() {
+            // SAFETY: memory layer initialised; original module loaded.
+            unsafe { attach_all() };
+        }
+    } else {
+        if engine_sv::attached() {
+            // SAFETY: hooks were attached by attach_all.
+            unsafe { detach_all() };
+        }
+        // Idempotent + cheap when already pristine: also clears byte patches a
+        // previous proxy module instance left applied across a map change when
+        // the server boots with the switch off.
+        // SAFETY: verified engine intra-patch sites (R-010).
+        unsafe { patch::revert_inline_patches() };
+    }
 }

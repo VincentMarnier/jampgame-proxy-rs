@@ -103,33 +103,44 @@ pub unsafe extern "C" fn vmMain(
     match command {
         GAME_INIT => game_init(&args),
         GAME_SHUTDOWN => game_shutdown(&args),
-        // The server is going to activate its new frame: track the time and
-        // refresh our cvar mirrors, then pass the frame on.
+        // The server is going to activate its new frame: track the time,
+        // refresh our cvar mirrors, reconcile the master enable switch (attach
+        // or detach the hook layer at runtime), then pass the frame on.
         GAME_RUN_FRAME => {
             state::set_svs_time(a0);
             update_proxy_cvars();
+            // SAFETY: original module loaded, memory layer initialised.
+            unsafe { hooks::set_enabled(state::proxy_enabled()) };
             forward(GAME_RUN_FRAME, &args)
         }
         GAME_CLIENT_CONNECT => {
-            shared_api::client_connect(a0, a1 != 0, a2 != 0);
+            if state::proxy_enabled() {
+                shared_api::client_connect(a0, a1 != 0, a2 != 0);
+            }
             forward(command, &args)
         }
         GAME_CLIENT_DISCONNECT => {
-            shared_api::client_disconnect(a0);
+            if state::proxy_enabled() {
+                shared_api::client_disconnect(a0);
+            }
             forward(command, &args)
         }
         GAME_CLIENT_BEGIN => {
-            shared_api::client_begin(a0, a1 != 0);
+            if state::proxy_enabled() {
+                shared_api::client_begin(a0, a1 != 0);
+            }
             forward(command, &args)
         }
         GAME_CLIENT_COMMAND => {
-            if !shared_api::client_command(a0) {
+            if state::proxy_enabled() && !shared_api::client_command(a0) {
                 return 0;
             }
             forward(command, &args)
         }
         GAME_CLIENT_USERINFO_CHANGED => {
-            shared_api::client_userinfo_changed(a0);
+            if state::proxy_enabled() {
+                shared_api::client_userinfo_changed(a0);
+            }
             forward(command, &args)
         }
         _ => forward(command, &args),
@@ -185,10 +196,13 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // (a game detour, later milestone); we register them here, after the game
     // has run its own registration, which is idempotent on the engine side.
     register_proxy_cvars();
+    update_proxy_cvars();
 
     // Attach the engine/game hook layer (D-002 keep set) after the game is up
-    // and the memory layer is populated.
-    unsafe { hooks::attach_all() };
+    // and the memory layer is populated. Skipped when `proxy_sv_enable` is off
+    // (the master disable switch): the proxy then stays a pure passthrough.
+    // SAFETY: original module loaded, memory layer initialised; hooks attach.
+    unsafe { hooks::set_enabled(state::proxy_enabled()) };
 
     response
 }
@@ -260,13 +274,15 @@ fn update_proxy_cvars() {
     if !original::is_loaded() {
         return;
     }
-    state::with_state(|s| {
+    let enabled = state::with_state(|s| {
         for (i, _) in PROXY_CVARS.iter().enumerate() {
             let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
             // SAFETY: cvar is stable within the state.
             unsafe { syscall::cvar_update(cvar) };
         }
+        s.cvars[state::CVAR_ENABLE].integer != 0
     });
+    state::set_proxy_enabled(enabled);
 }
 
 // ---------------------------------------------------------------------------

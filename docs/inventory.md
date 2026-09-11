@@ -23,6 +23,18 @@ Addresses are the original proxy's constants
 (`RuntimePatch/Engine/Proxy_Engine_Wrappers.hpp`); game-module ones are offsets
 from `jampgame_original.so`'s base.
 
+## Master switch (Rust addition)
+
+`proxy_sv_enable` (default `1`) is a Rust-only master switch. When set to `0`
+at runtime, the proxy detaches every engine/game detour, restores the
+`Com_Printf`/`SV_ClientThink` call-site retargets and rewrites the rcon
+NOP/byte, `ipAuthorize` and RMG intra patches back to their pristine engine
+bytes (captured from `linuxjampded`, see `patch::PRISTINE_*`). Its `vmMain`
+dispatch and trap interceptions stay installed but become pure passthrough
+(`state::proxy_enabled`). Setting it back to `1` re-attaches everything. When it
+is `0` at `GAME_INIT`, nothing is ever hooked. No equivalent exists in the
+original proxy.
+
 ## Wanted
 
 ### Security fixes — explicitly named

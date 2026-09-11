@@ -12,7 +12,8 @@ and adds features and security hardening on top.
 
 ## Features
 
-**Built-in security hardening** (always active):
+**Built-in security hardening** (active unless the master switch
+`proxy_sv_enable` is turned off):
 
 - `getstatus` flood protection (`ipAuthorize`/DDoS removal)
 - q3infoboom exploit guard
@@ -25,6 +26,7 @@ and adds features and security hardening on top.
 
 | cvar                                  | default | description                                                                                   |
 |---------------------------------------|---------|-----------------------------------------------------------------------------------------------|
+| `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module   |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |

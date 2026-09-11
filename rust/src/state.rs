@@ -10,6 +10,7 @@
 //! engine or game call.
 
 use core::ffi::CStr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
@@ -18,7 +19,8 @@ use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 7] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 8] = [
+    (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -30,13 +32,14 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 7] = [
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
 /// `proxy.cvars.*`, `Proxy_Header.hpp:108-120`, D-002 keep order).
-pub const CVAR_ENABLE_RCON_CMD_COOLDOWN: usize = 0;
-pub const CVAR_ENABLE_NET_STATUS: usize = 1;
-pub const CVAR_MAX_CALLVOTE_MAPRESTART: usize = 2;
-pub const CVAR_MODEL_PATH_LENGTH: usize = 3;
-pub const CVAR_ANTI_HP_TELLER: usize = 4;
-pub const CVAR_MIN_JUMP_TIME: usize = 5;
-pub const CVAR_ENABLE_END_GAME_STATS: usize = 6;
+pub const CVAR_ENABLE: usize = 0;
+pub const CVAR_ENABLE_RCON_CMD_COOLDOWN: usize = 1;
+pub const CVAR_ENABLE_NET_STATUS: usize = 2;
+pub const CVAR_MAX_CALLVOTE_MAPRESTART: usize = 3;
+pub const CVAR_MODEL_PATH_LENGTH: usize = 4;
+pub const CVAR_ANTI_HP_TELLER: usize = 5;
+pub const CVAR_MIN_JUMP_TIME: usize = 6;
+pub const CVAR_ENABLE_END_GAME_STATS: usize = 7;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -179,6 +182,26 @@ pub fn set_svs_time(time: i32) {
     with_state(|s| s.svs_time = time);
 }
 
+// ---------------------------------------------------------------------------
+// Master enable switch (mirror of `proxy_sv_enable`, refreshed each frame)
+// ---------------------------------------------------------------------------
+
+/// Whether the proxy's hooks/interceptions are active. Defaults to `true` so
+/// the narrow window between `dllEntry` and the first `GAME_RUN_FRAME` (before
+/// the cvar mirror is refreshed) keeps the proxy on, matching the cvar default.
+static PROXY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Set the master switch (called once the `proxy_sv_enable` cvar is refreshed).
+pub fn set_proxy_enabled(enabled: bool) {
+    PROXY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the proxy is currently enabled. Lock-free: read from hot paths
+/// (`G_GET_USERCMD` trap, every `vmMain`).
+pub fn proxy_enabled() -> bool {
+    PROXY_ENABLED.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +229,7 @@ mod tests {
             b"0"
         );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
     #[test]
