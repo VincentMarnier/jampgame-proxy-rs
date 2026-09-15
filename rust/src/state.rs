@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 10] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 13] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -30,6 +30,9 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 10] = [
     (c"proxy_sv_enableEndGameStats", c"1"),
     (c"proxy_sv_lockTeams", c"0"),
     (c"proxy_sv_teamSizeRules", c""),
+    (c"proxy_tffa_enable", c"0"),
+    (c"proxy_tffa_maxMatches", c"8"),
+    (c"proxy_tffa_maxGroupSize", c"12"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -46,6 +49,12 @@ pub const CVAR_LOCK_TEAMS: usize = 8;
 /// Per-team-size `timelimit`/`fraglimit`/`capturelimit` rules (reconciled every
 /// frame with the roster, independent of `proxy_sv_lockTeams`).
 pub const CVAR_TEAM_SIZE_RULES: usize = 9;
+/// Parallel TFFA matches (`GT_TEAM` only): `0` off, non-zero on.
+pub const CVAR_TFFA_ENABLE: usize = 10;
+/// Maximum number of parallel matches.
+pub const CVAR_TFFA_MAX_MATCHES: usize = 11;
+/// Maximum players per match (both teams combined).
+pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 12;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -105,6 +114,80 @@ impl Default for TeamLock {
             blue_max: -1,
             pending: true,
             saw_reconnect: false,
+        }
+    }
+}
+
+/// One parallel TFFA match: proxy-side score copy. The game's global
+/// `level.teamScores` is kept neutralised (see `tffa::on_add_score`) so the
+/// pristine `CheckExitRules` never fires early; each match is compared against
+/// the shared server `fraglimit` independently.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TffaMatch {
+    pub active: bool,
+    pub red: i32,
+    pub blue: i32,
+}
+
+/// Parallel-TFFA state.
+///
+/// Slot `0` is the **main TFFA**: every connected client starts there, and it
+/// is always `active`. Slots `1..=MAX_MATCHES` are player-created matches.
+/// `client_match[n]` holds the match id (`0` = main) and is cleared for fresh
+/// connects. `player_score[n]` is the per-match
+/// per-player score copy the `scores` rewrite substitutes for the game's
+/// global `PERS_SCORE` (which accumulates across the whole map).
+///
+/// `frame_stamp`/`rebuilt_stamp`/`owned` back the per-trace physics
+/// isolation: `owned` caches the linked player-owned entities (sabers,
+/// missiles, corpses) discovered on the last game frame.
+///
+/// `cs_players_base[n]` is the last `CS_PLAYERS + n` info string the game set
+/// (via `G_SET_CONFIGSTRING`); per-viewer `cs` overrides (prefixed names,
+/// outsiders forced to spectator) are derived from it so the unified
+/// scoreboard can show every match while keeping own teams intact.
+#[derive(Debug, Clone)]
+pub struct TffaState {
+    pub matches: [TffaMatch; crate::tffa::TOTAL_MATCH_SLOTS],
+    pub client_match: [u8; MAX_CLIENTS],
+    pub player_score: [i32; MAX_CLIENTS],
+    pub frame_stamp: u32,
+    pub rebuilt_stamp: u32,
+    pub owned: [(u16, u8); crate::tffa::OWNED_CAP],
+    pub owned_count: usize,
+    pub cs_players_base: [String; MAX_CLIENTS],
+    /// Last per-viewer `CS_SCORES1/2` sent, to skip redundant corrections
+    /// (the 128-slot reliable buffer overflows otherwise: every frag would
+    /// re-push unchanged scores to every client).
+    pub cs_scores_sent: [(i32, i32); MAX_CLIENTS],
+    /// Last `effective_match` per viewer, to re-push prefixed names + scores
+    /// when spectating (game follow) changes your instance without any proxy
+    /// command.
+    pub viewer_match_cache: [u8; MAX_CLIENTS],
+    /// Set when any intermission begins (pristine timelimit exit or the
+    /// proxy-triggered solo-main finish); cleared on `GAME_INIT`. While set,
+    /// fraglimit handling stays off — the map is ending.
+    pub intermission: bool,
+}
+
+impl Default for TffaState {
+    fn default() -> Self {
+        TffaState {
+            matches: core::array::from_fn(|i| TffaMatch {
+                active: i == 0,
+                red: 0,
+                blue: 0,
+            }),
+            client_match: [0; MAX_CLIENTS],
+            player_score: [0; MAX_CLIENTS],
+            frame_stamp: 0,
+            rebuilt_stamp: 0,
+            owned: [(0, 0); crate::tffa::OWNED_CAP],
+            owned_count: 0,
+            cs_players_base: core::array::from_fn(|_| String::new()),
+            cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
+            viewer_match_cache: [0; MAX_CLIENTS],
+            intermission: false,
         }
     }
 }
@@ -171,6 +254,7 @@ pub struct ProxyState {
     /// The `timelimit`/`fraglimit`/`capturelimit` captured before the proxy
     /// first overrode them, restored when the roster falls below every rule.
     pub base_limits: Option<crate::rules::BaseLimits>,
+    pub tffa: TffaState,
 }
 
 static STATE: Mutex<Option<ProxyState>> = Mutex::new(None);
@@ -209,6 +293,7 @@ impl ProxyState {
             team_lock: TeamLock::default(),
             last_team_rule: None,
             base_limits: None,
+            tffa: TffaState::default(),
         }
     }
 }
@@ -273,6 +358,9 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_TEAM_SIZE_RULES].1.to_bytes(), b"");
+        assert_eq!(PROXY_CVARS[CVAR_TFFA_ENABLE].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_MATCHES].1.to_bytes(), b"8");
+        assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_GROUP_SIZE].1.to_bytes(), b"12");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

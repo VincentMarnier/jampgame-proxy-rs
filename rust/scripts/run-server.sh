@@ -120,5 +120,6 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
     +set g_weaponDisable 524279 \
     +set g_friendlyFire 1 \
     +set g_friendlySaber 1 \
+    +set proxy_tffa_enable 1 \
     +map "$MAP" \
     ${JAMP_EXTRA:-}

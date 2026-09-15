@@ -2,9 +2,9 @@
 //! wanted game-side features as entry wrappers over pristine game functions
 //! (`crate::patch::GAME_HOOKS`): stats accounting (`G_Damage`, `player_die`,
 //! `BeginIntermission`), anti-HP teller (`G_AddEvent`) and minimum jump time
-//! (`ClientThink_real`).
-
-use core::ffi::{c_char, c_int};
+//! (`ClientThink_real`), plus the Rust-only parallel-TFFA hooks (`AddScore`
+/// accounting; `G_Damage`/`player_die` cross-match gating).
+use core::ffi::{CStr, c_char, c_int};
 
 use crate::hooks::engine_sv::read_i32;
 use crate::hooks::original_call;
@@ -14,8 +14,8 @@ use crate::sdk::{
     OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_DAMAGE_REDIRECT,
     OFFSET_GENTITY_PLAYER_STATE, OFFSET_GENTITY_S, OFFSET_LEVEL_TIME, OFFSET_PERS_CMD,
     OFFSET_PERS_NETNAME, OFFSET_PS_CLIENT_NUM, OFFSET_PS_PERSISTANT, OFFSET_PS_STATS,
-    OFFSET_SESS_SESSION_TEAM, PERS_KILLED, PERS_SCORE, STAT_ARMOR, STAT_HEALTH, TEAM_BLUE,
-    TEAM_RED, TEAM_SPECTATOR,
+    OFFSET_SESS_SESSION_TEAM, PERS_KILLED, PERS_SCORE, PERS_TEAM, SIZEOF_GENTITY, STAT_ARMOR,
+    STAT_HEALTH, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
 };
 use crate::state;
 use crate::syscall;
@@ -105,6 +105,48 @@ fn is_same_team(a: c_int, b: c_int) -> bool {
     (a == TEAM_RED || a == TEAM_BLUE) && a == b
 }
 
+/// Player slot (`0..32`) for a player entity, or `None` for world/non-player
+/// entities. Uses the `g_entities` index math (player entities are slots
+/// `0..MAX_CLIENTS`) and requires a live client pointer.
+fn tffa_player_slot(ent: usize) -> Option<c_int> {
+    if ent == 0 {
+        return None;
+    }
+    let base = g_entities();
+    if base == 0 || ent < base {
+        return None;
+    }
+    let idx = (ent - base) / SIZEOF_GENTITY;
+    if idx >= MAX_CLIENTS {
+        return None;
+    }
+    // SAFETY: ent is inside the g_entities array; client is a pointer field.
+    let client = unsafe { ent_client(ent) };
+    if client == 0 {
+        return None;
+    }
+    Some(idx as c_int)
+}
+
+/// Cross-match damage gate for `G_Damage`/`player_die`: `Some(true)` = drop,
+/// `Some(false)` = same match, `None` = not a player-vs-player hit (allow).
+fn tffa_damage_blocked(targ: usize, attacker: usize) -> Option<bool> {
+    if !crate::tffa::enabled() {
+        return Some(false);
+    }
+    let (Some(targ_num), Some(attacker_num)) = (tffa_player_slot(targ), tffa_player_slot(attacker))
+    else {
+        return None;
+    };
+    if targ_num == attacker_num {
+        return Some(false);
+    }
+    Some(crate::tffa::damage_blocked(
+        crate::tffa::client_match(attacker_num),
+        crate::tffa::client_match(targ_num),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // G_Damage — stats damage accounting (entry wrapper)
 // ---------------------------------------------------------------------------
@@ -128,6 +170,11 @@ pub unsafe extern "C" fn g_damage(
     dflags: c_int,
     mod_: c_int,
 ) {
+    // Parallel TFFA: cross-match player-vs-player hits deal no damage.
+    // Environment (world/trigger, no client) always passes through.
+    if tffa_damage_blocked(targ, attacker) == Some(true) {
+        return;
+    }
     let targ_client = unsafe { ent_client(targ) };
     let attacker_client = unsafe { ent_client(attacker) };
     let targ_redirect = unsafe { read_i32(targ + OFFSET_GENTITY_DAMAGE_REDIRECT) };
@@ -203,7 +250,10 @@ pub unsafe extern "C" fn player_die(
 
     let self_client = unsafe { ent_client(self_) };
     let attacker_client = unsafe { ent_client(attacker) };
-    if self_ != 0 && self_client != 0 && attacker != 0 && attacker_client != 0 {
+    // Parallel TFFA: cross-match kills (e.g. telefrag on shared spawns) still
+    // die, but they must not pollute per-match personal stats.
+    let cross_match = tffa_damage_blocked(self_, attacker) == Some(true);
+    if !cross_match && self_ != 0 && self_client != 0 && attacker != 0 && attacker_client != 0 {
         let self_num = unsafe { ent_client_num(self_) };
         let attacker_num = unsafe { ent_client_num(attacker) };
         if (0..MAX_CLIENTS as c_int).contains(&self_num)
@@ -419,9 +469,18 @@ fn send_server_command(client_num: c_int, text: &[u8]) {
 ///
 /// Entered from the game module with no arguments.
 pub unsafe extern "C" fn begin_intermission() {
+    run_begin_intermission();
+}
+
+/// Run the pristine intermission plus the end-game stats tables. Shared by
+/// the `BeginIntermission` detour and by the parallel-TFFA solo-main finish
+/// (no other active instance: the map ends normally instead of silently
+/// restarting a fresh main round).
+pub fn run_begin_intermission() {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_begin_intermission);
     unsafe { original() };
+    state::with_state(|s| s.tffa.intermission = true);
 
     if !end_game_stats_enabled() {
         return;
@@ -584,6 +643,270 @@ pub unsafe extern "C" fn begin_intermission() {
             );
         }
     }
+}
+
+/// Print end-of-match stats for one finished TFFA instance, filtered to its
+/// members: personal tables go to each member (only same-match opponents),
+/// the global table + best players go to members and to current spectators.
+/// No-op when `proxy_sv_enableEndGameStats` is off. Called from
+/// `tffa::on_run_frame_post` after the fraglimit, *not* via intermission.
+pub fn print_tffa_match_stats(members: &[c_int]) {
+    if !end_game_stats_enabled() || members.is_empty() {
+        return;
+    }
+    // NOTE: deliberately a linear scan, not a HashSet: this path runs once
+    // per match finish with a handful of members, and must not depend on
+    // hasher/thread-local machinery inside the engine's frame.
+    // Spectators that should also see the global table. Derived from the
+    // stored CS_PLAYERS bases (`t` team) instead of raw game reads: every
+    // team change (including the finish-moves above) refreshes the base via
+    // ClientUserinfoChanged, so it is current here.
+    let specs: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|cn| {
+                if members.contains(cn) {
+                    return false;
+                }
+                if !s.clients[*cn as usize].is_connected {
+                    return false;
+                }
+                let base = &s.tffa.cs_players_base[*cn as usize];
+                crate::tffa::info_value(base, "t").and_then(|t| t.parse::<i32>().ok())
+                    == Some(TEAM_SPECTATOR)
+            })
+            .collect()
+    });
+    let mut recipients: Vec<c_int> = members.to_vec();
+    recipients.extend(specs.iter().copied());
+
+    // Personal tables (members only, same-match opponents only).
+    for viewer in members {
+        let viewer = *viewer;
+        send_server_command(
+            viewer,
+            b"print \"========================== PERSONAL STATS ==========================\n           Name   K/D(^3diff.^7) [^5ratio^7]          Damages(^3diff.^7) [^5ratio^7]\n--------------- -------------------- -------------------------------\n\"",
+        );
+        for opponent in members {
+            let opponent = *opponent;
+            if opponent == viewer {
+                continue;
+            }
+            let (given, taken) = state::with_state(|s| {
+                let gs = &s.clients[viewer as usize].game_stats[opponent as usize];
+                (gs.damages_given, gs.damages_taken)
+            });
+            if given > 0 || taken > 0 {
+                let mut client_name = [0u8; MAX_NETNAME];
+                client_clean_netname(opponent, &mut client_name);
+                let name = String::from_utf8_lossy(&client_name[..utils::c_strlen(&client_name)]);
+                let (killed, killed_by) = state::with_state(|s| {
+                    let gs = &s.clients[viewer as usize].game_stats[opponent as usize];
+                    (gs.killed, gs.killed_by)
+                });
+                let kd = printf_str(&format_score(killed, killed_by), 28, 28);
+                let dmg = printf_str(&format_score(given, taken), 39, 39);
+                let row = format!("print \"{} {} {}\n\"", printf_str(&name, 36, 15), kd, dmg);
+                send_server_command(viewer, row.as_bytes());
+            }
+        }
+        send_server_command(viewer, b"print \"\n\"");
+    }
+
+    // Global table (members only, sent to members + specs).
+    let (mut highest_dmg_dealt, mut highest_dmg_dealer_client_num) = (i32::MIN, -1);
+    let (mut best_dmg_dealer_diff, mut best_dmg_dealer_client_num) = (i32::MIN, -1);
+    let (mut best_fragger_diff, mut best_fragger_client_num) = (i32::MIN, -1);
+    for target in &recipients {
+        send_server_command(
+            *target,
+            b"print \"======================================= GLOBAL STATS =======================================\n           Name   K/D(^3diff.^7) [^5ratio^7]          Damages(^3diff.^7) [^5ratio^7] Teamkills  Team damages\n--------------- -------------------- ------------------------------- --------- -------------\n\"",
+        );
+    }
+    for client_num in members {
+        let client_num = *client_num;
+        let (mut damages_given, damages_taken) = state::with_state(|s| {
+            let cl = &s.clients[client_num as usize];
+            let mut given = 0i32;
+            let mut taken = 0i32;
+            for opp in members {
+                let gs = &cl.game_stats[*opp as usize];
+                given += gs.damages_given;
+                taken += gs.damages_taken;
+            }
+            (given, taken)
+        });
+        if damages_given > 0 || damages_taken > 0 {
+            let client = client_of(client_num);
+            let (score, killed) = if client != 0 {
+                // SAFETY: client is a valid gclient_t.
+                (unsafe { ps_persistant(client, PERS_SCORE) }, unsafe {
+                    ps_persistant(client, PERS_KILLED)
+                })
+            } else {
+                (0, 0)
+            };
+            let kills_diff = score - killed;
+            let mut client_name = [0u8; MAX_NETNAME];
+            client_clean_netname(client_num, &mut client_name);
+            let name = String::from_utf8_lossy(&client_name[..utils::c_strlen(&client_name)]);
+            let kd = printf_str(&format_score(score, killed), 28, 28);
+            damages_given -=
+                state::with_state(|s| s.clients[client_num as usize].team_damages_given);
+            let dmg = printf_str(&format_score(damages_given, damages_taken), 39, 39);
+            let (team_kills, team_killed, team_dmg_given, team_dmg_taken) =
+                state::with_state(|s| {
+                    let cl = &s.clients[client_num as usize];
+                    (
+                        cl.team_kills,
+                        cl.team_killed,
+                        cl.team_damages_given,
+                        cl.team_damages_taken,
+                    )
+                });
+            let tk = printf_str(&format!("{team_kills}/{team_killed}"), 9, 9);
+            let tdmg = printf_str(&format!("{team_dmg_given}/{team_dmg_taken}"), 13, 13);
+            let row = format!(
+                "print \"{} {} {} {} {}\n\"",
+                printf_str(&name, 36, 15),
+                kd,
+                dmg,
+                tk,
+                tdmg
+            );
+            for target in &recipients {
+                send_server_command(*target, row.as_bytes());
+            }
+            let damages_diff = damages_given - damages_taken;
+            if damages_diff > best_dmg_dealer_diff {
+                best_dmg_dealer_diff = damages_diff;
+                best_dmg_dealer_client_num = client_num;
+            }
+            if damages_given > highest_dmg_dealt {
+                highest_dmg_dealt = damages_given;
+                highest_dmg_dealer_client_num = client_num;
+            }
+            if kills_diff > best_fragger_diff {
+                best_fragger_diff = kills_diff;
+                best_fragger_client_num = client_num;
+            }
+        }
+    }
+    if best_fragger_client_num >= 0
+        || best_dmg_dealer_client_num >= 0
+        || highest_dmg_dealer_client_num >= 0
+    {
+        for target in &recipients {
+            send_server_command(*target, b"print \"\n\"");
+        }
+        if best_dmg_dealer_client_num >= 0 {
+            let mut name = [0u8; MAX_NETNAME];
+            client_clean_netname(best_dmg_dealer_client_num, &mut name);
+            let name = String::from_utf8_lossy(&name[..utils::c_strlen(&name)]);
+            for target in &recipients {
+                send_server_command(
+                    *target,
+                    format!("print \"MVP: {name} (^3{:+}^7)\n\"", best_dmg_dealer_diff).as_bytes(),
+                );
+            }
+        }
+        if highest_dmg_dealer_client_num >= 0 {
+            let mut name = [0u8; MAX_NETNAME];
+            client_clean_netname(highest_dmg_dealer_client_num, &mut name);
+            let name = String::from_utf8_lossy(&name[..utils::c_strlen(&name)]);
+            for target in &recipients {
+                send_server_command(
+                    *target,
+                    format!(
+                        "print \"Highest damage dealer: {name} (^3{:+}^7)\n\"",
+                        highest_dmg_dealt
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        if best_fragger_client_num >= 0 {
+            let mut name = [0u8; MAX_NETNAME];
+            client_clean_netname(best_fragger_client_num, &mut name);
+            let name = String::from_utf8_lossy(&name[..utils::c_strlen(&name)]);
+            for target in &recipients {
+                send_server_command(
+                    *target,
+                    format!(
+                        "print \"Best fragger: {name} (^3{:+}^7)\n\"",
+                        best_fragger_diff
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AddScore — parallel-TFFA per-match accounting (entry wrapper)
+// ---------------------------------------------------------------------------
+
+/// `AddScore(gentity_t*, vec3_t, int)` wrapper: run the pristine body (keeps
+/// `PERS_SCORE`, warmup guard and `CalculateRanks`), then attribute the score
+/// to the scorer's match and neutralise the global `level.teamScores` bump so
+/// pristine `CheckExitRules` never ends the server early. Each match shares
+/// the server's own `fraglimit`, checked in `tffa::on_run_frame_post`.
+///
+/// `vec3_t` decays to `float*`, so the wrapper takes an origin pointer.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `AddScore` argument list.
+pub unsafe extern "C" fn add_score(ent: usize, origin: *const f32, score: c_int) {
+    // SAFETY: trampoline attached at GAME_INIT.
+    let original = original_call(crate::hooks::game_hook_original_add_score);
+    unsafe { original(ent, origin, score) };
+
+    if !crate::tffa::enabled() || score == 0 || ent == 0 {
+        return;
+    }
+    let client = unsafe { ent_client(ent) };
+    if client == 0 {
+        return;
+    }
+    // SAFETY: client is a valid gclient_t; persistant[PERS_TEAM] is an int.
+    let team = unsafe { ps_persistant(client, PERS_TEAM) };
+    if team != TEAM_RED && team != TEAM_BLUE {
+        return;
+    }
+    let ent_num = unsafe { ent_client_num(ent) };
+    if !(0..MAX_CLIENTS as c_int).contains(&ent_num) {
+        return;
+    }
+    crate::tffa::on_add_score(ent_num, team, score);
+}
+
+// ---------------------------------------------------------------------------
+// LogExit — parallel-TFFA pristine-exit swallow (entry wrapper)
+// ---------------------------------------------------------------------------
+
+/// `LogExit(const char*)` wrapper: while parallel TFFA matches run, swallow
+/// pristine fraglimit exits (`"Kill limit hit."`) — pristine `CheckExitRules`
+/// runs inside `CalculateRanks` inside `AddScore`, i.e. before the `AddScore`
+/// wrapper can neutralise the bump, so neutralising alone can never win that
+/// race (SIGSEGV 139: our post-handler `SetTeam` then collides with the queued
+/// intermission). The proxy's own `on_run_frame_post` owns ALL fraglimit
+/// endings. Every other exit string (timelimit, capturelimit, duel) passes
+/// through untouched, so the global `timelimit` still ends the map.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `LogExit` argument list.
+pub unsafe extern "C" fn log_exit(string: *const c_char) {
+    let kill_limit = !string.is_null()
+        // SAFETY: game passes a NUL-terminated exit string.
+        && unsafe { CStr::from_ptr(string) }.to_bytes() == b"Kill limit hit.";
+    if kill_limit && crate::tffa::enabled() {
+        return;
+    }
+    // SAFETY: trampoline attached at GAME_INIT.
+    let original = original_call(crate::hooks::game_hook_original_log_exit);
+    unsafe { original(string) };
 }
 
 #[cfg(test)]

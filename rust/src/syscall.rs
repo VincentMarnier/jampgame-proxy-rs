@@ -23,9 +23,10 @@ use core::ffi::{CStr, c_int};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sdk::{
-    G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE, G_CVAR_VARIABLE_INTEGER_VALUE,
-    G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT, G_GET_USERCMD, G_GET_USERINFO,
-    G_LOCATE_GAME_DATA, G_SEND_SERVER_COMMAND, G_SET_USERINFO, VmCvar,
+    CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
+    G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
+    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_SEND_SERVER_COMMAND,
+    G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -83,9 +84,14 @@ pub unsafe fn call_engine(command: c_int, args: &[c_int]) -> c_int {
 
 /// Fixed-arity continuation of the C variadic shim: forward one harvested trap
 /// call (command + up to 16 words) to the engine unchanged — except for the
-/// two traps the proxy intercepts (`Proxy_OriginalAPI_Wrappers.cpp:24-45`):
+/// traps the proxy intercepts (`Proxy_OriginalAPI_Wrappers.cpp:24-45`):
 /// `G_LOCATE_GAME_DATA` is recorded, `G_GET_USERCMD` is mutated after the
-/// engine fills the cmd. Both are then forwarded normally.
+/// engine fills the cmd, `G_SEND_SERVER_COMMAND` `scores ...` messages
+/// are rewritten per viewer while parallel TFFA matches are active, and
+/// `G_SET_CONFIGSTRING` for `CS_SCORES1/2` + `CS_PLAYERS` fans out per-viewer
+/// `cs` corrections (own-match mini HUD, unified scoreboard with outsiders as
+/// prefixed spectators).
+/// All are then forwarded normally.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jampgame_syscall_forward(
     command: c_int,
@@ -134,6 +140,131 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 unsafe { crate::shared_api::get_usercmd(a0, a1 as *mut crate::sdk::Usercmd) };
             }
             return response;
+        }
+        // `G_SEND_SERVER_COMMAND(int clientNum, const char*)`: rewrite the
+        // per-viewer `scores ...` message while parallel TFFA matches run so
+        // each match sees only its own roster and scores. Chat is left global.
+        // Pristine fraglimit notices (`Red|Blue|<name> …HIT_THE_KILL_LIMIT…`)
+        // are swallowed under TFFA (companion to the `LogExit` hook — the
+        // proxy's own `on_run_frame_post` owns ALL fraglimit endings).
+        G_SEND_SERVER_COMMAND => {
+            if crate::state::proxy_enabled() && !(a1 as usize as *const core::ffi::c_char).is_null()
+            {
+                // SAFETY: the game passes a NUL-terminated command string.
+                let text = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
+                if let Ok(text_str) = text.to_str() {
+                    if crate::tffa::enabled() && crate::tffa::is_kill_limit_print(text_str) {
+                        return 0;
+                    }
+                    if a0 >= 0 && (a0 as usize) < crate::sdk::MAX_CLIENTS {
+                        if let Some(rewritten) =
+                            crate::tffa::rewrite_scores_for_viewer(text_str, a0)
+                        {
+                            if let Ok(cmsg) = std::ffi::CString::new(rewritten) {
+                                // SAFETY: engine syscall registered; cmsg outlives
+                                // the call (the engine copies into
+                                // reliableCommands synchronously).
+                                let response = unsafe {
+                                    engine_syscall_call(
+                                        command,
+                                        [
+                                            a0,
+                                            cmsg.as_ptr() as c_int,
+                                            a2,
+                                            a3,
+                                            a4,
+                                            a5,
+                                            a6,
+                                            a7,
+                                            a8,
+                                            a9,
+                                            a10,
+                                            a11,
+                                            a12,
+                                            a13,
+                                            a14,
+                                            a15,
+                                        ],
+                                    )
+                                };
+                                return response;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Trace family (`trap_Trace`/`trap_G2Trace`/`trap_TraceCapsule`, all
+        // `SV_Trace(results, start, mins, maxs, end, passEntityNum=a5, …)`):
+        // while parallel TFFA matches run, zero `r.contents` of cross-match
+        // entities for the duration of this single synchronous trap so
+        // cross-match players/sabers/missiles are intangible game-side (no
+        // body blocking, no saber clashes), then restore.
+        crate::sdk::G_TRACE | crate::sdk::G_G2TRACE | crate::sdk::G_TRACECAPSULE => {
+            if crate::state::proxy_enabled() {
+                let mut flipbuf: [(usize, i32); 64] = [(0, 0); 64];
+                let n = crate::tffa::trace_flips(a5, &mut flipbuf);
+                if n > 0 {
+                    // SAFETY: contents slots are inside the game's gentity_t
+                    // array (address/offset validated in trace_flips).
+                    for (addr, _) in &flipbuf[..n] {
+                        unsafe { *((*addr) as *mut c_int) = 0 };
+                    }
+                    // SAFETY: engine syscall registered; words forwarded.
+                    let response = unsafe {
+                        engine_syscall_call(
+                            command,
+                            [
+                                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14,
+                                a15,
+                            ],
+                        )
+                    };
+                    // SAFETY: same slots, synchronous engine call above.
+                    for (addr, saved) in &flipbuf[..n] {
+                        unsafe { *((*addr) as *mut c_int) = *saved };
+                    }
+                    return response;
+                }
+            }
+        }
+        // `G_SET_CONFIGSTRING(int num, const char*)`: forward first (engine
+        // updates `sv.configstrings` + broadcasts `cs` to all), then fan out
+        // per-viewer `cs` corrections while TFFA runs so each match gets its
+        // own mini-HUD scores and unified scoreboard names. The corrections
+        // arrive after the broadcast and win per client.
+        G_SET_CONFIGSTRING => {
+            if crate::state::proxy_enabled()
+                && (a0 == CS_SCORES1
+                    || a0 == CS_SCORES2
+                    || (CS_PLAYERS..CS_PLAYERS + MAX_CLIENTS as c_int).contains(&a0))
+            {
+                let ptr = a1 as usize as *const core::ffi::c_char;
+                let value: Option<String> = if ptr.is_null() {
+                    Some(String::new())
+                } else {
+                    // SAFETY: game passes a NUL-terminated configstring.
+                    let cstr = unsafe { CStr::from_ptr(ptr) };
+                    Some(cstr.to_string_lossy().into_owned())
+                };
+                // SAFETY: engine syscall registered; words forwarded.
+                let response = unsafe {
+                    engine_syscall_call(
+                        command,
+                        [
+                            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+                        ],
+                    )
+                };
+                if let Some(value) = value {
+                    if a0 == CS_SCORES1 || a0 == CS_SCORES2 {
+                        crate::tffa::on_set_cs_scores();
+                    } else {
+                        crate::tffa::on_set_cs_players(a0 - CS_PLAYERS, &value);
+                    }
+                }
+                return response;
+            }
         }
         _ => {}
     }
@@ -245,6 +376,22 @@ pub unsafe fn cvar_set(name: &CStr, value: &CStr) {
         call_engine(
             G_CVAR_SET,
             &[name.as_ptr() as c_int, value.as_ptr() as c_int],
+        );
+    }
+}
+
+/// `trap_GetConfigstring` — copy server configstring `index` into `buffer`
+/// (`G_GET_CONFIGSTRING`).
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `buffer` is written by the
+/// engine and NUL-terminated.
+pub unsafe fn get_configstring(index: c_int, buffer: &mut [u8]) {
+    unsafe {
+        call_engine(
+            G_GET_CONFIGSTRING,
+            &[index, buffer.as_mut_ptr() as c_int, buffer.len() as c_int],
         );
     }
 }

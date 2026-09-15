@@ -619,14 +619,17 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 
 /// All engine detours, in attach order (mirrors `hookEntries` in
 /// `Proxy_Engine_Patch.cpp:29-52`), minus the dropped features (D-002):
-/// anti-wallhack (`SV_SendClientSnapshot`, `SV_AddEntitiesVisibleFromPoint`),
+/// anti-wallhack `SV_SendClientSnapshot` (still dropped),
 /// ping-fix (`SV_CalcPings`, `SV_SendMessageToClient`), the
 /// `SV_ExecuteClientMessage` rewrite (hack guards already in the shipped
 /// binary — see `docs/`), `SV_PacketEvent` (pristine `SV_ReadPackets` already
 /// has both fixes) and the `Cmd_TokenizeString` hook (proxy-local helper
 /// instead). `Com_Printf` is not detoured either: its hardening is the
 /// `vsprintf`→`vsnprintf` call-site retarget (`CALL_VSPRINTF`).
-pub static ENGINE_HOOKS: [Hook; 14] = [
+/// `SV_AddEntitiesVisibleFromPoint` is re-added as a Rust-only parallel-TFFA
+/// post-filter (invisibility); it runs the pristine body then drops
+/// cross-match entities from the snapshot list.
+pub static ENGINE_HOOKS: [Hook; 15] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -689,12 +692,18 @@ pub static ENGINE_HOOKS: [Hook; 14] = [
         crate::engine::functions::SV_EXECUTE_CLIENT_MESSAGE,
         false,
     ),
+    Hook::new(
+        "SV_AddEntitiesVisibleFromPoint",
+        crate::engine::functions::SV_ADD_ENTITIES_VISIBLE_FROM_POINT,
+        false,
+    ),
 ];
 
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
 /// (`Proxy_Engine_Patch.cpp:61-70`) minus the dropped `WP_SaberPositionUpdate`
-/// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror).
-pub static GAME_HOOKS: [Hook; 6] = [
+/// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror),
+/// plus the Rust-only parallel-TFFA `AddScore` accounting hook.
+pub static GAME_HOOKS: [Hook; 8] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -709,6 +718,8 @@ pub static GAME_HOOKS: [Hook; 6] = [
         true,
     ),
     Hook::new("SetTeam", crate::jampgame::FN_SET_TEAM, true),
+    Hook::new("AddScore", crate::jampgame::FN_ADD_SCORE, true),
+    Hook::new("LogExit", crate::jampgame::FN_LOG_EXIT, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -954,6 +965,11 @@ mod tests {
             want: 6,
         },
         Site {
+            name: "SV_AddEntitiesVisibleFromPoint",
+            bytes: b"\x55\x8b\xec\x83\xec\x58\x89\x7d\xf4\x89\x75\xf0\x89\x5d\xec\x8b",
+            want: 6,
+        },
+        Site {
             name: "Com_Printf",
             bytes: b"\x55\x8b\xec\x81\xec\x20\x11\x00\x00",
             want: 9,
@@ -989,6 +1005,16 @@ mod tests {
         Site {
             name: "SetTeam",
             bytes: b"\x55\x8b\xec\x83\xec\x38",
+            want: 6,
+        },
+        Site {
+            name: "AddScore",
+            bytes: b"\x55\x8b\xec\x83\xec\x08\x89\x5d\xfc\x8b\x55\x08\x8b\x45\x10\x8b",
+            want: 6,
+        },
+        Site {
+            name: "LogExit",
+            bytes: b"\x55\x8b\xec\x83\xec\x30\x89\x5d\xf4\x8b\x45\x08\xc7\x04\x24\x0c",
             want: 6,
         },
     ];

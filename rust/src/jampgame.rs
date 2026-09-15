@@ -39,6 +39,18 @@ pub const FN_CLIENT_THINK_REAL: usize = 0x0011_c4c4;
 /// the single choke point every team change funnels through. Hooked by
 /// `proxy_sv_lockTeams` to enforce the round-start caps.
 pub const FN_SET_TEAM: usize = 0x0012_ada4;
+/// `void AddScore(gentity_t*, vec3_t, int)` (nm `AddScore__FP9gentity_sPfi`,
+/// file offset `0x1313a4`; prologue `55 8b ec 83 ec 08`, 6 detour-safe bytes).
+/// `vec3_t` decays to `float*`, so the wrapper takes an origin pointer.
+pub const FN_ADD_SCORE: usize = 0x0013_13a4;
+/// `void LogExit(const char*)` (nm `LogExit__FPCc`, file offset `0x881d4`;
+/// prologue `55 8b ec 83 ec 30`, 6 detour-safe bytes). Hooked by the
+/// parallel-TFFA feature to swallow pristine fraglimit exits (`"Kill limit
+/// hit."` only — timelimit/capture/duel exits pass through): pristine
+/// `CheckExitRules` runs inside `CalculateRanks` inside `AddScore`, i.e.
+/// before the `AddScore` wrapper can neutralise the bump, so neutralising
+/// alone can never win the race.
+pub const FN_LOG_EXIT: usize = 0x0008_81d4;
 
 /// Re-type a game-module function at `base + offset` as `$fn_ty`.
 ///
@@ -183,6 +195,8 @@ mod tests {
             FN_G_ADD_EVENT,
             FN_CLIENT_THINK_REAL,
             FN_SET_TEAM,
+            FN_ADD_SCORE,
+            FN_LOG_EXIT,
         ] {
             assert!(off >= text_lo && off < text_hi, "0x{off:x} out of .text");
         }

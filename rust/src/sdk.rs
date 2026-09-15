@@ -58,6 +58,7 @@ pub const TEAM_FREE: i32 = 0;
 pub const TEAM_RED: i32 = 1;
 pub const TEAM_BLUE: i32 = 2;
 pub const TEAM_SPECTATOR: i32 = 3;
+pub const TEAM_NUM_TEAMS: i32 = 4;
 
 // gametype_t (bg_public.h:183-198): the team modes the proxy features apply to.
 pub const GT_TEAM: i32 = 6;
@@ -68,6 +69,7 @@ pub const CON_DISCONNECTED: i32 = 0;
 
 // PERS_* (server.h:16-18), STAT_* (q_shared.h) used by the stats printer.
 pub const PERS_SCORE: usize = 0;
+pub const PERS_TEAM: usize = 3;
 pub const PERS_KILLED: usize = 8;
 pub const STAT_HEALTH: usize = 0;
 pub const STAT_ARMOR: usize = 5;
@@ -105,10 +107,22 @@ pub const G_ARGV: i32 = 11;
 pub const G_LOCATE_GAME_DATA: i32 = 17;
 pub const G_DROP_CLIENT: i32 = 18;
 pub const G_SEND_SERVER_COMMAND: i32 = 19;
+pub const G_SET_CONFIGSTRING: i32 = 20;
+pub const G_GET_CONFIGSTRING: i32 = 21;
 pub const G_GET_USERINFO: i32 = 22;
 pub const G_SET_USERINFO: i32 = 23;
 pub const G_GET_USERCMD: i32 = 40;
 pub const G_NAV_FREE: i32 = 201;
+
+/// Trace-family traps (`g_public.h:182-185,235`; compiled-oracle verified —
+/// `G_TRACE` 27, `G_G2TRACE` 28, `G_TRACECAPSULE` 49, all forwarding to
+/// `SV_Trace(results, start, mins, maxs, end, passEntityNum=args[6],
+/// contentmask=args[7], …)` per `sv_game.cpp:599-606`). All share the same
+/// word layout, so the parallel-TFFA physics isolation intercepts them
+/// together.
+pub const G_TRACE: i32 = 27;
+pub const G_G2TRACE: i32 = 28;
+pub const G_TRACECAPSULE: i32 = 49;
 
 /// `trap_Milliseconds` ordinal (`g_public.h:110`).
 pub const G_MILLISECONDS: i32 = 2;
@@ -158,6 +172,62 @@ pub const OFFSET_GENTITY_S: usize = 0;
 pub const OFFSET_GENTITY_PLAYER_STATE: usize = 532;
 /// `offsetof(gentity_t, damageRedirect)`.
 pub const OFFSET_GENTITY_DAMAGE_REDIRECT: usize = 1488;
+
+/// `entityState_t` field offsets inside `gentity_t.s` (`s` at 0, SDK
+/// `q_shared.h:2670-2832` PC layout; `clientNum` at 232 matches the existing
+/// `OFFSET_ENTITY_CLIENT_NUM` pin, which anchors the whole table).
+pub const OFFSET_GENTITY_S_ETYPE: usize = 4;
+pub const OFFSET_GENTITY_S_OTHER_ENTITY_NUM: usize = 188;
+pub const OFFSET_GENTITY_S_OTHER_ENTITY_NUM2: usize = 192;
+/// `entityState_t.owner` (crosshair owner).
+pub const OFFSET_GENTITY_S_OWNER: usize = 280;
+/// `entityShared_t.r.ownerNum`: `r` starts at 560
+/// (`sizeof(entityState_t)` 532 + playerState* 4 + Vehicle* 4 + ghoul2 4 +
+/// localAnimIndex 4 + modelScale 12), `ownerNum` 100 bytes into `r`
+/// (linked 0, linkcount 4, svFlags 8, singleClient 12, bmodel 16, mins 20,
+/// maxs 32, contents 44, absmin 48, absmax 60, currentOrigin 72,
+/// currentAngles 84, mIsRoffing 96, ownerNum 100).
+pub const OFFSET_GENTITY_R_OWNER: usize = 660;
+/// `entityShared_t.contents` (`r` at 560 + `contents` 44). The parallel-TFFA
+/// trace isolation zeroes this field for cross-match entities for the
+/// duration of a single `SV_Trace`.
+pub const OFFSET_GENTITY_R_CONTENTS: usize = 604;
+/// `entityShared_t.linked` (`r` at 560, first field).
+pub const OFFSET_GENTITY_R_LINKED: usize = 560;
+
+/// `clientSnapshot_t` viewer: `areabytes(0) + areabits[32](4) + ps(36)`,
+/// `playerState_t.clientNum` at +172 → frame+208 (SDK `server.h:96-114`,
+/// `MAX_MAP_AREA_BYTES` 32 from `q_shared.h:416`).
+pub const OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM: usize = 208;
+/// `snapshotEntityNumbers_t` (`sv_snapshot.cpp:264-268`):
+/// `numSnapshotEntities` first, then `snapshotEntities[1024]`.
+pub const OFFSET_SNAPSHOT_ENUMS_COUNT: usize = 0;
+pub const OFFSET_SNAPSHOT_ENUMS_LIST: usize = 4;
+pub const MAX_SNAPSHOT_ENTITIES: usize = 1024;
+
+/// Entity numbers (`q_shared.h:1991-2016`, `GENTITYNUM_BITS` 10 on PC).
+pub const ENTITYNUM_NONE: i32 = 1023;
+pub const ENTITYNUM_WORLD: i32 = 1022;
+
+/// `entityState_t.eType` base for temp events (`bg_public.h`: `ET_EVENTS`,
+/// 18 on PC: GENERAL 0 .. FX 17). Temp entities have
+/// `eType = ET_EVENTS + event`.
+pub const ET_EVENTS: i32 = 18;
+
+/// Event numbers (`bg_public.h` `entity_event_t`, oracle-counted 2026-09-15).
+pub const EV_SABER_HIT: i32 = 30;
+pub const EV_SABER_BLOCK: i32 = 31;
+pub const EV_SABER_CLASHFLARE: i32 = 32;
+pub const EV_OBITUARY: i32 = 93;
+
+/// Configstring indices (`bg_public.h`): `CS_SCORES1/2` drive the mini HUD
+/// (`cgs.scores1/2`), `CS_PLAYERS + n` carries client `n`'s `n\t\…` info.
+pub const CS_SCORES1: i32 = 6;
+pub const CS_SCORES2: i32 = 7;
+/// `CS_PLAYERS = CS_ICONS + MAX_ICONS = 1131` (`bg_public.h` chain:
+/// `CS_AMBIENT_SET 37 + MAX_AMBIENT_SETS 256 → … → CS_SOUNDS 811 +
+/// MAX_SOUNDS 256 → CS_ICONS 1067 + MAX_ICONS 64`).
+pub const CS_PLAYERS: i32 = 1131;
 
 #[cfg(test)]
 mod layout_pins {
@@ -281,11 +351,33 @@ pub const OFFSET_PERS_CONNECTED: usize = 0;
 
 /// `offsetof(clientSession_t, sessionTeam)` — team_t.
 pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
+/// `offsetof(clientSession_t, spectatorState)` (`g_local.h`: `sessionTeam(0)`,
+/// `spectatorTime(4)`, `spectatorState(8)`).
+pub const OFFSET_SESS_SPECTATOR_STATE: usize = 8;
+/// `offsetof(clientSession_t, spectatorClient)` (`spectatorState(8)` + 4).
+pub const OFFSET_SESS_SPECTATOR_CLIENT: usize = 12;
+
+/// `spectatorState_t` (`g_local.h:373-378`).
+pub const SPECTATOR_NOT: i32 = 0;
+pub const SPECTATOR_FREE: i32 = 1;
+pub const SPECTATOR_FOLLOW: i32 = 2;
+pub const SPECTATOR_SCOREBOARD: i32 = 3;
 
 /// `offsetof(level_locals_t, time)`.
 pub const OFFSET_LEVEL_TIME: usize = 32;
 /// `offsetof(level_locals_t, framenum)`.
 pub const OFFSET_LEVEL_FRAMENUM: usize = 28;
+/// `offsetof(level_locals_t, teamScores)` (base of `int[TEAM_NUM_TEAMS]`,
+/// derived from the field order in SDK `g_local.h:812-832` and pinned by the
+/// existing `OFFSET_LEVEL_FRAMENUM`/`OFFSET_LEVEL_TIME` anchors:
+/// clients(0) gentities(4) gentitySize(8) num_entities(12) warmupTime(16)
+/// logFile(20) maxclients(24) framenum(28) time(32) previousTime(36)
+/// startTime(40) teamScores(44)).
+pub const OFFSET_LEVEL_TEAM_SCORES: usize = 44;
+/// `offsetof(level_locals_t, teamScores[TEAM_RED])`.
+pub const OFFSET_LEVEL_TEAM_SCORES_RED: usize = 48;
+/// `offsetof(level_locals_t, teamScores[TEAM_BLUE])`.
+pub const OFFSET_LEVEL_TEAM_SCORES_BLUE: usize = 52;
 
 /// `offsetof(msg_t, data)` — the message bytes (`SV_ExecuteClientMessage` peek).
 pub const OFFSET_MSG_DATA: usize = 12;
@@ -398,9 +490,15 @@ mod tests {
         assert_eq!(G_LOCATE_GAME_DATA, 17);
         assert_eq!(G_DROP_CLIENT, 18);
         assert_eq!(G_SEND_SERVER_COMMAND, 19);
+        assert_eq!(G_SET_CONFIGSTRING, 20);
+        assert_eq!(G_GET_CONFIGSTRING, 21);
         assert_eq!(G_GET_USERINFO, 22);
         assert_eq!(G_SET_USERINFO, 23);
         assert_eq!(G_GET_USERCMD, 40);
+        // Trace-family ordinals (compiled-oracle verified 2026-09-15).
+        assert_eq!(G_TRACE, 27);
+        assert_eq!(G_G2TRACE, 28);
+        assert_eq!(G_TRACECAPSULE, 49);
     }
 
     #[test]
@@ -465,6 +563,19 @@ mod tests {
         assert_eq!(OFFSET_SESS_SESSION_TEAM, 0);
         assert_eq!(OFFSET_LEVEL_TIME, 32);
         assert_eq!(OFFSET_LEVEL_FRAMENUM, 28);
+        assert_eq!(OFFSET_LEVEL_TEAM_SCORES, 44);
+        assert_eq!(OFFSET_LEVEL_TEAM_SCORES_RED, 48);
+        assert_eq!(OFFSET_LEVEL_TEAM_SCORES_BLUE, 52);
+        assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);
+        assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 192);
+        assert_eq!(OFFSET_GENTITY_S_OWNER, 280);
+        assert_eq!(OFFSET_GENTITY_R_OWNER, 660);
+        assert_eq!(OFFSET_GENTITY_R_CONTENTS, 604);
+        assert_eq!(OFFSET_GENTITY_R_LINKED, 560);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, 208);
+        assert_eq!(OFFSET_SNAPSHOT_ENUMS_LIST, 4);
+        assert_eq!(ENTITYNUM_NONE, 1023);
+        assert_eq!(ENTITYNUM_WORLD, 1022);
         assert_eq!(OFFSET_MSG_DATA, 12);
         assert_eq!(OFFSET_MSG_CURSIZE, 20);
         assert_eq!(OFFSET_NETCHAN_REMOTE_ADDRESS, 234556);

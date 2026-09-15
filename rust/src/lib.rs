@@ -40,6 +40,7 @@ mod shared_api;
 mod state;
 mod syscall;
 mod teamlock;
+mod tffa;
 mod utils;
 
 use core::ffi::c_int;
@@ -114,14 +115,25 @@ pub unsafe extern "C" fn vmMain(
             // SAFETY: original module loaded, memory layer initialised.
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
             if state::proxy_enabled() {
-                teamlock::on_run_frame();
-                rules::on_run_frame();
+                // Team lock / size rules are global-roster features; they are
+                // meaningless (and harmful) while parallel TFFA matches share
+                // the RED/BLUE teams, so they stay off then.
+                if !tffa::enabled() {
+                    teamlock::on_run_frame();
+                    rules::on_run_frame();
+                }
+                tffa::on_frame_start();
             }
-            forward(GAME_RUN_FRAME, &args)
+            let response = forward(GAME_RUN_FRAME, &args);
+            if state::proxy_enabled() {
+                tffa::on_run_frame_post();
+            }
+            response
         }
         GAME_CLIENT_CONNECT => {
             if state::proxy_enabled() {
                 shared_api::client_connect(a0, a1 != 0, a2 != 0);
+                tffa::on_client_connect(a0, a1 != 0);
                 teamlock::on_client_connect(a1 != 0);
             }
             forward(command, &args)
@@ -129,6 +141,7 @@ pub unsafe extern "C" fn vmMain(
         GAME_CLIENT_DISCONNECT => {
             if state::proxy_enabled() {
                 shared_api::client_disconnect(a0);
+                tffa::on_client_disconnect(a0);
             }
             forward(command, &args)
         }
@@ -136,11 +149,20 @@ pub unsafe extern "C" fn vmMain(
             if state::proxy_enabled() {
                 shared_api::client_begin(a0, a1 != 0);
             }
-            forward(command, &args)
+            let response = forward(command, &args);
+            if state::proxy_enabled() {
+                tffa::on_client_begin(a0);
+            }
+            response
         }
         GAME_CLIENT_COMMAND => {
-            if state::proxy_enabled() && !shared_api::client_command(a0) {
-                return 0;
+            if state::proxy_enabled() {
+                if tffa::handle_client_command(a0) {
+                    return 0;
+                }
+                if !shared_api::client_command(a0) {
+                    return 0;
+                }
             }
             forward(command, &args)
         }
@@ -204,6 +226,11 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // has run its own registration, which is idempotent on the engine side.
     register_proxy_cvars();
     update_proxy_cvars();
+
+    // Fresh round for the parallel-TFFA matches (scores reset, created
+    // matches closed, main slot re-opened). Client assignments survive a
+    // map_restart; a full map change re-dlopens the module (fresh state).
+    tffa::reset_round();
 
     // Attach the engine/game hook layer (D-002 keep set) after the game is up
     // and the memory layer is populated. Skipped when `proxy_sv_enable` is off

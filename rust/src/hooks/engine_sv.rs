@@ -12,12 +12,16 @@ use crate::hooks::netstatus;
 use crate::hooks::original_call;
 use crate::jampgame;
 use crate::sdk::{
-    CLC_MOVE, CLC_MOVE_NO_DELTA, CS_ACTIVE, ERR_DROP, MAX_GENTITIES, MAX_QPATH,
-    OFFSET_CLIENT_DOWNLOAD, OFFSET_CLIENT_DOWNLOAD_NAME, OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM,
-    OFFSET_CLIENT_LAST_CLIENT_COMMAND, OFFSET_CLIENT_NAME, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE,
-    OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_NUMBER, OFFSET_MSG_BIT, OFFSET_MSG_READCOUNT,
-    OFFSET_SHARED_ENTITY_S, OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES,
-    SIZEOF_CLIENT_T, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
+    CLC_MOVE, CLC_MOVE_NO_DELTA, CS_ACTIVE, ENTITYNUM_NONE, ENTITYNUM_WORLD, ERR_DROP, MAX_CLIENTS,
+    MAX_GENTITIES, MAX_QPATH, OFFSET_CLIENT_DOWNLOAD, OFFSET_CLIENT_DOWNLOAD_NAME,
+    OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM, OFFSET_CLIENT_LAST_CLIENT_COMMAND, OFFSET_CLIENT_NAME,
+    OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE, OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_NUMBER,
+    OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S_ETYPE,
+    OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
+    OFFSET_MSG_BIT, OFFSET_MSG_READCOUNT, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
+    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
+    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY,
+    SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
 };
 use crate::state::{self, CVAR_ENABLE_RCON_CMD_COOLDOWN, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
@@ -699,4 +703,179 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
     // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
     let original = original_call(crate::hooks::engine_hook_original_sv_execute_client_message);
     unsafe { original(cl, msg) };
+}
+
+// ---------------------------------------------------------------------------
+// SV_AddEntitiesVisibleFromPoint — parallel-TFFA invisibility (entry wrapper)
+// ---------------------------------------------------------------------------
+
+/// Rust-only parallel-TFFA hook: run the pristine PVS/area/broadcast logic,
+/// then drop cross-match entities from the snapshot list so players neither
+/// see nor hear (events ride entities) other matches' fights. `EV_OBITUARY`
+/// kill feeds are broadcast temp entities whose `s.otherEntityNum` is the
+/// victim, so they are hidden the same way without trap parsing.
+///
+/// World/static entities are always kept. Player entities (`entNum < 32`
+/// with a live client) and owned entities (missiles/sabers via
+/// `r.ownerNum`/`s.owner`, obituaries via `s.otherEntityNum*`) are kept only
+/// within the viewer's match (lobby `None` sees lobby).
+///
+/// # Safety
+///
+/// Entered from the engine with `(origin, frame, eNums, portal)`; all three
+/// pointers are valid engine snapshot structures.
+pub unsafe extern "C" fn sv_add_entities_visible_from_point(
+    origin: usize,
+    frame: usize,
+    e_nums: usize,
+    portal: c_int,
+) {
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original =
+        original_call(crate::hooks::engine_hook_original_sv_add_entities_visible_from_point);
+    unsafe { original(origin, frame, e_nums, portal) };
+
+    if !crate::tffa::enabled() {
+        return;
+    }
+    if frame == 0 || e_nums == 0 {
+        return;
+    }
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities == 0 {
+        return;
+    }
+    // SAFETY: frame is a valid clientSnapshot_t; clientNum is a plain int.
+    let viewer = unsafe { read_i32(frame + OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM) };
+    if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
+        return;
+    }
+    // Snapshot the match table once (no per-entity locking); the viewer's
+    // own match is follow-aware (spectating someone adopts their instance).
+    let viewer_match = crate::tffa::effective_match(viewer);
+    let table = state::with_state(|s| s.tffa.client_match);
+    // SAFETY: eNums is a valid snapshotEntityNumbers_t.
+    let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
+    if count <= 0 {
+        return;
+    }
+    let count = (count as usize).min(crate::sdk::MAX_SNAPSHOT_ENTITIES);
+    let mut kept = 0usize;
+    for i in 0..count {
+        // SAFETY: list holds `count` ints.
+        let ent_num = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4) };
+        let keep = snapshot_keep(viewer_match, &table, g_entities, ent_num);
+        if keep {
+            if kept != i {
+                // SAFETY: both slots are inside the eNums list.
+                unsafe {
+                    let v = read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4);
+                    *((e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + kept * 4) as *mut c_int) = v;
+                }
+            }
+            kept += 1;
+        }
+    }
+    // SAFETY: count slot is a plain int we own post-body.
+    unsafe {
+        *((e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) as *mut c_int) = kept as c_int;
+    }
+}
+
+/// Snapshot predicate for one entity number (pure given the match table).
+/// Match `0` is the main TFFA; every live player belongs to exactly one.
+fn snapshot_keep(
+    viewer_match: u8,
+    table: &[u8; MAX_CLIENTS],
+    g_entities: usize,
+    ent_num: c_int,
+) -> bool {
+    if ent_num < 0 || ent_num >= MAX_GENTITIES as c_int {
+        return true;
+    }
+    if ent_num < MAX_CLIENTS as c_int {
+        // Player entity: keep only same-match. Free slots (no client) are not
+        // players — keep them (they should not be listed anyway).
+        let ent = g_entities + ent_num as usize * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array; client is a pointer field.
+        let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+        if client == 0 {
+            return true;
+        }
+        return crate::tffa::entity_visible(viewer_match, table[ent_num as usize]);
+    }
+    let ent = g_entities + ent_num as usize * SIZEOF_GENTITY;
+    // SAFETY: ent is inside the g_entities array; eType/owner fields are ints.
+    let etype = unsafe { read_i32(ent + OFFSET_GENTITY_S_ETYPE) };
+    // Temp event entities (`G_TempEntity`: `eType = ET_EVENTS + event`) carry
+    // no `r.ownerNum`/`s.owner` attribution (`G_InitGentity` sets
+    // `r.ownerNum = NONE`, `s.owner` stays 0 from the freelist `memset` — a
+    // bare 0 that coincides with client 0 and used to hide every same-match
+    // saber effect whenever client 0 was elsewhere). Attribute them only via
+    // `s.otherEntityNum*`, event-specifically:
+    // - `EV_SABER_BLOCK` (saber-vs-saber clash): only `otherEntityNum2`
+    //   (attacker) is set, `otherEntityNum` is the untouched 0 default.
+    // - `EV_SABER_CLASHFLARE`: neither is set (both default 0) — broadcast,
+    //   it marks the shared hit point and carries no victim/attacker.
+    // - everything else (hits, obituaries, missile marks): both fields.
+    if etype >= crate::sdk::ET_EVENTS {
+        let event = etype - crate::sdk::ET_EVENTS;
+        if event == crate::sdk::EV_SABER_CLASHFLARE {
+            return true;
+        }
+        // SAFETY: ent is inside the g_entities array; owner fields are ints.
+        if event == crate::sdk::EV_SABER_BLOCK {
+            let o2 = unsafe { read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2) };
+            return owners_in_viewer_match(viewer_match, table, g_entities, &[o2]);
+        }
+        let owned = unsafe {
+            [
+                read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM),
+                read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2),
+            ]
+        };
+        return owners_in_viewer_match(viewer_match, table, g_entities, &owned);
+    }
+    // Non-player, non-temp entity: attribute via owner fields. Any player
+    // owner in a different match hides the entity; world-owned stays visible.
+    let owners = unsafe {
+        [
+            read_i32(ent + OFFSET_GENTITY_R_OWNER),
+            read_i32(ent + OFFSET_GENTITY_S_OWNER),
+            read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM),
+            read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2),
+        ]
+    };
+    owners_in_viewer_match(viewer_match, table, g_entities, &owners)
+}
+
+/// Hide `ent` when any live-player owner in `owned` is outside the viewer's
+/// match; world-owned (no live-player owners) stays visible.
+fn owners_in_viewer_match(
+    viewer_match: u8,
+    table: &[u8; MAX_CLIENTS],
+    g_entities: usize,
+    owned: &[i32],
+) -> bool {
+    for &o in owned {
+        if o == ENTITYNUM_NONE || o == ENTITYNUM_WORLD {
+            continue;
+        }
+        if !(0..MAX_CLIENTS as c_int).contains(&o) {
+            continue;
+        }
+        // Only treat it as an owner if that slot actually holds a player;
+        // otherwise e.g. a generic index coinciding with a client slot would
+        // wrongly hide world entities.
+        let owner_ent = g_entities + o as usize * SIZEOF_GENTITY;
+        // SAFETY: owner slot is inside the g_entities array.
+        let owner_client = unsafe { read_usize(owner_ent + OFFSET_GENTITY_CLIENT) };
+        if owner_client == 0 {
+            continue;
+        }
+        if !crate::tffa::entity_visible(viewer_match, table[o as usize]) {
+            return false;
+        }
+    }
+    true
 }

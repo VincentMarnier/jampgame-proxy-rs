@@ -64,6 +64,12 @@ static BASE: AtomicUsize = AtomicUsize::new(0);
 /// by the original module (R-004).
 static LEVEL: AtomicUsize = AtomicUsize::new(0);
 static G_ENTITIES: AtomicUsize = AtomicUsize::new(0);
+/// `g_dontPenalizeTeam` (`g_cmds.c:659`, `qboolean`): TRUE while pristine
+/// `SetTeam` runs its kill-the-player suicide — pristine `AddScore` then
+/// skips the global `teamScores` bump, so the proxy must skip its own
+/// accounting too (otherwise it subtracts a point nobody added). Optional:
+/// a binary without the symbol still loads (treated as always-false).
+static G_DONT_PENALIZE_TEAM: AtomicUsize = AtomicUsize::new(0);
 
 /// Look up a symbol, returning it as an opaque pointer or an error message.
 unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
@@ -122,6 +128,14 @@ pub fn load(path: &CStr) -> Result<(), String> {
             return Err(e);
         }
     };
+    // Optional: only gates TFFA suicide accounting; absence degrades to the
+    // old always-account behaviour (with an eprintln).
+    match unsafe { symbol(handle, c"g_dontPenalizeTeam") } {
+        Ok(sym) => G_DONT_PENALIZE_TEAM.store(sym as usize, Ordering::Relaxed),
+        Err(e) => {
+            eprintln!("----- proxy-rs: optional symbol missing ({e}); team accounting unguarded")
+        }
+    }
 
     // Load base: `dladdr` on the module's own dllEntry gives `dli_fbase`
     // (`Proxy_Main.cpp:35-43`); the proxy rebases all game offsets by it.
@@ -165,6 +179,17 @@ pub fn level_address() -> usize {
 /// Address of the original module's exported `g_entities` symbol, or 0.
 pub fn g_entities_address() -> usize {
     G_ENTITIES.load(Ordering::Relaxed)
+}
+
+/// Whether pristine `SetTeam` is inside its protected suicide
+/// (`g_dontPenalizeTeam != 0`; missing symbol reads as false).
+pub fn dont_penalize_team() -> bool {
+    let addr = G_DONT_PENALIZE_TEAM.load(Ordering::Relaxed);
+    if addr == 0 {
+        return false;
+    }
+    // SAFETY: resolved `qboolean` (i32) BSS of the loaded game module.
+    unsafe { core::ptr::read_unaligned(addr as *const c_int) != 0 }
 }
 
 /// Hand the proxy's own syscall forwarder to the original module, exactly like

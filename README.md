@@ -36,6 +36,9 @@ and adds features and security hardening on top.
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeams`                  | 0       | lock both teams at their round-start size when a TDM/CTF round starts even and populated (>=2 per team) |
 | `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeams` (see below) |
+| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility isolated per match, chat stays global (see below) |
+| `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
+| `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -61,6 +64,23 @@ is reconciled every frame, so the limits adapt when the roster changes mid-match
 below the smallest rule restores the server limits); they are only rewritten
 when the effective decision actually changes. This works whether or not
 `proxy_sv_lockTeams` is enabled. See `docs/decisions/0005-team-size-rules.md`.
+
+### Parallel TFFA matches
+
+With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
+parallel matches on the same map: `tffa_create` opens a match and joins it,
+`tffa_join <id>` / `tffa_leave` switch matches and `tffa_list` shows them.
+Each match is isolated: cross-match damage is
+dropped, cross-match players (and their projectiles, sabers and kill feed)
+are hidden from snapshots, and the scoreboard shows only the viewer's match
+with its own red/blue scores. Chat stays global. Every match shares the
+server's own `fraglimit` independently (the global team scores are kept
+neutralised so the pristine win check never fires early); when a match hits
+it, its members are moved to spectator and may join another match.
+`timelimit` stays global and ends everything. `proxy_sv_lockTeams` /
+`proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
+global (per-match HUD would need a client mod). See
+`docs/decisions/0006-parallel-tffa.md`.
 
 ## Usage
 

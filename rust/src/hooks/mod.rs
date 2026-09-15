@@ -145,6 +145,21 @@ game_trampoline!(
     5,
     unsafe extern "C" fn(usize, *const core::ffi::c_char)
 );
+game_trampoline!(
+    game_hook_original_add_score,
+    6,
+    unsafe extern "C" fn(usize, *const f32, core::ffi::c_int)
+);
+game_trampoline!(
+    game_hook_original_log_exit,
+    7,
+    unsafe extern "C" fn(*const core::ffi::c_char)
+);
+engine_trampoline!(
+    engine_hook_original_sv_add_entities_visible_from_point,
+    14,
+    unsafe extern "C" fn(usize, usize, usize, core::ffi::c_int)
+);
 
 /// Thin alias kept for call-site readability (`original_call(f) == f()`).
 #[inline]
@@ -227,6 +242,7 @@ pub unsafe fn attach_all() {
         engine_sv::navigator_load as usize,
         engine_sv::sv_send_client_game_state as usize,
         engine_sv::sv_execute_client_message as usize,
+        engine_sv::sv_add_entities_visible_from_point as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine
@@ -242,6 +258,8 @@ pub unsafe fn attach_all() {
         game::g_add_event as usize,
         game::client_think_real as usize,
         crate::teamlock::set_team as usize,
+        game::add_score as usize,
+        game::log_exit as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the
