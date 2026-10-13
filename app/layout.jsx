@@ -1,4 +1,5 @@
 import "./globals.css";
+import { logoFont, menuFont } from "./fonts";
 
 export const metadata = {
   title: "jampgame-proxy-rs — JKA dedicated-server proxy",
@@ -8,7 +9,7 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${logoFont.variable} ${menuFont.variable}`}>
       <body>{children}</body>
     </html>
   );

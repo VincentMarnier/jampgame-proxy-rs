@@ -1,6 +1,7 @@
+import Starfield from "./starfield";
+
 const REPO = "https://github.com/VincentMarnier/jampgame-proxy-rs";
 const RELEASES = `${REPO}/releases`;
-const PROXY_VERSION = "0.3.0";
 
 const cvars = [
   ["proxy_sv_enable", "1", "Master switch: when 0, detach every hook and forward everything to the original game module"],
@@ -27,12 +28,30 @@ const hardening = [
   "Download path validation",
 ];
 
+const tffaCommands = ["tffa_create", "tffa_join <id>", "tffa_leave", "tffa_list"];
+
+function Saber({ color = "blue" }) {
+  return (
+    <div className={`saber saber-${color}`} aria-hidden="true">
+      <span className="hilt" />
+      <span className="blade" />
+    </div>
+  );
+}
+
+function Code({ children }) {
+  return (
+    <pre className="codeblock"><code>{children}</code></pre>
+  );
+}
+
 export default function Home() {
   return (
     <>
+      <Starfield />
       <header className="site">
         <nav>
-          <a className="brand" href="#top">jampgame-proxy-rs</a>
+          <a className="brand" href="#top"><span className="dot">◆</span> jampgame-proxy-rs</a>
           <a href="#features">Features</a>
           <a href="#install">Install</a>
           <a href="#tffa">TFFA</a>
@@ -42,22 +61,21 @@ export default function Home() {
       </header>
       <main id="top">
         <div className="hero">
+          <span className="kicker">A Jedi Academy dedicated-server modification</span>
           <h1>jampgame-proxy-rs</h1>
           <p className="tagline">
-            Drop-in Rust proxy for the Jedi Academy dedicated-server game
-            module: security hardening, team tools, and parallel TFFA matches.
+            A drop-in Rust proxy for the game module <code>jampgamei386.so</code>:
+            it forwards everything to the original module and layers security
+            hardening, team tools, and parallel TFFA matches on top.
           </p>
-          <div className="badges">
-            <span className="badge">proxy v{PROXY_VERSION}</span>
-            <span className="badge">32-bit i686 .so</span>
-            <span className="badge">Jedi Academy dedicated server</span>
-          </div>
           <div className="cta">
             <a className="btn" href={RELEASES}>Download release</a>
             <a className="btn ghost" href="#install">Install guide</a>
             <a className="btn ghost" href={REPO}>Source</a>
           </div>
         </div>
+
+        <Saber color="blue" />
 
         <section id="how">
           <h2>How it works</h2>
@@ -69,14 +87,14 @@ export default function Home() {
             layer (<code>serverStatic_t</code> / <code>server_t</code>, cvar
             slots) for cvars and the net-status table.
           </p>
-          <pre>
-            <code>
-              linuxjampded ──dlopen──▶ jampgamei386.so (proxy) ──dlopen──▶ jampgame_original.so{"\n"}
-              {"                "}vmMain / syscall traps forwarded both ways,{"\n"}
-              {"                "}selected functions hooked by the proxy
-            </code>
-          </pre>
+          <Code>
+            linuxjampded ──dlopen──▶ jampgamei386.so (proxy) ──dlopen──▶ jampgame_original.so{"\n"}
+            {"                "}vmMain / syscall traps forwarded both ways,{"\n"}
+            {"                "}selected functions hooked by the proxy
+          </Code>
         </section>
+
+        <Saber color="green" />
 
         <section id="features">
           <h2>Features</h2>
@@ -85,7 +103,7 @@ export default function Home() {
             Active unless the master switch <code>proxy_sv_enable</code> is
             turned off:
           </p>
-          <ul className="tight">
+          <ul className="cards danger">
             {hardening.map((h) => (
               <li key={h}>{h}</li>
             ))}
@@ -119,6 +137,8 @@ export default function Home() {
           </p>
         </section>
 
+        <Saber color="red" />
+
         <section id="install">
           <h2>Install</h2>
           <ol className="steps">
@@ -143,7 +163,7 @@ export default function Home() {
             spaces/commas as <code>size:timelimit:fraglimit:capturelimit</code>{" "}
             (empty or <code>-</code> leaves a limit untouched):
           </p>
-          <pre><code>set proxy_sv_teamSizeRules &quot;2:20:30:5,3:15:40:0&quot;</code></pre>
+          <Code>set proxy_sv_teamSizeRules &quot;2:20:30:5,3:15:40:0&quot;</Code>
           <p>
             A round with no exact rule falls back to the nearest smaller
             defined size; below every defined size the server&apos;s original
@@ -152,22 +172,30 @@ export default function Home() {
           </p>
         </section>
 
+        <Saber color="purple" />
+
         <section id="tffa">
           <h2>Parallel TFFA matches</h2>
           <p>
             With <code>proxy_tffa_enable 1</code> (GT_TEAM only), players
-            self-organize into parallel matches on the same map:{" "}
-            <code>tffa_create</code> opens a match and joins it,{" "}
-            <code>tffa_join &lt;id&gt;</code> / <code>tffa_leave</code> switch
-            matches and <code>tffa_list</code> shows them.
+            self-organize into parallel matches on the same map — many duels
+            of fate, one server.
           </p>
+          <div className="cmds">
+            {tffaCommands.map((c) => (
+              <span className="cmd" key={c}>{c}</span>
+            ))}
+          </div>
           <ul className="tight">
+            <li><code>tffa_create</code> opens a match and joins it; <code>tffa_join &lt;id&gt;</code> / <code>tffa_leave</code> switch matches, <code>tffa_list</code> shows them.</li>
             <li>Cross-match damage dropped; cross-match players, projectiles, sabers and kill feed hidden.</li>
             <li>Scoreboard shows only the viewer&apos;s match with its own red/blue scores. Chat stays global.</li>
             <li>Every match shares the server&apos;s <code>fraglimit</code> independently; <code>timelimit</code> stays global.</li>
             <li>When a match hits the fraglimit its members move to spectator and may join another match.</li>
           </ul>
         </section>
+
+        <Saber color="gold" />
 
         <section id="build">
           <h2>Build from source</h2>
@@ -176,7 +204,7 @@ export default function Home() {
             the recommended route is the containerised dev environment
             (Docker). From <code>rust/</code>:
           </p>
-          <pre><code>./dev.sh sh ./scripts/build.sh      # -▶ ./jampgamei386.so</code></pre>
+          <Code>./dev.sh sh ./scripts/build.sh      # -▶ ./jampgamei386.so</Code>
           <p>
             Full build, test and run instructions (end-to-end engine test,
             persistent bot server) are in <code>rust/README.md</code> on{" "}
@@ -187,6 +215,8 @@ export default function Home() {
         </section>
       </main>
       <footer className="site">
+        <Saber color="blue" />
+        <p className="force">May the Force serve your packets well</p>
         <p>
           Rust rewrite of{" "}
           <a href="https://github.com/VincentMarnier/jampgame_proxy">jampgame_proxy</a>,
