@@ -1,2 +1,7 @@
 # If you need to store tests results or anything
 /artifacts/
+
+# website artifacts
+/.next/
+/node_modules/
+/out/
