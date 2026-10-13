@@ -1,0 +1,7 @@
+node_modules/
+.next/
+out/
+rust/target/
+.opencode/node_modules/
+tests/artifacts/
+artifacts/
