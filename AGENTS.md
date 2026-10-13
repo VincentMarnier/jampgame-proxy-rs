@@ -17,6 +17,8 @@ tests/ — compatibility, differential, integration, and regression tests.
 tools/ — scripts and tools used to analyze the original implementation and validate the Rust implementation.
 .opencode/ — OpenCode-specific agents, skills, commands, and tools.
 
+`website` branch — project website (static Next.js export, deployed to GitHub Pages at <https://vincentmarnier.github.io/jampgame-proxy-rs/>). Web-only: the proxy source of truth stays on `main`; do not merge `main` into it nor copy `rust/`/`original/`/`tools/` there; verify site facts against `origin/main`.
+
 Source authority (game vs engine)
 
 For game-module ABI (trap ordinals, `vmMain`/`dllEntry` signatures, `level`/`g_entities`, `g_*` structs), `original/jedi-academy-sdk/` is authoritative (the former proxy `src/sdk/` was verified byte-identical to the pristine SDK for these types before the proxy source was removed). `original/jedi-academy/codemp/` must not be used for game ABI where it diverges from the SDK (known divergences: commented-out `BOTLIB_AI_*CHAT*` block, missing `G_G2_COLLISIONDETECTCACHE`, missing `BOTLIB_EA_*` syscall wrappers, `g_entities` as pointer instead of array, older saber structs).

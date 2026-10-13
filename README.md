@@ -10,6 +10,8 @@ The proxy is a drop-in replacement for the game module `jampgamei386.so`: the
 engine loads it, it transparently forwards everything to the original module,
 and adds features and security hardening on top.
 
+Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
+
 ## Features
 
 **Built-in security hardening** (active unless the master switch
