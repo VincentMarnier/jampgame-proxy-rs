@@ -1,4 +1,5 @@
 import Starfield from "./starfield";
+import { Aurebesh } from "./aurebesh";
 import { CmdChip, CopyButton, CvarExplorer } from "./interactive";
 
 const REPO = "https://github.com/VincentMarnier/jampgame-proxy-rs";
@@ -49,11 +50,10 @@ function Icon({ d }) {
   );
 }
 
-function Saber({ color = "blue" }) {
+function Divider() {
   return (
-    <div className={`saber saber-${color}`} aria-hidden="true">
-      <span className="hilt" />
-      <span className="blade" />
+    <div className="rule" aria-hidden="true">
+      <Aurebesh text="JAMPGAME PROXY RS" />
     </div>
   );
 }
@@ -143,7 +143,7 @@ export default function Home() {
           </div>
         </div>
 
-        <Saber color="blue" />
+        <Divider />
 
         {/* ---------- how ---------- */}
         <section className="block" id="how" aria-labelledby="how-title">
@@ -182,7 +182,7 @@ export default function Home() {
           </div>
         </section>
 
-        <Saber color="green" />
+        <Divider />
 
         {/* ---------- install ---------- */}
         <section className="block" id="install" aria-labelledby="install-title">
@@ -203,7 +203,7 @@ export default function Home() {
           </ol>
         </section>
 
-        <Saber color="red" />
+        <Divider />
 
         {/* ---------- features ---------- */}
         <section className="block" id="features" aria-labelledby="features-title">
@@ -240,7 +240,7 @@ export default function Home() {
           </Code>
         </section>
 
-        <Saber color="purple" />
+        <Divider />
 
         {/* ---------- TFFA ---------- */}
         <section className="block" id="tffa" aria-labelledby="tffa-title">
@@ -264,7 +264,7 @@ export default function Home() {
           </ul>
         </section>
 
-        <Saber color="gold" />
+        <Divider />
 
         {/* ---------- build ---------- */}
         <section className="block" id="build" aria-labelledby="build-title">
@@ -285,7 +285,7 @@ export default function Home() {
 
       <footer className="site">
         <div className="foot-inner">
-          <Saber color="blue" />
+          <Divider />
           <p className="force">Set up in minutes — server-side only, no player downloads</p>
           <div className="foot-grid">
             <div>
