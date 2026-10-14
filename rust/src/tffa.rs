@@ -446,30 +446,106 @@ pub fn on_set_cs_scores() {
     let matches = state::with_state(|s| s.tffa.matches);
     for viewer in viewers {
         let vm = effective_match(viewer);
-        let m = &matches[vm as usize];
-        send_scores_to_viewer(viewer, m.red, m.blue);
+        let Some(m) = matches.get(vm as usize) else {
+            continue;
+        };
+        // Per-component dedup (reliable-buffer guard): a frag changes exactly
+        // one tally, so send a single `cs` instead of both — resending
+        // unchanged scores to everyone overflows (every frag triggers
+        // `CalculateRanks` twice plus this fresh push).
+        let (cached_red, cached_blue) =
+            state::with_state(|s| s.tffa.cs_scores_sent[viewer as usize]);
+        if m.red != cached_red {
+            send_single_cs_score(viewer, CS_SCORES1, m.red);
+        }
+        if m.blue != cached_blue {
+            send_single_cs_score(viewer, CS_SCORES2, m.blue);
+        }
     }
 }
 
-/// Send `CS_SCORES1/2` to one viewer unless identical to the last push
-/// (reliable-buffer guard: every frag triggers `CalculateRanks` twice plus
-/// our fresh push — resending unchanged scores to everyone overflows).
-fn send_scores_to_viewer(viewer: c_int, red: i32, blue: i32) {
-    let skip = state::with_state(|s| {
-        if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
-            return true;
-        }
-        if s.tffa.cs_scores_sent[viewer as usize] == (red, blue) {
-            return true;
-        }
-        s.tffa.cs_scores_sent[viewer as usize] = (red, blue);
-        false
-    });
-    if skip {
+/// Per-viewer correction after the game itself broadcast `CS_SCORES1` or
+/// `CS_SCORES2` (pristine `CalculateRanks` inside `AddScore`, connect,
+/// disconnect, team change).
+///
+/// The engine broadcast just overwrote every client's HUD with the *global*
+/// `level.teamScores` value — which is wrong for every match whose tally
+/// differs. The `(red, blue)` dedup cache cannot see that overwrite (it only
+/// tracks what *we* last sent), so a plain `on_set_cs_scores()` here would skip every viewer whose per-match tally
+/// did not change — leaving innocent bystander matches stuck on the killer's
+/// global bump. Instead compare each viewer's own match tally against the
+/// broadcast value and re-push (single score) only where they differ, keeping
+/// the cache pinned to the per-match tallies so the later fresh push (from
+/// `on_add_score`, after the proxy bump) only re-sends the scorer's match.
+pub fn on_set_cs_scores_broadcast(index: i32, value: &str) {
+    if !enabled() {
         return;
     }
-    send_cs_to_client(viewer, CS_SCORES1, &red.to_string());
-    send_cs_to_client(viewer, CS_SCORES2, &blue.to_string());
+    let is_red = index == CS_SCORES1;
+    let is_blue = index == CS_SCORES2;
+    if !is_red && !is_blue {
+        return;
+    }
+    let Ok(broadcast) = value.trim().parse::<i32>() else {
+        // Unparseable broadcast: cannot compare, so invalidate and fall back
+        // to a full push rather than leave HUDs stuck.
+        state::with_state(|s| {
+            for v in 0..MAX_CLIENTS {
+                s.tffa.cs_scores_sent[v] = (i32::MIN, i32::MIN);
+            }
+        });
+        on_set_cs_scores();
+        return;
+    };
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    let matches = state::with_state(|s| s.tffa.matches);
+    for viewer in viewers {
+        let vm = effective_match(viewer);
+        let Some(m) = matches.get(vm as usize) else {
+            continue;
+        };
+        let expected = if is_red { m.red } else { m.blue };
+        if expected != broadcast {
+            send_single_cs_score(viewer, index, expected);
+        } else {
+            // Broadcast already correct for this viewer: pin the cache to the
+            // per-match tally (e.g. first broadcast after connect, when the
+            // cache still holds the `(MIN, MIN)` sentinel) so later dedup
+            // compares against reality.
+            state::with_state(|s| {
+                if (0..MAX_CLIENTS as c_int).contains(&viewer) {
+                    let entry = &mut s.tffa.cs_scores_sent[viewer as usize];
+                    if is_red {
+                        entry.0 = m.red;
+                    } else {
+                        entry.1 = m.blue;
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Send one `CS_SCORES1/2` correction to a viewer and pin that half of the
+/// dedup cache (the other half is untouched: it already matches the viewer's
+/// per-match tally).
+fn send_single_cs_score(viewer: c_int, index: i32, value: i32) {
+    if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
+        return;
+    }
+    state::with_state(|s| {
+        let entry = &mut s.tffa.cs_scores_sent[viewer as usize];
+        if index == CS_SCORES1 {
+            entry.0 = value;
+        } else {
+            entry.1 = value;
+        }
+    });
+    send_cs_to_client(viewer, index, &value.to_string());
 }
 
 /// Live server configstring for a player slot (fallback when the proxy base

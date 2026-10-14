@@ -258,7 +258,12 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 };
                 if let Some(value) = value {
                     if a0 == CS_SCORES1 || a0 == CS_SCORES2 {
-                        crate::tffa::on_set_cs_scores();
+                        // The engine just broadcast the global tally to every
+                        // HUD: correct per viewer against the broadcast value
+                        // (plain `on_set_cs_scores()` would dedup-skip the
+                        // bystanders whose own tally did not move, leaving
+                        // them stuck on the killer's bump).
+                        crate::tffa::on_set_cs_scores_broadcast(a0, &value);
                     } else {
                         crate::tffa::on_set_cs_players(a0 - CS_PLAYERS, &value);
                     }
