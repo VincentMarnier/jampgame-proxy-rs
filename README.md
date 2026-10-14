@@ -41,11 +41,12 @@ install → `next build` → upload `out/` → deploy to GitHub Pages.
 
 ```text
 app/
-  page.jsx        # the whole site (single page: hero, features, install, TFFA, build)
+  page.jsx        # the whole site (hero, how, install, features, TFFA, build) + VERSION constant
+  interactive.jsx # client islands: CopyButton, CmdChip, CvarExplorer (SSR-rendered, static-safe)
   layout.jsx      # metadata + bundled display fonts
   fonts.js        # next/font/local wiring (Audiowide + Michroma, SIL OFL — see app/fonts/OFL-*.txt)
   starfield.jsx   # decorative canvas starfield (client-only, reduced-motion aware)
-  globals.css     # Jedi Academy theme
+  globals.css     # JKA theme tokens + layout system
   not-found.jsx   # static 404.html fallback
 public/.nojekyll  # required for _next/ assets on Pages
 docs/             # branch memory: guides + ADRs under docs/decisions/

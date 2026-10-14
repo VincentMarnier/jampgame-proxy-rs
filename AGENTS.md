@@ -40,6 +40,21 @@ drops `proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
 - Client-side routing only; no rewrites/redirects. Deep links must either be
   pre-rendered or fall back to a `404.html`.
 
+## Agent skills (install before starting, never commit)
+
+Agent skills are environment-local: install/load them at the start of a
+session if the task matches, and never commit them to this branch. Whatever
+directory your agent tool uses for local skills (e.g. `.opencode/skills/`)
+must stay git-ignored — see `.gitignore`; extend it if your tool uses a
+different path.
+
+- UI/UX design, review, or fix (pages, components, theme, accessibility,
+  responsive layout): load the `ui-ux-pro-max` skill first and follow its
+  workflow (design-system search → implement → pre-delivery checklist).
+- No other skill is required for routine work on this branch. If a task needs
+  another skill (e.g. slides, branding), note which one in the session and
+  keep it uncommitted all the same.
+
 ## Agent memory
 
 - Everything future agents need lives in `docs/` on this branch: guides plus
@@ -51,10 +66,11 @@ drops `proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
 ## Current workdir hygiene
 
 - This checkout has no scaffold yet: no root `package.json`, no `next.config`.
-  `.opencode/` is only the OpenCode plugin (`@opencode-ai/plugin`), `tests/`
-  is empty, `rust/target/` is leftover Rust build output — none of these get
-  committed to this branch.
+  Local agent-tooling directories (skill installs, plugins, caches),
+  `tests/` is empty, `rust/target/` is leftover Rust build output — none of
+  these get committed to this branch.
 - Website `.gitignore` must cover `node_modules/`, `.next/`, `out/`,
-  `rust/target/`, `.opencode/node_modules/`.
+  `rust/target/`, plus local agent-skills directories (currently
+  `.opencode/node_modules/`, `.opencode/skills/` — extend for other tools).
 - Verify with a clean static build producing `out/` (e.g. `npm run build`)
   before pushing; a dev server running is not verification.

@@ -3,5 +3,6 @@ node_modules/
 out/
 rust/target/
 .opencode/node_modules/
+.opencode/skills/
 tests/artifacts/
 artifacts/
