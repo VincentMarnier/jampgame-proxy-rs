@@ -4,7 +4,7 @@ import { logoFont, menuFont } from "./fonts";
 export const metadata = {
   title: "jampgame-proxy-rs — JKA dedicated-server proxy",
   description:
-    "Drop-in Rust proxy for the Jedi Academy dedicated server game module: security hardening, team tools, and parallel TFFA matches.",
+    "Add-on for the Jedi Academy dedicated server: exploit protection, team controls, and parallel matches.",
 };
 
 export default function RootLayout({ children }) {

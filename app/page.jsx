@@ -14,8 +14,8 @@ const cvars = [
   ["proxy_sv_modelPathLength", "64", "Maximum model path length accepted from clients", "hardening"],
   ["proxy_sv_enableNetStatus", "0", "Compute per-player network status (netStatus / showNet commands)", "observability"],
   ["proxy_sv_enableEndGameStats", "1", "Print personal / global / best-player stats tables at end of game", "stats"],
-  ["proxy_sv_antiHpTeller", "0", "Prevent HP tellers usage", "fair play"],
-  ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "fair play"],
+  ["proxy_sv_antiHpTeller", "0", "Prevent HP tellers usage", "gameplay"],
+  ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "gameplay"],
   ["proxy_sv_lockTeams", "0", "Lock both teams at round-start size when a TDM/CTF round starts even and populated", "teams"],
   ["proxy_sv_teamSizeRules", "(empty)", "Per-team-size timelimit / fraglimit / capturelimit overrides", "teams"],
   ["proxy_tffa_enable", "0", "Run parallel self-organized TFFA matches on one GT_TEAM map", "tffa"],
@@ -108,13 +108,12 @@ export default function Home() {
         {/* ---------- hero ---------- */}
         <div className="hero" id="top">
           <div>
-            <span className="status-pill"><span className="pulse" aria-hidden="true" />Rust · i686 .so · drop-in proxy</span>
-            <h1>One server.<br />Many duels of fate.</h1>
+            <span className="status-pill"><span className="pulse" aria-hidden="true" />Exploit protection · Team tools · Parallel matches</span>
+            <h1>Safer servers.<br />More matches.</h1>
             <p className="tagline">
-              <strong>jampgame-proxy-rs</strong> is a drop-in Rust proxy for the Jedi Academy
-              dedicated-server module <code>jampgamei386.so</code> — it forwards everything
-              to the original module, then layers <strong>security hardening</strong>,{" "}
-              <strong>team tools</strong>, and <strong>parallel TFFA matches</strong> on top.
+              <strong>jampgame-proxy-rs</strong> protects your Jedi Academy server
+              from exploits and cheats, adds match stats and team controls, and lets
+              more players fight at once — server-side only, no downloads for players.
             </p>
             <div className="cta-row">
               <a className="btn" href={RELEASES}>Download release</a>
@@ -158,7 +157,7 @@ export default function Home() {
             <span className="pipe-arrow" aria-hidden="true">→</span>
             <div className="pipe-node mid">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6l-8-4z" /></svg>
-              <b>proxy (Rust)</b>
+              <b>proxy</b>
               <p>Forwards everything, hooks selected functions to inject features.</p>
             </div>
             <span className="pipe-arrow" aria-hidden="true">→</span>
@@ -187,7 +186,7 @@ export default function Home() {
 
         {/* ---------- install ---------- */}
         <section className="block" id="install" aria-labelledby="install-title">
-          <SectionHead id="install-title" eyebrow="Get running" title="Install in three moves" lede="No engine patching, no config migration. Three file operations and the proxy is live." />
+          <SectionHead id="install-title" eyebrow="Get running" title="Install in three moves" lede="No config migration. Three file operations and the proxy is live." />
           <ol className="steps">
             <li>
               <b>Keep the original module aside</b>
@@ -220,7 +219,7 @@ export default function Home() {
           <h3 className="sub">Server cvars <span className="count">13 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
-            The Rust port deliberately drops <code>proxy_sv_pingFix</code>,{" "}
+            Not available here: <code>proxy_sv_pingFix</code>,{" "}
             <code>proxy_sv_antiWallHack</code>, <code>proxy_sv_sabersFps</code> and{" "}
             <code>proxy_sv_disableKillCmd</code> from the original C++ proxy — they are not available here.
           </p>
@@ -245,7 +244,7 @@ export default function Home() {
 
         {/* ---------- TFFA ---------- */}
         <section className="block" id="tffa" aria-labelledby="tffa-title">
-          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players self-organize into parallel matches on the same map — many duels of fate, one server." />
+          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players self-organize into parallel matches on the same map — no extra servers needed." />
           <div className="lifecycle" aria-label="TFFA match lifecycle">
             <div><b><i>1</i>Create</b><code>tffa_create</code> opens a match and joins it.</div>
             <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt;</code> switches matches; <code>tffa_list</code> shows them.</div>
@@ -287,11 +286,11 @@ export default function Home() {
       <footer className="site">
         <div className="foot-inner">
           <Saber color="blue" />
-          <p className="force">May the Force serve your packets well</p>
+          <p className="force">Set up in minutes — server-side only, no player downloads</p>
           <div className="foot-grid">
             <div>
               <b>Project</b>
-              <p>Rust rewrite of <a style={{ display: "inline", padding: 0 }} href="https://github.com/VincentMarnier/jampgame_proxy">jampgame_proxy</a>, extending <a style={{ display: "inline", padding: 0 }} href="https://github.com/Yberion/JKA_YBEProxy">JKA_YBEProxy</a> — a drop-in proxy for the Jedi Academy dedicated-server game module.</p>
+              <p>Based on <a style={{ display: "inline", padding: 0 }} href="https://github.com/VincentMarnier/jampgame_proxy">jampgame_proxy</a>, extending <a style={{ display: "inline", padding: 0 }} href="https://github.com/Yberion/JKA_YBEProxy">JKA_YBEProxy</a> — a server add-on for the Jedi Academy dedicated server.</p>
             </div>
             <div>
               <b>Site</b>
