@@ -70,10 +70,76 @@ int jampgame_vm_dllsyscall(int command, ...)
  * "%f"-crasher format can no longer overflow the buffer. 4096 matches the
  * original proxy's Proxy_Com_Printf `char msg[4096]` truncation and is strictly
  * smaller than the engine's 4352-byte buffer, so no overflow is possible.
+ *
+ * `%n` filter: vsnprintf honors `%n` (write-back to an attacker pointer).
+ * Any `%...n` specifier in the format is rewritten to `%p` (same single
+ * pointer argument consumed, no memory write) before formatting.
  */
+static void sanitize_n(const char *fmt, char *out, unsigned long out_size)
+{
+	char c;
+	unsigned long o = 0;
+	while ((c = *fmt++) != '\0' && o + 1 < out_size)
+	{
+		if (c != '%')
+		{
+			out[o++] = c;
+			continue;
+		}
+		/* `%%` literal: copy both chars. */
+		if (*fmt == '%')
+		{
+			if (o + 2 >= out_size)
+				break;
+			out[o++] = '%';
+			out[o++] = *fmt++;
+			continue;
+		}
+		/* Parse one conversion: flags / width / precision / length. */
+		const char *spec_start = fmt;
+		while (*fmt == '-' || *fmt == '+' || *fmt == ' ' || *fmt == '#' || *fmt == '0')
+			++fmt;
+		while ((*fmt >= '0' && *fmt <= '9') || *fmt == '*')
+			++fmt;
+		if (*fmt == '.')
+		{
+			++fmt;
+			while ((*fmt >= '0' && *fmt <= '9') || *fmt == '*')
+				++fmt;
+		}
+		while (*fmt == 'h' || *fmt == 'l' || *fmt == 'j' || *fmt == 'z' || *fmt == 't' || *fmt == 'L')
+			++fmt;
+		c = *fmt;
+		if (c == '\0')
+			break;
+		++fmt;
+		if (c == 'n')
+		{
+			/* Same arity (one pointer), no write-back. */
+			if (o + 2 >= out_size)
+				break;
+			out[o++] = '%';
+			out[o++] = 'p';
+		}
+		else
+		{
+			/* Copy the whole conversion verbatim (including length mods). */
+			unsigned long conv_len = (unsigned long)(fmt - spec_start) + 1; /* '%' + ... + spec */
+			if (o + conv_len >= out_size)
+				break;
+			out[o++] = '%';
+			while (spec_start < fmt)
+				out[o++] = *spec_start++;
+		}
+	}
+	out[o] = '\0';
+}
+
 int jampgame_proxy_vsnprintf_shim(char *buf, const char *fmt, va_list ap)
 {
-	return vsnprintf(buf, 4096, fmt, ap);
+	char clean[4096];
+	sanitize_n(fmt, clean, sizeof(clean));
+	return vsnprintf(buf, 4096, clean, ap);
 }
 
 /*
@@ -88,11 +154,20 @@ extern void jampgame_proxy_com_printf(const char *fmt, ...)
 void jampgame_proxy_com_printf(const char *fmt, ...)
 {
 	void (*engine_printf)(const char *, ...) = (void (*)(const char *, ...))0x08072ca4;
+	char buf[4096];
 	va_list ap;
 
 	va_start(ap, fmt);
-	/* The engine's Com_Printf is variadic cdecl: pass the va_list through
-	 * (it is just a char* on i386). */
-	((void (*)(const char *, char *))engine_printf)(fmt, (char *)ap);
+	/* Format locally (with the same truncation + %n filter as the shim),
+	 * then hand the engine a plain "%s" so no caller varargs are
+	 * reinterpreted: passing the raw va_list through as one word (the old
+	 * code) made the callee's va_start point at the wrong stack slot. */
+	{
+		char clean[4096];
+		sanitize_n(fmt, clean, sizeof(clean));
+		vsnprintf(buf, sizeof(buf), clean, ap);
+	}
 	va_end(ap);
+	buf[sizeof(buf) - 1] = '\0';
+	engine_printf("%s", buf);
 }

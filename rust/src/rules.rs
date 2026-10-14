@@ -63,6 +63,8 @@ pub enum Action {
 
 /// Parse the cvar value into rules. Malformed tokens/fields are ignored (a bad
 /// field is treated as unset rather than discarding the whole rule).
+/// Duplicate sizes keep the last occurrence, so the effective rule is
+/// deterministic.
 pub fn parse(value: &str) -> Vec<Rule> {
     let mut rules = Vec::new();
     for token in value.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace()) {
@@ -76,21 +78,29 @@ pub fn parse(value: &str) -> Vec<Rule> {
         if size <= 0 {
             continue;
         }
-        rules.push(Rule {
+        let rule = Rule {
             size,
             time_limit: parse_limit(parts.get(1).copied()),
             frag_limit: parse_limit(parts.get(2).copied()),
             capture_limit: parse_limit(parts.get(3).copied()),
-        });
+        };
+        // Last occurrence wins for a repeated size.
+        if let Some(existing) = rules.iter_mut().find(|r: &&mut Rule| r.size == size) {
+            *existing = rule;
+        } else {
+            rules.push(rule);
+        }
     }
     rules
 }
 
 /// One `:`-separated limit field: empty or `-` means "leave as-is".
+/// Negative numbers are rejected (treated as unset): the proxy only ever
+/// writes non-negative limits, so an admin typo cannot corrupt the server.
 fn parse_limit(field: Option<&str>) -> Option<i32> {
     match field.map(str::trim) {
         None | Some("") | Some("-") => None,
-        Some(text) => text.parse::<i32>().ok(),
+        Some(text) => text.parse::<i32>().ok().filter(|&v| v >= 0),
     }
 }
 
@@ -152,7 +162,13 @@ pub fn on_run_frame() {
         Action::Restore => {
             let base = restore_base_limits();
             eprintln!("----- proxy-rs: rules restore {red} vs {blue} -> {base:?}");
-            state::with_state(|s| s.last_team_rule = None);
+            // Clear both the applied rule and the captured base: the next
+            // Apply must re-capture the (possibly admin-changed) server limits
+            // instead of restoring stale prior-map values.
+            state::with_state(|s| {
+                s.last_team_rule = None;
+                s.base_limits = None;
+            });
         }
     }
 }
@@ -302,6 +318,32 @@ mod tests {
                 time_limit: None,
                 frag_limit: Some(30),
                 capture_limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn negative_limits_are_rejected_as_unset() {
+        assert_eq!(
+            parse("2:-5:-5:-5"),
+            vec![Rule {
+                size: 2,
+                time_limit: None,
+                frag_limit: None,
+                capture_limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_sizes_keep_the_last() {
+        assert_eq!(
+            parse("2:20:30:5,2:15:40:0"),
+            vec![Rule {
+                size: 2,
+                time_limit: Some(15),
+                frag_limit: Some(40),
+                capture_limit: Some(0),
             }]
         );
     }

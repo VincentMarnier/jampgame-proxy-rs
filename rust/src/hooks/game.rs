@@ -100,6 +100,11 @@ unsafe fn session_team(client: usize) -> c_int {
     unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) }
 }
 
+/// `usercmd_t.upmove` offset within `pers.cmd` (SDK `q_shared.h:2524-2533`:
+/// `server_time@0, angles@4[12], buttons@16, weapon@20, forcesel@21,
+/// invensel@22, generic@23, forwardmove@24, rightmove@25, upmove@26`).
+const OFFSET_USERCMD_UPMOVE: usize = 26;
+
 /// Whether the team pair counts as a teamkill/damage (RED or BLUE + same team).
 fn is_same_team(a: c_int, b: c_int) -> bool {
     (a == TEAM_RED || a == TEAM_BLUE) && a == b
@@ -173,6 +178,14 @@ pub unsafe extern "C" fn g_damage(
     // Parallel TFFA: cross-match player-vs-player hits deal no damage.
     // Environment (world/trigger, no client) always passes through.
     if tffa_damage_blocked(targ, attacker) == Some(true) {
+        return;
+    }
+    // Null entity pointers first: reading client fields at address 864/1488
+    // would fault. World/environment hits (null) go straight through.
+    if targ == 0 || attacker == 0 {
+        // SAFETY: trampoline attached at GAME_INIT.
+        let original = original_call(crate::hooks::game_hook_original_g_damage);
+        unsafe { original(targ, inflictor, attacker, dir, point, damage, dflags, mod_) };
         return;
     }
     let targ_client = unsafe { ent_client(targ) };
@@ -350,7 +363,8 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
             // SAFETY: ent_cl is a valid gclient_t; pers.cmd.upmove is an i8.
             unsafe {
                 core::ptr::read_unaligned(
-                    (ent_cl + OFFSET_GCLIENT_PERS + OFFSET_PERS_CMD + 26) as *const i8,
+                    (ent_cl + OFFSET_GCLIENT_PERS + OFFSET_PERS_CMD + OFFSET_USERCMD_UPMOVE)
+                        as *const i8,
                 ) as i32
             }
         } else {
@@ -366,7 +380,10 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
         let set_upmove = |v: i8| {
             if ent_cl != 0 {
                 // SAFETY: ent_cl is a valid gclient_t; pers.cmd.upmove is an i8.
-                unsafe { *((ent_cl + OFFSET_GCLIENT_PERS + OFFSET_PERS_CMD + 26) as *mut i8) = v };
+                unsafe {
+                    *((ent_cl + OFFSET_GCLIENT_PERS + OFFSET_PERS_CMD + OFFSET_USERCMD_UPMOVE)
+                        as *mut i8) = v
+                };
             }
         };
 
@@ -381,7 +398,12 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
         } else {
             let jump_start = state::with_state(|s| s.jump_start_time[client_num as usize]);
             if jump_start != 0 {
-                if (level_time - jump_start).abs() < min_jump_time {
+                // Forward-only elapsed time: no `.abs()` (which can overflow
+                // on i32::MIN), and a clock rewind (map_restart resets
+                // level.time) or a stale slot reused by a new client resets
+                // the timer instead of forcing a jump.
+                let elapsed = level_time.wrapping_sub(jump_start);
+                if elapsed >= 0 && elapsed < min_jump_time {
                     // Player is scripting, force him jumping a little longer.
                     set_upmove(127);
                 } else {
@@ -444,22 +466,31 @@ fn client_clean_netname(client_num: c_int, out: &mut [u8]) {
 fn printf_str(src: &str, size: usize, width: usize) -> String {
     let bytes = src.as_bytes();
     let cap = size.saturating_sub(1).min(width);
-    let len = cap.min(bytes.len());
+    // Cut at a UTF-8 char boundary so multi-byte names cannot panic the
+    // server (panic = abort in the cdylib).
+    let mut len = cap.min(bytes.len());
+    while len > 0 && !src.is_char_boundary(len) {
+        len -= 1;
+    }
+    // Avoid leaving a bare `^` color escape at the cut.
+    if len > 0 && bytes[len - 1] == b'^' {
+        len -= 1;
+    }
     let mut out = vec![b' '; width];
     out[width - len..].copy_from_slice(&bytes[..len]);
-    // SAFETY: out only contains spaces and the copied bytes (no NULs).
-    String::from_utf8(out).expect("stats table row is ASCII")
+    // SAFETY: out is spaces + a valid UTF-8 prefix of src (cut on a boundary,
+    // and `^` is ASCII so stepping back keeps the boundary).
+    String::from_utf8(out).unwrap_or_else(|_| " ".repeat(width))
 }
 
-/// `trap_SendServerCommand(clientNum, text)`.
+/// `trap_SendServerCommand(clientNum, text)`. Drops (fail closed) instead of
+/// invoking UB when the payload contains an interior NUL.
 fn send_server_command(client_num: c_int, text: &[u8]) {
-    let mut buf = Vec::with_capacity(text.len() + 1);
-    buf.extend_from_slice(text);
-    buf.push(0);
-    // SAFETY: buf has no interior NUL (callers build plain messages).
-    let text = unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(&buf) };
+    let Ok(text) = std::ffi::CString::new(text) else {
+        return;
+    };
     // SAFETY: engine syscall registered.
-    unsafe { syscall::send_server_command(client_num, text) };
+    unsafe { syscall::send_server_command(client_num, &text) };
 }
 
 /// `Proxy_BeginIntermission` (`Proxy_g_cmds.cpp:9-144`): run the pristine

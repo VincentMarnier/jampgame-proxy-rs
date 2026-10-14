@@ -231,6 +231,9 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // matches closed, main slot re-opened). Client assignments survive a
     // map_restart; a full map change re-dlopens the module (fresh state).
     tffa::reset_round();
+    // Fresh round for the team lock (caps cleared, snapshot re-armed for the
+    // reconnect burst that follows GAME_INIT).
+    teamlock::reset();
 
     // Attach the engine/game hook layer (D-002 keep set) after the game is up
     // and the memory layer is populated. Skipped when `proxy_sv_enable` is off

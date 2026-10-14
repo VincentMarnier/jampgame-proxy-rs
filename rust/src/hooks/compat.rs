@@ -15,10 +15,25 @@ use core::ffi::{c_char, c_int};
 use crate::engine;
 use crate::sdk::MAX_STRING_TOKENS;
 
-/// `FS_CheckDirTraversal` (`Proxy_sv_client.cpp:426-432`): reject `../` or
-/// `..\` escapes.
+/// `FS_CheckDirTraversal` (`Proxy_sv_client.cpp:426-432`), hardened: the
+/// original only rejected `../` and `..\\`, which misses a trailing `..`,
+/// absolute paths, drive specs and `....//` normalisation bypasses. Downloads
+/// are `.pk3` basenames by construction (the caller enforces the extension),
+/// so reject `..` anywhere, `/` or `\` prefixes, and `:` drives — fail closed.
 pub fn check_dir_traversal(checkdir: &[u8]) -> bool {
-    checkdir.windows(3).any(|w| w == b"../" || w == b"..\\")
+    if checkdir.windows(2).any(|w| w == b"..") {
+        return true;
+    }
+    if checkdir.windows(3).any(|w| w == b"../" || w == b"..\\") {
+        return true;
+    }
+    if checkdir.first() == Some(&b'/') || checkdir.first() == Some(&b'\\') {
+        return true;
+    }
+    if checkdir.contains(&b':') {
+        return true;
+    }
+    false
 }
 
 /// `FS_FilenameCompare` (`Proxy_sv_client.cpp:520-547`): case-folded, `\`/`:`
@@ -155,10 +170,16 @@ pub unsafe fn cmd_tokenize_string2(text_in: *const c_char, ignore_quotes: bool) 
     }
 }
 
-/// Write one output byte into `cmd_tokenized` at `out_pos`.
+/// Write one output byte into `cmd_tokenized` at `out_pos`. Bounds-checked:
+/// the engine buffer is 8192 + MAX_STRING_TOKENS bytes; input is capped at
+/// BIG_INFO_STRING - 1 with at most one NUL per token, so this only trips on
+/// logic drift — fail closed (truncate) instead of overflowing engine memory.
 fn write_token(out_pos: &mut usize, b: u8) {
-    // SAFETY: out_pos is bounded by the BIG_INFO_STRING input cap; the engine
-    // cmd_tokenized buffer is 8192+MAX_STRING_TOKENS bytes.
+    const CMD_TOKENIZED_LEN: usize = 8192 + crate::sdk::MAX_STRING_TOKENS;
+    if *out_pos >= CMD_TOKENIZED_LEN {
+        return;
+    }
+    // SAFETY: out_pos is bounds-checked above against the engine buffer size.
     unsafe {
         *(crate::engine::CMD_TOKENIZED_BASE as *mut u8).add(*out_pos) = b;
     }
@@ -166,7 +187,12 @@ fn write_token(out_pos: &mut usize, b: u8) {
 }
 
 fn write_nul(out_pos: &mut usize) {
-    // SAFETY: same bound as write_token.
+    // SAFETY: same bound as write_token (write_token checks before every
+    // byte; the NUL is one more byte in the same buffer).
+    const CMD_TOKENIZED_LEN: usize = 8192 + crate::sdk::MAX_STRING_TOKENS;
+    if *out_pos >= CMD_TOKENIZED_LEN {
+        return;
+    }
     unsafe {
         *(crate::engine::CMD_TOKENIZED_BASE as *mut u8).add(*out_pos) = 0;
     }
@@ -195,6 +221,10 @@ mod tests {
     fn dir_traversal_detection() {
         assert!(check_dir_traversal(b"../foo.pk3"));
         assert!(check_dir_traversal(b"..\\foo.pk3"));
+        assert!(check_dir_traversal(b".."));
+        assert!(check_dir_traversal(b"foo/.."));
+        assert!(check_dir_traversal(b"/abs/foo.pk3"));
+        assert!(check_dir_traversal(b"C:foo.pk3"));
         assert!(!check_dir_traversal(b"maps/foo.pk3"));
         assert!(!check_dir_traversal(b"base"));
     }

@@ -96,6 +96,9 @@ pub fn client_disconnect(client_num: c_int) {
             && s.clients[client_num as usize].is_connected
         {
             s.clients[client_num as usize] = Default::default();
+            // Drop any in-progress jump-hold so a new client reusing the slot
+            // is not forced to jump by a stale timer.
+            s.jump_start_time[client_num as usize] = 0;
         }
     });
 }
@@ -129,6 +132,7 @@ pub fn client_command(client_num: c_int) -> bool {
 
     // SAFETY: engine syscall registered (dllEntry ran) and buffers writable.
     unsafe { syscall::argv(0, &mut cmd) };
+    cmd[MAX_TOKEN_CHARS - 1] = 0;
     let cmd = nul_terminated(&cmd);
 
     // Anti-cheat: kick jkaDST_ tool commands.
@@ -166,6 +170,8 @@ pub fn client_command(client_num: c_int) -> bool {
     // SAFETY: engine syscall registered; buffers writable.
     unsafe { syscall::argv(1, &mut cmd_arg1) };
     unsafe { syscall::argv(2, &mut cmd_arg2) };
+    cmd_arg1[MAX_TOKEN_CHARS - 1] = 0;
+    cmd_arg2[MAX_TOKEN_CHARS - 1] = 0;
     let cmd_arg1 = nul_terminated(&cmd_arg1);
     let cmd_arg2 = nul_terminated(&cmd_arg2);
 
@@ -264,6 +270,9 @@ pub fn client_command(client_num: c_int) -> bool {
 /// `Proxy_SharedAPI_ClientUserinfoChanged` (`Proxy_SharedAPI.cpp:222-329`):
 /// sanitise the client's name/model/forcepowers in their userinfo.
 pub fn client_userinfo_changed(client_num: c_int) {
+    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
     let mut userinfo_buf = [0u8; MAX_INFO_STRING];
     // SAFETY: engine syscall registered; buffer writable.
     unsafe { syscall::get_userinfo(client_num, &mut userinfo_buf) };
@@ -303,10 +312,24 @@ pub fn client_userinfo_changed(client_num: c_int) {
     let model_ptr = unsafe { jampgame::info_value_for_key(info_ptr, c"model".as_ptr()) };
     if !model_ptr.is_null() {
         let model = cstr_bytes_or_empty(model_ptr);
-        let len = model.len() as c_int;
+
+        // Fixed literal lengths, so the game helper never reads past the
+        // literal's NUL (prefix semantics: catches suffixed variants).
+        // "darksidetools" = 13, "jedi_/red" = 9, "jedi_/blue" = 10,
+        // "rancor" = 6, "wampa" = 5.
+        let is_darkside_tools = model.len() >= 13
+            && unsafe { jampgame::q_stricmpn(model_ptr, c"darksidetools".as_ptr(), 13) } == 0;
+        let is_jedi_red = model.len() >= 9
+            && unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/red".as_ptr(), 9) } == 0;
+        let is_jedi_blue = model.len() >= 10
+            && unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/blue".as_ptr(), 10) } == 0;
+        let is_rancor = model.len() >= 6
+            && unsafe { jampgame::q_stricmpn(model_ptr, c"rancor".as_ptr(), 6) } == 0;
+        let is_wampa = model.len() >= 5
+            && unsafe { jampgame::q_stricmpn(model_ptr, c"wampa".as_ptr(), 5) } == 0;
 
         // Anti-cheat: darksidetools model.
-        if unsafe { jampgame::q_stricmpn(model_ptr, c"darksidetools".as_ptr(), len) } == 0 {
+        if is_darkside_tools {
             let name = String::from_utf8_lossy(&clean_name[..utils::c_strlen(&clean_name)]);
             let chat =
                 format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
@@ -324,14 +347,16 @@ pub fn client_userinfo_changed(client_num: c_int) {
 
         // Fix bugged / overlong models (also the model length crash fix; a
         // length check is duplicated in SV_UserinfoChanged).
+        // Admin-controlled cvar is clamped >= 1 so a negative value cannot
+        // disable the check via a huge `as usize` cast.
+        let max_model_len =
+            state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer.max(1)) as usize;
         let bad_model = (unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_".as_ptr(), 5) } == 0
-            && (unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/red".as_ptr(), len) } == 0
-                || unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/blue".as_ptr(), len) } == 0))
-            || unsafe { jampgame::q_stricmpn(model_ptr, c"rancor".as_ptr(), len) } == 0
-            || unsafe { jampgame::q_stricmpn(model_ptr, c"wampa".as_ptr(), len) } == 0
+            && (is_jedi_red || is_jedi_blue))
+            || is_rancor
+            || is_wampa
             || !utils::is_valid_ascii_str(model)
-            || model.len()
-                >= state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer) as usize;
+            || model.len() >= max_model_len;
 
         if bad_model {
             // SAFETY: userinfo buffer writable; literals NUL-terminated.
@@ -383,8 +408,10 @@ pub fn client_userinfo_changed(client_num: c_int) {
         utils::strncpyz(&mut force_powers, b"7-1-030000000000003332");
     }
 
-    // SAFETY: strncpyz NUL-terminates force_powers.
-    let fp_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(&force_powers) };
+    // SAFETY: strncpyz NUL-terminates force_powers; from_ptr stops at the
+    // first NUL (the buffer has trailing zeros, so the unchecked slice form
+    // would violate the single-NUL CStr contract).
+    let fp_cstr = unsafe { CStr::from_ptr(force_powers.as_ptr() as *const c_char) };
     unsafe {
         jampgame::info_set_value_for_key(
             userinfo_buf.as_mut_ptr() as *mut c_char,
@@ -393,8 +420,11 @@ pub fn client_userinfo_changed(client_num: c_int) {
         )
     };
 
-    // SAFETY: Info_SetValueForKey keeps userinfo_buf NUL-terminated.
-    let userinfo_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(&userinfo_buf) };
+    // SAFETY: Info_SetValueForKey keeps userinfo_buf NUL-terminated; the
+    // engine wrote it and every mutation above preserves termination.
+    // from_ptr stops at the first NUL instead of claiming trailing zeros.
+    userinfo_buf[MAX_INFO_STRING - 1] = 0;
+    let userinfo_cstr = unsafe { CStr::from_ptr(userinfo_buf.as_ptr() as *const c_char) };
     unsafe { syscall::set_userinfo(client_num, userinfo_cstr) };
 }
 
@@ -426,6 +456,9 @@ fn cstr_ptr(bytes: &[u8]) -> *const c_char {
 /// offsets (`gentity_t.client` @ 864, `gclient_t.pers` @ 1552,
 /// `clientPersistant_t.netname` @ 48).
 fn client_netname(client_num: c_int) -> String {
+    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+        return String::new();
+    }
     let base = original::g_entities_address();
     if base == 0 {
         return String::new();

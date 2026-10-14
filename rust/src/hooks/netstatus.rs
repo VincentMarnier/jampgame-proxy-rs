@@ -38,18 +38,26 @@ use crate::sdk::{
 use crate::state::{self, CVAR_ENABLE_NET_STATUS};
 use crate::syscall;
 
-/// `server.cvars.sv_maxclients->integer` (cvar slot 0x8273ea4).
+/// `server.cvars.sv_maxclients->integer` (cvar slot 0x8273ea4). Returns 0 when
+/// the memory layer is not initialised yet (null slot) instead of faulting.
 fn sv_maxclients() -> c_int {
     // SAFETY: the slot holds a cvar_t* (R-018 verified).
     let ptr = unsafe { *(crate::engine::cvar_slots::SV_MAXCLIENTS as *const usize) };
+    if ptr == 0 {
+        return 0;
+    }
     // SAFETY: ptr is a live cvar_t*.
     unsafe { engine::cvar_integer(ptr) }
 }
 
-/// `server.cvars.sv_fps->integer` (cvar slot 0x8273e84).
+/// `server.cvars.sv_fps->integer` (cvar slot 0x8273e84). Returns 0 when the
+/// memory layer is not initialised yet (null slot) instead of faulting.
 fn sv_fps() -> c_int {
     // SAFETY: cvar slot validated and dereferenced at GAME_INIT (R-018).
     let ptr = unsafe { *(crate::engine::cvar_slots::SV_FPS as *const usize) };
+    if ptr == 0 {
+        return 0;
+    }
     // SAFETY: the slot holds a cvar_t* (R-018 verified).
     unsafe { engine::cvar_integer(ptr) }
 }
@@ -94,6 +102,9 @@ fn update_ucmd_stats(client_num: usize, cmd: &Usercmd, packet_index: usize) {
 /// `cl` must be a valid `client_t*`; `cmd` a valid `usercmd_t*`.
 unsafe fn update_timenudge(cl: usize, cmd: &Usercmd, milliseconds: c_int) {
     let client_num = client_num_from_addr(cl);
+    if client_num >= crate::sdk::MAX_CLIENTS {
+        return;
+    }
     // SAFETY: engine memory layer initialised.
     let now = unsafe { svs_time() };
     // SAFETY: cl is a valid client_t.
@@ -134,6 +145,11 @@ fn calc_packets_and_fps(client_num: usize, packets: &mut c_int, fps: &mut c_int)
         let last = cl.cmd_stats[cl.cmd_index & (CMD_MASK - 1)].server_time;
         let mut last_packet_index = 0usize;
         for stat in &cl.cmd_stats {
+            // Skip never-written ring slots: a fresh client has server_time 0
+            // everywhere, which would otherwise count as a full 1024-fps ring.
+            if stat.server_time == 0 {
+                continue;
+            }
             if stat.server_time + 1000 >= last {
                 *fps += 1;
                 if last_packet_index != stat.packet_index {
@@ -186,6 +202,13 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     // SAFETY: cmd is the engine's usercmd buffer.
     let ucmd = unsafe { &*cmd };
     let client_num = client_num_from_addr(cl);
+    // A stale `client_t*` (e.g. after disconnect) can yield an out-of-range
+    // slot: fail closed instead of panicking (= abort) in the move-packet hot
+    // path. `update_timenudge` derives the same slot internally, so skip the
+    // whole feed when out of range.
+    if client_num >= crate::sdk::MAX_CLIENTS {
+        return;
+    }
     let packet_index = state::with_state(|s| s.clients[client_num].packet_counter) as usize;
     update_ucmd_stats(client_num, ucmd, packet_index);
     // SAFETY: engine syscall registered; G_MILLISECONDS takes no arguments.
@@ -233,7 +256,7 @@ pub fn client_command_net_status(client_num: c_int) {
         return;
     }
 
-    let maxclients = sv_maxclients();
+    let maxclients = sv_maxclients().clamp(0, crate::sdk::MAX_CLIENTS as c_int);
     let fps_cvar = sv_fps();
     // SAFETY: engine memory layer initialised.
     let clients = unsafe { clients_base() };
@@ -293,7 +316,21 @@ pub fn client_command_net_status(client_num: c_int) {
         let rate = unsafe { read_i32(cl + OFFSET_CLIENT_RATE) };
         let timenudge = state::with_state(|s| s.clients[i as usize].timenudge);
         // SAFETY: cl is a valid client_t; name is NUL-terminated.
+        // Escape `"`, `\` and newlines so a hostile name cannot break the
+        // `print "..."` reliable-command framing.
         let name = cstr_bytes((cl + OFFSET_CLIENT_NAME) as *const c_char);
+        let mut clean_name: Vec<u8> = Vec::with_capacity(name.len());
+        for &b in name {
+            match b {
+                b'"' => clean_name.push(b'\''),
+                b'\n' | b'\r' => clean_name.push(b' '),
+                b'\\' => {
+                    clean_name.push(b'\\');
+                    clean_name.push(b'\\');
+                }
+                _ => clean_name.push(b),
+            }
+        }
 
         status.extend_from_slice(
             format!(
@@ -301,7 +338,7 @@ pub fn client_command_net_status(client_num: c_int) {
             )
             .as_bytes(),
         );
-        status.extend_from_slice(name);
+        status.extend_from_slice(&clean_name);
         status.extend_from_slice(b"^7\n");
     }
 

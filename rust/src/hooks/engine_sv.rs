@@ -179,7 +179,9 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
         state::with_state(|s| s.cvars[CVAR_ENABLE_RCON_CMD_COOLDOWN].integer != 0);
     // SAFETY: engine memory layer initialised.
     let now = unsafe { svs_time() } as u32;
-    if cooldown_enabled && now < RCON_COOLDOWN.load(Ordering::Relaxed) + 500 {
+    // wrapping_add: svs.time wraps past u32::MAX after ~49 days; a plain `+`
+    // would panic (= abort) in debug builds at the wrap.
+    if cooldown_enabled && now.wrapping_sub(RCON_COOLDOWN.load(Ordering::Relaxed)) < 500 {
         return;
     }
     RCON_COOLDOWN.store(now, Ordering::Relaxed);
@@ -264,7 +266,10 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
     if !model.is_null() {
         let model_bytes = cstr_bytes(model);
         let model_len = model_bytes.len();
-        let max_len = state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer) as usize;
+        // Admin-controlled cvar is clamped >= 1 so a negative value cannot
+        // disable the check via a huge `as usize` cast.
+        let max_len =
+            state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer.max(1)) as usize;
         if !utils::is_valid_ascii_str(model_bytes) || model_len >= max_len {
             // SAFETY: userinfo buffer writable; literals NUL-terminated.
             unsafe {
@@ -512,7 +517,24 @@ pub unsafe extern "C" fn sv_sventity_for_gentity(g_ent: usize) -> usize {
     // SAFETY: sv is a valid server_t.
     let gentities = unsafe { read_i32(sv + OFFSET_SV_GENTITIES) } as usize;
     let gentity_size = unsafe { read_i32(sv + OFFSET_SV_GENTITY_SIZE) } as usize;
-    let num = g_ent.wrapping_sub(gentities) / gentity_size;
+    // Harden the array math: a crafted pointer with a plausible s.number but
+    // outside the array (or a zero/negative size) must not yield an OOB
+    // svEntity pointer for the engine to write through.
+    if gentity_size == 0 || g_ent < gentities || (g_ent - gentities) % gentity_size != 0 {
+        // SAFETY: game Com_Error is valid; literal format string.
+        unsafe {
+            com_error(ERR_DROP, c"SV_SvEntityForGentity: bad gEnt\n".as_ptr());
+        }
+        return 0;
+    }
+    let num = (g_ent - gentities) / gentity_size;
+    if num >= MAX_GENTITIES {
+        // SAFETY: game Com_Error is valid; literal format string.
+        unsafe {
+            com_error(ERR_DROP, c"SV_SvEntityForGentity: bad gEnt\n".as_ptr());
+        }
+        return 0;
+    }
     sv + OFFSET_SV_SV_ENTITIES + num * SIZEOF_SV_ENTITY_T
 }
 

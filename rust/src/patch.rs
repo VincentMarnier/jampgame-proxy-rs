@@ -52,8 +52,9 @@ unsafe extern "C" {
 /// `MAP_FAILED`, the mmap error sentinel on i386.
 const MAP_FAILED: usize = usize::MAX;
 
-/// `mmap(RWX|PRIVATE|ANON)` — the original proxy's `AllocateMemory`. Returns
-/// the base address or 0 on failure.
+/// `mmap(RW|PRIVATE|ANON)` for trampolines. Write-only until the back-jump is
+/// in place, then flipped to RX by `protect_trampoline_exec` (W^X: never
+/// writable+executable at once). Returns the base address or 0 on failure.
 fn alloc_trampoline(len: usize) -> usize {
     // SAFETY: kernel call with an anonymous, no-fd mapping; any returned
     // pointer is either valid or MAP_FAILED (checked below).
@@ -61,7 +62,7 @@ fn alloc_trampoline(len: usize) -> usize {
         mmap(
             core::ptr::null_mut(),
             len + 5,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
+            PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
@@ -71,6 +72,15 @@ fn alloc_trampoline(len: usize) -> usize {
     if addr == MAP_FAILED { 0 } else { addr }
 }
 
+/// Flip a fully-written trampoline (`len + 5` bytes) from RW to RX.
+/// Returns false when the kernel refuses, in which case the caller frees the
+/// mapping instead of leaving it writable+executable.
+fn protect_trampoline_exec(addr: usize, len: usize) -> bool {
+    // SAFETY: addr/len come from `alloc_trampoline` (page-granular anonymous
+    // mapping; len + 5 < one page for all detours).
+    unsafe { mprotect(addr as *mut c_void, len + 5, PROT_READ | PROT_EXEC) == 0 }
+}
+
 /// `munmap` of an allocated trampoline.
 fn release_trampoline(addr: usize, len: usize) -> bool {
     // SAFETY: addr/len come from `alloc_trampoline`.
@@ -78,24 +88,32 @@ fn release_trampoline(addr: usize, len: usize) -> bool {
 }
 
 /// `UnProtect`: flip the page(s) covering `[addr, addr+len)` to RWE.
+/// Returns false when the kernel refuses, in which case the caller must not
+/// write (a fault would follow).
 ///
 /// # Safety
 ///
 /// `addr` must be a readable engine/game mapping; the page must be mappable.
-unsafe fn unprotect(addr: usize, len: usize) {
+unsafe fn unprotect(addr: usize, len: usize) -> bool {
     // SAFETY: page size is a constant of the running kernel.
     let page = unsafe { getpagesize() } as usize;
     let p1 = addr & !(page - 1);
     let p2 = (addr + len) & !(page - 1);
     // SAFETY: p1/p2 are page-aligned within the mapped region (caller contract).
-    unsafe {
-        mprotect(p1 as *mut c_void, page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    let ok = unsafe { mprotect(p1 as *mut c_void, page, PROT_READ | PROT_WRITE | PROT_EXEC) == 0 };
+    if !ok {
+        eprintln!("----- proxy-rs: unprotect failed @ {addr:#x}");
+        return false;
     }
     if p1 != p2 {
-        unsafe {
-            mprotect(p2 as *mut c_void, page, PROT_READ | PROT_WRITE | PROT_EXEC);
+        let ok2 =
+            unsafe { mprotect(p2 as *mut c_void, page, PROT_READ | PROT_WRITE | PROT_EXEC) == 0 };
+        if !ok2 {
+            eprintln!("----- proxy-rs: unprotect failed @ {addr:#x} (2nd page)");
+            return false;
         }
     }
+    true
 }
 
 /// `ReProtect`: flip the page(s) back to RE.
@@ -353,6 +371,10 @@ pub struct Hook {
     pub trampoline: AtomicUsize,
     pub stolen_len: AtomicUsize,
     pub attached: AtomicBool,
+    /// Target address captured at attach time. Detach restores this address,
+    /// not a freshly rebased one, so a dlclose/dlopen cycle at a different
+    /// base (ASLR) cannot corrupt the new mapping.
+    pub attached_target: AtomicUsize,
 }
 
 impl Hook {
@@ -364,6 +386,7 @@ impl Hook {
             trampoline: AtomicUsize::new(0),
             stolen_len: AtomicUsize::new(0),
             attached: AtomicBool::new(false),
+            attached_target: AtomicUsize::new(0),
         }
     }
 
@@ -397,6 +420,11 @@ impl Hook {
 /// (validated by `steal_len` returning ≥5), and `wrapper` must be a function
 /// pointer with the exact signature of the target.
 pub unsafe fn attach(hook: &Hook, wrapper: usize) -> bool {
+    // Idempotent: a second attach without detach keeps the first trampoline
+    // instead of leaking it and patching patched bytes.
+    if hook.attached.load(Ordering::Relaxed) {
+        return true;
+    }
     let target = hook.runtime_address();
     if target == 0 {
         return false;
@@ -422,7 +450,7 @@ pub unsafe fn attach(hook: &Hook, wrapper: usize) -> bool {
     }
 
     // Copy the stolen bytes + append `E9 rel32` back into the original.
-    // SAFETY: tramp is a fresh RWX mapping of len+5 bytes; target is readable.
+    // SAFETY: tramp is a fresh RW mapping of len+5 bytes; target is readable.
     unsafe {
         core::ptr::copy_nonoverlapping(target as *const u8, tramp as *mut u8, len);
     }
@@ -433,10 +461,26 @@ pub unsafe fn attach(hook: &Hook, wrapper: usize) -> bool {
         *(tramp as *mut u8).add(len) = 0xE9;
         core::ptr::write_unaligned((tramp as *mut u8).add(len + 1) as *mut i32, rel);
     }
+    // W^X: the trampoline becomes executable only once fully written.
+    if !protect_trampoline_exec(tramp, len) {
+        eprintln!(
+            "----- proxy-rs: {name}: trampoline exec-protect failed",
+            name = hook.name
+        );
+        release_trampoline(tramp, len);
+        return false;
+    }
 
     // Overwrite the original entry.
-    // SAFETY: target is writable after unprotect.
-    unsafe { unprotect(target, len) };
+    // SAFETY: target is writable after unprotect (checked below).
+    if unsafe { !unprotect(target, len) } {
+        eprintln!(
+            "----- proxy-rs: {name}: unprotect failed, not patching",
+            name = hook.name
+        );
+        release_trampoline(tramp, len);
+        return false;
+    }
     // SAFETY: covered by unprotect.
     unsafe {
         memset(target as *mut c_void, 0x90, len);
@@ -449,6 +493,7 @@ pub unsafe fn attach(hook: &Hook, wrapper: usize) -> bool {
 
     hook.trampoline.store(tramp, Ordering::Relaxed);
     hook.stolen_len.store(len, Ordering::Relaxed);
+    hook.attached_target.store(target, Ordering::Relaxed);
     hook.attached.store(true, Ordering::Relaxed);
     eprintln!(
         "----- proxy-rs: attached {name} @ {target:#x} (trampoline {tramp:#x}, steal {len})",
@@ -466,18 +511,30 @@ pub unsafe fn detach(hook: &Hook) -> bool {
     if !hook.attached.load(Ordering::Relaxed) {
         return false;
     }
-    let target = hook.runtime_address();
+    // Restore the address captured at attach time, not a freshly rebased one
+    // (the module may have been reloaded at a different base since).
+    let target = hook.attached_target.load(Ordering::Relaxed);
     let len = hook.stolen_len.load(Ordering::Relaxed);
     let tramp = hook.trampoline.load(Ordering::Relaxed);
+    if target == 0 || len == 0 || tramp == 0 {
+        return false;
+    }
     // SAFETY: target was patched by attach and is writable after unprotect;
     // the trampoline still holds the stolen bytes (it is only released below).
+    if unsafe { !unprotect(target, len) } {
+        eprintln!(
+            "----- proxy-rs: detach {name} unprotect failed",
+            name = hook.name
+        );
+        return false;
+    }
     unsafe {
-        unprotect(target, len);
         core::ptr::copy_nonoverlapping(tramp as *const u8, target as *mut u8, len);
         reprotect(target, len);
     }
     hook.trampoline.store(0, Ordering::Relaxed);
     hook.stolen_len.store(0, Ordering::Relaxed);
+    hook.attached_target.store(0, Ordering::Relaxed);
     hook.attached.store(false, Ordering::Relaxed);
     // SAFETY: tramp came from alloc_trampoline.
     release_trampoline(tramp, len);
@@ -781,9 +838,13 @@ pub const PRISTINE_RMG_BRANCH: [u8; 6] = [0x0F, 0x84, 0x6A, 0x02, 0x00, 0x00];
 ///
 /// `addr..addr+bytes.len()` must be a readable/writable code range.
 unsafe fn write_code_bytes(addr: usize, bytes: &[u8]) {
-    // SAFETY: caller contract; unprotect makes the range writable.
+    // SAFETY: caller contract; unprotect makes the range writable. Bail out
+    // when the kernel refuses instead of faulting on the write.
     unsafe {
-        unprotect(addr, bytes.len());
+        if !unprotect(addr, bytes.len()) {
+            eprintln!("----- proxy-rs: write_code_bytes unprotect failed @ {addr:#x}");
+            return;
+        }
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
         reprotect(addr, bytes.len());
     }
@@ -859,6 +920,13 @@ fn lock() -> MutexGuard<'static, Vec<PatchedCall>> {
 ///
 /// `addr` must hold an `E8`/`E9` instruction.
 pub unsafe fn retarget_call_tracked(addr: usize, new_target: usize) {
+    // Dedup: a second attach without detach must not record our own shim as
+    // "original" — restoring that would leave the hook installed.
+    if lock().iter().any(|c| c.addr == addr) {
+        // SAFETY: same contract as retarget_call.
+        unsafe { retarget_call(addr, new_target) };
+        return;
+    }
     // SAFETY: addr must be a verified E8/E9 site.
     let original = unsafe { inline_fetch(addr) };
     lock().push(PatchedCall { addr, original });
@@ -869,7 +937,8 @@ pub unsafe fn retarget_call_tracked(addr: usize, new_target: usize) {
 /// Restore every retargeted call to its pre-attach target (GAME_SHUTDOWN).
 pub fn restore_calls() {
     let calls = core::mem::take(&mut *lock());
-    for c in calls {
+    // LIFO: the last retarget applied is the first reverted.
+    for c in calls.into_iter().rev() {
         // SAFETY: each addr was verified as an E8/E9 site at attach time.
         unsafe {
             retarget_call(c.addr, c.original);

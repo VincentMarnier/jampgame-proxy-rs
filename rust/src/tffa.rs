@@ -323,9 +323,19 @@ pub fn is_kill_limit_print(text: &str) -> bool {
 
 /// Send `cs <index> "<value>"` to one client (the same wire format the
 /// engine's own `SV_SetConfigstring` broadcast uses, so the client's
-/// `gameState` updates identically).
+/// `gameState` updates identically). `"` becomes `'` and CR/LF become spaces
+/// so a hostile player name cannot break the quoting/framing (names allow
+/// `0x22` through `ClientCleanName`).
 fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
-    let msg = format!("cs {index} \"{value}\"\n");
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => safe.push('\''),
+            '\n' | '\r' => safe.push(' '),
+            c => safe.push(c),
+        }
+    }
+    let msg = format!("cs {index} \"{safe}\"\n");
     let Ok(cmsg) = std::ffi::CString::new(msg) else {
         return;
     };
@@ -1364,12 +1374,15 @@ fn tell(client_num: c_int, text: &str) {
 
 fn max_matches() -> usize {
     let v = state::with_state(|s| s.cvars[CVAR_TFFA_MAX_MATCHES].integer);
-    (v as usize).clamp(1, MAX_MATCHES)
+    // Clamp before the `as usize` cast: a negative admin value would
+    // otherwise wrap huge and silently select the maximum.
+    v.clamp(1, MAX_MATCHES as i32) as usize
 }
 
 fn max_group_size() -> usize {
     let v = state::with_state(|s| s.cvars[CVAR_TFFA_MAX_GROUP_SIZE].integer);
-    (v as usize).clamp(2, MAX_CLIENTS)
+    // Same negative-wrap guard as max_matches (bounds 2..=MAX_CLIENTS).
+    v.clamp(2, MAX_CLIENTS as i32) as usize
 }
 
 fn match_size(match_id: u8) -> usize {
@@ -1408,7 +1421,9 @@ fn cmd_create(client_num: c_int) {
             if i == MAIN_MATCH as usize {
                 continue; // slot 0 is the implicit main match
             }
-            if i >= max {
+            // Slots are 1..=max (matches cmd_list's `i > max` break); `>=`
+            // would strand the top slot.
+            if i > max {
                 break;
             }
             if !m.active && s.tffa.client_match.iter().all(|c| *c != i as u8) {

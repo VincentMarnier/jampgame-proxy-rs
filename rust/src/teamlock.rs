@@ -130,13 +130,31 @@ pub(crate) fn team_count(team: i32) -> i32 {
 }
 
 /// `(ent - g_entities) / sizeof(gentity_t)` — the trap index used for
-/// `trap_SendServerCommand`.
+/// `trap_SendServerCommand`. Returns -1 when the entity is not a player slot
+/// (null/base not set/underflow/overflow), so callers fail closed instead of
+/// addressing an out-of-range client.
 fn ent_client_num(ent: usize) -> c_int {
     let base = state::with_state(|s| s.located_game_data.g_entities);
     if base == 0 || ent < base {
         return -1;
     }
-    ((ent - base) / SIZEOF_GENTITY) as c_int
+    let idx = (ent - base) / SIZEOF_GENTITY;
+    if idx >= MAX_CLIENTS {
+        return -1;
+    }
+    idx as c_int
+}
+
+/// Reset the round state for a new map (`GAME_INIT`): caps cleared, snapshot
+/// re-armed for the next reconnect burst. Without this the first snapshot's
+/// caps (or `-1`s) stick forever across all later rounds.
+pub fn reset() {
+    state::with_state(|s| {
+        s.team_lock.red_max = -1;
+        s.team_lock.blue_max = -1;
+        s.team_lock.pending = true;
+        s.team_lock.saw_reconnect = false;
+    });
 }
 
 /// The team an explicit `red`/`blue` request names, or `None` when the request
@@ -295,6 +313,11 @@ fn send_locked_message(block: &Block) {
 pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
     if let Some(block) = blocked_join(ent, s) {
         send_locked_message(&block);
+        return;
+    }
+    // Detour missing (attach failed or raced with detach): fail closed
+    // instead of calling a null function pointer.
+    if crate::patch::GAME_HOOKS[5].original() == 0 {
         return;
     }
     // SAFETY: trampoline attached at GAME_INIT.

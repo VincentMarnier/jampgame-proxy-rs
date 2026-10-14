@@ -27,6 +27,9 @@ pub fn is_color_string_ext(bytes: &[u8]) -> bool {
 /// Byte-for-byte port of the C loop.
 pub fn client_clean_name(input: &[u8], out: &mut [u8]) {
     let out_size = out.len();
+    if out_size == 0 {
+        return;
+    }
     let mut in_off = 0usize;
 
     // discard leading spaces and asterisks

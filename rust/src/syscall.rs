@@ -290,7 +290,10 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
 /// The engine syscall pointer must have been delivered via `dllEntry`.
 #[inline]
 unsafe fn engine_syscall_call(command: c_int, words: [c_int; 16]) -> c_int {
-    let syscall = engine_syscall().expect("engine syscall not registered");
+    let Some(syscall) = engine_syscall() else {
+        eprintln!("----- proxy-rs: syscall {command} before dllEntry");
+        return -1;
+    };
     unsafe {
         syscall(
             command, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
