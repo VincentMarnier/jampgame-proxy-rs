@@ -6,7 +6,7 @@ Lives at <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 
 This is the `website` branch. It is web-only: the proxy itself lives on
 `main` and is never built or modified from here. Proxy facts shown on the
-site (features, cvar defaults, install steps, version) are sourced from
+site (features, cvar defaults, install steps) are sourced from
 `main` — see `AGENTS.md` and `docs/decisions/0002-content-from-main.md`.
 
 ## Stack
@@ -41,7 +41,7 @@ install → `next build` → upload `out/` → deploy to GitHub Pages.
 
 ```text
 app/
-  page.jsx        # the whole site (hero, how, install, features, TFFA, build) + VERSION constant
+  page.jsx        # the whole site (hero, how, install, features, TFFA, build)
   interactive.jsx # client islands: CopyButton, CmdChip, CvarExplorer (SSR-rendered, static-safe)
   layout.jsx      # metadata + bundled display fonts
   fonts.js        # next/font/local wiring (Audiowide + Michroma, SIL OFL — see app/fonts/OFL-*.txt)

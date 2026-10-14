@@ -5,7 +5,7 @@ The Rust proxy lives on `main` and is never built or modified from here.
 
 ## Branch model
 
-- `main` (`origin/main`, v0.3.0): Rust proxy source of truth. Do not merge it
+- `main` (`origin/main`): Rust proxy source of truth. Do not merge it
   into this branch, do not copy `rust/`, `original/`, or `tools/` here.
 - `website` (this branch, currently unborn/no commits): Next.js static site,
   deployed to GitHub Pages.
@@ -16,12 +16,11 @@ The Rust proxy lives on `main` and is never built or modified from here.
 
 ## Content source of truth (read, don't guess)
 
-Proxy facts (features, cvar defaults, install steps, version) come from `main`.
+Proxy facts (features, cvar defaults, install steps) come from `main`.
 Read them without switching branches:
 
 ```sh
 git show origin/main:README.md
-git show origin/main:rust/Cargo.toml   # crate version
 git show origin/main:docs/decisions/0006-parallel-tffa.md
 ```
 

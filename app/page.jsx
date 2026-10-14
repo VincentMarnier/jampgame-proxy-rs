@@ -3,7 +3,6 @@ import { CmdChip, CopyButton, CvarExplorer } from "./interactive";
 
 const REPO = "https://github.com/VincentMarnier/jampgame-proxy-rs";
 const RELEASES = `${REPO}/releases`;
-const VERSION = "v0.3.1";
 
 const INSTALL_QUICKSTART = `mv jampgamei386.so jampgame_original.so
 # drop the proxy in place of jampgamei386.so, then start as usual`;
@@ -109,7 +108,7 @@ export default function Home() {
         {/* ---------- hero ---------- */}
         <div className="hero" id="top">
           <div>
-            <span className="status-pill"><span className="pulse" aria-hidden="true" />{VERSION} · Rust · i686 .so · drop-in proxy</span>
+            <span className="status-pill"><span className="pulse" aria-hidden="true" />Rust · i686 .so · drop-in proxy</span>
             <h1>One server.<br />Many duels of fate.</h1>
             <p className="tagline">
               <strong>jampgame-proxy-rs</strong> is a drop-in Rust proxy for the Jedi Academy
@@ -278,7 +277,7 @@ export default function Home() {
             <p>
               Full build, test and run instructions (end-to-end engine test, persistent bot
               server) are in <code>rust/README.md</code> on <a href={REPO}>GitHub</a>. Every
-              push to <code>main</code> is version-bumped from conventional commits and published
+              push to <code>main</code> is published
               as a GitHub Release with the <code>.so</code> attached.
             </p>
           </div>

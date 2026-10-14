@@ -1,10 +1,10 @@
-# 0004 — Full UI/UX redesign (v2): marketing-page IA on the JKA theme
+# 0004 — Full UI/UX redesign: marketing-page IA on the JKA theme
 
 Date: 2026-10-14. Status: accepted. Supersedes nothing; extends 0001–0003.
 
 ## Context
 
-The v1 site was a single linear column (hero → how → install → features →
+The previous site was a single linear column (hero → how → install → features →
 build) with one dense cvar table, no search, no copy affordances, and a weak
 hero (title + tagline + buttons, no proof, no quickstart). Content was
 accurate but hard to scan; server admins — the primary audience — could not
@@ -34,17 +34,16 @@ and stays.
   `h2` ids, labelled nav, table `<caption>`, visible focus rings, 44px
   minimum touch targets on nav/links/inputs/buttons, `prefers-reduced-motion`
   disables starfield animation, saber pulse, and smooth scroll.
-- Content re-verified against `origin/main` at redesign time (README +
-  `rust/Cargo.toml` = v0.3.1): same 13 cvars/defaults, same install steps,
-  same TFFA semantics, same four dropped C++ cvars. Hero shows the version
-  badge; version bumps only need the one `VERSION` constant in `page.jsx`.
+- Content re-verified against `origin/main` at redesign time (README):
+  same 13 cvars/defaults, same install steps,
+  same TFFA semantics, same four dropped C++ cvars.
 
 ## Consequences
 
 - `app/page.jsx` owns content + layout, `app/interactive.jsx` owns the three
   client islands, `app/globals.css` owns the token system (~700 lines). No
   new routes: deep links still resolve to anchors on the single page.
-- First-load JS unchanged (~105 kB, same chunk shape as v1) — the islands add
+- First-load JS unchanged (~105 kB, same chunk shape as before) — the islands add
   no dependencies.
-- Future content edits stay in `page.jsx` + the `VERSION` constant; if the
+- Future content edits stay in `page.jsx`; if the
   cvar table grows past ~20 rows, revisit 0002's build-time generation idea.
