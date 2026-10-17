@@ -75,6 +75,10 @@ use state::PROXY_CVARS;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dllEntry(syscall: syscall::EngineSyscall) {
     syscall::set_engine_syscall(syscall);
+    // Keep this module mapped for the whole process: the engine dlclose()s us
+    // mid-call on a map change (rcon commands run inside our SVC_RemoteCommand
+    // wrapper), and the stale return must land on mapped code.
+    original::pin_own_module();
     eprintln!("----- proxy-rs {VERSION}: dllEntry, engine syscall registered");
 }
 
@@ -189,6 +193,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     eprintln!("========================================================================");
     eprintln!("----- proxy-rs {VERSION}: bootstrap core loaded");
     eprintln!("========================================================================");
+
+    // Fresh state for this session: the pinned module survives map changes, so
+    // the fresh statics a real reload used to provide are reset here instead.
+    state::reset_session();
 
     // Version gate: only run on the pristine engine (R-009).
     if !engine_version_matches() {

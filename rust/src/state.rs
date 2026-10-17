@@ -273,6 +273,20 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
     f(state)
 }
 
+/// Drop every per-session value so the next `GAME_INIT` starts from the state
+/// a freshly `dlopen`ed module would have.
+///
+/// The proxy module is pinned for the process lifetime
+/// (`crate::original::pin_own_module`) because the engine unmaps it mid-call on
+/// a full map change; the engine's re-`dlopen` therefore reuses the same
+/// instance instead of giving us fresh statics. This reset restores the
+/// documented semantics ("a full map change re-dlopens the module (fresh
+/// state)") on top of the pinned instance. Called at the top of `GAME_INIT`.
+pub fn reset_session() {
+    let mut guard = lock();
+    *guard = None;
+}
+
 /// Heap-built per-client table: element-wise construction keeps the default
 /// off the stack (see `ProxyState`).
 fn default_clients() -> Box<[ClientEntry]> {

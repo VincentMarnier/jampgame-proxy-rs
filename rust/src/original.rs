@@ -227,6 +227,60 @@ pub fn forward_vm_main(command: c_int, args: &[c_int; 12]) -> Option<c_int> {
     })
 }
 
+/// Pin the *proxy* module itself for the process lifetime.
+///
+/// The engine `dlclose`s `jampgamei386.so` at every full map change
+/// (`SV_SpawnServer` → `SV_ShutdownGameProgs` → `VM_Free` → `Sys_UnloadDll`),
+/// which unmaps our code while a call frame can still be live: an rcon command
+/// executes synchronously *inside* the `SVC_RemoteCommand` wrapper's trampoline
+/// call, so `rcon map`/`rcon exec` tears the module down mid-call and the
+/// engine's `SVC_RemoteCommand` then returns into the unmapped wrapper —
+/// SIGSEGV at that return address (reproduced 3/4 rcon map changes in
+/// `tools/runtime` map-change storm; EIP = old module base + the instruction
+/// after the trampoline `call`).
+///
+/// A self-`dlopen` bumps the module's reference count so the engine's
+/// `dlclose` cannot unmap it and every stale return completes against
+/// still-mapped code. The engine's next `dlopen` resolves to the same object
+/// (same path/inode), so the module instance is reused across map changes —
+/// per-session state must therefore be reset explicitly at `GAME_INIT`
+/// (`crate::state::reset_session`), which is what a fresh `dlopen` used to
+/// provide.
+pub fn pin_own_module() {
+    static PINNED: AtomicUsize = AtomicUsize::new(0);
+    if PINNED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let mut info = DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    // SAFETY: `pin_own_module` is code inside this module; `info` is writable.
+    let ok = unsafe { dladdr(pin_own_module as usize as *const c_void, &mut info) } != 0
+        && !info.dli_fname.is_null();
+    if !ok {
+        eprintln!(
+            "----- proxy-rs: cannot pin own module (dladdr failed: {})",
+            last_error()
+        );
+        return;
+    }
+    // SAFETY: `dli_fname` is the path the loader opened for this module
+    // (NUL-terminated); RTLD_NOW matches the engine's own load flags.
+    let handle = unsafe { dlopen(info.dli_fname, RTLD_NOW) };
+    if handle.is_null() {
+        eprintln!(
+            "----- proxy-rs: cannot pin own module (dlopen failed: {})",
+            last_error()
+        );
+        return;
+    }
+    // The handle is deliberately never dlclose()d: that is the pin.
+    PINNED.store(1, Ordering::Relaxed);
+}
+
 /// Close the original module and reset the stored state (GAME_SHUTDOWN path).
 pub fn unload() {
     let handle = HANDLE.swap(core::ptr::null_mut(), Ordering::Relaxed);
