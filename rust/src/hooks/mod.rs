@@ -155,6 +155,21 @@ game_trampoline!(
     7,
     unsafe extern "C" fn(*const core::ffi::c_char)
 );
+game_trampoline!(
+    game_hook_original_g_sound,
+    8,
+    unsafe extern "C" fn(usize, core::ffi::c_int, core::ffi::c_int)
+);
+game_trampoline!(
+    game_hook_original_g_sound_temp_entity,
+    9,
+    unsafe extern "C" fn(usize, core::ffi::c_int, core::ffi::c_int) -> usize
+);
+game_trampoline!(
+    game_hook_original_g_temp_entity,
+    10,
+    unsafe extern "C" fn(usize, core::ffi::c_int) -> usize
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -260,6 +275,9 @@ pub unsafe fn attach_all() {
         crate::teamlock::set_team as usize,
         game::add_score as usize,
         game::log_exit as usize,
+        game::g_sound as usize,
+        game::g_sound_temp_entity as usize,
+        game::g_temp_entity as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the

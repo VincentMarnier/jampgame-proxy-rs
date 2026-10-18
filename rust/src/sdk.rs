@@ -177,6 +177,9 @@ pub const OFFSET_GENTITY_DAMAGE_REDIRECT: usize = 1488;
 /// `q_shared.h:2670-2832` PC layout; `clientNum` at 232 matches the existing
 /// `OFFSET_ENTITY_CLIENT_NUM` pin, which anchors the whole table).
 pub const OFFSET_GENTITY_S_ETYPE: usize = 4;
+/// `offsetof(entityState_t, eFlags)` (`q_shared.h` field order: `number` @0,
+/// `eType` @4, `eFlags` @8 — the `OFFSET_GENTITY_S_ETYPE` pin anchors it).
+pub const OFFSET_GENTITY_S_EFLAGS: usize = 8;
 pub const OFFSET_GENTITY_S_OTHER_ENTITY_NUM: usize = 188;
 pub const OFFSET_GENTITY_S_OTHER_ENTITY_NUM2: usize = 192;
 /// `entityState_t.owner` (crosshair owner).
@@ -214,11 +217,23 @@ pub const ENTITYNUM_WORLD: i32 = 1022;
 /// `eType = ET_EVENTS + event`.
 pub const ET_EVENTS: i32 = 18;
 
-/// Event numbers (`bg_public.h` `entity_event_t`, oracle-counted 2026-09-15).
+/// Event numbers (`bg_public.h` `entity_event_t`, oracle-counted 2026-09-15;
+/// the sound set re-counted 2026-10-18 and cross-checked against these pins).
 pub const EV_SABER_HIT: i32 = 30;
 pub const EV_SABER_BLOCK: i32 = 31;
 pub const EV_SABER_CLASHFLARE: i32 = 32;
+pub const EV_MUTE_SOUND: i32 = 74;
+pub const EV_GENERAL_SOUND: i32 = 76;
+pub const EV_GLOBAL_SOUND: i32 = 77;
+pub const EV_GLOBAL_TEAM_SOUND: i32 = 78;
+pub const EV_ENTITY_SOUND: i32 = 79;
 pub const EV_OBITUARY: i32 = 93;
+
+/// `EF_PLAYER_EVENT` (`bg_public.h:570`, `1<<5`): the temp entity carries a
+/// predicted player event (`SendPendingPredictableEvents`, `g_active.c:1058`),
+/// whose generating player is `s.otherEntityNum` (`CG_CheckEvents`
+/// `cg_event.c:3533` rewrites `number` to that player on the client).
+pub const EF_PLAYER_EVENT: i32 = 1 << 5;
 
 /// Configstring indices (`bg_public.h`): `CS_SCORES1/2` drive the mini HUD
 /// (`cgs.scores1/2`), `CS_PLAYERS + n` carries client `n`'s `n\t\…` info.
@@ -566,6 +581,8 @@ mod tests {
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES, 44);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_RED, 48);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_BLUE, 52);
+        assert_eq!(OFFSET_GENTITY_S_ETYPE, 4);
+        assert_eq!(OFFSET_GENTITY_S_EFLAGS, 8);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 192);
         assert_eq!(OFFSET_GENTITY_S_OWNER, 280);
@@ -581,5 +598,23 @@ mod tests {
         assert_eq!(OFFSET_NETCHAN_REMOTE_ADDRESS, 234556);
         assert_eq!(OFFSET_NETCHAN_QPORT, 28);
         assert_eq!(OFFSET_NETCHAN_UNSENT_FRAGMENTS, 49200);
+    }
+
+    #[test]
+    fn temp_event_sound_constants_match_bg_public() {
+        // `entity_event_t` (bg_public.h) and the `EF_PLAYER_EVENT` flag: the
+        // numbers were re-counted 2026-10-18 and cross-checked against the
+        // oracle-counted 2026-09-15 pins below.
+        assert_eq!(ET_EVENTS, 18);
+        assert_eq!(EV_SABER_HIT, 30);
+        assert_eq!(EV_SABER_BLOCK, 31);
+        assert_eq!(EV_SABER_CLASHFLARE, 32);
+        assert_eq!(EV_MUTE_SOUND, 74);
+        assert_eq!(EV_GENERAL_SOUND, 76);
+        assert_eq!(EV_GLOBAL_SOUND, 77);
+        assert_eq!(EV_GLOBAL_TEAM_SOUND, 78);
+        assert_eq!(EV_ENTITY_SOUND, 79);
+        assert_eq!(EV_OBITUARY, 93);
+        assert_eq!(EF_PLAYER_EVENT, 0x20);
     }
 }

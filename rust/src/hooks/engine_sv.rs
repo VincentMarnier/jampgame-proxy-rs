@@ -12,11 +12,12 @@ use crate::hooks::netstatus;
 use crate::hooks::original_call;
 use crate::jampgame;
 use crate::sdk::{
-    CLC_MOVE, CLC_MOVE_NO_DELTA, CS_ACTIVE, ENTITYNUM_NONE, ENTITYNUM_WORLD, ERR_DROP, MAX_CLIENTS,
-    MAX_GENTITIES, MAX_QPATH, OFFSET_CLIENT_DOWNLOAD, OFFSET_CLIENT_DOWNLOAD_NAME,
-    OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM, OFFSET_CLIENT_LAST_CLIENT_COMMAND, OFFSET_CLIENT_NAME,
-    OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE, OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_NUMBER,
-    OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S_ETYPE,
+    CLC_MOVE, CLC_MOVE_NO_DELTA, CS_ACTIVE, EF_PLAYER_EVENT, ENTITYNUM_NONE, ENTITYNUM_WORLD,
+    ERR_DROP, MAX_CLIENTS, MAX_GENTITIES, MAX_QPATH, OFFSET_CLIENT_DOWNLOAD,
+    OFFSET_CLIENT_DOWNLOAD_NAME, OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM,
+    OFFSET_CLIENT_LAST_CLIENT_COMMAND, OFFSET_CLIENT_NAME, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE,
+    OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_CLIENT_NUM, OFFSET_ENTITY_NUMBER, OFFSET_GENTITY_CLIENT,
+    OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS, OFFSET_GENTITY_S_ETYPE,
     OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
     OFFSET_MSG_BIT, OFFSET_MSG_READCOUNT, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
     OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
@@ -735,7 +736,12 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
 /// then drop cross-match entities from the snapshot list so players neither
 /// see nor hear (events ride entities) other matches' fights. `EV_OBITUARY`
 /// kill feeds are broadcast temp entities whose `s.otherEntityNum` is the
-/// victim, so they are hidden the same way without trap parsing.
+/// victim, so they are hidden the same way without trap parsing. Sound temp
+/// entities carry no owner of their own, so they are attributed to the match
+/// that created them (the `G_Sound`/`G_TempEntity` stamp in
+/// `TffaState::sound_source`, or `s.clientNum` for `EV_ENTITY_SOUND`) and
+/// dropped the same way; map/world sounds and `EV_GLOBAL_SOUND` broadcasts
+/// stay visible/audible everywhere.
 ///
 /// World/static entities are always kept. Player entities (`entNum < 32`
 /// with a live client) and owned entities (missiles/sabers via
@@ -772,10 +778,11 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    // Snapshot the match table once (no per-entity locking); the viewer's
-    // own match is follow-aware (spectating someone adopts their instance).
+    // Snapshot the match table and the sound attribution once (no per-entity
+    // locking); the viewer's own match is follow-aware (spectating someone
+    // adopts their instance).
     let viewer_match = crate::tffa::effective_match(viewer);
-    let table = state::with_state(|s| s.tffa.client_match);
+    let (table, sound_source) = state::with_state(|s| (s.tffa.client_match, s.tffa.sound_source));
     // SAFETY: eNums is a valid snapshotEntityNumbers_t.
     let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
     if count <= 0 {
@@ -786,7 +793,7 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     for i in 0..count {
         // SAFETY: list holds `count` ints.
         let ent_num = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4) };
-        let keep = snapshot_keep(viewer_match, &table, g_entities, ent_num);
+        let keep = snapshot_keep(viewer_match, &table, &sound_source, g_entities, ent_num);
         if keep {
             if kept != i {
                 // SAFETY: both slots are inside the eNums list.
@@ -804,11 +811,12 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     }
 }
 
-/// Snapshot predicate for one entity number (pure given the match table).
+/// Snapshot predicate for one entity number (pure given the match tables).
 /// Match `0` is the main TFFA; every live player belongs to exactly one.
 fn snapshot_keep(
     viewer_match: u8,
     table: &[u8; MAX_CLIENTS],
+    sound_source: &[u8; MAX_GENTITIES],
     g_entities: usize,
     ent_num: c_int,
 ) -> bool {
@@ -833,8 +841,9 @@ fn snapshot_keep(
     // no `r.ownerNum`/`s.owner` attribution (`G_InitGentity` sets
     // `r.ownerNum = NONE`, `s.owner` stays 0 from the freelist `memset` — a
     // bare 0 that coincides with client 0 and used to hide every same-match
-    // saber effect whenever client 0 was elsewhere). Attribute them only via
-    // `s.otherEntityNum*`, event-specifically:
+    // saber effect whenever client 0 was elsewhere). Sound and predicted
+    // player events are attributed first (their own sources, below); the rest
+    // only via `s.otherEntityNum*`, event-specifically:
     // - `EV_SABER_BLOCK` (saber-vs-saber clash): only `otherEntityNum2`
     //   (attacker) is set, `otherEntityNum` is the untouched 0 default.
     // - `EV_SABER_CLASHFLARE`: neither is set (both default 0) — broadcast,
@@ -842,6 +851,39 @@ fn snapshot_keep(
     // - everything else (hits, obituaries, missile marks): both fields.
     if etype >= crate::sdk::ET_EVENTS {
         let event = etype - crate::sdk::ET_EVENTS;
+        // Predicted player events (`SendPendingPredictableEvents`,
+        // `g_active.c:1058`): the generating player rides `s.otherEntityNum`
+        // and the client plays the event as that player (`CG_CheckEvents`
+        // rewrites `number`), while `s.otherEntityNum2` is
+        // `ps->emplacedIndex` (turret state, not an owner). Attribute to the
+        // generator alone — this covers the predicted combat sounds
+        // (`EV_FIRE_WEAPON`, `EV_SABER_ATTACK`, `EV_JUMP`, ...).
+        // SAFETY: ent is inside the g_entities array; eFlags is a plain int.
+        let eflags = unsafe { read_i32(ent + OFFSET_GENTITY_S_EFLAGS) };
+        if eflags & EF_PLAYER_EVENT != 0 {
+            // SAFETY: ent is inside the g_entities array; owner fields are ints.
+            let generator = unsafe { read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM) };
+            return owners_in_viewer_match(viewer_match, table, g_entities, &[generator]);
+        }
+        // Sound events are attributed by the emitting entity's match — the
+        // creation-time stamp for `G_Sound`, `s.clientNum` for
+        // `G_EntitySound`/`G_SoundOnEnt` — while deliberate broadcasts stay
+        // audible everywhere.
+        match crate::tffa::sound_attribution(event) {
+            crate::tffa::SoundAttribution::Broadcast => return true,
+            crate::tffa::SoundAttribution::Stamped => {
+                return crate::tffa::sound_visible(viewer_match, sound_source[ent_num as usize]);
+            }
+            crate::tffa::SoundAttribution::Emitter => {
+                // SAFETY: ent is inside the g_entities array; s.clientNum is
+                // a plain int.
+                let emitter =
+                    unsafe { read_i32(ent + OFFSET_GENTITY_S + OFFSET_ENTITY_CLIENT_NUM) };
+                let source = crate::tffa::source_match_of_num(g_entities, emitter, table);
+                return crate::tffa::sound_visible(viewer_match, source);
+            }
+            crate::tffa::SoundAttribution::None => {}
+        }
         if event == crate::sdk::EV_SABER_CLASHFLARE {
             return true;
         }

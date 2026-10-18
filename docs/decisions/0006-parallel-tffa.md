@@ -227,14 +227,55 @@ deliberately not filtered.
   overrides — crashlog blue slots carrying `cultist/red` render red
   client-side regardless of `t`; verify the blue players' chosen models carry
   blue skins in base TDM before chasing proxy-side.
+- **Sound isolation (2026-10-18, live report: "sounds of a TFFA instance can
+  be heard in another instance"):** sounds reach clients only as entity
+  events in snapshots (`cg_event.c`), and the temp entities the game's sound
+  helpers create carry no owner — so the visibility filter attributed every
+  sound temp entity to client 0's match (and kept it for everyone whenever
+  client 0 was not a live player). New game detours `G_Sound` (`0x16e824`),
+  `G_SoundTempEntity` (`0x16e224`) and `G_TempEntity` (`0x16e0d4`, all steal
+  6; `G_SoundTempEntity` has exactly one call site, inside `G_Sound` —
+  objdump-verified) attribute **every** temp entity at construction to the
+  match that owns its creating entity: `TffaState::sound_source` is stamped
+  via the `G_Sound` → `G_SoundTempEntity` handshake, with the same
+  `request_match` resolution the trace isolation uses (player slot or one
+  `r.ownerNum` hop) taken while the entity is live; `G_TempEntity` stamps
+  world so a reused slot never keeps a stale attribution. `GAME_HOOKS` 8→11.
+  The snapshot filter then drops, per viewer:
+  - `EV_GENERAL_SOUND` (76) created by another match (`G_Sound`);
+  - `EV_ENTITY_SOUND` (79) whose `s.clientNum` emitter is in another match
+    (`G_EntitySound`/`G_SoundOnEnt`: grip choke, grapple, jump voice);
+  - every `EF_PLAYER_EVENT` temp entity (`SendPendingPredictableEvents`,
+    `g_active.c:1058`), attributed to its generating player alone
+    (`s.otherEntityNum`; `s.otherEntityNum2` is `ps->emplacedIndex`, not an
+    owner) — covering the predicted combat sounds `EV_FIRE_WEAPON`/
+    `EV_ALT_FIRE`, `EV_SABER_ATTACK`, `EV_JUMP`, `EV_TAUNT`, ... and fixing
+    the client-0 coincidence for predicted events of every kind.
+  Map/world sounds (`G_SoundAtLoc`, item respawns, doors, NPC chatter) and
+  the deliberate broadcasts (`EV_GLOBAL_SOUND` 77, `EV_GLOBAL_TEAM_SOUND` 78,
+  `EV_MUTE_SOUND` 74 — muting a sound a match never received is a no-op) stay
+  audible everywhere, and sounds riding a filtered entity (`G_AddEvent` on a
+  cross-match player) were already hidden with the entity. Stamping is
+  unconditional (not TFFA-gated) so the table is current whenever the filter
+  activates.
 - Known limitations (documented, not fixed here): force
   grip/push and force-heal target selection are not trace-based and may
   still cross matches; cross-match telefrag-induced kills still die
   (hidden feed, score lands in the attacker's match — spawn separation is
   future work); the flip path needs mixed-match assignments to observe at
-  runtime (bots never issue `tffa_*`).
+  runtime (bots never issue `tffa_*`); `EV_ENTITY_SOUND` is attributed at
+  snapshot time from `s.clientNum`, so a non-player emitter freed within the
+  same frame would fall back to the client-0 owner hop (the emitters in
+  practice are players and NPCs, which outlive their sounds).
 - Verification: 7 new unit tests (gates, scores filter, fraglimit);
   `cargo test` 56/56; `clippy` clean; i686 release builds; engine smoke
   (proxy overlay boots, queries answer) plus a 70 s TFFA+bot soak on
   `mp/ctf1` (`proxy_tffa_enable 1`, `bot_minplayers 4`): all hooks attach,
   bots connect/enter/fight/die, server keeps answering, no crash.
+  Sound round (2026-10-18): `cargo test` 64/64 (3 new — sound attribution
+  classification, sound visibility gate, gentity-slot math), `clippy -D
+  warnings` clean, steal fixtures pinned for the three new sites (6/6/6),
+  engine smoke green with all 27 detours attached (live attach lines at
+  `base+0x16e824` / `base+0x16e224` / `base+0x16e0d4`). Cross-match audio
+  isolation itself still needs a live two-instance listen (bots never create
+  split instances).

@@ -13,7 +13,7 @@ use core::ffi::CStr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::sdk::{MAX_CLIENTS, MAX_NETNAME, VmCvar};
+use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 
 /// The `proxy.cvars` mirror table (D-002 keep list): each entry is
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
@@ -155,6 +155,15 @@ pub struct TffaState {
     pub rebuilt_stamp: u32,
     pub owned: [(u16, u8); crate::tffa::OWNED_CAP],
     pub owned_count: usize,
+    /// Sound attribution for the temp entity living in each gentity slot
+    /// (parallel-TFFA sound isolation): the match whose action created it, or
+    /// `crate::tffa::SOURCE_WORLD` for map/world sounds. Every temp-entity
+    /// construction (`G_TempEntity`/`G_SoundTempEntity` detours) stamps its
+    /// slot, so a reused slot never keeps a stale attribution.
+    pub sound_source: [u8; MAX_GENTITIES],
+    /// The `G_Sound` → `G_SoundTempEntity` handshake: source match of the
+    /// temp entity currently being constructed (`SOURCE_WORLD` when none).
+    pub pending_sound_source: u8,
     pub cs_players_base: [String; MAX_CLIENTS],
     /// Last per-viewer `CS_SCORES1/2` sent, to skip redundant corrections
     /// (the 128-slot reliable buffer overflows otherwise: every frag would
@@ -184,6 +193,8 @@ impl Default for TffaState {
             rebuilt_stamp: 0,
             owned: [(0, 0); crate::tffa::OWNED_CAP],
             owned_count: 0,
+            sound_source: [crate::tffa::SOURCE_WORLD; MAX_GENTITIES],
+            pending_sound_source: crate::tffa::SOURCE_WORLD,
             cs_players_base: core::array::from_fn(|_| String::new()),
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],

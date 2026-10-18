@@ -19,6 +19,13 @@
 //! - physics: the `G_TRACE`/`G_G2TRACE`/`G_TRACECAPSULE` traps flip
 //!   `r.contents` of cross-match entities for the duration of the trace, so
 //!   other matches neither body-block nor saber-clash (`trace_flips`).
+//! - sounds: the `G_Sound`/`G_SoundTempEntity`/`G_TempEntity` detours stamp
+//!   every temp entity with the match that created it (`sound_source`), and
+//!   the snapshot filter drops cross-match `EV_GENERAL_SOUND`/
+//!   `EV_ENTITY_SOUND` events plus the predicted `EF_PLAYER_EVENT` combat
+//!   events (`EV_FIRE_WEAPON`, `EV_SABER_ATTACK`, `EV_JUMP`, ...). Map/world
+//!   sounds (`G_SoundAtLoc`, item respawns) and `EV_GLOBAL_SOUND` broadcasts
+//!   stay audible everywhere.
 //! - scoreboard: `G_SEND_SERVER_COMMAND` trap rewrites `scores ...` per
 //!   viewer with the per-player per-match score copies.
 //! - chat is intentionally left global.
@@ -1237,6 +1244,116 @@ fn move_match_to_spectator(match_id: u8) {
 }
 
 // ---------------------------------------------------------------------------
+// Sound isolation (temp-entity sound attribution)
+// ---------------------------------------------------------------------------
+
+/// Attribution of a temp entity that belongs to no match: map/world sounds
+/// (doors, item respawns, `G_SoundAtLoc`, NPC chatter) stay audible for every
+/// match.
+pub const SOURCE_WORLD: u8 = u8::MAX;
+
+/// How one temp-event number reaches the clients' speakers, and therefore how
+/// the snapshot filter must attribute it to a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundAttribution {
+    /// Not a sound event (falls through to the generic owner attribution).
+    None,
+    /// `G_Sound` sound: the creating entity's match was stamped into
+    /// `TffaState::sound_source` at construction.
+    Stamped,
+    /// `G_EntitySound`/`G_SoundOnEnt`: the emitting entity rides `s.clientNum`.
+    Emitter,
+    /// Deliberate broadcast (`EV_GLOBAL_SOUND`, `EV_GLOBAL_TEAM_SOUND`,
+    /// `EV_MUTE_SOUND`): head-relative map/CTF audio, or a mute that is a
+    /// no-op for matches that never received the sound.
+    Broadcast,
+}
+
+/// Classification of a temp event (`event = eType - ET_EVENTS`).
+pub fn sound_attribution(event: c_int) -> SoundAttribution {
+    use crate::sdk::{
+        EV_ENTITY_SOUND, EV_GENERAL_SOUND, EV_GLOBAL_SOUND, EV_GLOBAL_TEAM_SOUND, EV_MUTE_SOUND,
+    };
+    match event {
+        EV_GENERAL_SOUND => SoundAttribution::Stamped,
+        EV_ENTITY_SOUND => SoundAttribution::Emitter,
+        EV_GLOBAL_SOUND | EV_GLOBAL_TEAM_SOUND | EV_MUTE_SOUND => SoundAttribution::Broadcast,
+        _ => SoundAttribution::None,
+    }
+}
+
+/// Pure snapshot gate for an attributed sound: world sounds are heard by
+/// every match, attributed ones only by the source's own match.
+pub fn sound_visible(viewer_match: u8, source_match: u8) -> bool {
+    source_match == SOURCE_WORLD || entity_visible(viewer_match, source_match)
+}
+
+/// gentity slot of `ent` (`ent - g_entities` in `SIZEOF_GENTITY` steps), or
+/// `None` when the pointer is not a slot of the `g_entities` array.
+fn ent_num_of(g_entities: usize, ent: usize) -> Option<c_int> {
+    if g_entities == 0 || ent < g_entities {
+        return None;
+    }
+    let off = ent - g_entities;
+    if off % crate::sdk::SIZEOF_GENTITY != 0 {
+        return None;
+    }
+    let num = off / crate::sdk::SIZEOF_GENTITY;
+    if num >= MAX_GENTITIES {
+        return None;
+    }
+    Some(num as c_int)
+}
+
+/// Match that owns entity `ent`: a player slot directly, or one `r.ownerNum`
+/// hop to its player (missiles, saber entities) — the same resolution the
+/// trace isolation uses (`request_match`), taken while the entity is still
+/// live. `SOURCE_WORLD` when no live player resolves (world/map/NPC).
+pub fn source_match(g_entities: usize, ent: usize, table: &[u8; MAX_CLIENTS]) -> u8 {
+    match ent_num_of(g_entities, ent) {
+        Some(num) => source_match_of_num(g_entities, num, table),
+        None => SOURCE_WORLD,
+    }
+}
+
+/// `source_match` for an already-known gentity slot.
+pub fn source_match_of_num(g_entities: usize, ent_num: c_int, table: &[u8; MAX_CLIENTS]) -> u8 {
+    request_match(g_entities, ent_num, table).unwrap_or(SOURCE_WORLD)
+}
+
+/// `G_Sound` entry wrapper: resolve which match's action owns the temp entity
+/// the pristine body is about to construct and stash it for the constructor
+/// handshake. Returns the previous pending value for `end_sound_source` to
+/// restore (nested sound creation must not steal the outer attribution).
+pub fn begin_sound_source(ent: usize) -> u8 {
+    state::with_state(|s| {
+        let source = source_match(s.located_game_data.g_entities, ent, &s.tffa.client_match);
+        let previous = s.tffa.pending_sound_source;
+        s.tffa.pending_sound_source = source;
+        previous
+    })
+}
+
+/// Restore the pending slot saved by `begin_sound_source`.
+pub fn end_sound_source(previous: u8) {
+    state::with_state(|s| s.tffa.pending_sound_source = previous);
+}
+
+/// Temp-entity constructor wrapper (`G_TempEntity`/`G_SoundTempEntity`):
+/// attribute the fresh slot to the pending source and consume it. Every
+/// construction stamps, so a slot reuse never keeps a stale attribution.
+pub fn stamp_temp_source(te: usize) {
+    state::with_state(|s| {
+        let Some(num) = ent_num_of(s.located_game_data.g_entities, te) else {
+            return;
+        };
+        let source = s.tffa.pending_sound_source;
+        s.tffa.pending_sound_source = SOURCE_WORLD;
+        s.tffa.sound_source[num as usize] = source;
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Physics isolation (G_TRACE / G_G2TRACE / G_TRACECAPSULE interception)
 // ---------------------------------------------------------------------------
 
@@ -1650,6 +1767,48 @@ mod tests {
         assert!(!entity_visible(1, 2));
         assert!(!entity_visible(MAIN_MATCH, 1));
         assert!(entity_visible(MAIN_MATCH, MAIN_MATCH));
+    }
+
+    #[test]
+    fn sound_attribution_classifies_temp_events() {
+        use SoundAttribution::*;
+        assert_eq!(sound_attribution(crate::sdk::EV_GENERAL_SOUND), Stamped);
+        assert_eq!(sound_attribution(crate::sdk::EV_ENTITY_SOUND), Emitter);
+        assert_eq!(sound_attribution(crate::sdk::EV_GLOBAL_SOUND), Broadcast);
+        assert_eq!(
+            sound_attribution(crate::sdk::EV_GLOBAL_TEAM_SOUND),
+            Broadcast
+        );
+        assert_eq!(sound_attribution(crate::sdk::EV_MUTE_SOUND), Broadcast);
+        // Non-sound events keep the generic owner attribution.
+        assert_eq!(sound_attribution(crate::sdk::EV_SABER_BLOCK), None);
+        assert_eq!(sound_attribution(crate::sdk::EV_SABER_CLASHFLARE), None);
+        assert_eq!(sound_attribution(crate::sdk::EV_OBITUARY), None);
+        assert_eq!(sound_attribution(0), None);
+    }
+
+    #[test]
+    fn sound_visible_world_and_same_match_only() {
+        // Map/world sounds stay audible for every match.
+        assert!(sound_visible(1, SOURCE_WORLD));
+        assert!(sound_visible(MAIN_MATCH, SOURCE_WORLD));
+        // Attributed sounds follow the source's match.
+        assert!(sound_visible(1, 1));
+        assert!(!sound_visible(1, 2));
+        assert!(!sound_visible(MAIN_MATCH, 1));
+        assert!(sound_visible(MAIN_MATCH, MAIN_MATCH));
+    }
+
+    #[test]
+    fn ent_num_of_accepts_only_gentity_slots() {
+        let base = 0x1000usize;
+        let size = crate::sdk::SIZEOF_GENTITY;
+        assert_eq!(ent_num_of(0, base), None);
+        assert_eq!(ent_num_of(base, base), Some(0));
+        assert_eq!(ent_num_of(base, base + size), Some(1));
+        // One past the array, and an unaligned pointer, are not slots.
+        assert_eq!(ent_num_of(base, base + MAX_GENTITIES * size), None);
+        assert_eq!(ent_num_of(base, base + 1), None);
     }
 
     #[test]

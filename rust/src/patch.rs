@@ -759,8 +759,9 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
 /// (`Proxy_Engine_Patch.cpp:61-70`) minus the dropped `WP_SaberPositionUpdate`
 /// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror),
-/// plus the Rust-only parallel-TFFA `AddScore` accounting hook.
-pub static GAME_HOOKS: [Hook; 8] = [
+/// plus the Rust-only parallel-TFFA hooks (`AddScore` accounting; sound
+/// attribution `G_Sound`/`G_SoundTempEntity`/`G_TempEntity`).
+pub static GAME_HOOKS: [Hook; 11] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -777,6 +778,13 @@ pub static GAME_HOOKS: [Hook; 8] = [
     Hook::new("SetTeam", crate::jampgame::FN_SET_TEAM, true),
     Hook::new("AddScore", crate::jampgame::FN_ADD_SCORE, true),
     Hook::new("LogExit", crate::jampgame::FN_LOG_EXIT, true),
+    Hook::new("G_Sound", crate::jampgame::FN_G_SOUND, true),
+    Hook::new(
+        "G_SoundTempEntity",
+        crate::jampgame::FN_G_SOUND_TEMP_ENTITY,
+        true,
+    ),
+    Hook::new("G_TempEntity", crate::jampgame::FN_G_TEMP_ENTITY, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1084,6 +1092,21 @@ mod tests {
         Site {
             name: "LogExit",
             bytes: b"\x55\x8b\xec\x83\xec\x30\x89\x5d\xf4\x8b\x45\x08\xc7\x04\x24\x0c",
+            want: 6,
+        },
+        Site {
+            name: "G_Sound",
+            bytes: b"\x55\x8b\xec\x83\xec\x20\x89\x7d\xf8\x89\x75\xf4\x89\x5d\xfc\x8b",
+            want: 6,
+        },
+        Site {
+            name: "G_SoundTempEntity",
+            bytes: b"\x55\x8b\xec\x83\xec\x38\x89\x7d\xf4\x89\x75\xf8\x89\x5d\xf0\x8b",
+            want: 6,
+        },
+        Site {
+            name: "G_TempEntity",
+            bytes: b"\x55\x8b\xec\x83\xec\x38\x89\x7d\xf4\x89\x75\xf8\x89\x5d\xf0\x8b",
             want: 6,
         },
     ];

@@ -51,6 +51,24 @@ pub const FN_ADD_SCORE: usize = 0x0013_13a4;
 /// before the `AddScore` wrapper can neutralise the bump, so neutralising
 /// alone can never win the race.
 pub const FN_LOG_EXIT: usize = 0x0008_81d4;
+/// `void G_Sound(gentity_t*, int, int)` (nm `G_Sound__FP9gentity_siT2`, file
+/// offset `0x16e824`; prologue `55 8b ec 83 ec 20`, 6 detour-safe bytes).
+/// Parallel-TFFA sound isolation: records which match's action owns the temp
+/// entity the pristine body is about to construct (the
+/// `G_SoundTempEntity` handshake).
+pub const FN_G_SOUND: usize = 0x0016_e824;
+/// `gentity_t *G_SoundTempEntity(vec3_t, int, int)` (nm
+/// `G_SoundTempEntity__FPfiT2`, file offset `0x16e224`; prologue `55 8b ec
+/// 83 ec 38`, 6 detour-safe bytes). The sole creator of `G_Sound`'s temp
+/// entity — one call site at `0x16e84e`, inside `G_Sound` (objdump-verified
+/// over the shipped binary) — so it is where the handshake lands.
+pub const FN_G_SOUND_TEMP_ENTITY: usize = 0x0016_e224;
+/// `gentity_t *G_TempEntity(vec3_t, int)` (nm `G_TempEntity__FPfi`, file
+/// offset `0x16e0d4`; prologue `55 8b ec 83 ec 38`, 6 detour-safe bytes).
+/// The only other temp-entity creator (objdump: all 7 call sites are the
+/// `g_utils.c` event helpers); stamps world attribution so a reused slot
+/// never keeps a stale sound attribution.
+pub const FN_G_TEMP_ENTITY: usize = 0x0016_e0d4;
 
 /// Re-type a game-module function at `base + offset` as `$fn_ty`.
 ///

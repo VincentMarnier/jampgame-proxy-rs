@@ -940,6 +940,63 @@ pub unsafe extern "C" fn log_exit(string: *const c_char) {
     unsafe { original(string) };
 }
 
+// ---------------------------------------------------------------------------
+// G_Sound / G_SoundTempEntity / G_TempEntity — parallel-TFFA sound isolation
+// ---------------------------------------------------------------------------
+
+/// `void G_Sound(gentity_t *ent, int channel, int soundIndex)`: record which
+/// match's action owns the temp entity the pristine body is about to
+/// construct (the `G_SoundTempEntity` handshake — `G_SoundTempEntity` is the
+/// sole creator of that temp entity, objdump-verified).
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_Sound` argument list.
+pub unsafe extern "C" fn g_sound(ent: usize, channel: c_int, sound_index: c_int) {
+    let previous = crate::tffa::begin_sound_source(ent);
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_sound);
+    unsafe { original(ent, channel, sound_index) };
+    crate::tffa::end_sound_source(previous);
+}
+
+/// `gentity_t *G_SoundTempEntity(vec3_t origin, int event, int channel)`:
+/// stamp the created temp entity with the pending `G_Sound` attribution.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_SoundTempEntity`
+/// argument list.
+pub unsafe extern "C" fn g_sound_temp_entity(origin: usize, event: c_int, channel: c_int) -> usize {
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_sound_temp_entity);
+    let te = unsafe { original(origin, event, channel) };
+    if te != 0 {
+        crate::tffa::stamp_temp_source(te);
+    }
+    te
+}
+
+/// `gentity_t *G_TempEntity(vec3_t origin, int event)`: stamp the created
+/// temp entity — world attribution for the `G_SoundAtLoc`/`G_EntitySound`/
+/// `G_SoundOnEnt` helpers and the direct map-sound callers. Stamping every
+/// construction keeps a reused slot from inheriting a stale sound
+/// attribution.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_TempEntity` argument
+/// list.
+pub unsafe extern "C" fn g_temp_entity(origin: usize, event: c_int) -> usize {
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_temp_entity);
+    let te = unsafe { original(origin, event) };
+    if te != 0 {
+        crate::tffa::stamp_temp_source(te);
+    }
+    te
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
