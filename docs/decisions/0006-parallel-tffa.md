@@ -258,6 +258,40 @@ deliberately not filtered.
   cross-match player) were already hidden with the entity. Stamping is
   unconditional (not TFFA-gated) so the table is current whenever the filter
   activates.
+- **World-entity visibility fix (2026-10-18, live report: "people in TFFA
+  instances cannot see escalators/doors", fine in main):** the snapshot
+  filter's non-temp owner attribution read `s.owner` @280 and
+  `s.otherEntityNum*` @188/192 and treated a `0` in any of them as a
+  reference to client 0. Those three fields are *not* initialised: `G_InitGame`
+  memsets the whole `g_entities` array (`g_main.c:963`) and `G_InitGentity`
+  resets only `r.ownerNum` (`g_utils.c:694-700`), so every entity the game
+  never gives an owner (movers, items, NPCs) keeps the bare `0` default, was
+  attributed to client 0's match, and was dropped from every other instance.
+  Only `r.ownerNum` @660 has a real sentinel (`ENTITYNUM_NONE`, re-set on
+  every spawn). Runtime evidence (filter instrumented, viewer forced into
+  instance 1 while client 0 was a live main player, `mp/duel1` + 6 bots): the
+  only non-player entity dropped each frame was
+  `ent=48 eType=6 (ET_MOVER) client=0x0 r.ownerNum=1023 s.owner=0 oEN=0
+  oEN2=0` — no item/NPC/static to blame the omission on; main-instance
+  viewers kept it. Fix: the non-temp branch skips zero-valued `s.*` owner
+  fields (`r.ownerNum` keeps `0` meaningful), so client 0's
+  missiles/sabers/corpses/dropped items are still hidden from other
+  instances while map geometry stays visible everywhere. Cost accepted: an
+  entity the game genuinely gives `s.owner == 0` — client 0's `s.owner`-only
+  deployments (sentry/shield/e-web, none of which set `r.ownerNum`) — is no
+  longer hidden cross-instance.
+- **Residual (same root cause, temp branch, deliberately not changed):** the
+  temp-event fallback still reads both `s.otherEntityNum*` fields, so a temp
+  entity that sets neither is attributed to client 0 and dropped from every
+  other instance. Observed owner-less drops in the same run
+  (`s.owner=oEN=oEN2=0`, all `SVF_BROADCAST`): `EV_CLIENTJOIN` (1),
+  `EV_SET_FREE_SABER` (106), `EV_SET_FORCE_DISABLE` (107),
+  `EV_PLAYER_TELEPORT_IN` (64) — so those broadcasts currently reach main
+  only. A blanket "zero means unset" is *not* safe here: `EV_OBITUARY`
+  (victim `s.otherEntityNum`, killer `s.otherEntityNum2`), `EV_SABER_HIT` and
+  the `EF_PLAYER_EVENT` set legitimately carry `0` for client 0, so a
+  follow-up needs the event-specific classification the sound round used
+  (the `EF_PLAYER_EVENT` / saber special cases above are exactly that).
 - Known limitations (documented, not fixed here): force
   grip/push and force-heal target selection are not trace-based and may
   still cross matches; cross-match telefrag-induced kills still die
@@ -279,3 +313,14 @@ deliberately not filtered.
   `base+0x16e824` / `base+0x16e224` / `base+0x16e0d4`). Cross-match audio
   isolation itself still needs a live two-instance listen (bots never create
   split instances).
+  World-entity visibility round (2026-10-18): `cargo test` 69/69 (5 new
+  `snapshot_keep` fixtures over a fabricated `g_entities` buffer: a mover/item
+  with default owner fields stays visible in a foreign instance; all-zero
+  `s.*` owner fields are not client 0; `r.ownerNum` still follows its owner's
+  match; a non-zero `s.owner` still follows its owner's match; a player entity
+  still follows its own match. 4 of the 5 fail on the pre-fix predicate),
+  `clippy -D warnings` clean, `fmt --check` clean. Runtime confirmation: same
+  instrumented `mp/duel1` + 6-bot run as above re-executed after the fix shows
+  no `ET_MOVER` (nor any other non-player world entity) in the drop set; only
+  the player `eType=1` entities and the owner-less temp events listed under
+  *Residual* remain dropped.

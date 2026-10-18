@@ -902,15 +902,37 @@ fn snapshot_keep(
     }
     // Non-player, non-temp entity: attribute via owner fields. Any player
     // owner in a different match hides the entity; world-owned stays visible.
-    let owners = unsafe {
-        [
+    //
+    // `r.ownerNum` is set to `ENTITYNUM_NONE` on every spawn (`G_InitGentity`,
+    // `g_utils.c:694-700`), so a `0` there really is client 0. The
+    // `s.owner`/`s.otherEntityNum*` fields are not initialised that way:
+    // `G_InitGame` memsets the whole array (`g_main.c:963`) and nothing
+    // re-zeroes a spawned entity's `s`, so an entity the game never gave an
+    // owner keeps the bare `0` default. That `0` coincides with client 0, and
+    // treating it as a real owner hid every world-owned entity from each
+    // viewer whose match was not client 0's — movers (doors/escalators),
+    // items, NPCs. It is the same coincidence the temp-entity round fixed for
+    // `EF_PLAYER_EVENT`/saber effects (D-006), missed on this path: an
+    // observed drop was a mover with `r.ownerNum=NONE`, `s.owner=0`,
+    // `otherEntityNum=otherEntityNum2=0`. Skip `0` here; `r.ownerNum` still
+    // carries the real owner of missiles/sabers/corpses/dropped items.
+    let (r_owner, s_owner, oen, oen2) = unsafe {
+        (
             read_i32(ent + OFFSET_GENTITY_R_OWNER),
             read_i32(ent + OFFSET_GENTITY_S_OWNER),
             read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM),
             read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2),
-        ]
+        )
     };
-    owners_in_viewer_match(viewer_match, table, g_entities, &owners)
+    let mut owners = [r_owner, 0, 0, 0];
+    let mut count = 1usize;
+    for o in [s_owner, oen, oen2] {
+        if o != 0 {
+            owners[count] = o;
+            count += 1;
+        }
+    }
+    owners_in_viewer_match(viewer_match, table, g_entities, &owners[..count])
 }
 
 /// Hide `ent` when any live-player owner in `owned` is outside the viewer's
@@ -942,4 +964,148 @@ fn owners_in_viewer_match(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tffa::SOURCE_WORLD;
+
+    /// `entityType_t` values used by the fixtures (`bg_public.h:1189-1206`).
+    const ET_ITEM: i32 = 2;
+    const ET_MISSILE: i32 = 3;
+    const ET_MOVER: i32 = 6;
+
+    /// A fabricated `g_entities` array: `MAX_GENTITIES` zeroed gentity slots,
+    /// exactly the state `G_InitGame`'s `memset` leaves them in (`g_main.c:963`).
+    struct Game {
+        mem: Vec<u8>,
+    }
+
+    impl Game {
+        fn new() -> Self {
+            Self {
+                mem: vec![0u8; MAX_GENTITIES * SIZEOF_GENTITY],
+            }
+        }
+
+        fn base(&self) -> usize {
+            self.mem.as_ptr() as usize
+        }
+
+        fn put_i32(&mut self, ent: usize, off: usize, v: i32) {
+            let at = ent * SIZEOF_GENTITY + off;
+            self.mem[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        fn put_ptr(&mut self, ent: usize, off: usize, v: usize) {
+            let at = ent * SIZEOF_GENTITY + off;
+            self.mem[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        }
+
+        /// Mark a client slot as occupied: the game preassigns `client` for
+        /// every slot below `maxclients` (`g_main.c:974`), so the pointer (not
+        /// a connection) is what `owners_in_viewer_match` tests.
+        fn with_player(&mut self, ent: usize) {
+            self.put_ptr(ent, OFFSET_GENTITY_CLIENT, 0x1000_0000 + ent);
+        }
+
+        /// A non-player entity created by `G_Spawn`/`G_InitGentity`: the given
+        /// `eType`, `r.ownerNum = ENTITYNUM_NONE`, and the `s.owner` /
+        /// `s.otherEntityNum*` memset defaults (`0`) untouched — the state of
+        /// a map mover, item or NPC.
+        fn with_entity(&mut self, ent: usize, etype: i32) {
+            self.put_i32(ent, OFFSET_GENTITY_S_ETYPE, etype);
+            self.put_i32(ent, OFFSET_GENTITY_R_OWNER, ENTITYNUM_NONE);
+        }
+    }
+
+    /// A player in slot 0 (main) and a second instance holding the viewer.
+    fn main_player_and_viewer() -> (Game, [u8; MAX_CLIENTS]) {
+        let mut game = Game::new();
+        game.with_player(0);
+        let table = [0u8; MAX_CLIENTS];
+        (game, table)
+    }
+
+    fn sound_table() -> [u8; MAX_GENTITIES] {
+        [SOURCE_WORLD; MAX_GENTITIES]
+    }
+
+    /// Doors/escalators (and items, NPCs) keep the `s.*` memset defaults; a
+    /// viewer outside client 0's match must still see them (the reported bug:
+    /// "people in TFFA instances cannot see escalators/doors").
+    #[test]
+    fn world_owned_entity_is_kept_for_another_instance() {
+        for etype in [ET_MOVER, ET_ITEM] {
+            let (game, table) = main_player_and_viewer();
+            let mut game = game;
+            game.with_entity(48, etype);
+            assert!(
+                snapshot_keep(1, &table, &sound_table(), game.base(), 48),
+                "eType {etype} with default owner fields must stay visible"
+            );
+            // ... and stays visible for a same-instance viewer too.
+            assert!(snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+        }
+    }
+
+    /// A bare `0` in `s.owner`/`s.otherEntityNum*` is the memset default, not a
+    /// reference to client 0 (the regression this test pins).
+    #[test]
+    fn zero_s_owner_fields_are_not_client_zero() {
+        let mut game = Game::new();
+        game.with_player(0);
+        game.with_entity(48, ET_MOVER);
+        game.put_i32(48, OFFSET_GENTITY_S_OWNER, 0);
+        game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 0);
+        game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 0);
+        let table = [0u8; MAX_CLIENTS];
+        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
+    }
+
+    /// `r.ownerNum` has a real sentinel, so owner `0` there is client 0 and a
+    /// player-owned entity follows its owner's match.
+    #[test]
+    fn r_owner_num_follows_its_owner_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_entity(48, ET_MISSILE);
+        game.put_i32(48, OFFSET_GENTITY_R_OWNER, 0);
+        assert!(
+            !snapshot_keep(1, &table, &sound_table(), game.base(), 48),
+            "client 0's missile must be hidden from instance 1"
+        );
+        assert!(snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+        // Same entity owned by an instance-1 player instead.
+        game.with_player(5);
+        table[5] = 1;
+        game.put_i32(48, OFFSET_GENTITY_R_OWNER, 5);
+        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
+        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+    }
+
+    /// `s.owner` still attributes player-owned entities the game does set it
+    /// on (deployed sentries/shields/e-webs), as long as it is not the `0`
+    /// default.
+    #[test]
+    fn non_zero_s_owner_follows_its_owner_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        game.with_entity(48, ET_ITEM);
+        game.put_i32(48, OFFSET_GENTITY_S_OWNER, 5);
+        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
+    }
+
+    /// Player entities follow their own match (unchanged behaviour).
+    #[test]
+    fn player_entity_follows_its_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        assert!(!snapshot_keep(1, &table, &sound_table(), game.base(), 0));
+        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 5));
+        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 5));
+    }
 }
