@@ -74,6 +74,471 @@ viewer's per-match red/blue. `SendScoreboardMessageToAllClients` thus fans
 out correctly with no game detour. Chat (`say`/`say_team`/`tell`) is
 deliberately not filtered.
 
+### D-006.6 — Per-instance interactive world entities (doors, escalators, triggers)
+
+*Status: decisions accepted (user, 2026-10-18); clone pass, collision gate, touch
+gate, link gate, runtime-spawn gate and world-query/item gate landed, plus the
+runtime soak (see below).*
+
+The world itself is shared: a `func_door`/`func_plat`/`elevator` or a
+`trigger_multiple` is one gentity in `g_entities`, and both `G_UseTargets`
+(activates by `targetname` across the whole array, `g_utils.c`) and
+`G_TouchTriggers` (`g_active.c:516-572`, ungated) reach every instance. A door
+opened in match 1 therefore opens in all of them. This became visible once the
+world-visibility fix above put shared movers back in every instance's snapshot.
+
+**Coverage is all-or-nothing per instance.** An interactive entity that is *not*
+duplicated is a shared entity any instance can activate for all of them, so a
+partial clone set is a leaky instance. Coverage is never traded for instance
+count.
+
+**Interactive predicate (structural, decided):** duplicate when any of
+
+- `r.contents & CONTENTS_TRIGGER` (`0x400`, `surfaceflags.h:20`), or
+- `s.eType == ET_MOVER` (`6`, `bg_public.h:1189-1208`), or
+- any of `touch`/`use`/`think`/`reached`/`blocked` non-null, or
+- `targetname`/`target`/`team` non-null, or
+- in a team chain (`teamchain`/`teammaster` non-null).
+
+Everything else — spawn points without keys, `misc_model_static`, lights —
+stays shared and inert.
+
+**Capacity (decided):** clones are created with the instance (lazily), one set
+costing `interactive_count` entity slots; when the free ordinary range cannot
+take another full set, `tffa_create` is refused with a message. No silent
+reduction of the instance count, no partial set. (`free_world_slots` counts
+`[MAX_CLIENTS, ENTITYNUM_MAX_NORMAL)`, the slots `G_Spawn` can still open,
+`g_utils.c:800-846`.)
+
+**Mechanism:** a proxy-side tag table `entity_instance: [u8; MAX_GENTITIES]`
+(`ENTITY_SHARED` = no instance) plus per-instance copies of the interactive
+entities, created with the game's own `G_Spawn` and driven by the pristine
+`G_RunEntity`/`G_RunMover`; the snapshot filter, the trace flip
+(`trace_flips`), the touch gate (`G_TouchTriggers` + `touch_flips`) and the
+**acting scope** — the instance whose game code is running, opened around the
+calls that run it (`G_RunThink`, `G_UseTargets2`, `G_RunMissile`,
+`ClientThink_real`, the vmMain client command/disconnect paths) and resolved
+from the acting entity or, when it carries no instance, its owner — read by the
+`G_Find` link gate, the `G_Spawn` runtime-spawn gate and the
+`G_EntitiesInBox`/`G_EntityContact` world-query gates — then resolve everything
+against the tag, so no game code is reimplemented.
+
+**The collision gate (S5, landed).** `trace_flips` (already zeroing `r.contents`
+of cross-match players/owned entities for the duration of one synchronous trace)
+now also covers every tagged entity whose instance differs from the requester's:
+a player in instance N collides with instance N's own doors/plats/elevators and
+with nobody else's, and main's originals are foreign to every created instance.
+Only entities whose contents intersect the trace's own `contentmask` are flipped
+(the engine skips the rest anyway, `sv_world.cpp:637`), and the mask is the trap's
+seventh word — `trap_Trace`, `trap_G2Trace` and `trap_TraceCapsule` all pass
+`passEntityNum` then `contentmask` (`g_local.h:1698`), so `a5`/`a6` cover all
+three. Entities whose contents are zero (targets, `target_speaker`,
+`info_notnull`) need no flip and are skipped.
+
+The save list is a reusable `Vec` held in the state and taken out around the
+trap, not a fixed array: the number of entities one trace must ignore grows with
+the map and the instance count, and a cap that silently overflowed would leave a
+door solid in someone else's instance (the all-or-nothing rule forbids that).
+Taking it out also means a nested trace finds it empty instead of clobbering the
+outer list, and the capacity is kept, so steady play never allocates inside the
+engine frame. The `G_TRACE` arm tests the cvar before touching the buffer, so a
+server that has not turned the feature on pays one cvar read per trace and
+nothing else.
+
+A requester that resolves to no match flips nothing — the world stays solid for
+it, exactly as before this feature. "No match" now includes a *freed* requester
+slot, whose `memset` owner fields would otherwise read as client 0, and
+`ENTITYNUM_WORLD`/`ENTITYNUM_NONE` (1022/1023), which name no entity: `G_Spawn`
+never hands those slots out (`g_utils.c:837`).
+
+**The touch gate (S6, landed).** `G_TouchTriggers` gets an entry wrapper
+(`GAME_HOOKS` now 13, prologue `55 8b ec 81 ec 70 11 00 00`, steal 9): for the
+duration of the call it clears `CONTENTS_TRIGGER` on every trigger, door trigger
+and item of another instance and restores afterwards, so a player touches their
+own instance's triggers and nobody else's. This rides the pristine filter: the
+touch loop skips an entity without `r.contents & CONTENTS_TRIGGER`
+(`g_active.c:548`; in the shipped binary `0x119d46`/`0x119d4c` — `mov
+0x25c(%edi),%ecx` then `test $0x4,%ch`, `je` past the entity), so nothing is
+reimplemented and the requester's own instance is untouched. The requester is the
+calling entity's own match (`touch_requester`): only a live client slot qualifies,
+because pristine `G_TouchTriggers` returns immediately for anything else
+(`g_active.c:524-531`), and the entity is a player, so no `r.ownerNum` hop is
+needed. The same reusable save list as the trace gate is used, taken out of the
+state so a trace issued inside the window (an item dropping to the floor) gets an
+empty one.
+
+Unlike a trace, this window runs *game* code, so the restore is guarded: a slot is
+written back only while it is still `inuse` and still shows the `0` the gate wrote,
+which keeps a stale `contents` from being written over a value the game set
+meanwhile (`Use_Item` re-arming an item) and never resurrects a slot the game
+freed inside the window (`G_FreeEntity` memsets it). This is what makes it safe to
+run on every player think of every frame.
+
+**The link gate (S7, landed).** Duplication alone still leaves the `targetname`
+link: `G_UseTargets2` resolves a chain with `G_Find(NULL, FOFS(targetname),
+string)` and *walks every match* (`g_utils.c:566-601`), so a trigger in main
+opens main's door **and** every instance's copy of it. Rather than reimplementing
+that loop, the gate filters its search: `G_UseTargets2` gets an entry wrapper
+(prologue `55 8b ec 83 ec 20`, steal 6) that opens the **acting scope** — the
+firing entity's own instance — around the pristine call, and `G_Find` gets one
+(`prologue 55 8b ec 83 ec 18`, steal 6) that, while a scope is open and only for
+`fieldofs == FOFS(targetname)` (`0x31c`), skips matches tagged to another
+instance.
+
+Every step of the search is delegated to the pristine `G_Find` (`find_visible`
+re-calls it from the last hidden match, so its `level.num_entities` bound and
+`Q_stricmp` stay the game's own), and **nothing is written into game memory** —
+unlike the contents flips of S5/S6, this gate has no save list and no restore, so
+there is no stale-write hazard to guard. `G_UseTargets` needs no hook of its own:
+objdump shows it reads `ent->target` and calls `G_UseTargets2` at `0x170545`, so
+the one hook covers it and every direct chain caller (`target2`, `opentarget`,
+`closetarget`, `paintarget`, …). A chain scheduled for later (`multi_wait`
+delayed uses) resolves when it fires, with its own scope, so no timer path needs
+separate handling.
+
+The scope comes from the *acting* entity, read through the tag table
+(`acting_instance`): a live player slot resolves through `client_match` (as the
+touch gate does), a tagged world entity resolves to its own tag — main included,
+main being a match like any other — and an actor that carries no instance (a
+shared/untagged entity, a freed slot, `ENTITYNUM_WORLD`/`ENTITYNUM_NONE`, a
+pointer outside the array) **keeps the scope it was already in**. A nested chain
+therefore never widens halfway through a cascade, and a top-level call by an
+unattributable actor stays ungated, exactly as before this gate. Only
+`targetname` lookups are filtered: `classname` searches (`info_player_*`
+pickers, terrain, detpack) behave as before, and players and untagged entities
+stay reachable from every instance — the same rule the visibility, collision and
+touch gates use.
+
+The scope is opened by **two** hooks, not one: `G_UseTargets2` (a chain runs
+`target->use`) and `G_RunThink` (`g_main.c:3473`, the only dispatcher of
+`ent->think`, prologue `55 8b ec 83 ec 10`, steal 6).
+Widening it to think dispatch is what keeps *deferred* activation inside its
+instance: `target_scriptrunner_use` may defer `scriptrunner_run` to a think
+(`g_target.c:748-758`), ICARUS resolves entity names through
+`G_Find(targetname)` (`g_ICARUScb.c:1025,1155,1972,3058` and the fallbacks), train
+paths look up their next corner in `G_Find` (`g_mover.c:1826`) and
+`asteroid_field_think` looks up its `func_rotating` target (`g_trigger.c:1796`).
+`G_RunThink`'s `runicarus` tail runs inside the scope too, so ICARUS task-manager
+callbacks (a completed move, a scripted `affect`) resolve against the entity that
+owns the task. All of these were previously *unscoped* at think time, i.e. a
+script/task started by an instance's clone could look up and act on main's
+original.
+
+**Map scripts (decided with S8).** A `target_scriptrunner` is interactive (its
+`use` is `target_scriptrunner_use`, `g_target.c:734`), so it is tagged and
+duplicated like any other interactive entity, and its `use`/`think` runs in that
+copy's scope. The script itself runs on the *activator*
+(`trap_ICARUS_RunScript(self->activator, …)`, `g_target.c:821`), i.e. on the
+player or entity that fired the chain, so its per-entity state lives with the
+player and is already per-instance; its effects on other entities resolve by
+`targetname` through `G_Find` and are therefore scoped by the same acting scope.
+Nothing extra was needed beyond S7/S8. `mp/ffa_YavinPlaza` is the only
+instance-capable map in the shipped set with script runners (four
+`target_scriptrunner`s: `hugger`, `hugee`, `typing`, `commander_typing`);
+`t3home2` adds `NPC_spawner`s (the spawners are duplicable; the NPC they spawn is
+an actor, see below). Neither was run under a scripted differential: what a
+script *does* to a named entity is observable only by its effect, and the flag
+question — should one instance's script see the other instances' copies at all —
+is answered "no" by the scope. The remaining boundary is structural, not a
+decision: a script that holds *no* tagged entity (an untagged activator, a global
+task) has no instance to scope to and keeps its old reach.
+
+**The runtime-spawn gate (S8, landed).** The clone pass copies the map's
+interactive set, but the map's own code also *creates* interactive entities after
+`GAME_INIT`: `Think_SpawnNewDoorTrigger` (`g_mover.c:1158`) spawns the
+`trigger_door` that makes a touch-openable `func_door` work (a door with no
+`targetname`/`health`/locked flag, `g_mover.c:1442-1462`),
+`asteroid_field_think` (`g_trigger.c:1856`) spawns the asteroids it counts by
+`r.ownerNum`, `misc_faller_create` (`g_misc.c:2789`, a `use` handler) spawns a
+falling prop, and `ATST_ManageDamageBoxes` (`g_misc.c:2126`) spawns damage boxes.
+Such an entity was untagged, hence shared: on `mp/ctf2` (four `func_door`s
+forming one `team blue_door1` chain) main's doors create one `trigger_door` that
+any instance's player can touch, i.e. it opens main's door from instance N.
+
+The gate attributes the spawn instead of duplicating it. `G_Spawn` gets an entry
+wrapper (`0x16db44`, prologue `55 8b ec 83 ec 30`, steal 6, `GAME_HOOKS` 15 → 17)
+that, after the pristine allocation, records the returned slot **only while a
+world entity is running game code**; `G_RunThink` and `G_UseTargets2` open the
+acting scope around that code. When the outermost call closes, each recorded slot
+is classified: a live, interactive, non-event entity (the S2 predicate) gets the
+scope's tag, everything else — an inert prop, a temp event entity
+(`eType >= ET_EVENTS`: the event/sound machinery's, `freeAfterEvent`), a slot the
+game already freed or recycled — stays untagged and shared. A fresh `G_Spawn`
+result cannot be classified at spawn time (`G_InitGentity` has only just reset
+it; the caller sets the callbacks afterwards), hence the deferred flush at the
+end of the acting call, still inside the same frame. No state is written into
+game memory here either, and the pending list is a reusable `Vec` in the proxy
+state (no fixed cap to silently drop spawns).
+
+No cross-instance cloning is involved: every entity that runs code at runtime is
+interactive by the predicate (`think`/`use`/`touch`/`reached`/`blocked`,
+`CONTENTS_TRIGGER`, `ET_MOVER`, a name, a team), so each instance already has its
+own copy of the *spawner*, and that copy creates its own child. An instance's
+`trigger_door` is thus built by the instance's own door clone from the clone's
+own bounds, linked and parented (`parent` is an in-set link the clone pass
+re-points) to that instance's door. Two orderings both end with one trigger per
+instance: a match created *after* main spawned its trigger copies it with the
+rest of main's set (a door's `nextthink` has been consumed, so the instance's
+door clone does not build a second one), while a match created *before* the spawn
+still carries the armed `nextthink` and its door clone builds its own.
+
+Capacity: these children consume slots beyond the `GAME_INIT` measurement
+(`world_clone_cost`), they are released with their instance's set, and the
+create-time check measures the *live* main-tagged set at `tffa_create` time — so
+it stays exact for the instance being created, but cannot pre-reserve the
+children a match will spawn later.
+
+**Evidence (S8):** `G_RunThink` `0x8a1b4` (`nm -D`
+`G_RunThink__FP9gentity_s`, prologue `55 8b ec 83 ec 10`; the body reads
+`nextthink` at `0x4a4` and calls the pointer at `0x4a8`, both pinned offsets, and
+reaches `trap_ICARUS_MaintainTaskManager` after the think), `G_Spawn` `0x16db44`
+(prologue `55 8b ec 83 ec 30`; its free-slot scan starts at `0x20` =
+`MAX_CLIENTS`), `Think_SpawnNewDoorTrigger` `g_mover.c:1158` (`G_Spawn` at
+`:1193`, `r.contents = CONTENTS_TRIGGER`, `touch = Touch_DoorTrigger`, `parent =
+ent`), `asteroid_field_think` `g_trigger.c:1856`, `SpawnPlatTrigger`
+`g_mover.c:1517` (called from `SP_func_plat`, i.e. at map load, hence in the
+measured set), `misc_faller_create` `g_misc.c:2789`, `target_scriptrunner_use`
+`g_target.c:734-758`, `scriptrunner_run` `g_target.c:754`, `G_TempEntity`
+`g_utils.c:1054` (`G_Spawn` + `eType = ET_EVENTS + event`). Runtime matched pair
+(`mp/ctf2`, `g_gametype 6`, `proxy_tffa_enable 1`, 6 bots, 100 s, same build, one
+run with the attribution bypassed by a temporary env var, instance 1 forced
+through the pass at `GAME_INIT`, temporary census of the live interactive
+entities by tag): with the gate **off**, 0 attributed spawns and **2 shared
+`trigger_door`s for the whole run** (main's and instance 1's door clone's), each
+taggable from any instance; with the gate **on**, exactly 2 attributed spawns
+(1 main + 1 instance 1), **0 shared `trigger_door`s**, and the tagged interactive
+count rises by one per instance (73 → 74 main and instance 1). The control also
+shows what stays shared by design: missiles and dropped items (`shared` 3 → 10
+over the run) keep their owner-based handling. `mp/ctf1` is inert here — all
+eight `func_door`s are named (`Think_MatchTeam`), so a 70 s bot run attributes
+nothing and the S5/S6/S7 numbers stand unchanged.
+
+**Evidence:** game addresses (`nm -D`, all inside `.text` `0x85564..0x1a66c4`)
+`G_Spawn` `0x16db44`, `G_InitGentity` `0x16d984`, `G_FreeEntity` `0x16de44`,
+`G_RunThink` `0x8a1b4` (`G_RunThink__FP9gentity_s`; `nextthink` read at `0x4a4`,
+the `think` pointer called at `0x4a8`, `trap_ICARUS_MaintainTaskManager` after it),
+`G_RunMissile` `0x14d274` (`G_RunMissile__FP9gentity_s`; prologue
+`55 8b ec 81 ec d8 00 00 00`),
+`G_Find` `0x16cec4`, `G_UseTargets` `0x170524`, `G_UseTargets2` `0x16d604`,
+`G_TouchTriggers`
+`0x119bf4` (`0x400` contents test at `0x119d4c`: `mov 0x25c(%edi),%ecx` +
+`test $0x4,%ch`, i.e. `r.contents & CONTENTS_TRIGGER` after the slot's `imul
+$0x5ec`, the pinned `sizeof(gentity_t)`; the `$0x400` at `0x119c95` is
+`MAX_GENTITIES`, the `trap_EntitiesInBox` maxcount argument, not a mask), `G_MoverTeam`
+`0x14e6f4`, `G_RunMover` `0x14e974`, `G_SpawnEntitiesFromString` `0x15d094`.
+`G_UseTargets2` resolves through `G_Find` with `fieldofs` `0x31c` at `0x16d68e`
+(first match) and `0x16d6de` (resume from the last match), and `G_UseTargets`
+reads `0x448(%edx)` (`ent->target`) before calling `G_UseTargets2` at
+`0x170545` — the pin that makes one hook cover both.
+`gentity_t`/`entityState_t` offsets from the i386 layout oracle (`sizeof 1516`,
+`r 560`, `client 864` anchors): `inuse 880`, `freetime 972`, `classname 800`,
+`targetname 796`, `spawnflags 888`, `flags 960`, `neverFree 956`, `clipmask
+996`, `parent 1036`, `nextTrain 1040`, `prevTrain 1044`, `pos1 1048`, `pos2
+1060`, `target 1096`, `target2 1100`, `team 1120`, `nextthink 1188`, `think
+1192`, `reached 1196`, `blocked 1200`, `touch 1204`, `use 1208`, `die 1216`,
+`takedamage 1236`, `count 1360`, `chain 1372`, `teamchain 1388`, `teammaster
+1392`, `wait 1408`, `delay 1416`, `genericValue1 1420`, `moverState 1012`;
+`s.number 0`, `s.pos 16`, `s.apos 52`, `s.time 88`, `s.time2 92`,
+`s.modelindex 224`, `s.modelindex2 228`, `s.solid 268`. Runtime
+(`mp/ctf1`, `g_gametype 6`, `proxy_tffa_enable 1`, `sv_maxclients 8`): 115
+interactive entities and 822 free slots, i.e. room for 7 further instances —
+the live count is below the BSP-lump estimate (168) because lights/point ents
+are freed at spawn.
+
+**The world-query and item gate (S9, landed).** Duplicating entities scopes
+*what exists*; two things still crossed instances: the interactive entities the
+game creates for a player (the weapon a dying player drops, which carries no
+owner), and the questions game code asks *about* the world —
+`G_EntitiesInBox`/`G_EntityContact` return entity slots, not tags, so
+`G_RadiusDamage`'s blast list, `G_MoverTouchPushTriggers`' synthetic touches and
+force powers' radius lists reached every instance's copies.
+
+A dropped item is interactive (`r.contents = CONTENTS_TRIGGER`, `touch =
+Touch_Item`, `g_items.c:2653-2680`) but carries no `r.ownerNum` — `G_InitGentity`
+leaves it at `ENTITYNUM_NONE` (`g_utils.c:833-840`) and `LaunchItem` does not set
+one — so the owned-entity machinery never isolated it: it stayed shared, visible
+and pickable from every instance. S9 gives it the *dropper's* instance instead.
+The three paths that create items run in that player's scope:
+`player_die` → `TossClientItems` (`g_combat.c:2644`, drops the held weapon),
+`ClientDisconnect` → `TossClientItems` (`g_client.c:3876`, drops what the
+leaver carried) and force push → `ForceThrow` → `TossClientWeapon`
+(`w_force.c:3609`, inside the pushed player's think). `G_Spawn` records the
+slots and the S8 flush tags what is interactive and unowned; `tag_pending` now
+also **skips** anything whose owner resolves to a live player, because the
+client-think scope would otherwise enrol every missile and saber entity in the
+tag table — the owned-entity machinery already scopes those, and a tag would
+additionally copy live projectiles into a later match's world.
+
+The acting scope itself grew to cover the code that matters (the same
+"instance whose game code runs" rule, no new concept):
+
+- `ClientThink_real` (a player's think: force powers, weapon radius damage,
+  `G_TouchTriggers`/`G_TouchEnts`), `GAME_CLIENT_COMMAND` (the game's own
+  `ClientCommand`, so a player's `+use` on a named target is looked up in their
+  instance — `g_cmds.c:3251`) and `GAME_CLIENT_DISCONNECT`. The vmMain paths
+  open it through `open_client_scope`, which reads the proxy's own match table
+  because the game may clear `ent->client` inside those calls;
+- `acting_instance` resolves an untagged *live* entity through
+  `request_match` (one `r.ownerNum` hop to a live player) — so a missile's,
+  physics object's or body's code runs in its owner's instance, exactly the
+  resolution the trace gate already used for it;
+- a new `G_RunMissile` hook (`GAME_HOOKS` 17 → 18) so a missile's trajectory,
+  impact (`G_MissileImpact` → `G_RadiusDamage`) and think run in the firing
+  entity's scope.
+
+The two world-query traps then filter their results by that scope, reusing the
+exact `G_Find` hide rule (`link_hides_tag`): a foreign-tagged entity is dropped
+from a box list (compacted in place — the engine still performs the whole box
+test) and answers `false` to a contact test, which needs no engine call at all.
+A query made with no scope open is pristine, exactly as before this gate, so the
+verified touch/trace behaviour of S5–S7 (which runs in client paths) is
+unchanged.
+
+**Evidence (S9):** `G_RunMissile` `0x14d274` (`nm -D`
+`G_RunMissile__FP9gentity_s`; prologue `55 8b ec 81 ec d8 00 00 00`, 9
+detour-safe bytes; `G_RunFrame` routes every `ET_MISSILE` here, `g_main.c:3773`),
+trap ordinals enum-counted in `g_public.h` and pinned between verified anchors:
+`G_ENTITIES_IN_BOX` 36 and `G_ENTITY_CONTACT` 37 (between `G_UNLINKENTITY` 35
+and `G_GET_USERCMD` 40), `G_ENTITY_CONTACTCAPSULE` 50 (right after
+`G_TRACECAPSULE` 49). Source: `LaunchItem` `g_items.c:2653`, `Drop_Item`
+`:2742`, `TossClientItems` `g_combat.c:567` (called from `player_die` `:2644`
+and `ClientDisconnect` `g_client.c:3876`), `TossClientWeapon` `g_combat.c:468`
+(from `ForceThrow` `w_force.c:3609`), `G_InitGentity` `g_utils.c:833`, the
+box users `G_RadiusDamage` `g_combat.c:5565`, `G_RadiusList` `g_utils.c:251`,
+`G_MoverTouchPushTriggers` `g_active.c:601`, `G_KillBox` `g_utils.c:1162`
+(damages clients only, which the damage gate already covers),
+`SpotWouldTelefrag` `g_client.c:529`. Unit tests: `acting_instance` follows an
+untagged entity's owner (and not a freed, absent or out-of-range one), the box
+list keeps own/shared/player/non-slot entries and drops only foreign tags.
+Runtime matched pair (`mp/ctf1`, `g_gametype 6`, `proxy_tffa_enable 1`,
+`bot_enable 1` + `bot_minplayers 8`–`10`, 180 s, instance 1 forced at `GAME_INIT`,
+`g_weaponDisable 8` so bot deaths drop the held weapon, one run with the whole
+S9 gate set bypassed by a temporary env var, census of `ET_ITEM` entities with
+`s.modelindex2 != 0` — what `LaunchItem` marks a dropped item with): bypassed,
+**one dropped item stayed shared for the whole run** (`shared=1`, slot 328,
+tag 255) — the leak, pickable from any instance; gated, **three dropped items
+were tagged with their dropper's match** (`etype=2`, instance 0) and none stayed
+shared, while the flush's "1 of 4" lines show the owned missiles it deliberately
+left alone. The box gate ran 18 996 scoped queries in the same run and dropped
+3 291 foreign-tagged entries from their lists; the bypass run confirms the
+counter only moves inside the gate. `G_EntityContact` was never reached with a
+scope and a foreign target on `mp/ctf1` (`G_MoverTouchPushTriggers` needs an
+`ET_PUSH_TRIGGER`, and no shipped instance-capable map has one), so that arm is
+inert here and rests on the source reading plus the shared rule it reuses.
+
+**S10 soak (landed).** 300 s on `mp/ctf1` with **two instance worlds live**
+(115 clones each) and one bot placed in each, 10 bots in total: both duplicates
+complete, all seven world-entity hooks attached (`G_FreeEntity`, `G_TouchTriggers`,
+`G_UseTargets2`, `G_Find`, `G_Spawn`, `G_RunThink`, `G_RunMissile`), 8 kills and
+22 item pickups in the log, one runtime-spawn attribution, **no errors and the
+server still running at the end**. The public README documents the
+per-match-world behaviour under `proxy_tffa_enable`.
+
+**The clone pass (landed).** `tffa::realize_instance(instance)` runs before a
+new match is handed to a player: it walks the entities tagged as main's, takes
+one `G_Spawn` clone each, copies the *live* source structure byte for byte,
+restores the clone's own `s.number` (the engine routes snapshots by it),
+re-points in-set links (`parent`/`nextTrain`/`prevTrain`/`target_ent`/`enemy`/
+`lastEnemy`/`activator`/`teamchain`/`teammaster`) at the corresponding clone so a
+duplicated team/train chain stays inside its instance, and links every clone
+through `G_LINKENTITY` (ordinal 34). Pointers out of the set (players, inert
+props) are left alone — those stay shared by design.
+
+`G_FreeEntity` is detoured so a clone that leaves the world (a `killtarget`, an
+entity whose own think frees it) loses its tag with its slot: `G_Spawn` hands
+freed slots to later entities, temp entities included, and a recycled slot
+keeping a stale tag would hide its new occupant from every other instance. A
+`neverFree` entity is unlinked but stays in use (`g_utils.c:945`), so its tag
+stays with it.
+
+An instance's set is released when its match closes (fraglimit, or a match
+promoted to main), drained at the next `GAME_RUN_FRAME` start, between frames:
+a later match in the same slot starts from a fresh world and the capacity
+returns. Clone creation is idempotent, so a slot that never released reuses the
+world it left.
+
+**Entity budget and eligibility.** `free_world_slots` counts the slots `G_Spawn`
+can still open (`[MAX_CLIENTS, ENTITYNUM_MAX_NORMAL)`, `g_utils.c:800-846`), and
+the pass runs synchronously (no temp entity appears mid-pass), so a whole set
+fits exactly when the count says so. A map holding an interactive entity with a
+shared `ghoul2` model or a dynamically allocated `client` (an NPC/actor:
+`is_duplicable_entity`) takes no instance at all: a naive copy would animate as
+one body and `G_FreeEntity` would clean the model out from under the other
+(`g_utils.c:945-1013`). All-or-nothing again — no instance, rather than an
+inconsistent one.
+
+**Landed so far:** the tag table and its snapshot gate, the predicate, the
+`GAME_INIT`/lazy capacity scan, the clone pass, the create-time refusal, the
+`G_FreeEntity` lifetime detour, the per-trace collision gate, the per-call touch
+gate, the per-call link gate, the runtime-spawn gate, the world-query/item gate,
+and the tests below. Runtime (`mp/ctf1`,
+`g_gametype 6`,
+`proxy_tffa_enable 1`, forced through the pass at `GAME_INIT` because only a real
+client can issue `tffa_create`): 7
+sets of 115 clones (instance 8 refused with "no entity capacity left"), clones
+`inuse`/linked with their own `s.number` and classname, and — the load-bearing
+observation — the GT_TEAM flags (`team_CTF_blueflag`/`redflag`, interactive and
+self-freeing off CTF) freed themselves in all seven instances at the same point,
+each copy running its own think. The collision gate ran under real movement
+(`bot_enable 1` + `bot_minplayers 4`): 4k–13k trace traps per 200-frame window,
+~10 flips per trace (instance 1's solid movers), and the count of instance-1
+clones with non-zero `r.contents` flat at 96–97 for the whole run, i.e. every one
+of ~500k flips restored exactly. The touch gate ran in a matched pair (6 bots,
+180 s, same build, one run with the gate bypassed by a temporary env var): 17172
+touch windows each, 1.49M flips gated, and **no instance-1 item clone was ever
+picked up by a main player with the gate on (0 of 4 main pickups), against 5 of 5
+with it off** — the independent `G_LogPrintf("Item: %i %s")` stream shows exactly
+those 5 extra pickups.
+
+The link gate ran on the same map as a matched pair (6 bots, 150 s, same build,
+instance 1 forced at `GAME_INIT`, one run bypassed by a temporary env var). The
+observable is ctf1's `trigger_multiple` → named `func_door`/`func_plat` chain
+(`blueriser`, `t175`, `t87`, `t89`, `bluelift2`, …), read as each mover's
+`s.pos.trBase[2]` with a sticky "moved" flag per slot: with the gate on, 115
+`G_UseTargets2` calls (107 of them scoped to a definite instance) hid 29 matches
+and — the load-bearing observation — **main's movers moved (5 of 10) while
+instance 1's stayed at rest (0 of 10)**, with the hidden matches naming the
+chains (`window=0 slot=211 target=t175`, `window=0 slot=299 target=t87`,
+`window=0 slot=300 target=t89`, `window=0 slot=296 target=bluelift2`: main's
+trigger reaching for instance 1's clones). With the gate bypassed, the same
+build hid 0 matches and **every main mover that moved moved its instance-1 clone
+too (3 of 10 moved in both instances)** — the leak the gate closes. The
+symmetric direction was checked by forcing one bot into instance 1 (temporary
+env var): instance 1's own chain moved an instance-1 mover, and its windows hid
+`slot=51 target=t175` — **main's original** door — so neither instance can reach
+the other's copies.
+
+An earlier reading of the same map is worth correcting: the 64 map items arming
+themselves in every instance is *not* a chain leak. `G_SpawnItem` defers
+(`nextthink = level.time + FRAMETIME * 2`, `think = FinishSpawningItem`,
+`g_items.c:2953-2955`), the clone copies that pending think, and each instance's
+copy finishes spawning itself; `FinishSpawningItem` then leaves a *targetname*d
+item inert (`contents = 0`) and an untargeted one armed (`g_items.c:2944-2948`).
+The link gate concerns the `Use_Item` chains that re-arm items by name, not that
+initial, per-copy state.
+
+The runtime-spawn gate ran as a matched pair on `mp/ctf2` (6 bots, 100 s, same
+build, instance 1 forced at `GAME_INIT`, one run bypassed by a temporary env
+var). `mp/ctf2` has one touch-openable door *team* (`team blue_door1`), so main's
+doom — i.e. the map's own code — creates exactly one `trigger_door` at runtime;
+the forced instance's door clone creates its own. Bypassed: 0 attributed spawns
+and **2 shared `trigger_door`s that stay shared for the whole run** (a main
+player's touch acts on main's door from any instance). Gate on: **2 attributed
+spawns (1 main, 1 instance 1) and 0 shared door triggers**, the instance-tagged
+interactive count rising by one on each side (73 → 74), and with the instance
+release path unchanged. `mp/ctf1` attributes nothing (all eight doors are named,
+so no runtime trigger exists), which is why the S5/S6/S7 numbers above are
+unchanged by S8.
+
+The item and world-query gates ran as a matched pair on `mp/ctf1` (8–10 bots,
+180 s, instance 1 forced, `g_weaponDisable 8` so a dying bot drops the weapon it
+holds; the run is otherwise the same in both halves, one with the S9 gates
+bypassed by a temporary env var). Bypassed: the dropped item stayed **shared**
+for the whole run, i.e. pickable from any match. Gated: dropped items carried
+their dropper's match, and 18 996 scoped box queries dropped 3 291
+foreign-tagged entries. The soak (300 s, two instance worlds live with a bot in
+each, 10 bots) ended with the server running and no errors.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
@@ -324,3 +789,178 @@ deliberately not filtered.
   no `ET_MOVER` (nor any other non-player world entity) in the drop set; only
   the player `eType=1` entities and the owner-less temp events listed under
   *Residual* remain dropped.
+- **Per-instance world entities, clone pass (2026-10-18, D-006.6):** the
+  interactive map set is now actually duplicated per instance, and one more
+  game detour was added: `G_FreeEntity` (`0x16de44`, steal 6) returns a freed
+  slot's tag to `ENTITY_SHARED` so `G_Spawn`'s reuse (temp entities included)
+  cannot inherit a stale instance. `GAME_HOOKS` 11→12. New
+  `state::TffaState` fields `world_release`/`world_cloned`/`world_clone_blocked`/
+  `world_scanned`; `tffa::realize_instance` (clone pass, in-set link remapping,
+  `G_LINKENTITY` 34), `tffa::release_instance`/`drain_world_releases` (frame
+  start), `tffa::note_entity_freed`, `tffa::interactive_sources`,
+  `tffa::is_duplicable_entity`, and `cmd_create`'s refusal path.
+  `jampgame::g_spawn`/`g_free_entity` are the two new game-function bindings
+  (`FN_G_SPAWN` `0x16db44`, `FN_G_FREE_ENTITY` `0x16de44`).
+  Verification: `cargo test` 76/76 (2 new: interactive-source scan bounds incl.
+  freed/player slots; NPC-eligibility predicate), `clippy -D warnings` clean,
+  `fmt --check` clean, steal fixture pinned for `G_FreeEntity` (6: the
+  whole-instruction decoder stops once it has 5 bytes, at `push`/`mov`/`sub`).
+  Runtime (`mp/ctf1`, `g_gametype 6`, `proxy_tffa_enable 1`, `sv_maxclients 8`,
+  pass forced at `GAME_INIT` by a temporary instrumentation, since only a real
+  client can issue `tffa_create`): 7 instances × 115 clones realised
+  (`level.num_entities` 206→1005, free slots 822→17), instance 8 refused for
+  capacity with no partial set, every clone `inuse`+linked with its own
+  `s.number` and classname, the GT_TEAM flags self-freeing identically in all
+  7 instances (clones running their own thinks), the `G_FreeEntity` detour
+  observed clearing tags (115→113 per instance), no `G_Spawn: no free
+  entities`, no crash, protocol-26 queries still answered. The temporary
+  instrumentation was removed before the final build (the staged `.so` BuildID
+  came back identical to the pre-instrumentation build).
+- **Per-instance world entities, collision gate (2026-10-18, D-006.6 S5):**
+  `tffa::trace_flips` now also flips every tagged entity of a foreign instance,
+  filtered by the trace's `contentmask` (the trap's `a6`; the `G_TRACE` arm no
+  longer passes only `a5`), so a player collides with their own instance's
+  doors/plats/elevators and nobody else's. The save list is a new
+  `state::TffaState::flip_buf: Vec<(usize, i32)>` taken out of the state
+  around the trap — unbounded (a fixed 64-entry stack array could silently leave
+  a door solid on a big map) and allocation-free once grown. `request_match` now
+  refuses a requester outside `[0, ENTITYNUM_MAX_NORMAL)` and a freed one, whose
+  `memset` owner fields previously resolved to client 0's match. New pin
+  `sdk::CONTENTS_SOLID` (`0x1`, `surfaceflags.h:10`).
+  Verification: `cargo test` 78/78 (2 new: foreign-instance flip selection incl.
+  the contentmask filter and the requester-own/shared exemptions; no-match
+  requesters flip nothing while a live owned entity still resolves through
+  `r.ownerNum`), `clippy -D warnings` clean, `fmt --check` clean. Runtime
+  (`mp/ctf1`, `proxy_tffa_enable 1`, `bot_enable 1` + `bot_minplayers 4`,
+  instance 1 forced at `GAME_INIT` by temporary instrumentation): 4k–13k trace
+  traps per 200-frame window with ~10 flips each, the instance-1 clone
+  non-zero-`contents` count flat at 96–97 for the whole run (every flip restored
+  exactly), no errors, and 0 flips for the no-bot run's 128 world/item traces
+  (the intended conservative default).
+- **Per-instance world entities, touch gate (2026-10-18, D-006.6 S6):** new game
+  hook `G_TouchTriggers` (`GAME_HOOKS` 12→13, `FN_G_TOUCH_TRIGGERS` 0x119bf4,
+  prologue `55 8b ec 81 ec 70 11 00 00`, steal 9, fixture pinned in `GAME_SITES`).
+  `tffa::touch_flips` reuses the trace gate's selection with the trigger mask
+  (`collect_flips`, split out of `flip_list`) and `touch_requester` resolves the
+  requester from the calling entity's own match — only a live client slot has one,
+  because the pristine body returns immediately otherwise (`g_active.c:524-531`).
+  `flip_apply`/`flip_restore` are now shared by both gates; the restore is guarded
+  (still `inuse`, still showing the `0` the gate wrote), which a window running
+  game code needs and a trace window satisfies trivially. Evidence that the
+  pristine loop honours the flip: the shipped binary's touch loop at `0x119d46`
+  reads `r.contents` (`mov 0x25c(%edi),%ecx`) and skips on `test $0x4,%ch` — the
+  `CONTENTS_TRIGGER` bit our gate clears (the `$0x400` at `0x119c95` is
+  `MAX_GENTITIES`, `trap_EntitiesInBox`'s maxcount, not a mask; the slot stride
+  `imul $0x5ec` re-confirms `sizeof(gentity_t)`).
+  Verification: `cargo test` 80/80 (2 new: requester resolution for live client
+  slots only; `flip_apply`/`flip_restore` exactness plus the no-resurrect guard),
+  `clippy -D warnings` clean, `fmt --check` clean, attach log
+  `attached G_TouchTriggers @ <base>+0x119bf4 (steal 9)`. Runtime, matched pair
+  (`mp/ctf1`, `proxy_tffa_enable 1`, `bot_enable 1` + `bot_minplayers 6`, 180 s,
+  instance 1 forced at `GAME_INIT` by temporary instrumentation, gate bypassed in
+  the control run by a temporary env var, both removed before the final build):
+  17172 touch windows and 1.49M flips in the gated run for the same 17172 windows
+  in the control; **main players picked up 0 of the 64 instance-1 item clones with
+  the gate on (4 main pickups) and 5 with it off (5 main pickups)** — and the
+  independent `G_LogPrintf("Item: %i %s")` stream logged exactly those 5 extra
+  pickups (11 vs 6 lines), while the diag caught a main item and its clone
+  disarmed together only in the control. No errors, no leak, and the standard
+  smoke (`rust/scripts/engine-test.sh`, `mp/duel1`, feature off) still passes.
+- **Per-instance world entities, acting scope (2026-10-19, D-006.6 S7 + S8):**
+  three game hooks make the world per-instance. `G_UseTargets2`
+  (`FN_G_USE_TARGETS2` 0x16d604, prologue `55 8b ec 83 ec 20`, steal 6) and
+  `G_RunThink` (`FN_G_RUN_THINK` 0x8a1b4, prologue `55 8b ec 83 ec 10`, steal 6)
+  open the *acting scope* — the acting entity's own instance — around the
+  pristine call; `G_Find` (`FN_G_FIND` 0x16cec4, prologue `55 8b ec 83 ec 18`,
+  steal 6) filters its results while one is open; `G_Spawn` (`FN_G_SPAWN`
+  0x16db44, prologue `55 8b ec 83 ec 30`, steal 6) records the slots it hands out
+  so they can be classified when the call returns (`GAME_HOOKS` 13 → 17, all
+  fixtures pinned in `GAME_SITES`). `G_UseTargets` is deliberately not hooked:
+  objdump shows it reads `0x448(%edx)` (`ent->target`) and calls `G_UseTargets2`
+  at `0x170545`, and `G_UseTargets2` resolves with `G_Find(…, 0x31c
+  /*FOFS(targetname)*/, …)` at `0x16d68e` and `0x16d6de`, so one scope covers
+  every chain caller. `tffa::acting_instance` resolves the acting entity's
+  instance (live player slot → `client_match`, tagged world entity → its tag, main
+  included; no tag → keep the enclosing scope),
+  `tffa::link_hides`/`find_visible` skip foreign tagged matches while delegating
+  every search step to the pristine `G_Find` (its `level.num_entities` bound and
+  `Q_stricmp` intact), and `state::TffaState` carries `acting_scope`
+  (`SCOPE_NONE`, reset by `scan_world_entities`). Neither gate writes into game
+  memory — no save list, no restore, so the stale-write hazard class the contents
+  flips have to guard does not exist here. Verification (S7): `cargo test`
+  includes the requester resolution, the hide rule and the windowed search;
+  `clippy -D warnings` and `fmt` clean; attach log `attached G_Find @
+  <base>+0x16cec4 (steal 6)` + `attached G_UseTargets2 @ <base>+0x16d604 (steal
+  6)`. Runtime, matched pair (`mp/ctf1`, `proxy_tffa_enable 1`, `bot_enable 1` +
+  `bot_minplayers 6`, 150 s, instance 1 forced at `GAME_INIT`, gate bypassed in
+  the control by a temporary env var, all instrumentation removed before the
+  final build): the observable is the map's `trigger_multiple` → named
+  `func_door`/`func_plat` chain, read as `s.pos.trBase[2]` with a sticky moved
+  flag. Gated: 115 calls / 107 scoped / 29 matches hidden, **main's movers moved
+  (5 of 10), instance 1's never did (0 of 10)**, hidden events naming the chains
+  (`window=0 slot=211 target=t175`, `299 target=t87`, `300 target=t89`, `296
+  target=bluelift2`). Bypassed: same build, 0 hidden, **3 of 10 movers moved in
+  each instance** — main's trigger moving instance 1's clones, the leak itself.
+  Positive control (one bot forced into instance 1): instance 1's chain moved an
+  instance-1 mover and its window hid `slot=51 target=t175`, main's original —
+  both directions verified. The standard smoke (`rust/scripts/engine-test.sh`,
+  `mp/duel1`) and a final ctf1 TFFA run with the instrumentation removed both pass
+  with no errors.
+- **Runtime-spawned interactive children (2026-10-19, D-006.6 S8):** while a
+  scope is open, `tffa::note_spawned` records each `G_Spawn` slot with that
+  instance (ordinary range only, `MAX_CLIENTS..ENTITYNUM_MAX_NORMAL`), and
+  `tffa::close_acting_scope` flushes them at the outermost close: `tag_pending`
+  tags the live, interactive, non-event entities (the S2 predicate; `eType >=
+  ET_EVENTS` excluded — those are the event/sound machinery's) and leaves inert
+  props, temp entities and already-freed/recycled slots shared. The pending list
+  is a reusable `Vec` (`TffaState::spawn_pending`), so no fixed cap silently drops
+  spawns; it is cleared by `scan_world_entities` and flushed defensively at
+  `on_frame_start`. Nothing is cloned across instances: every runtime spawner runs
+  code, so it is interactive, so each instance already owns a copy of the spawner
+  and that copy creates its own child (a `trigger_door` built from the door
+  clone's own bounds, its `parent` re-pointed by the clone pass). The scope is
+  opened by `G_RunThink` as well as `G_UseTargets2`, which is also what keeps
+  *deferred* activation inside its instance (`target_scriptrunner_use` deferring
+  `scriptrunner_run` to a think, ICARUS name lookups through `G_Find`, train
+  corners, `asteroid_field_think`'s target) — see the S8 section above for the
+  scope's extension and the map-script decision.
+  Verification: `cargo test` 85/85 (2 new: `spawn_record` range/scope rules,
+  `tag_pending` classification), `clippy -D warnings` clean, `fmt` clean, attach
+  log `attached G_Spawn @ <base>+0x16db44 (steal 6)` + `attached G_RunThink @
+  <base>+0x8a1b4 (steal 6)`. Runtime matched pair (`mp/ctf2`, `proxy_tffa_enable
+  1`, `bot_enable 1` + `bot_minplayers 6`, 100 s, instance 1 forced at
+  `GAME_INIT`, attribution bypassed in the control by a temporary env var, census
+  instrumentation removed before the final build): the observable is the one
+  runtime `trigger_door` created by the map's touch-openable door team
+  (`blue_door1`). Bypassed: 0 attributed, **2 shared `trigger_door`s for the whole
+  run**; gated: **2 attributed (1 main + 1 instance 1), 0 shared**, tagged
+  interactive count 73 → 74 per instance. The detoured `G_Spawn` leaves the clone
+  pass alone: a forced instance still duplicated its whole set (75/75 on `ctf2`,
+  115/115 on `ctf1`). `mp/ctf1` attributes nothing (all its
+  doors are named → `Think_MatchTeam`), so the S5/S6/S7 numbers are unaffected;
+  the standard smoke (`rust/scripts/engine-test.sh`, `mp/duel1`), a final ctf2 run
+  and a final ctf1 TFFA run all pass with no errors.
+- **World queries and dropped items (2026-10-19, D-006.6 S9 + S10):** one more
+  game hook, `G_RunMissile` (`FN_G_RUN_MISSILE` 0x14d274, prologue
+  `55 8b ec 81 ec d8 00 00 00`, steal 9, `GAME_HOOKS` 17 → 18), so a missile's
+  impact runs in the firing entity's scope; two new trap arms
+  (`G_EntitiesInBox` 36, `G_EntityContact` 37 and its capsule variant 50,
+  enum-counted between the pinned `G_UNLINKENTITY` 35 / `G_GET_USERCMD` 40 and
+  after `G_TRACECAPSULE` 49) that filter their results with the same
+  `link_hides_tag` rule the `G_Find` link gate uses (`tffa::filter_box_list` /
+  `retain_visible_slots`, pure and unit-tested; the engine still performs the
+  whole query); `tffa::acting_instance` now follows an untagged live entity's
+  owner (`r.ownerNum` → player); the scope is opened in `ClientThink_real`,
+  `GAME_CLIENT_COMMAND` and `GAME_CLIENT_DISCONNECT` (through
+  `tffa::open_client_scope`, which reads the proxy's own match table because
+  those calls may clear `ent->client`) and in `player_die` for the items a dying
+  player drops; `tag_pending` leaves anything with a live-player owner to the
+  owned-entity machinery instead of tagging live projectiles. Nothing is written
+  into game memory — the trap gates only compact the game's own result array.
+  Verification: `cargo test` 87/87 (2 new: the owner fallback, the box-list
+  retention rule), `clippy -D warnings` and `fmt` clean, attach log
+  `attached G_RunMissile @ <base>+0x14d274 (steal 9)`; runtime matched pair on
+  `mp/ctf1` (a dropped item stays *shared* with the gate bypassed and carries its
+  dropper's match with it on; 18 996 scoped box queries dropping 3 291
+  foreign-tagged entries) and a 300 s soak with two instance worlds live (no
+  errors, server still running).

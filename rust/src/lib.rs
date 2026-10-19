@@ -147,7 +147,19 @@ pub unsafe extern "C" fn vmMain(
                 shared_api::client_disconnect(a0);
                 tffa::on_client_disconnect(a0);
             }
-            forward(command, &args)
+            // A disconnecting client drops what they carry
+            // (`ClientDisconnect` → `TossClientItems`, `g_client.c:3876`): the
+            // dropped items belong to the match the player was in (S9).
+            let scope = if tffa::enabled() {
+                Some(tffa::open_client_scope(a0))
+            } else {
+                None
+            };
+            let response = forward(command, &args);
+            if let Some(previous) = scope {
+                tffa::close_acting_scope(previous);
+            }
+            response
         }
         GAME_CLIENT_BEGIN => {
             if state::proxy_enabled() {
@@ -168,7 +180,20 @@ pub unsafe extern "C" fn vmMain(
                     return 0;
                 }
             }
-            forward(command, &args)
+            // The game's own `ClientCommand` runs here (a player's `+use` on a
+            // named target looks it up with `G_Find`, `g_cmds.c:3251`): running
+            // it in the issuing player's scope keeps that lookup inside their
+            // instance (S9).
+            let scope = if tffa::enabled() {
+                Some(tffa::open_client_scope(a0))
+            } else {
+                None
+            };
+            let response = forward(command, &args);
+            if let Some(previous) = scope {
+                tffa::close_acting_scope(previous);
+            }
+            response
         }
         GAME_CLIENT_USERINFO_CHANGED => {
             if state::proxy_enabled() {
@@ -239,6 +264,13 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // matches closed, main slot re-opened). Client assignments survive a
     // map_restart; a full map change re-dlopens the module (fresh state).
     tffa::reset_round();
+    // Measure this map's interactive-entity set (per-instance world entities,
+    // D-006 extension): the gentity cost of one further instance, and thus how
+    // many matches the map can still take. Map entities now exist (the pristine
+    // GAME_INIT spawned them).
+    if tffa::enabled() {
+        tffa::scan_world_entities();
+    }
     // Fresh round for the team lock (caps cleared, snapshot re-armed for the
     // reconnect burst that follows GAME_INIT).
     teamlock::reset();

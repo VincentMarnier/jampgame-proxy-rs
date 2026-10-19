@@ -760,8 +760,13 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// (`Proxy_Engine_Patch.cpp:61-70`) minus the dropped `WP_SaberPositionUpdate`
 /// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror),
 /// plus the Rust-only parallel-TFFA hooks (`AddScore` accounting; sound
-/// attribution `G_Sound`/`G_SoundTempEntity`/`G_TempEntity`).
-pub static GAME_HOOKS: [Hook; 11] = [
+/// attribution `G_Sound`/`G_SoundTempEntity`/`G_TempEntity`; `G_FreeEntity` for
+/// per-instance world-entity lifetimes; `G_TouchTriggers` for the per-instance
+/// touch gate; `G_UseTargets2` + `G_Find` for the per-instance link gate;
+/// `G_Spawn` + `G_RunThink` for the runtime-spawned children of a world entity;
+/// `G_RunMissile` so a missile's impact (radius damage) runs in its owner's
+/// instance).
+pub static GAME_HOOKS: [Hook; 18] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -785,6 +790,17 @@ pub static GAME_HOOKS: [Hook; 11] = [
         true,
     ),
     Hook::new("G_TempEntity", crate::jampgame::FN_G_TEMP_ENTITY, true),
+    Hook::new("G_FreeEntity", crate::jampgame::FN_G_FREE_ENTITY, true),
+    Hook::new(
+        "G_TouchTriggers",
+        crate::jampgame::FN_G_TOUCH_TRIGGERS,
+        true,
+    ),
+    Hook::new("G_UseTargets2", crate::jampgame::FN_G_USE_TARGETS2, true),
+    Hook::new("G_Find", crate::jampgame::FN_G_FIND, true),
+    Hook::new("G_Spawn", crate::jampgame::FN_G_SPAWN, true),
+    Hook::new("G_RunThink", crate::jampgame::FN_G_RUN_THINK, true),
+    Hook::new("G_RunMissile", crate::jampgame::FN_G_RUN_MISSILE, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1108,6 +1124,41 @@ mod tests {
             name: "G_TempEntity",
             bytes: b"\x55\x8b\xec\x83\xec\x38\x89\x7d\xf4\x89\x75\xf8\x89\x5d\xf0\x8b",
             want: 6,
+        },
+        Site {
+            name: "G_FreeEntity",
+            bytes: b"\x55\x8b\xec\x83\xec\x20\x89\x7d\xf8\x89\x5d\xfc\x8b\x5d\x08",
+            want: 6,
+        },
+        Site {
+            name: "G_TouchTriggers",
+            bytes: b"\x55\x8b\xec\x81\xec\x70\x11\x00\x00",
+            want: 9,
+        },
+        Site {
+            name: "G_UseTargets2",
+            bytes: b"\x55\x8b\xec\x83\xec\x20\x89\x7d\xfc\x89\x75\xf8\x89\x5d\xf4\x8b",
+            want: 6,
+        },
+        Site {
+            name: "G_Find",
+            bytes: b"\x55\x8b\xec\x83\xec\x18\x89\x5d\xfc\x8b\x45\x08\x8b\x4d\x0c\x8b",
+            want: 6,
+        },
+        Site {
+            name: "G_Spawn",
+            bytes: b"\x55\x8b\xec\x83\xec\x30\x89\x7d\xf8\x33\xc9\xb8\x80\xbd\x00\x00",
+            want: 6,
+        },
+        Site {
+            name: "G_RunThink",
+            bytes: b"\x55\x8b\xec\x83\xec\x10\x89\x75\xfc\x8b\x75\x08\xdb\x86\xa4\x04",
+            want: 6,
+        },
+        Site {
+            name: "G_RunMissile",
+            bytes: b"\x55\x8b\xec\x81\xec\xd8\x00\x00\x00\x89\x7d\xd0\x89\x75\xcc",
+            want: 9,
         },
     ];
 

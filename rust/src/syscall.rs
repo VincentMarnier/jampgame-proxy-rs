@@ -195,21 +195,64 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             }
         }
         // Trace family (`trap_Trace`/`trap_G2Trace`/`trap_TraceCapsule`, all
-        // `SV_Trace(results, start, mins, maxs, end, passEntityNum=a5, …)`):
-        // while parallel TFFA matches run, zero `r.contents` of cross-match
-        // entities for the duration of this single synchronous trap so
-        // cross-match players/sabers/missiles are intangible game-side (no
-        // body blocking, no saber clashes), then restore.
+        // `SV_Trace(results, start, mins, maxs, end, passEntityNum=a5,
+        // contentmask=a6)`): while parallel TFFA matches run, zero `r.contents`
+        // of cross-match entities for the duration of this single synchronous
+        // trap so they are intangible game-side (no body blocking, no saber
+        // clashes, no other instance's door in the way), then restore.
+        //
+        // `a6` (the trace's contentmask) lets the selection skip entities the
+        // engine would skip anyway (`sv_world.cpp:637`), which is what keeps
+        // the list short on a map with hundreds of tagged entities.
+        //
+        // The save list is a reusable `Vec` held in the state: it can grow to
+        // whatever the map needs (no fixed cap that could silently leave a door
+        // solid), steady play never allocates, and taking it *out* means a
+        // nested trace simply finds it empty instead of clobbering this one.
+        //
+        // The `enabled()` gate is here rather than in `trace_flips` so a server
+        // that never turns the feature on pays one cvar read per trace and no
+        // state buffer traffic at all.
         crate::sdk::G_TRACE | crate::sdk::G_G2TRACE | crate::sdk::G_TRACECAPSULE => {
-            if crate::state::proxy_enabled() {
-                let mut flipbuf: [(usize, i32); 64] = [(0, 0); 64];
-                let n = crate::tffa::trace_flips(a5, &mut flipbuf);
+            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+                let mut flips = crate::state::with_state(|s| core::mem::take(&mut s.tffa.flip_buf));
+                let n = crate::tffa::trace_flips(a5, a6, &mut flips);
                 if n > 0 {
-                    // SAFETY: contents slots are inside the game's gentity_t
-                    // array (address/offset validated in trace_flips).
-                    for (addr, _) in &flipbuf[..n] {
-                        unsafe { *((*addr) as *mut c_int) = 0 };
-                    }
+                    crate::tffa::flip_apply(&flips[..n]);
+                }
+                // SAFETY: engine syscall registered; words forwarded.
+                let response = unsafe {
+                    engine_syscall_call(
+                        command,
+                        [
+                            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+                        ],
+                    )
+                };
+                if n > 0 {
+                    crate::tffa::flip_restore(&flips[..n]);
+                }
+                flips.clear();
+                crate::state::with_state(|s| s.tffa.flip_buf = flips);
+                return response;
+            }
+        }
+        // World-query family (`trap_EntitiesInBox` / `trap_EntityContact` /
+        // `trap_EntityContactCapsule`, D-006 extension S9): game code that asks
+        // the world what is around it only sees its own instance's tagged
+        // entities plus everything shared. The engine still does the whole query
+        // — the box test, the brush-model contact test — and the filter is the
+        // same rule the `G_Find` link gate applies (a foreign tag is hidden), so
+        // a mover, an explosion or a script running in one instance no longer
+        // reaches another instance's doors, triggers or items.
+        //
+        // The scope comes from the acting entity (`G_RunThink`, `G_RunMissile`,
+        // `G_UseTargets2`, `player_die`); with no scope open the query is
+        // pristine, exactly as before this gate.
+        crate::sdk::G_ENTITIES_IN_BOX => {
+            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+                let scope = crate::tffa::acting_scope();
+                if scope != crate::tffa::SCOPE_NONE {
                     // SAFETY: engine syscall registered; words forwarded.
                     let response = unsafe {
                         engine_syscall_call(
@@ -220,11 +263,39 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                             ],
                         )
                     };
-                    // SAFETY: same slots, synchronous engine call above.
-                    for (addr, saved) in &flipbuf[..n] {
-                        unsafe { *((*addr) as *mut c_int) = *saved };
+                    // `a2` is the game's `int *list`, `a3` its `maxcount`.
+                    let count = response.min(a3.max(0));
+                    // SAFETY: the engine wrote `count` numbers into the game's
+                    // own array, which is what the filter compacts in place.
+                    return unsafe {
+                        crate::tffa::filter_box_list(a2 as usize as *mut c_int, count, scope)
+                    };
+                }
+            }
+        }
+        crate::sdk::G_ENTITY_CONTACT | crate::sdk::G_ENTITY_CONTACTCAPSULE => {
+            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+                let scope = crate::tffa::acting_scope();
+                if scope == crate::tffa::SCOPE_NONE {
+                    // fall through to the pristine call below
+                } else {
+                    // `a2` is the `const gentity_t *` the contact is tested
+                    // against. A foreign instance's entity does not exist for
+                    // this query, and the engine test is a pure geometric
+                    // predicate, so answering `false` needs no engine call.
+                    if a2 != 0 && crate::tffa::link_hides(a2 as usize, scope) {
+                        return 0;
                     }
-                    return response;
+                    // SAFETY: engine syscall registered; words forwarded.
+                    return unsafe {
+                        engine_syscall_call(
+                            command,
+                            [
+                                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14,
+                                a15,
+                            ],
+                        )
+                    };
                 }
             }
         }

@@ -177,6 +177,61 @@ pub struct TffaState {
     /// proxy-triggered solo-main finish); cleared on `GAME_INIT`. While set,
     /// fraglimit handling stays off — the map is ending.
     pub intermission: bool,
+    /// Instance tag of each world-entity slot (per-instance world entities,
+    /// D-006 extension): the match id owning the entity, or
+    /// `crate::tffa::ENTITY_SHARED` for an entity visible and solid in every
+    /// instance. Untagged entities behave exactly as before.
+    pub entity_instance: [u8; MAX_GENTITIES],
+    /// Interactive map entities measured at the world scan
+    /// (`crate::tffa::interactive_sources`) — the gentity cost of one further
+    /// instance's clone set, and the number the capacity log line reports.
+    /// `0` until the scan runs (`world_scanned`).
+    pub world_clone_cost: usize,
+    /// Instance whose clone set the map holds no longer (a freed clone slot
+    /// must not be handed to a later match still tagged): instance `i` is
+    /// marked for release when its match closes; the clones are freed at the
+    /// next `GAME_RUN_FRAME` start, when no game code is mid-iteration.
+    pub world_release: u16,
+    /// Instances whose clone sets exist, as a bitmask (bit `i` = instance `i`).
+    /// Clone creation is idempotent: re-opening a slot whose set survived
+    /// reuses the world it left behind.
+    pub world_cloned: u16,
+    /// Whether the map holds an interactive entity that cannot be duplicated
+    /// (an NPC/actor with a shared Ghoul2 model or a dynamic `client`): such a
+    /// map takes no instance at all — all-or-nothing, D-006.6.
+    pub world_clone_blocked: bool,
+    /// Whether `scan_world_entities` has measured this map. A server that turns
+    /// `proxy_tffa_enable` on mid-map has not scanned yet, and an unmeasured
+    /// map must not take an instance (an empty clone set would silently leave
+    /// every door shared).
+    pub world_scanned: bool,
+    /// Reusable save list for the world-entity gates: `(address of r.contents,
+    /// saved value)` pairs, taken out of the state for the duration of one
+    /// window (a synchronous trace, or a `G_TouchTriggers` call) and put back
+    /// with its capacity. A list rather than a fixed array because the number of
+    /// entities one window must ignore grows with the map and the number of
+    /// instances — a cap that silently overflowed would leave a foreign door
+    /// solid or triggerable (all-or-nothing) — and taking it out of the state
+    /// keeps a nested window from sharing the outer one's entries.
+    pub flip_buf: Vec<(usize, i32)>,
+    /// The instance the game code currently running belongs to
+    /// (`crate::tffa::SCOPE_NONE` outside such a call). Set and restored around
+    /// each `G_RunThink` and `G_UseTargets2` call, and inherited by nested calls
+    /// whose acting entity carries no tag, so a cascade a player action started
+    /// never widens halfway through. Two gates read it:
+    ///
+    /// - `G_Find` skips `targetname` matches tagged to another instance (S7 link
+    ///   gate), so a chain — a door trigger, ICARUS, a script runner — resolves
+    ///   inside the instance whose code fired it;
+    /// - `G_Spawn` remembers the slots it hands out, so an interactive entity
+    ///   created mid-map joins the acting instance once its spawner returns
+    ///   (S8 runtime-spawn gate).
+    pub acting_scope: u8,
+    /// The `(slot, instance)` pairs `G_Spawn` handed out inside the acting calls
+    /// in progress, classified when the outermost one closes. Only the spawns
+    /// that turn out *interactive* join an instance; the rest (temp event
+    /// entities, missiles, debris) keep their tagless, shared life.
+    pub spawn_pending: Vec<(u16, u8)>,
 }
 
 impl Default for TffaState {
@@ -199,6 +254,15 @@ impl Default for TffaState {
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission: false,
+            entity_instance: [crate::tffa::ENTITY_SHARED; MAX_GENTITIES],
+            world_clone_cost: 0,
+            world_release: 0,
+            world_cloned: 0,
+            world_clone_blocked: false,
+            world_scanned: false,
+            flip_buf: Vec::new(),
+            acting_scope: crate::tffa::SCOPE_NONE,
+            spawn_pending: Vec::new(),
         }
     }
 }

@@ -259,7 +259,23 @@ pub unsafe extern "C" fn player_die(
 ) {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_player_die);
+    // D-006 extension (S9): a dying player's code creates the items they drop
+    // (`TossClientItems`/`TossClientWeapon` → `Drop_Item` → `LaunchItem`,
+    // `g_combat.c:612-624`, the only item-creating path in the shipped game), and
+    // a dropped item is interactive (`CONTENTS_TRIGGER` + `Touch_Item`,
+    // `g_items.c:2653-2680`) but carries no owner, so the owned-entity machinery
+    // does not isolate it. The dying player's own match is the scope here: the
+    // S8 flush tags each dropped item with it, after which the visibility, trace
+    // and touch gates scope the item like any other per-instance world entity.
+    let scope = if crate::tffa::enabled() {
+        Some(crate::tffa::open_acting_scope(self_))
+    } else {
+        None
+    };
     unsafe { original(self_, inflictor, attacker, damage, means_of_death) };
+    if let Some(previous) = scope {
+        crate::tffa::close_acting_scope(previous);
+    }
 
     let self_client = unsafe { ent_client(self_) };
     let attacker_client = unsafe { ent_client(attacker) };
@@ -416,7 +432,23 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
 
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_client_think_real);
+    // D-006 extension (S9): a player's think runs game code on their behalf —
+    // force powers that make a pushed player drop a weapon (`ForceThrow` →
+    // `TossClientWeapon`, `w_force.c:3609`), weapon radius damage
+    // (`DEMP2_AltRadiusDamage`), `G_TouchTriggers`/`G_TouchEnts` and their box
+    // queries. Opening the scope here gives all of that the player's instance;
+    // entities the think spawns that carry an owner (missiles, saber entities)
+    // are left to the owned-entity machinery, so only what nothing else scopes
+    // (a weapon-force drop) is tagged.
+    let scope = if crate::tffa::enabled() {
+        Some(crate::tffa::open_acting_scope(ent))
+    } else {
+        None
+    };
     unsafe { original(ent) };
+    if let Some(previous) = scope {
+        crate::tffa::close_acting_scope(previous);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1027,206 @@ pub unsafe extern "C" fn g_temp_entity(origin: usize, event: c_int) -> usize {
         crate::tffa::stamp_temp_source(te);
     }
     te
+}
+
+/// `G_FreeEntity` wrapper (D-006 extension): the pristine body first, then the
+/// per-instance world keeps the freed slot's instance tag in step with the
+/// slot. `G_Spawn` recycles freed slots (temp entities included), so a stale
+/// tag would hide the slot's next occupant from every other instance.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_FreeEntity` argument.
+pub unsafe extern "C" fn g_free_entity(ed: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_free_entity);
+    unsafe { original(ed) };
+    crate::tffa::note_entity_freed(ed);
+}
+
+/// `G_TouchTriggers(gentity_t *ent)` wrapper (D-006 extension touch gate):
+/// while parallel TFFA matches run, clear `CONTENTS_TRIGGER` on every trigger of
+/// another instance for the duration of the call, so a player only touches
+/// their own instance's triggers, door triggers and items. Pristine
+/// `G_TouchTriggers` already skips an entity whose `r.contents` lacks
+/// `CONTENTS_TRIGGER` (`g_active.c:548`), so no game logic is reimplemented;
+/// the entities of the *requester's own* instance are left untouched.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_TouchTriggers` argument.
+pub unsafe extern "C" fn g_touch_triggers(ent: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_touch_triggers);
+    // `enabled()` must not run under the state lock (it reads a cvar engine-side)
+    // and the pristine body early-returns for a non-player entity anyway.
+    if ent == 0 || !crate::tffa::enabled() {
+        unsafe { original(ent) };
+        return;
+    }
+    // The same reusable save list the trace gate uses, taken out of the state so
+    // a trace issued *inside* this call (an item dropping to the floor, a mover
+    // think) gets an empty one instead of sharing this window's entries.
+    let mut flips = crate::state::with_state(|s| core::mem::take(&mut s.tffa.flip_buf));
+    let n = crate::tffa::touch_flips(ent, &mut flips);
+    if n > 0 {
+        crate::tffa::flip_apply(&flips[..n]);
+    }
+    // SAFETY: trampoline attached at GAME_INIT; pristine argument forwarded.
+    unsafe { original(ent) };
+    // The window ran game code, so `flip_restore` guards each slot (it is not
+    // ours to write back once the game changed or freed it).
+    if n > 0 {
+        crate::tffa::flip_restore(&flips[..n]);
+    }
+    flips.clear();
+    crate::state::with_state(|s| s.tffa.flip_buf = flips);
+}
+
+/// `G_UseTargets2(gentity_t *ent, gentity_t *activator, const char *string)`
+/// wrapper (D-006 extension link gate): while parallel TFFA matches run, a
+/// target chain resolves inside the instance that fired it. The pristine body
+/// resolves the chain with `G_Find(…, FOFS(targetname), string)` (objdump: the
+/// two calls at `0x16d68e`/`0x16d6de` pass `0x31c`), so opening a link window
+/// here is enough — the `G_Find` wrapper below does the filtering, and no
+/// resolution is reimplemented. All chain callers funnel through this function:
+/// `G_UseTargets` is a tail that calls it (`0x170545`), so one hook covers both.
+/// The same call opens the acting scope (S7 link gate + S8 runtime-spawn gate):
+/// the chain resolves inside the firing entity's instance, and a `use` handler
+/// that creates an interactive entity creates it there too.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_UseTargets2` arguments.
+pub unsafe extern "C" fn g_use_targets2(ent: usize, activator: usize, string: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_use_targets2);
+    // `enabled()` must not run under the state lock (it reads a cvar
+    // engine-side); the pristine body returns early for a null target anyway.
+    if ent == 0 || !crate::tffa::enabled() {
+        unsafe { original(ent, activator, string) };
+        return;
+    }
+    let previous = crate::tffa::open_acting_scope(ent);
+    // SAFETY: trampoline attached at GAME_INIT; pristine arguments forwarded.
+    // The chain runs game code, which is why the scope is a plain state field
+    // restored right after: it never outlives this call.
+    unsafe { original(ent, activator, string) };
+    crate::tffa::close_acting_scope(previous);
+}
+
+/// `G_Find(gentity_t *from, int fieldofs, const char *match)` wrapper (D-006
+/// extension link gate): while an acting scope is open, a `targetname` search
+/// skips entities tagged to another instance, so the chain reaches the acting
+/// instance's copies only. Only `FOFS(targetname)` lookups are filtered (the
+/// offset is pinned; objdump shows `G_UseTargets2` passes `0x31c`), leaving
+/// `classname`/`script_targetname` searches — spawn-point pickers, ICARUS — to
+/// behave as before. Every step is delegated to the pristine `G_Find`, so its
+/// `level.num_entities` bound and `Q_stricmp` stay the game's own.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_Find` arguments;
+/// `fieldofs` must be a field offset inside `gentity_t`.
+pub unsafe extern "C" fn g_find(from: usize, fieldofs: c_int, match_: usize) -> usize {
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_find);
+    let window = crate::state::with_state(|s| s.tffa.acting_scope);
+    if window == crate::tffa::SCOPE_NONE
+        || fieldofs != crate::sdk::OFFSET_GENTITY_TARGETNAME as c_int
+    {
+        return unsafe { original(from, fieldofs, match_) };
+    }
+    // SAFETY: the closures only ever call the pristine search with arguments it
+    // was going to receive anyway, and resume from a pointer it returned.
+    unsafe {
+        crate::tffa::find_visible(
+            from,
+            |cur| original(cur, fieldofs, match_),
+            |found| crate::tffa::link_hides(found, window),
+        )
+    }
+}
+
+/// `G_Spawn(void)` wrapper (D-006 extension runtime world entities): the
+/// pristine allocation first, then the slot is remembered while a world entity
+/// is running game code. A fresh `G_Spawn` sets no callbacks, so the interactive
+/// predicate cannot be applied here — `G_RunThink`'s flush does that once the
+/// spawning code has finished initialising the entity.
+///
+/// # Safety
+///
+/// Entered from the game module with no arguments; the returned pointer is the
+/// pristine `G_Spawn` slot (or `0`, which carries no instance).
+pub unsafe extern "C" fn g_spawn() -> usize {
+    // SAFETY: trampoline attached at GAME_INIT; no arguments.
+    let original = original_call(crate::hooks::game_hook_original_g_spawn);
+    let ent = unsafe { original() };
+    crate::tffa::note_spawned(ent);
+    ent
+}
+
+/// `G_RunThink(gentity_t *ent)` wrapper (D-006 extension): while the think runs,
+/// the acting entity's instance is the scope both gates read.
+///
+/// - Runtime-spawn gate (S8): a `G_Spawn` the think makes is remembered and, once
+///   the think returns, an interactive entity among them joins that instance — a
+///   door's `trigger_door` (`Think_SpawnNewDoorTrigger`, `g_mover.c:1158`), an
+///   asteroid field's `func_rotating` asteroids (`g_trigger.c:1856`), an ICARUS
+///   `spawn` callback — instead of being shared by all instances.
+/// - Link gate (S7): a `targetname` search the think makes resolves inside that
+///   instance. This is what keeps a *deferred* activation scripted or timed code
+///   started earlier in the same instance: `target_scriptrunner_use` may defer
+///   `scriptrunner_run` to a think (`g_target.c:748`), and ICARUS resolves names
+///   through `G_Find(targetname)` (`g_ICARUScb.c:1025,1972,3058`), as do train
+///   path lookups (`g_mover.c:1826`) and `asteroid_field_think`'s target
+///   (`g_trigger.c:1796`). The `runicarus` tail runs inside this scope too, so
+///   task-manager callbacks are covered.
+///
+/// The pristine body is the only dispatcher of `ent->think`, so one hook covers
+/// every thinker.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_RunThink` argument.
+pub unsafe extern "C" fn g_run_think(ent: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_run_think);
+    // `enabled()` must not run under the state lock (it reads a cvar
+    // engine-side); an unattributable think is the pristine call.
+    if ent == 0 || !crate::tffa::enabled() {
+        unsafe { original(ent) };
+        return;
+    }
+    let previous = crate::tffa::open_acting_scope(ent);
+    // SAFETY: trampoline attached at GAME_INIT; pristine argument forwarded.
+    unsafe { original(ent) };
+    crate::tffa::close_acting_scope(previous);
+}
+
+/// `G_RunMissile(gentity_t *ent)` wrapper (D-006 extension world queries, S9):
+/// the missile's trajectory, impact (`G_MissileImpact` → `G_RadiusDamage`) and
+/// its own think run in the missile's acting scope. A missile carries no
+/// instance of its own, but its `r.ownerNum` does, so the scope resolves to the
+/// firing player's match: the blast's `G_RadiusDamage`/`G_RadiusList` box query
+/// then only sees that instance's entities, and a foreign instance's door or
+/// breakable can no longer be damaged from the explosion of a rocket fired in
+/// another match.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `G_RunMissile` argument.
+pub unsafe extern "C" fn g_run_missile(ent: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_g_run_missile);
+    if ent == 0 || !crate::tffa::enabled() {
+        unsafe { original(ent) };
+        return;
+    }
+    let previous = crate::tffa::open_acting_scope(ent);
+    // SAFETY: trampoline attached at GAME_INIT; pristine argument forwarded.
+    unsafe { original(ent) };
+    crate::tffa::close_acting_scope(previous);
 }
 
 #[cfg(test)]

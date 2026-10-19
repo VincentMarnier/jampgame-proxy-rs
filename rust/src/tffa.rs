@@ -32,12 +32,19 @@
 
 use core::ffi::{c_char, c_int};
 
-use crate::hooks::engine_sv::{read_i32, read_usize};
+use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
-    CS_PLAYERS, CS_SCORES1, CS_SCORES2, GT_TEAM, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME,
-    MAX_TOKEN_CHARS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_R_CONTENTS,
-    OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER, OFFSET_SESS_SESSION_TEAM, TEAM_BLUE, TEAM_RED,
-    TEAM_SPECTATOR,
+    CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ENTITYNUM_MAX_NORMAL, ET_EVENTS,
+    ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME,
+    MAX_TOKEN_CHARS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED,
+    OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE,
+    OFFSET_GENTITY_LAST_ENEMY, OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT,
+    OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED,
+    OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE,
+    OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET, OFFSET_GENTITY_TARGET_ENT,
+    OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM, OFFSET_GENTITY_TEAMCHAIN,
+    OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK, OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE,
+    OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
 };
 use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_MAX_MATCHES};
 
@@ -135,6 +142,17 @@ pub fn damage_blocked(attacker_match: u8, victim_match: u8) -> bool {
 /// Pure snapshot gate: `true` = keep entity for viewer.
 pub fn entity_visible(viewer_match: u8, ent_match: u8) -> bool {
     viewer_match == ent_match
+}
+
+/// Instance tag of an entity belonging to no instance: visible and solid in
+/// every instance (players, missiles, temp ents, inert props).
+pub const ENTITY_SHARED: u8 = u8::MAX;
+
+/// Visibility gate for a tagged world entity (per-instance world entities,
+/// D-006 extension): `ENTITY_SHARED` is visible to every viewer, a tagged one
+/// only to its own instance.
+pub fn world_entity_visible(viewer_match: u8, tag: u8) -> bool {
+    tag == ENTITY_SHARED || viewer_match == tag
 }
 
 /// Whether a per-match score has hit the shared `fraglimit`.
@@ -851,6 +869,15 @@ pub fn reset_round() {
         s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
         // New round: fraglimit handling runs again.
         s.tffa.intermission = false;
+        // Per-instance worlds are per map: a fresh `GAME_INIT` memset the
+        // entity array, so no clone and no tag survives it. Re-measured by
+        // `scan_world_entities` right after this call.
+        s.tffa.entity_instance = [ENTITY_SHARED; MAX_GENTITIES];
+        s.tffa.world_clone_cost = 0;
+        s.tffa.world_clone_blocked = false;
+        s.tffa.world_release = 0;
+        s.tffa.world_cloned = 0;
+        s.tffa.world_scanned = false;
     });
 }
 /// Clear all TFFA state for a fresh first-time connect (the slot may have
@@ -911,6 +938,11 @@ pub fn on_frame_start() {
     state::with_state(|s| s.tffa.frame_stamp = s.tffa.frame_stamp.wrapping_add(1));
     if enabled() {
         clamp_global_scores();
+        // Closed instances give their clones back here, between game frames.
+        drain_world_releases();
+        // Defensive: a spawn recorded by a call that never reached its close
+        // (nothing should) is classified rather than carried into the next map.
+        flush_pending_spawns();
     }
 }
 
@@ -1015,6 +1047,9 @@ pub fn on_run_frame_post() {
                 m.red = 0;
                 m.blue = 0;
                 m.active = false;
+                // The instance is over: queue its world for release at the next
+                // frame start (members are being moved out below).
+                s.tffa.world_release |= 1u16 << f.id;
             }
         }
     });
@@ -1111,6 +1146,10 @@ pub fn on_run_frame_post() {
                 s.tffa.matches[id as usize].red = 0;
                 s.tffa.matches[id as usize].blue = 0;
                 s.tffa.matches[id as usize].active = false;
+                // The promoted instance's own world does not become main's:
+                // its players see the pristine map entity set from here on, and
+                // its clone set is given back at the next frame start.
+                s.tffa.world_release |= 1u16 << id;
                 for cn in &members {
                     s.tffa.client_match[*cn as usize] = MAIN_MATCH;
                 }
@@ -1244,6 +1283,409 @@ fn move_match_to_spectator(match_id: u8) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-instance world entities (D-006 extension)
+//
+// Every *interactive* map entity (door, plat, elevator, `trigger_*`, button)
+// is meant to exist once per instance, so one instance cannot open another's
+// door or fire another's trigger. An interactive entity that is not
+// duplicated is a *shared* entity any instance can activate for all of them,
+// so coverage is all-or-nothing per instance: either the whole interactive
+// set is cloned for an instance or the instance is refused. Capacity is spent
+// on instances, never on coverage.
+// ---------------------------------------------------------------------------
+
+/// Whether entity `ent_num` is *interactive* and so must be duplicated per
+/// instance — the decided structural predicate
+/// (`docs/decisions/0006-parallel-tffa.md`):
+///
+/// - `r.contents & CONTENTS_TRIGGER`, or
+/// - `s.eType == ET_MOVER`, or
+/// - any of `touch`/`use`/`think`/`reached`/`blocked` non-null, or
+/// - `targetname`/`target`/`team` non-null, or
+/// - taking part in a team chain (`teamchain`/`teammaster` non-null).
+///
+/// Everything else — spawn points without keys, `misc_model_static`, lights —
+/// stays shared and inert.
+pub fn is_interactive_entity(g_entities: usize, ent_num: c_int) -> bool {
+    if g_entities == 0 || !(0..MAX_GENTITIES as c_int).contains(&ent_num) {
+        return false;
+    }
+    let ent = g_entities + ent_num as usize * SIZEOF_GENTITY;
+    // SAFETY: `ent` is inside the `g_entities` array; every field read is
+    // either the int `r.contents`/`s.eType` or a pointer-sized field
+    // (function pointers and `char*`), all valid for a spawned gentity.
+    unsafe {
+        if read_i32(ent + OFFSET_GENTITY_R_CONTENTS) & CONTENTS_TRIGGER != 0 {
+            return true;
+        }
+        if read_i32(ent + OFFSET_GENTITY_S_ETYPE) == ET_MOVER {
+            return true;
+        }
+        if [
+            OFFSET_GENTITY_TOUCH,
+            OFFSET_GENTITY_USE,
+            OFFSET_GENTITY_THINK,
+            OFFSET_GENTITY_REACHED,
+            OFFSET_GENTITY_BLOCKED,
+        ]
+        .iter()
+        .any(|&off| read_usize(ent + off) != 0)
+        {
+            return true;
+        }
+        [
+            OFFSET_GENTITY_TARGETNAME,
+            OFFSET_GENTITY_TARGET,
+            OFFSET_GENTITY_TEAM,
+            OFFSET_GENTITY_TEAMCHAIN,
+            OFFSET_GENTITY_TEAMMASTER,
+        ]
+        .iter()
+        .any(|&off| read_usize(ent + off) != 0)
+    }
+}
+
+/// The live interactive entities in `[MAX_CLIENTS, ENTITYNUM_MAX_NORMAL)`, in
+/// slot order — the set one further instance duplicates, and therefore the
+/// gentity cost of that instance. Measured at `GAME_INIT`
+/// (`scan_world_entities`), when no temp entity exists yet.
+///
+/// # Safety
+///
+/// Not `unsafe` in Rust's sense, but `g_entities` must be the live array the
+/// game located (`G_LOCATE_GAME_DATA`) or `0`: every element read is bounded by
+/// `MAX_GENTITIES` and every field read is valid for a spawned gentity.
+pub fn interactive_sources(g_entities: usize) -> Vec<c_int> {
+    if g_entities == 0 {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    for num in MAX_CLIENTS as c_int..ENTITYNUM_MAX_NORMAL {
+        let ent = g_entities + num as usize * SIZEOF_GENTITY;
+        // SAFETY: `num` is a valid gentity slot.
+        let live = unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } != 0;
+        if live && is_interactive_entity(g_entities, num) {
+            sources.push(num);
+        }
+    }
+    sources
+}
+
+/// Entity slots `G_Spawn` could still hand out right now (free, inside the
+/// ordinary range): the capacity check for one further clone set. Slots below
+/// `MAX_CLIENTS` are the engine's player slots.
+pub fn free_world_slots(g_entities: usize) -> usize {
+    if g_entities == 0 {
+        return 0;
+    }
+    (MAX_CLIENTS as i32..ENTITYNUM_MAX_NORMAL)
+        .filter(|&num| {
+            let ent = g_entities + num as usize * SIZEOF_GENTITY;
+            // SAFETY: `num` is a valid gentity slot.
+            unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) == 0 }
+        })
+        .count()
+}
+
+/// Whether a naive `memcpy` duplicate of this interactive entity is sound.
+///
+/// An NPC/actor owns a server-side Ghoul2 model instance and a dynamically
+/// allocated `client`; a copy would animate through the *same* body and
+/// `G_FreeEntity` would clean the model out from under the other
+/// (`g_utils.c:945-1013`). A map holding one takes no instance at all —
+/// all-or-nothing, D-006.6.
+fn is_duplicable_entity(g_entities: usize, ent_num: c_int) -> bool {
+    let ent = g_entities + ent_num as usize * SIZEOF_GENTITY;
+    // SAFETY: `ent_num` is a valid gentity slot.
+    unsafe {
+        read_i32(ent + OFFSET_GENTITY_S_ETYPE) != ET_NPC
+            && read_usize(ent + OFFSET_GENTITY_CLIENT) == 0
+            && read_usize(ent + OFFSET_GENTITY_GHOUL2) == 0
+    }
+}
+
+/// `gentity_t` pointer fields that can name another entity. A duplicated
+/// team/train chain must stay inside its own instance, so a clone's links are
+/// re-pointed at the corresponding clone. A pointer that resolves outside the
+/// set (a player, an inert shared prop) is left exactly as copied — players
+/// and inert props are shared in every instance by design.
+const CLONE_LINK_FIELDS: [usize; 9] = [
+    OFFSET_GENTITY_PARENT,
+    OFFSET_GENTITY_NEXT_TRAIN,
+    OFFSET_GENTITY_PREV_TRAIN,
+    OFFSET_GENTITY_TARGET_ENT,
+    OFFSET_GENTITY_ENEMY,
+    OFFSET_GENTITY_LAST_ENEMY,
+    OFFSET_GENTITY_ACTIVATOR,
+    OFFSET_GENTITY_TEAMCHAIN,
+    OFFSET_GENTITY_TEAMMASTER,
+];
+
+/// `GAME_INIT` post-pass: measure the map's interactive-entity set — one
+/// further instance's clone cost — and how many further instances the entity
+/// budget can take, once the pristine `GAME_INIT` returned (map spawned,
+/// `g_entities` located). The interactive entities are tagged as belonging to
+/// main (`MAIN_MATCH`), which is inert while every viewer is in main and makes
+/// the set the clone pass reads. Called lazily from `cmd_create` too, so a
+/// server that enables `proxy_tffa_enable` mid-map is still measured before
+/// its first instance.
+pub fn scan_world_entities() {
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    let sources = interactive_sources(g_entities);
+    let cost = sources.len();
+    let blocked = sources
+        .iter()
+        .any(|&num| !is_duplicable_entity(g_entities, num));
+    let slots = free_world_slots(g_entities);
+    state::with_state(|s| {
+        // A map change can leave the previous map's tags and clone bookkeeping
+        // behind (only a full reload rebuilds the state); start clean.
+        s.tffa.entity_instance = [ENTITY_SHARED; MAX_GENTITIES];
+        // A map change must not inherit a chain scope from the map before it,
+        // nor spawns of the map before it.
+        s.tffa.acting_scope = SCOPE_NONE;
+        s.tffa.spawn_pending.clear();
+        s.tffa.world_clone_cost = cost;
+        s.tffa.world_clone_blocked = blocked;
+        s.tffa.world_release = 0;
+        s.tffa.world_cloned = 0;
+        s.tffa.world_scanned = true;
+        if !blocked {
+            for &num in &sources {
+                s.tffa.entity_instance[num as usize] = MAIN_MATCH;
+            }
+        }
+    });
+    // A map with nothing interactive never limits the number of matches.
+    let fits = if cost == 0 { MAX_MATCHES } else { slots / cost };
+    eprintln!(
+        "----- proxy-rs: {cost} interactive map entities, {slots} free entity slots — room for {fits} further TFFA instance(s)"
+    );
+    if blocked {
+        eprintln!(
+            "----- proxy-rs: an interactive entity on this map cannot be duplicated (NPC/actor) — parallel TFFA instances are unavailable on it"
+        );
+    }
+}
+
+/// Measure the map's interactive set if that has not happened yet. Returns
+/// whether the world is measured (and so whether an instance may be created).
+fn ensure_world_scanned() -> bool {
+    if state::with_state(|s| s.tffa.world_scanned) {
+        return true;
+    }
+    if !enabled() {
+        return false;
+    }
+    scan_world_entities();
+    state::with_state(|s| s.tffa.world_scanned)
+}
+
+/// Duplicate the map's whole interactive set for `instance`, or report why this
+/// instance cannot exist. All-or-nothing: a partial set would leave some
+/// doors/triggers shared, activatable from every instance.
+///
+/// The clones are created with the game's own `G_Spawn` (so slot accounting
+/// matches the pristine game), copy the *live* source entity at creation time,
+/// have their in-set entity links re-pointed at their own copies, and are
+/// linked into the engine world through `G_LINKENTITY`. `s.number` is restored
+/// to the clone's own slot: the engine addresses snapshots by it.
+pub fn realize_instance(instance: u8) -> Result<(), &'static str> {
+    if instance == MAIN_MATCH {
+        // Main is the pristine map entity set.
+        return Ok(());
+    }
+    if instance as usize >= TOTAL_MATCH_SLOTS {
+        return Err("not a match slot");
+    }
+    let (g_entities, blocked, done, cost) = state::with_state(|s| {
+        (
+            s.located_game_data.g_entities,
+            s.tffa.world_clone_blocked,
+            s.tffa.world_cloned,
+            s.tffa.world_clone_cost,
+        )
+    });
+    let bit = 1u16 << instance;
+    if done & bit != 0 {
+        // The set survived the instance that used it (a closed match keeps its
+        // world until the next map): reuse it.
+        return Ok(());
+    }
+    if !ensure_world_scanned() {
+        return Err("this map has not been measured for per-instance worlds");
+    }
+    if blocked {
+        return Err("an interactive entity here cannot be duplicated (NPC/actor)");
+    }
+    if g_entities == 0 {
+        return Err("the game module has not located its entities yet");
+    }
+    // The set is exactly the entities tagged as main's. Reading it from the
+    // tag table (not the `GAME_INIT` count) keeps the pass correct when a
+    // source was destroyed during the map.
+    let tags: [u8; MAX_GENTITIES] = state::with_state(|s| s.tffa.entity_instance);
+    let needed = tags[..ENTITYNUM_MAX_NORMAL as usize]
+        .iter()
+        .filter(|t| **t == MAIN_MATCH)
+        .count();
+    // `G_Spawn` hands out `free_world_slots` further ordinary slots before it
+    // `G_Error`s, and the pass runs synchronously (no temp entity appears
+    // mid-pass), so the whole set fits whenever the count does.
+    if free_world_slots(g_entities) < needed {
+        return Err("this map has no entity capacity left for another full instance");
+    }
+
+    // Pass 1: spawn a clone per source and take the source's live state.
+    let mut clone_of = [u16::MAX; MAX_GENTITIES];
+    let mut made: Vec<u16> = Vec::with_capacity(needed);
+    for src in MAX_CLIENTS as c_int..ENTITYNUM_MAX_NORMAL {
+        if tags[src as usize] != MAIN_MATCH {
+            continue;
+        }
+        // SAFETY: the game module is loaded and running; `G_Spawn` allocates
+        // from the ordinary range the capacity check just showed is free.
+        let clone = unsafe { crate::jampgame::g_spawn() };
+        if clone == 0 {
+            break;
+        }
+        let Some(clone_num) = ent_num_of(g_entities, clone) else {
+            break;
+        };
+        let clone_num = clone_num as u16;
+        // SAFETY: `src` and `clone` are live gentity slots inside the same
+        // `g_entities` array; the copy is the plain struct duplicate this
+        // mechanism is defined as.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (g_entities + src as usize * SIZEOF_GENTITY) as *const u8,
+                clone as *mut u8,
+                SIZEOF_GENTITY,
+            );
+            // `G_InitGentity` set the clone's own number; the copy replaced it
+            // with the source's. The engine routes snapshots by `s.number`.
+            write_i32(clone + OFFSET_GENTITY_S_NUMBER, clone_num as i32);
+        }
+        clone_of[src as usize] = clone_num;
+        made.push(clone_num);
+    }
+    if made.len() != needed {
+        // Not reachable through the capacity check above; unwind rather than
+        // leave a partial set (it would be activatable from every instance).
+        for &num in &made {
+            // SAFETY: the slot is a clone this pass just spawned.
+            unsafe {
+                crate::jampgame::g_free_entity(g_entities + num as usize * SIZEOF_GENTITY);
+            }
+        }
+        return Err("the map ran out of entity slots while duplicating its world");
+    }
+
+    // Pass 2: re-point in-set links at the copies, then link each clone into
+    // the engine world so it collides and renders.
+    for &clone_num in &made {
+        let clone = g_entities + clone_num as usize * SIZEOF_GENTITY;
+        for off in CLONE_LINK_FIELDS {
+            // SAFETY: `clone` is a live gentity; `off` is one of its pointer
+            // fields.
+            let target = unsafe { read_usize(clone + off) };
+            if target == 0 {
+                continue;
+            }
+            let Some(src_num) = ent_num_of(g_entities, target) else {
+                continue;
+            };
+            if tags[src_num as usize] != MAIN_MATCH {
+                continue; // a player, or an inert shared prop
+            }
+            let mapped = clone_of[src_num as usize];
+            if mapped != u16::MAX {
+                let mapped = g_entities + mapped as usize * SIZEOF_GENTITY;
+                // SAFETY: the clone field may be written; `mapped` is a live
+                // gentity of this same set.
+                unsafe { write_usize(clone + off, mapped) };
+            }
+        }
+        // SAFETY: engine syscall registered; `clone` is a gentity slot. The
+        // engine links by entity number, which the copy already carries.
+        unsafe {
+            crate::syscall::call_engine(G_LINKENTITY, &[clone as c_int]);
+        }
+    }
+    state::with_state(|s| {
+        for &num in &made {
+            s.tffa.entity_instance[num as usize] = instance;
+        }
+        s.tffa.world_cloned |= bit;
+    });
+    eprintln!(
+        "----- proxy-rs: instance {instance} world: duplicated {} of the {cost} interactive map entities measured at GAME_INIT",
+        made.len()
+    );
+    Ok(())
+}
+
+/// Free one instance's clone set and clear its tags, so a later match in the
+/// same slot starts from a fresh world and the capacity comes back.
+fn release_instance(instance: u8) {
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    let victims: Vec<u16> = state::with_state(|s| {
+        if g_entities == 0 {
+            return Vec::new();
+        }
+        (MAX_CLIENTS..ENTITYNUM_MAX_NORMAL as usize)
+            .filter(|n| s.tffa.entity_instance[*n] == instance)
+            .map(|n| n as u16)
+            .collect()
+    });
+    for num in victims {
+        let ent = g_entities + num as usize * SIZEOF_GENTITY;
+        // SAFETY: the slot is a clone this proxy spawned; frame start is
+        // between game frames, so nothing is iterating `g_entities`.
+        unsafe { crate::jampgame::g_free_entity(ent) };
+        state::with_state(|s| s.tffa.entity_instance[num as usize] = ENTITY_SHARED);
+    }
+    state::with_state(|s| s.tffa.world_cloned &= !(1u16 << instance));
+}
+
+/// Drain the instance releases queued since the last frame.
+pub fn drain_world_releases() {
+    let pending = state::with_state(|s| core::mem::take(&mut s.tffa.world_release));
+    if pending == 0 {
+        return;
+    }
+    for instance in 1..TOTAL_MATCH_SLOTS {
+        if pending & (1u16 << instance) != 0 {
+            release_instance(instance as u8);
+        }
+    }
+}
+
+/// `G_FreeEntity` detour body: an entity that actually left the world must lose
+/// its instance tag with its slot. `G_Spawn` hands freed slots to later
+/// entities (temp entities included), and a recycled slot that kept a stale tag
+/// would hide its new occupant from every other instance. A `neverFree` entity
+/// is unlinked but stays in use (`g_utils.c:945`): its tag stays with it.
+pub fn note_entity_freed(ed: usize) {
+    if ed == 0 {
+        return;
+    }
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    let Some(num) = ent_num_of(g_entities, ed) else {
+        return;
+    };
+    // SAFETY: `ed` is a gentity the game just handed to `G_FreeEntity`.
+    if unsafe { read_i32(ed + OFFSET_GENTITY_INUSE) } != 0 {
+        return;
+    }
+    state::with_state(|s| {
+        if s.tffa.entity_instance[num as usize] != ENTITY_SHARED {
+            s.tffa.entity_instance[num as usize] = ENTITY_SHARED;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Sound isolation (temp-entity sound attribution)
 // ---------------------------------------------------------------------------
 
@@ -1357,20 +1799,25 @@ pub fn stamp_temp_source(te: usize) {
 // Physics isolation (G_TRACE / G_G2TRACE / G_TRACECAPSULE interception)
 // ---------------------------------------------------------------------------
 
-/// Build the flip list for one trace: the `r.contents` slot of every
-/// cross-match entity (players + player-owned entities) the requester must
-/// not collide with, paired with the saved value for the restore. Returns
-/// the number of entries written into `out` (capped at its length).
+/// Build the flip list for one trace: the `r.contents` slot of every entity the
+/// requester must not collide with, paired with the saved value for the
+/// restore. `out` ends up holding exactly this trace's entries.
 ///
-/// The engine's `SV_ClipMoveToEntities` (`sv_world.cpp:589`) skips entities
-/// whose `r.contents` has no bit in the trace's contentmask, so zeroing
+/// The engine's `SV_ClipMoveToEntities` (`sv_world.cpp:637`) skips entities
+/// whose `r.contents` has no bit in the trace's `contentmask`, so zeroing
 /// `contents` for the duration of this single synchronous trap makes
-/// cross-match players, sabers, missiles and corpses intangible game-side
-/// (no body blocking, no saber clashes) without touching movement code.
-pub fn trace_flips(pass_entity_num: c_int, out: &mut [(usize, i32)]) -> usize {
-    if out.is_empty() || !enabled() {
-        return 0;
-    }
+/// cross-match entities intangible game-side (no body blocking, no saber
+/// clashes, no foreign door in the way) without touching movement code.
+///
+/// Call only while the feature is on: the `G_TRACE` arm tests `enabled()`
+/// before taking the state lock, so this never runs on a server that has not
+/// turned parallel TFFA on.
+pub fn trace_flips(
+    pass_entity_num: c_int,
+    contentmask: c_int,
+    out: &mut Vec<(usize, i32)>,
+) -> usize {
+    out.clear();
     let g_entities = state::with_state(|s| s.located_game_data.g_entities);
     if g_entities == 0 {
         return 0;
@@ -1381,81 +1828,532 @@ pub fn trace_flips(pass_entity_num: c_int, out: &mut [(usize, i32)]) -> usize {
             rebuild_owned(s, g_entities);
             s.tffa.rebuilt_stamp = s.tffa.frame_stamp;
         }
-        let table = s.tffa.client_match;
-        // The trace's requester: a player slot, or (missiles/sabers/other
-        // ents) the `r.ownerNum` player. Unknown/world requesters keep the
-        // world solid everywhere (no filtering).
-        let requester = request_match(g_entities, pass_entity_num, &table);
-        let Some(requester) = requester else {
+        flip_list(&s.tffa, g_entities, pass_entity_num, contentmask, out)
+    })
+}
+
+/// The flip selection proper — no state access, so it can be unit-tested with a
+/// fabricated `g_entities` array and table. `out` is cleared first. Three groups
+/// are collected, each only when its `r.contents` intersects the trace's
+/// `contentmask`:
+///
+/// - players of other matches, and their owned entities (sabers, missiles,
+///   corpses): cross-match body blocking and saber clashes;
+/// - per-instance world entities (doors, plats, elevators, items) tagged with
+///   an instance other than the requester's: each instance collides with its
+///   own copies, and with nobody else's. Main's originals (tag `MAIN_MATCH`)
+///   are foreign to every created instance.
+///
+/// A requester with no match (a world trace, `ENTITYNUM_NONE`) flips nothing:
+/// the world stays solid for it, exactly as before this feature.
+fn flip_list(
+    t: &crate::state::TffaState,
+    g_entities: usize,
+    pass_entity_num: c_int,
+    contentmask: c_int,
+    out: &mut Vec<(usize, i32)>,
+) -> usize {
+    out.clear();
+    let table = &t.client_match;
+    // The trace's requester: a player slot, or (missiles/sabers/other ents) the
+    // `r.ownerNum` player. Unknown/world requesters keep the world solid
+    // everywhere (no filtering).
+    let Some(requester) = request_match(g_entities, pass_entity_num, table) else {
+        return 0;
+    };
+    collect_flips(t, g_entities, requester, contentmask, out)
+}
+
+/// The flip selection for a *known* requester instance: every entity whose
+/// contents intersect `contentmask` and which the requester must not collide
+/// with or touch. Shared by the trace gate (`flip_list`) and the touch gate
+/// (`touch_flips`), so both see exactly the same per-instance world.
+fn collect_flips(
+    t: &crate::state::TffaState,
+    g_entities: usize,
+    requester: u8,
+    contentmask: c_int,
+    out: &mut Vec<(usize, i32)>,
+) -> usize {
+    let table = &t.client_match;
+    let mut flip = |addr: usize| {
+        // SAFETY: `addr` is a `r.contents` slot inside the game's gentity array
+        // (validated by the caller's construction).
+        let contents = unsafe { read_i32(addr) };
+        if contents != 0 && (contents & contentmask) != 0 {
+            out.push((addr, contents));
+        }
+    };
+    // Player entities.
+    for cn in 0..MAX_CLIENTS as i32 {
+        if table[cn as usize] == requester {
+            continue;
+        }
+        let ent = g_entities + cn as usize * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array.
+        if unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0 {
+            continue;
+        }
+        flip(ent + OFFSET_GENTITY_R_CONTENTS);
+    }
+    // Player-owned entities (saber ents, missiles, corpses).
+    for k in 0..t.owned_count {
+        let (num, owner) = t.owned[k];
+        if table[owner as usize] == requester {
+            continue;
+        }
+        flip(g_entities + num as usize * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS);
+    }
+    // Per-instance world entities of every other instance. Only the ordinary
+    // range is ever tagged (`scan_world_entities`/`realize_instance`), so the
+    // walk can stop there.
+    for (num, &tag) in t
+        .entity_instance
+        .iter()
+        .enumerate()
+        .take(ENTITYNUM_MAX_NORMAL as usize)
+        .skip(MAX_CLIENTS)
+    {
+        if tag == ENTITY_SHARED || tag == requester {
+            continue;
+        }
+        flip(g_entities + num * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS);
+    }
+    out.len()
+}
+
+/// Zero `r.contents` on every collected flip slot. The caller restores them
+/// once the window (the synchronous trap, or the pristine game function) is
+/// done.
+pub fn flip_apply(flips: &[(usize, i32)]) {
+    for (addr, _) in flips {
+        // SAFETY: `addr` is a `r.contents` slot inside the game's gentity array
+        // (built by `flip_list`/`touch_flips`).
+        unsafe { write_i32(*addr, 0) };
+    }
+}
+
+/// Restore a window's flips. A slot is restored only while it is still in use
+/// and still shows the `0` this gate wrote: the guard keeps a window that runs
+/// *game* code (`G_TouchTriggers`) from writing a stale `contents` back over a
+/// value the game set meanwhile (`Use_Item` re-arming an item, a target that
+/// reached a foreign entity) and from resurrecting contents on a slot the game
+/// freed inside the window (`G_FreeEntity` memsets it). For a trace window,
+/// which runs no game code at all, the guard always holds.
+pub fn flip_restore(flips: &[(usize, i32)]) {
+    for (addr, saved) in flips {
+        // SAFETY: `addr` is a `r.contents` slot inside the game's gentity array;
+        // the entity pointer is recovered by the same offset math.
+        let inuse = unsafe { read_i32(*addr - OFFSET_GENTITY_R_CONTENTS + OFFSET_GENTITY_INUSE) };
+        if inuse == 0 {
+            continue;
+        }
+        // SAFETY: same slot.
+        if unsafe { read_i32(*addr) } != 0 {
+            continue;
+        }
+        // SAFETY: same slot.
+        unsafe { write_i32(*addr, *saved) };
+    }
+}
+
+/// The flip list for one `G_TouchTriggers` call: `CONTENTS_TRIGGER` cleared on
+/// every foreign instance's trigger, door trigger and item for the duration of
+/// the call. Pristine `G_TouchTriggers` skips an entity whose `r.contents` lacks
+/// `CONTENTS_TRIGGER` (`g_active.c:548`), so nothing is reimplemented: a player
+/// touches their own instance's triggers and nobody else's.
+pub fn touch_flips(ent: usize, out: &mut Vec<(usize, i32)>) -> usize {
+    out.clear();
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities == 0 {
+        return 0;
+    }
+    state::with_state(|s| {
+        let Some(requester) = touch_requester(&s.tffa, g_entities, ent) else {
             return 0;
         };
-        let mut n = 0usize;
-        // Player entities.
-        for cn in 0..MAX_CLIENTS as i32 {
-            if table[cn as usize] == requester {
-                continue;
-            }
-            let ent = g_entities + cn as usize * crate::sdk::SIZEOF_GENTITY;
-            // SAFETY: ent is inside the g_entities array.
-            let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
-            if client == 0 {
-                continue;
-            }
-            let addr = ent + OFFSET_GENTITY_R_CONTENTS;
-            // SAFETY: contents is a plain int inside gentity_t.
-            let contents = unsafe { read_i32(addr) };
-            if contents != 0 && n < out.len() {
-                out[n] = (addr, contents);
-                n += 1;
-            }
-        }
-        // Player-owned entities (saber ents, missiles, corpses).
-        for k in 0..s.tffa.owned_count {
-            let (num, owner) = s.tffa.owned[k];
-            if table[owner as usize] == requester {
-                continue;
-            }
-            let addr =
-                g_entities + num as usize * crate::sdk::SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS;
-            // SAFETY: addr is inside gentity_t.
-            let contents = unsafe { read_i32(addr) };
-            if contents != 0 && n < out.len() {
-                out[n] = (addr, contents);
-                n += 1;
-            }
-        }
-        n
+        collect_flips(&s.tffa, g_entities, requester, CONTENTS_TRIGGER, out)
     })
+}
+
+/// The instance a `G_TouchTriggers(ent)` call belongs to: the calling player's
+/// own match. `None` for anything that is not a live client slot — pristine
+/// `G_TouchTriggers` returns immediately for those (`g_active.c:524-531`), so
+/// there is nothing to isolate.
+fn touch_requester(s: &crate::state::TffaState, g_entities: usize, ent: usize) -> Option<u8> {
+    if ent < g_entities {
+        return None;
+    }
+    let idx = (ent - g_entities) / SIZEOF_GENTITY;
+    if idx >= MAX_CLIENTS {
+        return None;
+    }
+    // SAFETY: ent is inside the g_entities array.
+    if unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0 {
+        return None;
+    }
+    Some(s.client_match[idx])
+}
+
+// ---------------------------------------------------------------------------
+// Acting scope (S7 link gate, S8 runtime-spawn gate): the instance whose game
+// code is running
+// ---------------------------------------------------------------------------
+
+/// No acting scope is open: `G_Find` is the pristine global search and a
+/// `G_Spawn` made now belongs to no instance. Shares `ENTITY_SHARED` with
+/// "untagged entity" because both mean "no instance filter", and a scope is only
+/// ever a real match id (`0..TOTAL_MATCH_SLOTS`).
+pub const SCOPE_NONE: u8 = ENTITY_SHARED;
+
+/// The instance a call into game code belongs to — the *acting* entity's own
+/// instance. `None` when the actor cannot be attributed: a live player slot
+/// resolves through `client_match` (a chain or a think fired by a player is that
+/// player's instance's), a tagged world entity through its tag (main included),
+/// a live entity that carries no tag through its owner (one `r.ownerNum` hop to
+/// a live player: missiles, saber entities, physics objects, bodies — the same
+/// resolution the trace gate's `request_match` uses), and anything else — a
+/// shared inert prop, a freed one, a pointer below the array, the world slots —
+/// resolves to nothing.
+fn acting_instance(s: &crate::state::TffaState, g_entities: usize, ent: usize) -> Option<u8> {
+    if g_entities == 0 || ent < g_entities {
+        return None;
+    }
+    let num = (ent - g_entities) / SIZEOF_GENTITY;
+    if num >= MAX_GENTITIES {
+        return None;
+    }
+    if num < MAX_CLIENTS {
+        // SAFETY: `ent` is inside the g_entities array.
+        if unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0 {
+            return None;
+        }
+        return Some(s.client_match[num]);
+    }
+    if num >= ENTITYNUM_MAX_NORMAL as usize {
+        // Only the ordinary range is ever tagged (and `G_Spawn` never hands out
+        // `ENTITYNUM_WORLD`/`ENTITYNUM_NONE`).
+        return None;
+    }
+    // SAFETY: `ent` is inside the g_entities array.
+    if unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } == 0 {
+        // A freed slot keeps no instance: its clone set is gone, and its stale
+        // tag must not scope anybody's chain.
+        return None;
+    }
+    let tag = s.entity_instance[num];
+    if tag != ENTITY_SHARED {
+        return Some(tag);
+    }
+    // Untagged but owned: a missile, saber entity, physics object or body acts
+    // in its owner's instance. Its instance is not the tag table's business (the
+    // owned-entity machinery already scopes it), but the *code it runs* — an
+    // impact's radius damage, a box query, a chain it fires — belongs there.
+    request_match(g_entities, num as c_int, &s.client_match)
+}
+
+/// Open the acting scope for one call into game code (`G_RunThink`,
+/// `G_RunMissile`, `G_UseTargets2`, `player_die`) and return the scope to hand
+/// back to `close_acting_scope`. The acting entity's instance is authoritative;
+/// when it cannot be attributed the enclosing scope is kept, so a cascade a
+/// player action started never widens halfway through.
+pub fn open_acting_scope(ent: usize) -> u8 {
+    state::with_state(|s| {
+        let previous = s.tffa.acting_scope;
+        let g_entities = s.located_game_data.g_entities;
+        let this = acting_instance(&s.tffa, g_entities, ent);
+        s.tffa.acting_scope = this.unwrap_or(previous);
+        previous
+    })
+}
+
+/// The acting scope now open, or `SCOPE_NONE`. A trap gate reads it once per
+/// call rather than holding the state lock across the engine call.
+pub fn acting_scope() -> u8 {
+    state::with_state(|s| s.tffa.acting_scope)
+}
+
+/// Open the acting scope for one call the **engine** makes on behalf of a client
+/// (`vmMain`: `GAME_CLIENT_COMMAND`, `GAME_CLIENT_DISCONNECT`). The vmMain path
+/// carries only the client number — and the game's own `ClientCommand` /
+/// `ClientDisconnect` may clear `ent->client` inside the call — so the client's
+/// match is read from the proxy's own table instead of the entity. Keeps the
+/// enclosing scope for a number that names no client.
+pub fn open_client_scope(client_num: c_int) -> u8 {
+    state::with_state(|s| {
+        let previous = s.tffa.acting_scope;
+        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
+            s.tffa.acting_scope = s.tffa.client_match[client_num as usize];
+        }
+        previous
+    })
+}
+
+// ---------------------------------------------------------------------------
+/// Close the acting scope of one call into game code. At the outermost close —
+/// no scope was open before it — the entities spawned anywhere inside the call
+/// are classified: an interactive world entity joins the instance of the entity
+/// whose code spawned it, so each instance's own copy of that entity produces
+/// its own children (and never one that is shared by all of them).
+pub fn close_acting_scope(previous: u8) {
+    if previous == SCOPE_NONE {
+        flush_pending_spawns();
+    }
+    state::with_state(|s| s.tffa.acting_scope = previous);
+}
+
+/// Whether the open acting scope hides an entity a *world query* named: yes for
+/// an entity tagged to another instance, no for everything else. Players and
+/// untagged entities (shared props, `info_player_*`, lights) stay reachable from
+/// every instance, exactly as the visibility, collision and touch gates treat
+/// them. Both the `G_Find` link gate (S7) and the box/contact gates
+/// (`G_EntitiesInBox`/`G_EntityContact`, S9) ask this question.
+pub fn link_hides(found: usize, window: u8) -> bool {
+    state::with_state(|s| {
+        link_hides_tag(
+            &s.tffa.entity_instance,
+            s.located_game_data.g_entities,
+            found,
+            window,
+        )
+    })
+}
+
+/// Compact a box-query result in place, dropping the entries a foreign instance
+/// owns; returns the number of entries kept. Pure over the caller's slice, so
+/// the rule is unit-tested directly.
+fn retain_visible_slots(tags: &[u8; MAX_GENTITIES], list: &mut [c_int], scope: u8) -> usize {
+    let mut kept = 0usize;
+    for i in 0..list.len() {
+        let num = list[i];
+        if scope_hides_num(tags, num, scope) {
+            continue;
+        }
+        list[kept] = num;
+        kept += 1;
+    }
+    kept
+}
+
+/// Keep only the entities the open acting scope may see in a box-query result,
+/// compacting `list` in place and returning the new count. The engine already
+/// did the box test (`G_EntitiesInBox`); only the entries tagged to another
+/// instance are dropped — the same rule `link_hides` applies to `G_Find`
+/// results, so a mover, an explosion or a script running in one instance no
+/// longer sees another instance's doors, triggers or items in its box.
+///
+/// # Safety
+///
+/// `list` must point to at least `count` writable `c_int`s — the game's own
+/// array, exactly as the engine just filled it.
+pub unsafe fn filter_box_list(list: *mut c_int, count: c_int, scope: u8) -> c_int {
+    if list.is_null() || count <= 0 {
+        return count.max(0);
+    }
+    state::with_state(|s| {
+        if s.located_game_data.g_entities == 0 {
+            // Nothing can be judged without the array: keep what the engine
+            // returned rather than hide entities at random.
+            return count;
+        }
+        // SAFETY: the caller guarantees `count` writable `c_int`s at `list`
+        // (the game's own array, as the engine just filled it).
+        let slice = unsafe { core::slice::from_raw_parts_mut(list, count as usize) };
+        retain_visible_slots(&s.tffa.entity_instance, slice, scope) as c_int
+    })
+}
+
+/// The hide rule proper, in the form every user needs — a *slot number* is
+/// hidden when it is tagged to another instance than `scope`. Players, the world
+/// slots and untagged (shared) entities are never hidden, the rule the
+/// visibility, collision and touch gates also follow. No state access, so it can
+/// be unit-tested with a fabricated tag table.
+fn scope_hides_num(tags: &[u8; MAX_GENTITIES], num: i32, scope: u8) -> bool {
+    if !(MAX_CLIENTS as i32..ENTITYNUM_MAX_NORMAL).contains(&num) {
+        return false;
+    }
+    let tag = tags[num as usize];
+    tag != ENTITY_SHARED && tag != scope
+}
+
+/// The hide decision for a `G_Find` result pointer — the pointer form of
+/// `scope_hides_num`.
+fn link_hides_tag(tags: &[u8; MAX_GENTITIES], g_entities: usize, found: usize, window: u8) -> bool {
+    if g_entities == 0 || found < g_entities {
+        return false;
+    }
+    scope_hides_num(tags, ((found - g_entities) / SIZEOF_GENTITY) as i32, window)
+}
+
+/// Walk pristine `G_Find` results from `from`, skipping the entities an open
+/// acting scope hides, and return the first visible match (or `0`, `NULL`).
+/// `next` is one pristine search step — every comparison and the
+/// `level.num_entities` bound stay the game's own, nothing is reimplemented —
+/// and it always advances, so the walk terminates. No lock is held across it.
+pub fn find_visible(
+    from: usize,
+    mut next: impl FnMut(usize) -> usize,
+    hides: impl Fn(usize) -> bool,
+) -> usize {
+    let mut cur = from;
+    loop {
+        let found = next(cur);
+        if found == 0 || !hides(found) {
+            return found;
+        }
+        cur = found;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-spawn gate (S8): an entity the map's code creates mid-map belongs to
+// the instance that created it
+// ---------------------------------------------------------------------------
+
+/// The `(slot, instance)` one `G_Spawn` inside game code contributes, or `None`
+/// when it belongs to no instance: nothing is running game code, the slot is not
+/// a `gentity_t` of the ordinary world range (`MAX_CLIENTS..ENTITYNUM_MAX_NORMAL`,
+/// the range `G_Spawn` hands out and the only range that is ever tagged), or the
+/// `g_entities` array is not located.
+fn spawn_record(acting_scope: u8, g_entities: usize, ed: usize) -> Option<(u16, u8)> {
+    if acting_scope == SCOPE_NONE || ed == 0 {
+        return None;
+    }
+    let num = ent_num_of(g_entities, ed)?;
+    if !(MAX_CLIENTS as c_int..ENTITYNUM_MAX_NORMAL).contains(&num) {
+        return None;
+    }
+    Some((num as u16, acting_scope))
+}
+
+/// `G_Spawn` detour body — the pristine allocation already happened. A fresh
+/// entity carries no callbacks yet (`G_InitGentity` just reset it), so the
+/// interactive predicate cannot be applied here: the slot is only remembered,
+/// with the instance of the code that spawned it, and
+/// `flush_pending_spawns` classifies it when that code returns.
+pub fn note_spawned(ed: usize) {
+    state::with_state(|s| {
+        let scope = s.tffa.acting_scope;
+        if scope == SCOPE_NONE {
+            return;
+        }
+        let g_entities = s.located_game_data.g_entities;
+        if let Some(record) = spawn_record(scope, g_entities, ed) {
+            s.tffa.spawn_pending.push(record);
+        }
+    });
+}
+
+/// Classify the slots spawned since the outermost acting call opened: an
+/// interactive world entity inherits the instance recorded with it, everything
+/// else (an inert prop, a temp event entity, a slot the game already freed) stays
+/// untagged and shared. Returns how many entities joined an instance. No state is
+/// touched, so it can be unit-tested on a fabricated `g_entities`.
+fn tag_pending(
+    tags: &mut [u8; MAX_GENTITIES],
+    table: &[u8; MAX_CLIENTS],
+    g_entities: usize,
+    pending: &[(u16, u8)],
+) -> usize {
+    let mut tagged = 0usize;
+    for &(num, instance) in pending {
+        if g_entities == 0 {
+            break;
+        }
+        let ent = g_entities + num as usize * SIZEOF_GENTITY;
+        // SAFETY: `num` is an ordinary-range gentity slot (checked when it was
+        // recorded) and every field read is valid for a spawned gentity.
+        let live = unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } != 0;
+        if !live {
+            // `G_Spawn` recycled the slot again, or the game freed the entity
+            // before its spawner returned: there is nothing to tag.
+            continue;
+        }
+        // A temp event entity (`eType = ET_EVENTS + event`) is the event/sound
+        // machinery's, never a world entity: its visibility is the sound
+        // attribution's and it frees itself after its event, so it keeps no
+        // instance even inside an acting scope.
+        // SAFETY: same slot as above; `s.eType` is a plain int.
+        if unsafe { read_i32(ent + OFFSET_GENTITY_S_ETYPE) } >= ET_EVENTS {
+            continue;
+        }
+        // An entity that carries a live-player owner is already isolated by the
+        // owned-entity machinery (visibility, trace and touch all resolve it
+        // through `r.ownerNum`), and a tag would additionally enroll a live
+        // projectile or physics object in the clone set a later instance copies.
+        // Only what nothing else scopes — a dropped item, a trigger or door
+        // trigger the map creates mid-map — needs the tag.
+        if request_match(g_entities, num as c_int, table).is_some() {
+            continue;
+        }
+        if !is_interactive_entity(g_entities, num as c_int) {
+            continue;
+        }
+        tags[num as usize] = instance;
+        tagged += 1;
+    }
+    tagged
+}
+
+/// Drain the pending spawns and tag those that turned out interactive. Runs at
+/// the outermost acting call's close (and, defensively, at frame start, so an
+/// entry can never outlive the call it was recorded in).
+pub fn flush_pending_spawns() {
+    let pending: Vec<(u16, u8)> = state::with_state(|s| core::mem::take(&mut s.tffa.spawn_pending));
+    if pending.is_empty() {
+        return;
+    }
+    let tagged = state::with_state(|s| {
+        let g_entities = s.located_game_data.g_entities;
+        tag_pending(
+            &mut s.tffa.entity_instance,
+            &s.tffa.client_match,
+            g_entities,
+            &pending,
+        )
+    });
+    if tagged > 0 {
+        eprintln!(
+            "----- proxy-rs: {tagged} of {} runtime-spawned entities joined their spawner's instance",
+            pending.len()
+        );
+    }
 }
 
 /// The match whose trace this is: player slots resolve directly; other
 /// entities resolve once through `r.ownerNum` (missiles, saber entities).
 /// World/unknown requesters get `None` (no isolation for that trace).
 fn request_match(g_entities: usize, ent_num: c_int, table: &[u8; MAX_CLIENTS]) -> Option<u8> {
+    // `ENTITYNUM_WORLD` (1022) and `ENTITYNUM_NONE` (1023) name no entity, and
+    // `G_Spawn` never hands those slots out (`g_utils.c:837`): reading one would
+    // take a zeroed slot's `r.ownerNum == 0` for a reference to client 0 and
+    // attribute a world trace to client 0's match.
+    if !(0..ENTITYNUM_MAX_NORMAL).contains(&ent_num) {
+        return None;
+    }
+    let ent = g_entities + ent_num as usize * SIZEOF_GENTITY;
     let live_player = |num: i32| -> bool {
         if !(0..MAX_CLIENTS as i32).contains(&num) {
             return false;
         }
         // SAFETY: num is a valid g_entities slot.
         unsafe {
-            read_usize(
-                g_entities + num as usize * crate::sdk::SIZEOF_GENTITY + OFFSET_GENTITY_CLIENT,
-            ) != 0
+            read_usize(g_entities + num as usize * SIZEOF_GENTITY + OFFSET_GENTITY_CLIENT) != 0
         }
     };
     if live_player(ent_num) {
         return Some(table[ent_num as usize]);
     }
-    if (0..MAX_GENTITIES as i32).contains(&ent_num) {
-        // SAFETY: ent_num is a valid gentity index.
-        let owner = unsafe {
-            read_i32(
-                g_entities + ent_num as usize * crate::sdk::SIZEOF_GENTITY + OFFSET_GENTITY_R_OWNER,
-            )
-        };
-        if live_player(owner) {
-            return Some(table[owner as usize]);
-        }
+    // SAFETY: ent is inside the g_entities array.
+    if unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } == 0 {
+        // A freed slot's owner fields are memset zeros, not a reference to
+        // client 0: an entity that is gone owns nothing.
+        return None;
+    }
+    // SAFETY: ent is inside the g_entities array.
+    let owner = unsafe { read_i32(ent + OFFSET_GENTITY_R_OWNER) };
+    if live_player(owner) {
+        return Some(table[owner as usize]);
     }
     None
 }
@@ -1620,33 +2518,46 @@ fn cmd_create(client_num: c_int) {
                 break;
             }
             if !m.active && s.tffa.client_match.iter().all(|c| *c != i as u8) {
-                m.active = true;
-                m.red = 0;
-                m.blue = 0;
                 id = i as u8;
                 break;
             }
         }
-        if id != 0 {
-            s.tffa.client_match[client_num as usize] = id;
-            s.tffa.player_score[client_num as usize] = 0;
-        }
     });
     if id == 0 {
         tell(client_num, "print \"No free match slot.\n\"");
-    } else {
-        // New assignment: other viewers need the prefixed view of this slot,
-        // and the creator needs their own match's scores/names.
-        reset_slot_stats(client_num);
-        broadcast_cs_players_slot(client_num);
-        refresh_cs_players_for_viewer(client_num);
+        return;
+    }
+    // Per-instance world entities (D-006 extension): the instance's own doors,
+    // plats, elevators and triggers must exist *before* it is handed a player —
+    // a door left shared is activatable from every instance. Capacity is spent
+    // on whole instances, so the map either pays for the complete interactive
+    // set or the instance is refused.
+    if let Err(reason) = realize_instance(id) {
         tell(
             client_num,
-            &format!(
-                "print \"Created match {id}. Team up with /team red|blue, invite others with tffa_join {id}.\n\""
-            ),
+            &format!("print \"Cannot create match {id}: {reason}.\n\""),
         );
+        return;
     }
+    state::with_state(|s| {
+        let m = &mut s.tffa.matches[id as usize];
+        m.active = true;
+        m.red = 0;
+        m.blue = 0;
+        s.tffa.client_match[client_num as usize] = id;
+        s.tffa.player_score[client_num as usize] = 0;
+    });
+    // New assignment: other viewers need the prefixed view of this slot,
+    // and the creator needs their own match's scores/names.
+    reset_slot_stats(client_num);
+    broadcast_cs_players_slot(client_num);
+    refresh_cs_players_for_viewer(client_num);
+    tell(
+        client_num,
+        &format!(
+            "print \"Created match {id}. Team up with /team red|blue, invite others with tffa_join {id}.\n\""
+        ),
+    );
 }
 
 fn cmd_join(client_num: c_int, id: i32) {
@@ -1748,7 +2659,7 @@ fn cmd_list(client_num: c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sdk::{ENTITYNUM_NONE, ENTITYNUM_WORLD};
+    use crate::sdk::{CONTENTS_SOLID, ENTITYNUM_NONE, ENTITYNUM_WORLD};
 
     #[test]
     fn damage_blocked_unless_same_match() {
@@ -1817,6 +2728,524 @@ mod tests {
         assert!(fraglimit_hit(3, 10, 10));
         assert!(!fraglimit_hit(9, 9, 10));
         assert!(!fraglimit_hit(10, 10, 0));
+    }
+
+    /// Per-instance world entities (D-006 extension): a fabricated
+    /// `g_entities` array in the state `G_InitGame`'s `memset` leaves it.
+    struct World {
+        mem: Vec<u8>,
+    }
+
+    impl World {
+        fn new() -> Self {
+            Self {
+                mem: vec![0u8; MAX_GENTITIES * SIZEOF_GENTITY],
+            }
+        }
+
+        fn base(&self) -> usize {
+            self.mem.as_ptr() as usize
+        }
+
+        fn put_i32(&mut self, ent: usize, off: usize, v: i32) {
+            let at = ent * SIZEOF_GENTITY + off;
+            self.mem[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        fn put_ptr(&mut self, ent: usize, off: usize, v: usize) {
+            let at = ent * SIZEOF_GENTITY + off;
+            self.mem[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        }
+
+        /// A live entity with the given `eType` and no other field set (an
+        /// inert prop such as `misc_model_static`).
+        fn spawn(&mut self, ent: usize, etype: i32) {
+            self.put_i32(ent, OFFSET_GENTITY_INUSE, 1);
+            self.put_i32(ent, OFFSET_GENTITY_S_ETYPE, etype);
+        }
+    }
+
+    #[test]
+    fn world_entity_visible_only_when_shared_or_same_instance() {
+        assert!(world_entity_visible(0, ENTITY_SHARED));
+        assert!(world_entity_visible(3, ENTITY_SHARED));
+        assert!(world_entity_visible(0, 0));
+        assert!(world_entity_visible(2, 2));
+        assert!(!world_entity_visible(0, 2));
+        assert!(!world_entity_visible(2, 0));
+    }
+
+    /// The decided structural predicate: triggers, movers, anything with a
+    /// callback or a name, and team members are interactive; a plain
+    /// key-less spawn point / static model / light is not.
+    #[test]
+    fn interactive_predicate_matches_the_decided_rule() {
+        let mut w = World::new();
+        // Inert: spawned, no keys, no callbacks.
+        w.spawn(48, crate::sdk::ET_GENERAL);
+        assert!(!is_interactive_entity(w.base(), 48));
+
+        // `r.contents & CONTENTS_TRIGGER` (a `trigger_multiple` brush).
+        w.put_i32(48, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        assert!(is_interactive_entity(w.base(), 48));
+
+        // `s.eType == ET_MOVER` alone (a door/plat/elevator).
+        w.spawn(49, ET_MOVER);
+        assert!(is_interactive_entity(w.base(), 49));
+
+        // A callback (`touch` here; any of the five suffices).
+        w.spawn(50, crate::sdk::ET_GENERAL);
+        w.put_ptr(50, OFFSET_GENTITY_TOUCH, 0x0800_0000);
+        assert!(is_interactive_entity(w.base(), 50));
+
+        // A name a target can resolve (`targetname`).
+        w.spawn(51, crate::sdk::ET_GENERAL);
+        w.put_ptr(51, OFFSET_GENTITY_TARGETNAME, 0x0800_1000);
+        assert!(is_interactive_entity(w.base(), 51));
+
+        // A team-chain member (`teammaster`).
+        w.spawn(52, crate::sdk::ET_GENERAL);
+        w.put_ptr(52, OFFSET_GENTITY_TEAMMASTER, 0x0800_2000);
+        assert!(is_interactive_entity(w.base(), 52));
+
+        // Out-of-range slots and a null array are never interactive.
+        assert!(!is_interactive_entity(w.base(), -1));
+        assert!(!is_interactive_entity(w.base(), MAX_GENTITIES as c_int));
+        assert!(!is_interactive_entity(0, 48));
+    }
+
+    /// The clone cost counts live interactive entities only: freed slots and
+    /// the engine's player range never contribute.
+    #[test]
+    fn interactive_sources_ignore_free_and_player_slots() {
+        let mut w = World::new();
+        // Player range (below MAX_CLIENTS) is never scanned even when it looks
+        // interactive.
+        w.spawn(0, ET_MOVER);
+        w.put_i32(0, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        // Two live interactive entities and one inert prop above MAX_CLIENTS.
+        w.spawn(48, ET_MOVER);
+        w.spawn(49, crate::sdk::ET_GENERAL);
+        w.put_i32(49, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        w.spawn(50, crate::sdk::ET_GENERAL);
+        // A freed slot that still carries interactive-looking fields.
+        w.put_ptr(51, OFFSET_GENTITY_TARGETNAME, 0x0800_3000);
+        assert_eq!(interactive_sources(w.base()), vec![48, 49]);
+        assert!(interactive_sources(0).is_empty());
+    }
+
+    /// An NPC/actor cannot be duplicated (its Ghoul2 model and `client` are
+    /// shared): a map holding one takes no instance at all, while an ordinary
+    /// door/trigger can.
+    #[test]
+    fn duplicable_entities_exclude_npc_actors() {
+        let mut w = World::new();
+        let npc = crate::sdk::ET_NPC;
+        // A plain mover, an item (CONTENTS_TRIGGER), and a trigger brush.
+        w.spawn(48, ET_MOVER);
+        assert!(is_duplicable_entity(w.base(), 48));
+        w.spawn(49, crate::sdk::ET_GENERAL);
+        w.put_i32(49, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        assert!(is_duplicable_entity(w.base(), 49));
+        // An NPC tells on itself by its eType...
+        w.spawn(50, npc);
+        assert!(!is_duplicable_entity(w.base(), 50));
+        // ... and so does any entity with a Ghoul2 model or a dynamic client.
+        w.spawn(51, ET_MOVER);
+        w.put_ptr(51, OFFSET_GENTITY_GHOUL2, 0x0900_0000);
+        assert!(!is_duplicable_entity(w.base(), 51));
+        w.spawn(52, ET_MOVER);
+        w.put_ptr(52, OFFSET_GENTITY_CLIENT, 0x0900_1000);
+        assert!(!is_duplicable_entity(w.base(), 52));
+    }
+
+    /// The collision gate (S5): a trace by one instance's player ignores every
+    /// other instance's world entities — main's originals included — while the
+    /// requester's own copies and untagged shared props stay solid. Entities
+    /// whose contents do not intersect the trace's `contentmask` are left
+    /// alone, exactly as the engine skips them.
+    #[test]
+    fn trace_flips_cover_foreign_instances_only() {
+        let mut w = World::new();
+        let mut t = crate::state::TffaState::default();
+        // Client 0 plays match 1 (the requester), client 1 plays match 2.
+        w.spawn(0, 1);
+        w.put_ptr(0, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        w.put_i32(0, OFFSET_GENTITY_R_CONTENTS, CONTENTS_SOLID);
+        w.spawn(1, 1);
+        w.put_ptr(1, OFFSET_GENTITY_CLIENT, 0x0800_0100);
+        w.put_i32(1, OFFSET_GENTITY_R_CONTENTS, CONTENTS_SOLID);
+        t.client_match[0] = 1;
+        t.client_match[1] = 2;
+
+        // Main's original door (tag 0), the requester's own door (tag 1), a
+        // foreign door (tag 2), and an untagged solid prop.
+        for (slot, tag, contents) in [
+            (48usize, MAIN_MATCH, CONTENTS_SOLID),
+            (49, 1, CONTENTS_SOLID),
+            (50, 2, CONTENTS_SOLID),
+            (51, ENTITY_SHARED, CONTENTS_SOLID),
+        ] {
+            w.spawn(slot, ET_MOVER);
+            w.put_i32(slot, OFFSET_GENTITY_R_CONTENTS, contents);
+            t.entity_instance[slot] = tag;
+        }
+        // A foreign instance's trigger brush: invisible to a solid mask.
+        w.spawn(52, crate::sdk::ET_GENERAL);
+        w.put_i32(52, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        t.entity_instance[52] = 2;
+
+        let mut out = Vec::new();
+        let n = flip_list(&t, w.base(), 0, CONTENTS_SOLID, &mut out);
+        assert_eq!(n, 3, "foreign player, main's door, foreign door");
+        let mut flipped: Vec<usize> = out.iter().map(|(addr, _)| *addr).collect();
+        flipped.sort_unstable();
+        let mut want = vec![
+            w.base() + SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+            w.base() + 48 * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+            w.base() + 50 * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+        ];
+        want.sort_unstable();
+        assert_eq!(flipped, want);
+        // Saved values are the live contents, so the restore is exact.
+        for (_, saved) in &out {
+            assert_eq!(*saved, CONTENTS_SOLID);
+        }
+
+        // A trigger-mask trace (what `G_TouchTriggers` uses) picks the foreign
+        // trigger instead: the doors carry no `CONTENTS_TRIGGER` bit.
+        let n = flip_list(&t, w.base(), 0, CONTENTS_TRIGGER, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(
+            out[0],
+            (
+                w.base() + 52 * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+                CONTENTS_TRIGGER
+            )
+        );
+    }
+
+    /// A trace nobody owns (`ENTITYNUM_WORLD`/`ENTITYNUM_NONE`, out of range,
+    /// or a freed requester slot whose zeroed `r.ownerNum` would read as client
+    /// 0) filters nothing — the world stays solid for it, as before this
+    /// feature. A live owned entity still resolves through `r.ownerNum`.
+    #[test]
+    fn trace_flips_ignore_world_and_freed_requesters() {
+        let mut w = World::new();
+        let mut t = crate::state::TffaState::default();
+        w.spawn(0, 1);
+        w.put_ptr(0, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        t.client_match[0] = 1;
+        // A foreign door that would be flipped if the requester resolved.
+        w.spawn(50, ET_MOVER);
+        w.put_i32(50, OFFSET_GENTITY_R_CONTENTS, CONTENTS_SOLID);
+        t.entity_instance[50] = 2;
+
+        let mut out = Vec::new();
+        // A freed ordinary slot: `inuse == 0` and `r.ownerNum == 0`.
+        w.put_i32(70, OFFSET_GENTITY_INUSE, 0);
+        // A live missile of client 0's match.
+        w.spawn(80, 1);
+        w.put_i32(80, OFFSET_GENTITY_R_OWNER, 0);
+        for pass in [ENTITYNUM_WORLD, ENTITYNUM_NONE, -1, 1024, 70] {
+            assert_eq!(
+                flip_list(&t, w.base(), pass, CONTENTS_SOLID, &mut out),
+                0,
+                "passEntityNum {pass}"
+            );
+        }
+        // The live missile resolves to its owner's match, so main's door (tag
+        // 0, another instance) is flipped for its trace.
+        assert_eq!(flip_list(&t, w.base(), 80, CONTENTS_SOLID, &mut out), 1);
+        assert_eq!(
+            out[0],
+            (
+                w.base() + 50 * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+                CONTENTS_SOLID
+            )
+        );
+    }
+
+    /// The touch gate (S6) resolves its requester from the calling entity: only a
+    /// live client slot has one (pristine `G_TouchTriggers` returns immediately
+    /// for anything else, `g_active.c:524-531`), and it is that player's own
+    /// match — the instance their body is in.
+    #[test]
+    fn touch_requester_resolves_only_live_client_slots() {
+        let mut w = World::new();
+        let mut t = crate::state::TffaState::default();
+        let base = w.base();
+        let ent = |slot: usize| base + slot * SIZEOF_GENTITY;
+        w.spawn(3, 1);
+        w.put_ptr(3, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        t.client_match[3] = 5;
+        assert_eq!(touch_requester(&t, base, ent(3)), Some(5));
+        // Main is a match like any other.
+        w.spawn(4, 1);
+        w.put_ptr(4, OFFSET_GENTITY_CLIENT, 0x0800_0100);
+        assert_eq!(touch_requester(&t, base, ent(4)), Some(MAIN_MATCH));
+        // A freed client slot (no `client`), a non-player slot above the player
+        // range, a pointer below the array, and a null array resolve to none.
+        w.spawn(5, 1);
+        assert_eq!(touch_requester(&t, base, ent(5)), None);
+        w.spawn(48, crate::sdk::ET_GENERAL);
+        w.put_ptr(48, OFFSET_GENTITY_CLIENT, 0x0800_0200);
+        assert_eq!(touch_requester(&t, base, ent(48)), None);
+        assert_eq!(touch_requester(&t, base, base - SIZEOF_GENTITY), None);
+        assert_eq!(touch_requester(&t, 0, ent(3)), None);
+    }
+
+    /// The window helpers (S5/S6): `flip_apply` zeroes exactly the collected
+    /// slots, and `flip_restore` puts the saved value back only while the slot is
+    /// still ours — in use and still showing the `0` we wrote. A slot the game
+    /// freed inside the window, or one whose contents the game changed meanwhile,
+    /// is left alone (no stale write, no resurrection).
+    #[test]
+    fn flip_apply_and_restore_are_exact_but_never_resurrect() {
+        let mut w = World::new();
+        let contents = |w: &World, slot: usize| {
+            let at = slot * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS;
+            i32::from_le_bytes(w.mem[at..at + 4].try_into().unwrap())
+        };
+        let mut flips = Vec::new();
+        for slot in [48usize, 49, 50] {
+            w.spawn(slot, ET_MOVER);
+            w.put_i32(slot, OFFSET_GENTITY_R_CONTENTS, CONTENTS_SOLID);
+            flips.push((
+                w.base() + slot * SIZEOF_GENTITY + OFFSET_GENTITY_R_CONTENTS,
+                CONTENTS_SOLID,
+            ));
+        }
+        flip_apply(&flips);
+        for slot in [48usize, 49, 50] {
+            assert_eq!(contents(&w, slot), 0, "slot {slot} zeroed");
+        }
+        // Slot 49 is freed inside the window, slot 50 is re-armed by the game.
+        w.put_i32(49, OFFSET_GENTITY_INUSE, 0);
+        w.put_i32(50, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        flip_restore(&flips);
+        assert_eq!(contents(&w, 48), CONTENTS_SOLID, "ours, restored");
+        assert_eq!(contents(&w, 49), 0, "freed: not resurrected");
+        assert_eq!(contents(&w, 50), CONTENTS_TRIGGER, "game's value kept");
+    }
+
+    /// The acting-instance resolution the acting scope uses for both of its
+    /// gates (S7 link, S8 runtime-spawn): a live player slot through `client_match` (as the touch gate does), a
+    /// tagged world entity through its instance tag — main included — and
+    /// nothing for an actor that carries no instance (shared/untagged, freed, the
+    /// world/NONE slots, a pointer outside the array).
+    #[test]
+    fn acting_instance_resolves_the_firing_entitys_instance() {
+        let mut w = World::new();
+        let mut t = crate::state::TffaState::default();
+        let base = w.base();
+        let ent = |slot: usize| base + slot * SIZEOF_GENTITY;
+
+        // A live player in instance 3 fires through that player's match.
+        w.spawn(2, 1);
+        w.put_ptr(2, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        t.client_match[2] = 3;
+        assert_eq!(acting_instance(&t, base, ent(2)), Some(3));
+
+        // A tagged world entity (a cloned trigger) resolves to its own instance.
+        w.spawn(48, ET_MOVER);
+        t.entity_instance[48] = 1;
+        assert_eq!(acting_instance(&t, base, ent(48)), Some(1));
+        w.spawn(49, ET_MOVER);
+        t.entity_instance[49] = MAIN_MATCH;
+        assert_eq!(acting_instance(&t, base, ent(49)), Some(MAIN_MATCH));
+
+        // Untagged (shared) and freed entities, the world slots, a client slot
+        // without a client, a pointer below the array and a null array: no
+        // instance, so the call keeps the scope it was already in.
+        w.spawn(50, ET_MOVER);
+        assert_eq!(acting_instance(&t, base, ent(50)), None);
+        w.spawn(51, ET_MOVER);
+        t.entity_instance[51] = 2;
+        w.put_i32(51, OFFSET_GENTITY_INUSE, 0);
+        assert_eq!(acting_instance(&t, base, ent(51)), None, "freed slot");
+        w.spawn(3, 1);
+        assert_eq!(acting_instance(&t, base, ent(3)), None, "no client");
+        assert_eq!(
+            acting_instance(&t, base, ent(ENTITYNUM_WORLD as usize)),
+            None
+        );
+        assert_eq!(
+            acting_instance(&t, base, ent(ENTITYNUM_NONE as usize)),
+            None
+        );
+        assert_eq!(acting_instance(&t, base, base - SIZEOF_GENTITY), None);
+        assert_eq!(acting_instance(&t, 0, ent(49)), None);
+    }
+
+    /// An untagged entity that carries a live-player owner acts in its owner's
+    /// instance — the resolution the trace gate uses for missiles, saber
+    /// entities, physics objects and bodies (S9). An owner that is not a live
+    /// player (the world, a freed client slot, `ENTITYNUM_NONE`, which is what a
+    /// freshly spawned entity carries) resolves to nothing.
+    #[test]
+    fn acting_instance_follows_the_owner_of_an_untagged_entity() {
+        let mut w = World::new();
+        let mut t = crate::state::TffaState::default();
+        let base = w.base();
+        let ent = |slot: usize| base + slot * SIZEOF_GENTITY;
+        t.client_match[3] = 2;
+        w.spawn(3, 1);
+        w.put_ptr(3, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+
+        // A missile fired by instance 2's client 3.
+        w.spawn(60, crate::sdk::ET_GENERAL);
+        w.put_i32(60, OFFSET_GENTITY_R_OWNER, 3);
+        assert_eq!(acting_instance(&t, base, ent(60)), Some(2));
+
+        // A physics object with no owner (as `G_Spawn` leaves one).
+        w.spawn(61, crate::sdk::ET_GENERAL);
+        assert_eq!(acting_instance(&t, base, ent(61)), None);
+        w.put_i32(61, OFFSET_GENTITY_R_OWNER, ENTITYNUM_NONE);
+        assert_eq!(acting_instance(&t, base, ent(61)), None);
+        // Owner pointing at a client slot that holds no client.
+        w.put_i32(61, OFFSET_GENTITY_R_OWNER, 4);
+        assert_eq!(acting_instance(&t, base, ent(61)), None);
+        // A freed owner slot owns nothing.
+        w.put_i32(61, OFFSET_GENTITY_R_OWNER, 3);
+        w.put_ptr(3, OFFSET_GENTITY_CLIENT, 0);
+        assert_eq!(acting_instance(&t, base, ent(61)), None);
+        // A tagged entity never falls back to its owner: the tag wins.
+        t.entity_instance[61] = 1;
+        w.put_ptr(3, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        assert_eq!(acting_instance(&t, base, ent(61)), Some(1));
+    }
+
+    /// A box query made inside an acting scope keeps the scope's own and every
+    /// shared/untagged slot (players included) and drops the entries tagged to
+    /// another instance — the same rule the link gate applies to `G_Find`.
+    #[test]
+    fn box_list_drops_only_foreign_tagged_entries() {
+        let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
+        tags[48] = 1; // instance 1's door
+        tags[49] = 2; // instance 2's own
+        tags[51] = MAIN_MATCH; // main's original
+        // 50 stays shared, 3 is a player, 1023/`-1` are not slots at all.
+        let mut list = [48, 49, 51, 50, 3, ENTITYNUM_NONE as c_int, -1];
+        assert_eq!(retain_visible_slots(&tags, &mut list, 2), 5);
+        assert_eq!(list[0], 49, "own instance kept, foreign dropped");
+        assert_eq!(
+            &list[..5],
+            &[49, 50, 3, ENTITYNUM_NONE as c_int, -1],
+            "shared prop, player and non-slots are never dropped"
+        );
+        // Main's scope hides both instances' copies but not its own original.
+        let mut list = [48, 49, 51, 50];
+        assert_eq!(retain_visible_slots(&tags, &mut list, MAIN_MATCH), 2);
+        assert_eq!(&list[..2], &[51, 50]);
+        // A scope that owns nothing keeps only the shared/player entries.
+        let mut list = [48, 49, 51, 50, 3];
+        assert_eq!(retain_visible_slots(&tags, &mut list, 5), 2);
+        assert_eq!(&list[..2], &[50, 3]);
+    }
+
+    /// The acting scope hides exactly the entities tagged to another instance:
+    /// the firing instance's own copies and everything shared (untagged props,
+    /// players) stay reachable, so a chain resolves to its instance's targets and
+    /// no game code is reimplemented.
+    #[test]
+    fn acting_scope_hides_only_foreign_tagged_entities() {
+        let w = World::new();
+        let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
+        let base = w.base();
+        let ent = |slot: usize| base + slot * SIZEOF_GENTITY;
+        tags[48] = MAIN_MATCH;
+        tags[49] = 1;
+        tags[50] = 2;
+        tags[51] = ENTITY_SHARED;
+
+        // A chain fired by instance 2's entity reaches instance 2's targets, and
+        // is out of reach of main's original, instance 1's clone and nobody
+        // else's — while a shared prop stays reachable from every instance.
+        assert!(!link_hides_tag(&tags, base, ent(50), 2), "own clone");
+        assert!(
+            link_hides_tag(&tags, base, ent(49), 2),
+            "instance 1's clone"
+        );
+        assert!(link_hides_tag(&tags, base, ent(48), 2), "main's original");
+        assert!(!link_hides_tag(&tags, base, ent(51), 2), "shared stays");
+        // A chain fired by main reaches main's own targets only.
+        assert!(!link_hides_tag(&tags, base, ent(48), MAIN_MATCH));
+        assert!(link_hides_tag(&tags, base, ent(49), MAIN_MATCH));
+        assert!(link_hides_tag(&tags, base, ent(50), MAIN_MATCH));
+        // Players and out-of-range slots are never hidden.
+        assert!(!link_hides_tag(&tags, base, ent(3), 2));
+        assert!(!link_hides_tag(
+            &tags,
+            base,
+            ent(ENTITYNUM_WORLD as usize),
+            2
+        ));
+        assert!(!link_hides_tag(&tags, base, base - SIZEOF_GENTITY, 2));
+        assert!(!link_hides_tag(&tags, 0, ent(49), 2));
+    }
+
+    /// The windowed search walks pristine `G_Find` results and returns the first
+    /// one the window does not hide, resuming past each hidden match; `NULL`
+    /// ends it. The stub stands in for the pristine search, which always
+    /// advances and starts at the array head for a null `from`.
+    #[test]
+    fn find_visible_skips_hidden_matches_and_resumes() {
+        let w = World::new();
+        let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
+        let base = w.base();
+        tags[48] = MAIN_MATCH;
+        tags[49] = 2;
+        tags[50] = 1;
+        tags[51] = ENTITY_SHARED;
+        let found: Vec<usize> = [48usize, 49, 50, 51]
+            .iter()
+            .map(|&slot| base + slot * SIZEOF_GENTITY)
+            .collect();
+        let next = |cur: usize| {
+            let after = if cur == 0 { base - 1 } else { cur };
+            found.iter().copied().find(|f| *f > after).unwrap_or(0)
+        };
+        let visible =
+            |window: u8| find_visible(0, next, |f| link_hides_tag(&tags, base, f, window));
+        // Instance 2: main's original is hidden, its own clone comes first, then
+        // the shared prop; instance 1's clone stays hidden throughout.
+        assert_eq!(visible(2), base + 49 * SIZEOF_GENTITY);
+        assert_eq!(
+            find_visible(base + 49 * SIZEOF_GENTITY, next, |f| link_hides_tag(
+                &tags, base, f, 2
+            )),
+            base + 51 * SIZEOF_GENTITY
+        );
+        assert_eq!(
+            find_visible(base + 51 * SIZEOF_GENTITY, next, |f| link_hides_tag(
+                &tags, base, f, 2
+            )),
+            0
+        );
+        // Instance 1 sees only its own, main only main's.
+        assert_eq!(visible(1), base + 50 * SIZEOF_GENTITY);
+        assert_eq!(visible(MAIN_MATCH), base + 48 * SIZEOF_GENTITY);
+    }
+
+    /// One further instance costs `interactive_sources().len()` slots; capacity
+    /// is the free ordinary range divided by that cost.
+    #[test]
+    fn free_world_slots_covers_the_ordinary_range_only() {
+        let mut w = World::new();
+        assert_eq!(
+            free_world_slots(w.base()),
+            (ENTITYNUM_MAX_NORMAL - MAX_CLIENTS as i32) as usize
+        );
+        // Occupying the player range changes nothing.
+        w.spawn(0, ET_MOVER);
+        // Occupying an ordinary slot removes exactly one.
+        w.spawn(48, ET_MOVER);
+        assert_eq!(
+            free_world_slots(w.base()),
+            (ENTITYNUM_MAX_NORMAL - MAX_CLIENTS as i32) as usize - 1
+        );
+        assert_eq!(free_world_slots(0), 0);
     }
 
     fn sample_entry(client: i32, score: i32) -> Vec<i32> {
@@ -1906,5 +3335,83 @@ mod tests {
     fn entitynum_constants_match_sdk() {
         assert_eq!(ENTITYNUM_NONE, 1023);
         assert_eq!(ENTITYNUM_WORLD, 1022);
+    }
+
+    /// `G_Spawn` records a slot only while a world entity is running game code,
+    /// and only for the ordinary range it hands out: nothing else can carry an
+    /// instance.
+    #[test]
+    fn spawn_record_takes_ordinary_slots_with_a_context_only() {
+        let w = World::new();
+        let base = w.base();
+        let ent = |slot: usize| base + slot * SIZEOF_GENTITY;
+        assert_eq!(spawn_record(SCOPE_NONE, base, ent(48)), None);
+        assert_eq!(spawn_record(1, 0, ent(48)), None);
+        assert_eq!(spawn_record(1, base, 0), None);
+        assert_eq!(spawn_record(1, base, ent(48)), Some((48, 1)));
+        assert_eq!(spawn_record(MAIN_MATCH, base, ent(300)), Some((300, 0)));
+        // The player range and the world/NONE slots are never handed out by
+        // `G_Spawn` and are never tagged.
+        for slot in [0usize, MAX_CLIENTS - 1] {
+            assert_eq!(spawn_record(1, base, ent(slot)), None, "slot {slot}");
+        }
+        for slot in [ENTITYNUM_WORLD as usize, ENTITYNUM_NONE as usize] {
+            assert_eq!(spawn_record(1, base, ent(slot)), None, "slot {slot}");
+        }
+        assert_eq!(spawn_record(1, base, base - SIZEOF_GENTITY), None);
+        assert_eq!(spawn_record(1, base, base + 1), None);
+    }
+
+    /// When the acting call returns, only the spawned entities that are *live
+    /// interactive, unowned world entities* join the instance recorded for them:
+    /// an inert prop, a temp event entity, a slot the game already freed or
+    /// recycled, and an entity the owned-entity machinery already scopes (a
+    /// missile or physics object with a live-player owner) keep the tagless,
+    /// shared life they had before this feature.
+    #[test]
+    fn tag_pending_joins_only_live_interactive_world_entities() {
+        let mut w = World::new();
+        let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[3] = 2;
+        // An interactive trigger and a door spawned by main's own code.
+        w.spawn(48, crate::sdk::ET_GENERAL);
+        w.put_i32(48, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        w.spawn(49, ET_MOVER);
+        // An inert prop, a temp event entity (`ET_EVENTS + EV_...`), a freed
+        // slot, a slot recycled into an inert prop, and an interactive entity
+        // owned by a live player (a missile: `r.ownerNum` -> client 3).
+        w.spawn(50, crate::sdk::ET_GENERAL);
+        w.spawn(51, ET_EVENTS + 5);
+        w.spawn(52, ET_MOVER);
+        w.put_i32(52, OFFSET_GENTITY_INUSE, 0);
+        w.spawn(53, crate::sdk::ET_GENERAL);
+        w.spawn(54, crate::sdk::ET_GENERAL);
+        w.put_i32(54, OFFSET_GENTITY_R_CONTENTS, CONTENTS_TRIGGER);
+        w.put_i32(54, OFFSET_GENTITY_R_OWNER, 3);
+        w.spawn(3, 1);
+        w.put_ptr(3, OFFSET_GENTITY_CLIENT, 0x0800_0000);
+        let pending = [
+            (48u16, MAIN_MATCH),
+            (49, 2),
+            (50, MAIN_MATCH),
+            (51, MAIN_MATCH),
+            (52, MAIN_MATCH),
+            (53, 2),
+            (54, 2),
+        ];
+        assert_eq!(tag_pending(&mut tags, &table, w.base(), &pending), 2);
+        assert_eq!(tags[48], MAIN_MATCH, "main's runtime trigger");
+        assert_eq!(tags[49], 2, "instance 2's runtime door");
+        assert_eq!(tags[50], ENTITY_SHARED, "inert prop stays shared");
+        assert_eq!(tags[51], ENTITY_SHARED, "temp event entity stays shared");
+        assert_eq!(tags[52], ENTITY_SHARED, "freed slot");
+        assert_eq!(tags[53], ENTITY_SHARED, "recycled inert slot");
+        assert_eq!(
+            tags[54], ENTITY_SHARED,
+            "owned entity keeps its tagless life"
+        );
+        // A missing `g_entities` tags nothing and does not read memory.
+        assert_eq!(tag_pending(&mut tags, &table, 0, &pending), 0);
     }
 }

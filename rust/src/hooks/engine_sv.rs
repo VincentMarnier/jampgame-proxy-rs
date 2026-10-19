@@ -124,6 +124,27 @@ pub unsafe fn read_usize(addr: usize) -> usize {
     unsafe { core::ptr::read_unaligned(addr as *const usize) }
 }
 
+/// Write an `i32` engine/game struct field.
+///
+/// # Safety
+///
+/// `addr` must be a writable field the caller owns (the clone pass writes
+/// gentity slots it just spawned, never a slot another owner holds).
+pub unsafe fn write_i32(addr: usize, value: i32) {
+    // SAFETY: caller guarantees a writable int field.
+    unsafe { core::ptr::write_unaligned(addr as *mut i32, value) }
+}
+
+/// Write a `usize` (pointer) engine/game struct field.
+///
+/// # Safety
+///
+/// See `write_i32`; `value` must be a valid pointer for the field's meaning.
+pub unsafe fn write_usize(addr: usize, value: usize) {
+    // SAFETY: caller guarantees a writable pointer field.
+    unsafe { core::ptr::write_unaligned(addr as *mut usize, value) }
+}
+
 /// The client's `state` field.
 ///
 /// # Safety
@@ -782,7 +803,13 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     // locking); the viewer's own match is follow-aware (spectating someone
     // adopts their instance).
     let viewer_match = crate::tffa::effective_match(viewer);
-    let (table, sound_source) = state::with_state(|s| (s.tffa.client_match, s.tffa.sound_source));
+    let (table, sound_source, entity_instance) = state::with_state(|s| {
+        (
+            s.tffa.client_match,
+            s.tffa.sound_source,
+            s.tffa.entity_instance,
+        )
+    });
     // SAFETY: eNums is a valid snapshotEntityNumbers_t.
     let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
     if count <= 0 {
@@ -793,7 +820,14 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     for i in 0..count {
         // SAFETY: list holds `count` ints.
         let ent_num = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4) };
-        let keep = snapshot_keep(viewer_match, &table, &sound_source, g_entities, ent_num);
+        let keep = snapshot_keep(
+            viewer_match,
+            &table,
+            &sound_source,
+            &entity_instance,
+            g_entities,
+            ent_num,
+        );
         if keep {
             if kept != i {
                 // SAFETY: both slots are inside the eNums list.
@@ -817,6 +851,7 @@ fn snapshot_keep(
     viewer_match: u8,
     table: &[u8; MAX_CLIENTS],
     sound_source: &[u8; MAX_GENTITIES],
+    entity_instance: &[u8; MAX_GENTITIES],
     g_entities: usize,
     ent_num: c_int,
 ) -> bool {
@@ -899,6 +934,12 @@ fn snapshot_keep(
             ]
         };
         return owners_in_viewer_match(viewer_match, table, g_entities, &owned);
+    }
+    // Per-instance world entity (D-006 extension): a tagged door/trigger/button
+    // clone is visible only inside its own instance; untagged (`ENTITY_SHARED`)
+    // entities fall through to the owner attribution below, unchanged.
+    if !crate::tffa::world_entity_visible(viewer_match, entity_instance[ent_num as usize]) {
+        return false;
     }
     // Non-player, non-temp entity: attribute via owner fields. Any player
     // owner in a different match hides the entity; world-owned stays visible.
@@ -1032,6 +1073,11 @@ mod tests {
         [SOURCE_WORLD; MAX_GENTITIES]
     }
 
+    /// No entity is instance-tagged (the state before any clone pass runs).
+    fn shared_table() -> [u8; MAX_GENTITIES] {
+        [crate::tffa::ENTITY_SHARED; MAX_GENTITIES]
+    }
+
     /// Doors/escalators (and items, NPCs) keep the `s.*` memset defaults; a
     /// viewer outside client 0's match must still see them (the reported bug:
     /// "people in TFFA instances cannot see escalators/doors").
@@ -1042,11 +1088,18 @@ mod tests {
             let mut game = game;
             game.with_entity(48, etype);
             assert!(
-                snapshot_keep(1, &table, &sound_table(), game.base(), 48),
+                snapshot_keep(1, &table, &sound_table(), &shared_table(), game.base(), 48),
                 "eType {etype} with default owner fields must stay visible"
             );
             // ... and stays visible for a same-instance viewer too.
-            assert!(snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+            assert!(snapshot_keep(
+                0,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
         }
     }
 
@@ -1061,7 +1114,14 @@ mod tests {
         game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 0);
         game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 0);
         let table = [0u8; MAX_CLIENTS];
-        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
     }
 
     /// `r.ownerNum` has a real sentinel, so owner `0` there is client 0 and a
@@ -1072,16 +1132,37 @@ mod tests {
         game.with_entity(48, ET_MISSILE);
         game.put_i32(48, OFFSET_GENTITY_R_OWNER, 0);
         assert!(
-            !snapshot_keep(1, &table, &sound_table(), game.base(), 48),
+            !snapshot_keep(1, &table, &sound_table(), &shared_table(), game.base(), 48),
             "client 0's missile must be hidden from instance 1"
         );
-        assert!(snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+        assert!(snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
         // Same entity owned by an instance-1 player instead.
         game.with_player(5);
         table[5] = 1;
         game.put_i32(48, OFFSET_GENTITY_R_OWNER, 5);
-        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
-        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 48));
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+        assert!(!snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
     }
 
     /// `s.owner` still attributes player-owned entities the game does set it
@@ -1094,8 +1175,22 @@ mod tests {
         table[5] = 1;
         game.with_entity(48, ET_ITEM);
         game.put_i32(48, OFFSET_GENTITY_S_OWNER, 5);
-        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 48));
-        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 48));
+        assert!(!snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
     }
 
     /// Player entities follow their own match (unchanged behaviour).
@@ -1104,8 +1199,76 @@ mod tests {
         let (mut game, mut table) = main_player_and_viewer();
         game.with_player(5);
         table[5] = 1;
-        assert!(!snapshot_keep(1, &table, &sound_table(), game.base(), 0));
-        assert!(snapshot_keep(1, &table, &sound_table(), game.base(), 5));
-        assert!(!snapshot_keep(0, &table, &sound_table(), game.base(), 5));
+        assert!(!snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            0
+        ));
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            5
+        ));
+        assert!(!snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            5
+        ));
+    }
+
+    /// Per-instance world entities (D-006 extension): a tagged door/trigger is
+    /// visible only inside its own instance, and tagging an entity is inert for
+    /// every other instance (they keep the untagged behaviour).
+    #[test]
+    fn tagged_world_entity_visible_only_in_its_instance() {
+        let (game, table) = main_player_and_viewer();
+        let mut game = game;
+        game.with_entity(48, ET_MOVER);
+        let mut tags = shared_table();
+        tags[48] = 1; // instance 1's door
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &tags,
+            game.base(),
+            48
+        ));
+        assert!(!snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &tags,
+            game.base(),
+            48
+        ));
+        assert!(!snapshot_keep(
+            2,
+            &table,
+            &sound_table(),
+            &tags,
+            game.base(),
+            48
+        ));
+        // Untagged (the state before any clone pass): visible everywhere.
+        for viewer_match in [0, 1, 2] {
+            assert!(snapshot_keep(
+                viewer_match,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+        }
     }
 }

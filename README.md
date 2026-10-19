@@ -84,6 +84,22 @@ it, its members are moved to spectator and may join another match.
 global (per-match HUD would need a client mod). See
 `docs/decisions/0006-parallel-tffa.md`.
 
+**The world is per match.** Doors, plats, elevators, buttons, triggers and map
+items are duplicated for every match, so a door opened in one match is open only
+there, a trigger fires only for its own match's players, and an item taken in one
+match is still lying there in the others. The duplicate set is created with the
+match (the map is measured at level start) and given back when it closes.
+Entities the game creates *while the map runs* — a touch-openable door's trigger,
+an asteroid field's rocks, a dropped weapon, a script's spawn — are attributed to
+the match whose code created them, and the questions a match's world entities ask
+about the world (collision, touch, `targetname` chains, blast radius and box
+queries) see only their own match's copies plus everything shared: spawn points,
+lights, static models and a player's own projectiles stay as they were. A map
+whose interactive entities cannot be duplicated (an NPC or vehicle actor among
+them) takes no parallel matches at all, and `tffa_create` is refused with a
+message when the map's remaining entity slots cannot hold another whole set —
+coverage is never traded for match count.
+
 ## Usage
 
 1. Rename the original `jampgamei386.so` of your server's gamedir to

@@ -70,6 +70,90 @@ pub const FN_G_SOUND_TEMP_ENTITY: usize = 0x0016_e224;
 /// never keeps a stale sound attribution.
 pub const FN_G_TEMP_ENTITY: usize = 0x0016_e0d4;
 
+// ---------------------------------------------------------------------------
+// Parallel-TFFA per-instance world-entity support (`nm -D` verified 2026-10-18,
+// original/jalinuxded_1.011/jampgamei386.so; all inside .text 0x85564..0x1a66c4).
+// Used by the clone pass (S3), the touch/link gates (S6/S7), the
+// runtime-spawn attribution (S8) and the world-query gates (S9). Pinned ahead of
+// the implementation, so allowed dead until the callers land.
+// ---------------------------------------------------------------------------
+
+/// `gentity_t *G_Spawn(void)` (nm `G_Spawn__Fv`; prologue `55 8b ec 83 ec 30`,
+/// 6 detour-safe bytes) — allocates a free gentity slot (reusing a freed one, or
+/// opening a new slot and bumping `level.num_entities`) and runs
+/// `G_InitGentity` on it. The per-instance clone pass uses it rather than a
+/// hand-rolled allocator so slot accounting matches the pristine game, and it is
+/// detoured (index 15) so an entity the *game* spawns while a world entity runs
+/// its code (a door's `Think_SpawnNewDoorTrigger` → `trigger_door`, an asteroid
+/// field's `func_rotating` asteroids) is remembered until its callbacks are set,
+/// then tagged to that entity's instance (S8).
+pub const FN_G_SPAWN: usize = 0x0016_db44;
+/// `void G_InitGentity(gentity_t*)` (nm `G_InitGentity__FP9gentity_s`).
+#[allow(dead_code)]
+pub const FN_G_INIT_GENTITY: usize = 0x0016_d984;
+/// `void G_FreeEntity(gentity_t*)` (nm `G_FreeEntity__FP9gentity_s`). Detoured
+/// (index 11) so a clone that leaves the world loses its instance tag with the
+/// slot (a recycled slot must not inherit a stale tag).
+pub const FN_G_FREE_ENTITY: usize = 0x0016_de44;
+/// `void G_UseTargets(gentity_t*, gentity_t*)` (nm `G_UseTargets__FP9gentity_sT1`)
+/// — resolves `ent->target` by `targetname` across all of `g_entities`, so
+/// duplication alone would still cross-fire between instances. Not hooked:
+/// objdump shows it is a tail that reads `ent->target` (`0x448(%edx)`) and
+/// calls `G_UseTargets2` at `0x170545`, so the one hook on `G_UseTargets2`
+/// covers it and every direct chain caller.
+#[allow(dead_code)]
+pub const FN_G_USE_TARGETS: usize = 0x0017_0524;
+/// `void G_UseTargets2(gentity_t*, gentity_t*, const char*)` (nm
+/// `G_UseTargets2__FP9gentity_sT1PCc`, file offset `0x16d604`; prologue
+/// `55 8b ec 83 ec 20`, 6 detour-safe bytes). The funnel every target chain
+/// goes through: hooked (index 13) to scope the `targetname` search it drives
+/// to the firing entity's own instance.
+pub const FN_G_USE_TARGETS2: usize = 0x0016_d604;
+/// `gentity_t *G_Find(gentity_t *from, int fieldofs, const char *match)` (nm
+/// `G_Find__FP9gentity_siPCc`, file offset `0x16cec4`; prologue `55 8b ec 83 ec
+/// 18`, 6 detour-safe bytes). The search `G_UseTargets2` resolves a chain with:
+/// objdump shows its two calls inside it pass `fieldofs` `0x31c`
+/// (`FOFS(targetname)`, pinned `sdk::OFFSET_GENTITY_TARGETNAME`) at `0x16d68e`
+/// (first match) and `0x16d6de` (resume). Hooked (index 14) so a `targetname`
+/// lookup skips entities tagged to another instance while a link window is open.
+pub const FN_G_FIND: usize = 0x0016_cec4;
+/// `void G_RunThink(gentity_t *ent)` (nm `G_RunThink__FP9gentity_s`, file offset
+/// `0x8a1b4`; prologue `55 8b ec 83 ec 10`, 6 detour-safe bytes). The single
+/// dispatcher of `ent->think` (`g_main.c:3473-3487`: it reads `nextthink` at
+/// `0x4a4` and `think` at `0x4a8`, both pinned `gentity_t` offsets, and calls
+/// the function pointer): `G_RunFrame` reaches it directly for ordinary
+/// entities, through `G_RunMover` for `ET_MOVER` and through `G_RunItem`/
+/// `G_RunMissile` for those. Hooked (index 16) to record *which* entity's code
+/// is running, so an interactive entity a think spawns inherits that entity's
+/// instance instead of staying shared (S8).
+pub const FN_G_RUN_THINK: usize = 0x0008_a1b4;
+/// `void G_RunMissile(gentity_t *ent)` (nm `G_RunMissile__FP9gentity_s`, file
+/// offset `0x14d274`; prologue `55 8b ec 81 ec d8 00 00 00`, 9 detour-safe
+/// bytes). `G_RunFrame` routes every `ET_MISSILE` here (`g_main.c:3773`): it
+/// advances the trajectory, resolves the impact (`G_MissileImpact` →
+/// `G_RadiusDamage`, `G_RadiusList`) and ends with `G_RunThink` for the missile's
+/// own think. Hooked (index 17) so the impact runs in the firing entity's acting
+/// scope: a missile carries no instance of its own, but its owner does
+/// (`r.ownerNum` → the firing player), so its radius damage and box queries only
+/// reach that instance's entities (S9).
+pub const FN_G_RUN_MISSILE: usize = 0x0014_d274;
+/// `void G_TouchTriggers(gentity_t*)` (nm `G_TouchTriggers__FP9gentity_s`) —
+/// the per-think touch dispatch (`g_active.c:720`). Hooked to clear
+/// `CONTENTS_TRIGGER` on foreign-instance triggers for the duration.
+#[allow(dead_code)]
+pub const FN_G_TOUCH_TRIGGERS: usize = 0x0011_9bf4;
+/// `void G_MoverTeam(gentity_t*)` (nm `G_MoverTeam__FP9gentity_s`).
+#[allow(dead_code)]
+pub const FN_G_MOVER_TEAM: usize = 0x0014_e6f4;
+/// `void G_RunMover(gentity_t*)` (nm `G_RunMover__FP9gentity_s`).
+#[allow(dead_code)]
+pub const FN_G_RUN_MOVER: usize = 0x0014_e974;
+/// `void G_SpawnEntitiesFromString(qboolean)` (nm
+/// `G_SpawnEntitiesFromString__F8qboolean`) — map spawn, runs inside
+/// `G_InitGame`; the clone pass runs after it returns.
+#[allow(dead_code)]
+pub const FN_G_SPAWN_ENTITIES_FROM_STRING: usize = 0x0015_d094;
+
 /// Re-type a game-module function at `base + offset` as `$fn_ty`.
 ///
 /// # Safety
@@ -183,6 +267,31 @@ pub unsafe fn concat_args(start: c_int) -> *const c_char {
     unsafe { f(start) }
 }
 
+/// `gentity_t* G_Spawn(void)` at game base+0x16db44.
+///
+/// # Safety
+///
+/// The original module must be loaded and `GAME_INIT` must have run (the game
+/// spawns entities through this very function, so it is live from then on).
+/// The returned pointer is valid until the entity is freed.
+pub unsafe fn g_spawn() -> usize {
+    // SAFETY: pointer from base+offset of a loaded module.
+    let f: unsafe extern "C" fn() -> usize = game_fn!(unsafe extern "C" fn() -> usize, FN_G_SPAWN);
+    unsafe { f() }
+}
+
+/// `void G_FreeEntity(gentity_t*)` at game base+0x16de44.
+///
+/// # Safety
+///
+/// `ent` must be a live gentity the caller owns (the clone pass passes a slot
+/// it just spawned); the game must not be iterating `g_entities` at the time.
+pub unsafe fn g_free_entity(ent: usize) {
+    // SAFETY: pointer from base+offset of a loaded module.
+    let f: unsafe extern "C" fn(usize) = game_fn!(unsafe extern "C" fn(usize), FN_G_FREE_ENTITY);
+    unsafe { f(ent) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +324,18 @@ mod tests {
             FN_SET_TEAM,
             FN_ADD_SCORE,
             FN_LOG_EXIT,
+            FN_G_SPAWN,
+            FN_G_INIT_GENTITY,
+            FN_G_FREE_ENTITY,
+            FN_G_USE_TARGETS,
+            FN_G_USE_TARGETS2,
+            FN_G_FIND,
+            FN_G_RUN_THINK,
+            FN_G_RUN_MISSILE,
+            FN_G_TOUCH_TRIGGERS,
+            FN_G_MOVER_TEAM,
+            FN_G_RUN_MOVER,
+            FN_G_SPAWN_ENTITIES_FROM_STRING,
         ] {
             assert!(off >= text_lo && off < text_hi, "0x{off:x} out of .text");
         }
