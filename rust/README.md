@@ -9,9 +9,6 @@ intercepts the `G_LOCATE_GAME_DATA`/`G_GET_USERCMD` traps, and runs the proxy's
 own `vmMain` event handlers (client connect/begin/disconnect/command/
 userinfo + per-frame cvar refresh).
 
-See `docs/` at the repository root for the reverse-engineering evidence
-(findings R-001…R-020) and `../AGENTS.md` for the project rules.
-
 ## How it works (30 seconds)
 
 ```
@@ -47,7 +44,7 @@ The 2003 engine calls game modules with a 4-byte-aligned stack, but Rust i686
 codegen assumes 16-byte alignment at entry and emits SSE moves that fault on
 such a stack (the original proxy's "-mstackrealign" quirk). The i686 target
 therefore disables SSE (`.cargo/config.toml`) and the C shim is compiled with
-`-mstackrealign` (build.rs) — see `docs/decisions/0001-bootstrap-core.md`.
+`-mstackrealign` (build.rs).
 
 ## Requirements
 

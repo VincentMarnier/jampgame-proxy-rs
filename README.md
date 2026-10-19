@@ -44,7 +44,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
-`proxy_sv_disableKillCmd`) — see `docs/decisions/0002-scope.md`.
+`proxy_sv_disableKillCmd`).
 
 ### Per-team-size rules
 
@@ -65,7 +65,7 @@ is reconciled every frame, so the limits adapt when the roster changes mid-match
 (e.g. a game that becomes 2 vs 2 adopts the 2 vs 2 rules, and dropping back
 below the smallest rule restores the server limits); they are only rewritten
 when the effective decision actually changes. This works whether or not
-`proxy_sv_lockTeams` is enabled. See `docs/decisions/0005-team-size-rules.md`.
+`proxy_sv_lockTeams` is enabled.
 
 ### Parallel TFFA matches
 
@@ -81,8 +81,7 @@ neutralised so the pristine win check never fires early); when a match hits
 it, its members are moved to spectator and may join another match.
 `timelimit` stays global and ends everything. `proxy_sv_lockTeams` /
 `proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
-global (per-match HUD would need a client mod). See
-`docs/decisions/0006-parallel-tffa.md`.
+global (per-match HUD would need a client mod).
 
 **The world is per match.** Doors, plats, elevators, buttons, triggers and map
 items are duplicated for every match, so a door opened in one match is open only
@@ -135,11 +134,7 @@ route is the containerised dev environment (Docker). From `rust/`:
 See [`rust/README.md`](rust/README.md) for the full build, test and run
 instructions (end-to-end engine test, persistent bot server).
 
-## Project notes
+## Contributing
 
-- The original C++ proxy is not part of this repository; its source lives at
-  <https://github.com/VincentMarnier/jampgame_proxy> (pinned commit
-  `687997412ea6e5ead93f5c7b25db552590a2eeb1`).
-- `docs/` holds the reverse-engineering evidence, the architecture notes and
-  the decisions taken during the port. `AGENTS.md` records the project rules.
-- Feel free to open an issue or a PR if you want to see anything added to it.
+Issues and pull requests are welcome.
+

@@ -19,6 +19,18 @@ tools/ — scripts and tools used to analyze the original implementation and val
 
 `website` branch — project website (static Next.js export, deployed to GitHub Pages at <https://vincentmarnier.github.io/jampgame-proxy-rs/>). Web-only: the proxy source of truth stays on `main`; do not merge `main` into it nor copy `rust/`/`original/`/`tools/` there; verify site facts against `origin/main`.
 
+Documentation
+
+README.md is for humans: what the proxy is, its features and cvars, and how to use and build it. Keep agent instructions, evidence trails and `docs/` pointers out of it; those belong here or in docs/.
+
+docs/ holds the reverse-engineering evidence, the architecture notes and the decisions taken during the port. Decisions behind features described in README.md:
+
+- docs/decisions/0001-bootstrap-core.md — bootstrap core, the i386 4-byte stack alignment finding and the `-mstackrealign` / SSE-off workaround.
+- docs/decisions/0002-scope.md — port scope; records the cvars deliberately dropped from the original C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`, `proxy_sv_disableKillCmd`).
+- docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeams`.
+- docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM).
+- docs/decisions/README.md — index of the decision records.
+
 Source authority (game vs engine)
 
 For game-module ABI (trap ordinals, `vmMain`/`dllEntry` signatures, `level`/`g_entities`, `g_*` structs), `original/jedi-academy-sdk/` is authoritative (the former proxy `src/sdk/` was verified byte-identical to the pristine SDK for these types before the proxy source was removed). `original/jedi-academy/codemp/` must not be used for game ABI where it diverges from the SDK (known divergences: commented-out `BOTLIB_AI_*CHAT*` block, missing `G_G2_COLLISIONDETECTCACHE`, missing `BOTLIB_EA_*` syscall wrappers, `g_entities` as pointer instead of array, older saber structs).
