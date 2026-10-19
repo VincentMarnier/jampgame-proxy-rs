@@ -1229,6 +1229,31 @@ pub unsafe extern "C" fn g_run_missile(ent: usize) {
     crate::tffa::close_acting_scope(previous);
 }
 
+/// `team_t TeamCount(int ignoreClientNum, team_t team)` wrapper (parallel TFFA
+/// auto team balance): with the feature on, the census is scoped to one
+/// instance, so `PickTeam` (the game's own auto pick behind `team free`/empty
+/// and `g_teamAutoJoin`) balances the joining client's instance and `SetTeam`'s
+/// `g_teamForceBalance` check agrees with that pick instead of refusing it
+/// against a level-wide count. Falls through to the pristine count when the
+/// feature is off or the census has no instance context.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `TeamCount` argument list.
+pub unsafe extern "C" fn team_count(ignore_client_num: c_int, team: c_int) -> c_int {
+    if let Some(count) = crate::tffa::instance_team_count(ignore_client_num, team) {
+        return count;
+    }
+    // Detour missing (attach failed or raced with detach): fail closed rather
+    // than calling a null trampoline.
+    if crate::patch::GAME_HOOKS[18].original() == 0 {
+        return 0;
+    }
+    // SAFETY: trampoline attached at GAME_INIT; arguments forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_team_count);
+    unsafe { original(ignore_client_num, team) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

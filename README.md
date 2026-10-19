@@ -71,7 +71,15 @@ when the effective decision actually changes. This works whether or not
 
 With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
 parallel matches on the same map: `tffa_create` opens a match and joins it,
-`tffa_join <id>` / `tffa_leave` switch matches and `tffa_list` shows them.
+`tffa_join <id>` / `tffa_leave` switch matches (`tffa_join 0` returns to the
+main game, same as `tffa_leave`) and `tffa_list` shows them.
+They work while playing, not only from spectator: a travel command puts
+the player in the spectator team first (their character is killed), then
+switches the instance, so they re-pick a team with `/team red|blue`. A
+command that names the instance the player is already in changes nothing
+(no needless death). Auto team picks (`team free`, the client's
+auto-join, `g_teamAutoJoin`) balance the match being joined rather than
+the whole server, so one match's sides stay even.
 Each match is isolated: cross-match damage is
 dropped, cross-match players (and their projectiles, sabers and kill feed)
 are hidden from snapshots, and the scoreboard shows only the viewer's match

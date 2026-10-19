@@ -39,6 +39,14 @@ pub const FN_CLIENT_THINK_REAL: usize = 0x0011_c4c4;
 /// the single choke point every team change funnels through. Hooked by
 /// `proxy_sv_lockTeams` to enforce the round-start caps.
 pub const FN_SET_TEAM: usize = 0x0012_ada4;
+/// `team_t TeamCount(int ignoreClientNum, team_t team)` (nm-verified
+/// `TeamCount__FiT1`, offset `0x124a24`; prologue `55 8b ec 83 ec 18`, 6
+/// detour-safe bytes). Every team census goes through it: `PickTeam`
+/// (`g_client.c:1294-1295`, the game's auto pick behind `team free`/empty and
+/// `g_teamAutoJoin`) and `SetTeam`'s `g_teamForceBalance` check
+/// (`g_cmds.c:723-724`). Hooked by the parallel-TFFA feature so both see the
+/// joining client's own instance instead of the whole level.
+pub const FN_TEAM_COUNT: usize = 0x0012_4a24;
 /// `void AddScore(gentity_t*, vec3_t, int)` (nm `AddScore__FP9gentity_sPfi`,
 /// file offset `0x1313a4`; prologue `55 8b ec 83 ec 08`, 6 detour-safe bytes).
 /// `vec3_t` decays to `float*`, so the wrapper takes an origin pointer.

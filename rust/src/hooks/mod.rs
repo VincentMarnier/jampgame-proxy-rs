@@ -205,6 +205,11 @@ game_trampoline!(
     17,
     unsafe extern "C" fn(usize)
 );
+game_trampoline!(
+    game_hook_original_team_count,
+    18,
+    unsafe extern "C" fn(core::ffi::c_int, core::ffi::c_int) -> core::ffi::c_int
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -320,6 +325,7 @@ pub unsafe fn attach_all() {
         game::g_spawn as usize,
         game::g_run_think as usize,
         game::g_run_missile as usize,
+        game::team_count as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the

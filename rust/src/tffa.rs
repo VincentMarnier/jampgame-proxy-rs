@@ -34,17 +34,18 @@ use core::ffi::{c_char, c_int};
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
-    CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ENTITYNUM_MAX_NORMAL, ET_EVENTS,
-    ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME,
-    MAX_TOKEN_CHARS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED,
-    OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE,
-    OFFSET_GENTITY_LAST_ENEMY, OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT,
-    OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED,
-    OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE,
-    OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET, OFFSET_GENTITY_TARGET_ENT,
-    OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM, OFFSET_GENTITY_TEAMCHAIN,
-    OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK, OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE,
-    OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
+    CON_DISCONNECTED, CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ENTITYNUM_MAX_NORMAL,
+    ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME,
+    MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR,
+    OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2,
+    OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY, OFFSET_GENTITY_NEXT_TRAIN,
+    OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS,
+    OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED,
+    OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
+    OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM,
+    OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
+    OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM,
+    SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
 };
 use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_MAX_MATCHES};
 
@@ -757,10 +758,105 @@ pub fn session_team_of(client_num: c_int) -> Option<i32> {
     // SAFETY: client is a valid gclient_t.
     Some(unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) })
 }
-/// Whether the client is currently spectating (unknown → false, fail closed:
-/// travel commands refuse without game memory).
-pub fn is_spectator(client_num: c_int) -> bool {
-    session_team_of(client_num) == Some(TEAM_SPECTATOR)
+
+/// `TeamCount` scoped to one instance, for the game's auto team pick
+/// (`PickTeam` → `TeamCount`, `g_client.c:1294-1295`) and `SetTeam`'s
+/// `g_teamForceBalance` check (`g_cmds.c:723-724`): both pass the joining
+/// client, so counting only that client's instance balances the roster of the
+/// match being joined instead of the whole level (base `TeamCount` counts every
+/// connected client, so an instance's teams could be lopsided while the global
+/// counts looked even). `None` when the count must stay pristine (feature off,
+/// world not located).
+pub fn instance_team_count(ignore_client_num: c_int, team: c_int) -> Option<c_int> {
+    if !enabled() {
+        return None;
+    }
+    let (g_entities, matches) =
+        state::with_state(|s| (s.located_game_data.g_entities, s.tffa.client_match));
+    if g_entities == 0 {
+        return None;
+    }
+    // A caller with a client slot (`team free` → `PickTeam(clientNum)`, and the
+    // force-balance check itself) counts that client's instance; a caller
+    // without one (`-1`: the connect auto-join and bot creation) means main, the
+    // instance every unassigned client belongs to.
+    let instance = if (0..MAX_CLIENTS as c_int).contains(&ignore_client_num) {
+        matches[ignore_client_num as usize]
+    } else {
+        MAIN_MATCH
+    };
+    // The roster is read from game memory like the pristine body
+    // (`g_client.c:1240-1266`: `level.clients[i]`, reachable through
+    // `g_entities[i].client`), then censused by the pure helper.
+    let mut rows = [RosterRow::default(); MAX_CLIENTS];
+    for (i, row) in rows.iter_mut().enumerate() {
+        let ent = g_entities + i * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array.
+        let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+        if client == 0 {
+            continue;
+        }
+        // SAFETY: client is a valid gclient_t; both fields are plain ints.
+        let connected = unsafe {
+            read_i32(client + OFFSET_GCLIENT_PERS + OFFSET_PERS_CONNECTED) != CON_DISCONNECTED
+        };
+        // SAFETY: as above.
+        let team_of = unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) };
+        *row = RosterRow {
+            connected,
+            team: team_of,
+            instance: matches[i],
+        };
+    }
+    Some(count_instance_team(
+        ignore_client_num,
+        instance,
+        &rows,
+        team,
+    ))
+}
+
+/// One roster entry: whether the slot is connected, its session team and its
+/// proxy instance. `default()` is a disconnected main slot (its team is never
+/// read).
+#[derive(Clone, Copy)]
+struct RosterRow {
+    connected: bool,
+    team: i32,
+    instance: u8,
+}
+
+impl Default for RosterRow {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            team: TEAM_SPECTATOR, // any value; `connected = false` skips it
+            instance: MAIN_MATCH,
+        }
+    }
+}
+
+/// The census itself (pure, so a test can fabricate the roster): the pristine
+/// `TeamCount`'s filters — skip the ignored client, count clients that are
+/// connected, on `team`, and in `instance`. TFFA is `GT_TEAM`, so the siege
+/// `siegeDesiredTeam` arm of the pristine loop cannot apply.
+fn count_instance_team(
+    ignore_client_num: c_int,
+    instance: u8,
+    rows: &[RosterRow; MAX_CLIENTS],
+    team: i32,
+) -> c_int {
+    let mut count = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if i as c_int == ignore_client_num {
+            continue;
+        }
+        if !row.connected || row.instance != instance || row.team != team {
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,46 +1310,59 @@ fn announce_name(raw: &str) -> String {
     String::from_utf8_lossy(&bytes[..n]).into_owned()
 }
 
-/// Force every member of a match to spectator through the pristine `SetTeam`
-/// body (trampoline, not the wrapper → no recursion, no teamlock block:
-/// spectator requests always pass). Members return to the main slot so they
-/// can see it and join elsewhere.
-fn move_match_to_spectator(match_id: u8) {
-    let base = crate::original::base();
-    if base == 0 {
-        return;
-    }
-    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
-    if g_entities == 0 {
-        return;
+/// Send one client to the spectator team through the pristine `SetTeam` body
+/// (trampoline, not the wrapper → no recursion, no teamlock block: spectator
+/// requests always pass). This is the same move `/team spectator` makes, so
+/// the player suicides and respawns spectating. Returns false when the client
+/// has no live game entity (a free slot's `ent->client` is null and the game
+/// body would deref it) or the trampoline is not attached.
+fn set_client_spectator(client_num: c_int) -> bool {
+    if crate::original::base() == 0 {
+        return false;
     }
     // SAFETY: trampoline holds the pristine SetTeam body (attached at GAME_INIT).
     let tramp = crate::patch::GAME_HOOKS[5].original();
     if tramp == 0 {
-        return;
+        return false;
+    }
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities == 0 {
+        return false;
+    }
+    let ent = g_entities + client_num as usize * crate::sdk::SIZEOF_GENTITY;
+    // SAFETY: ent is inside the g_entities array.
+    if unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0 {
+        return false;
     }
     let original: unsafe extern "C" fn(usize, *const c_char) =
         unsafe { core::mem::transmute(tramp) };
-    let members: Vec<usize> = state::with_state(|s| {
+    // SAFETY: ent points into g_entities; spectator string is static.
+    unsafe { original(ent, c"spectator".as_ptr()) };
+    true
+}
+
+/// Force every member of a match to spectator through the pristine `SetTeam`
+/// body. Members return to the main slot so they can see it and join
+/// elsewhere.
+fn move_match_to_spectator(match_id: u8) {
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities == 0 {
+        return;
+    }
+    let members: Vec<c_int> = state::with_state(|s| {
         s.tffa
             .client_match
             .iter()
             .enumerate()
             .filter(|(i, m)| **m == match_id && s.clients[*i].is_connected)
-            .map(|(i, _)| g_entities + i * crate::sdk::SIZEOF_GENTITY)
+            .map(|(i, _)| i as c_int)
             .collect()
     });
-    for ent in members {
-        let cn = ((ent - g_entities) / crate::sdk::SIZEOF_GENTITY) as c_int;
-        // Free slots have no client — never call the game body on them
+    for cn in members {
+        // Free slots have no client — `set_client_spectator` refuses them
         // (null `ent->client` deref would take the server down); just reset
         // the proxy assignment.
-        // SAFETY: ent is inside the g_entities array.
-        let has_client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } != 0;
-        if has_client {
-            // SAFETY: ent points into g_entities; spectator string is static.
-            unsafe { original(ent, c"spectator".as_ptr()) };
-        }
+        set_client_spectator(cn);
         let moved = state::with_state(|s| {
             if !(0..MAX_CLIENTS as c_int).contains(&cn) {
                 return false;
@@ -2414,8 +2523,12 @@ pub fn handle_client_command(client_num: c_int) -> bool {
         return true;
     }
     if name == b"tffa_join" {
-        let id = cmd_arg_i32(1);
-        cmd_join(client_num, id);
+        match cmd_arg_i32(1) {
+            Some(id) => cmd_join(client_num, id),
+            // Bare `tffa_join` must not fall through as `0` (which now
+            // selects the main game): report the usage instead.
+            None => tell(client_num, JOIN_USAGE),
+        }
         return true;
     }
     if name == b"tffa_leave" {
@@ -2433,18 +2546,54 @@ pub fn handle_client_command(client_num: c_int) -> bool {
     false
 }
 
-fn require_spectator(client_num: c_int) -> bool {
-    if is_spectator(client_num) {
-        return true;
-    }
-    tell(
-        client_num,
-        "print \"You must be spectator to travel between TFFA matches (use /team spectator first).\n\"",
-    );
-    false
+/// What a travel command must do about the client's team before it can move
+/// them to another instance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TravelMove {
+    /// Already spectating: nothing to do.
+    None,
+    /// Playing (RED/BLUE/duel/…): force the spectator team first, exactly as
+    /// `/team spectator` does (the player suicides), then move the instance.
+    ToSpectator,
+    /// Team unknown (no live game slot): fail closed, travel refused.
+    Refuse,
 }
 
-fn cmd_arg_i32(n: c_int) -> i32 {
+/// Decide the team move from the client's session team (`None` = unknown).
+fn travel_move(team: Option<i32>) -> TravelMove {
+    match team {
+        Some(TEAM_SPECTATOR) => TravelMove::None,
+        Some(_) => TravelMove::ToSpectator,
+        None => TravelMove::Refuse,
+    }
+}
+
+/// `print` constant: travel refused (no live game slot to move).
+const TRAVEL_REFUSED: &str = "print \"You cannot travel between TFFA matches right now.\n\"";
+/// `print` constant: the client was playing and is now spectating.
+const MOVED_TO_SPECTATOR: &str = "print \"Moved to spectator to travel between TFFA matches.\n\"";
+
+/// Make the client legal for a match move: a playing client is first sent to
+/// the spectator team through the pristine `SetTeam` body (the same move as
+/// `/team spectator`, so the player suicides and respawns spectating) because
+/// every instance switch happens as a spectator. A client already spectating
+/// is left untouched. Returns false (with a message) when the client has no
+/// live game slot.
+fn travel_to_spectator(client_num: c_int) -> bool {
+    match travel_move(session_team_of(client_num)) {
+        TravelMove::None => true,
+        TravelMove::ToSpectator if set_client_spectator(client_num) => {
+            tell(client_num, MOVED_TO_SPECTATOR);
+            true
+        }
+        TravelMove::ToSpectator | TravelMove::Refuse => {
+            tell(client_num, TRAVEL_REFUSED);
+            false
+        }
+    }
+}
+
+fn cmd_arg_i32(n: c_int) -> Option<i32> {
     let mut buf = [0u8; 64];
     // SAFETY: engine syscall registered; buffer writable.
     unsafe { crate::syscall::argv(n, &mut buf) };
@@ -2452,7 +2601,21 @@ fn cmd_arg_i32(n: c_int) -> i32 {
     core::str::from_utf8(&buf[..end])
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0)
+}
+
+const JOIN_USAGE: &str =
+    "print \"Usage: tffa_join <match> (0 = main game, 1..N = created matches, see tffa_list).\n\"";
+
+/// Resolve a `tffa_join` argument for a created match slot (`1..=max`).
+///
+/// Main (`0`) is handled before this call (`cmd_join` routes it through
+/// `cmd_leave`), so `0` is not a valid target here.
+fn join_target(id: i32, max: usize) -> Option<u8> {
+    if (1..=MAX_MATCHES as i32).contains(&id) && id as usize <= max {
+        Some(id as u8)
+    } else {
+        None
+    }
 }
 
 fn tell(client_num: c_int, text: &str) {
@@ -2497,11 +2660,6 @@ fn cmd_create(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    if !require_spectator(client_num) {
-        return;
-    }
-    // Leave current match first.
-    cmd_leave_silent(client_num);
     // Hoisted: `max_matches()` itself takes the state lock, and `with_state`
     // is non-reentrant — calling it inside the closure below deadlocks the
     // engine thread (the `tffa_list`/`tffa_create` server crash).
@@ -2527,6 +2685,14 @@ fn cmd_create(client_num: c_int) {
         tell(client_num, "print \"No free match slot.\n\"");
         return;
     }
+    // Travel last among the checks that can refuse: a playing client is
+    // moved to spectator (which suicides them), so no refusal may come after
+    // it. `tffa_create` works ingame, exactly like `tffa_join`/`tffa_leave`.
+    if !travel_to_spectator(client_num) {
+        return;
+    }
+    // Leave current match first.
+    cmd_leave_silent(client_num);
     // Per-instance world entities (D-006 extension): the instance's own doors,
     // plats, elevators and triggers must exist *before* it is handed a player —
     // a door left shared is activatable from every instance. Capacity is spent
@@ -2561,6 +2727,16 @@ fn cmd_create(client_num: c_int) {
 }
 
 fn cmd_join(client_num: c_int, id: i32) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    // `tffa_join 0` returns to the main game: it is the same move as
+    // `tffa_leave`, and like it works even when the feature gate is off (a
+    // match can outlive the cvar/gametype that opened it).
+    if id == MAIN_MATCH as i32 {
+        cmd_leave(client_num);
+        return;
+    }
     if !enabled() {
         tell(
             client_num,
@@ -2568,20 +2744,20 @@ fn cmd_join(client_num: c_int, id: i32) {
         );
         return;
     }
-    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+    let Some(id) = join_target(id, max_matches()) else {
+        tell(client_num, JOIN_USAGE);
         return;
-    }
-    if !require_spectator(client_num) {
-        return;
-    }
-    if !(1..=(MAX_MATCHES as i32)).contains(&id) || id as usize > max_matches() {
+    };
+    // Already in that instance: there is no move, so do not put the client
+    // through the spectator step (a travel would kill a playing client for
+    // nothing). `tffa_join 0` / `tffa_leave` say the same through `cmd_leave`.
+    if client_match(client_num) == id {
         tell(
             client_num,
-            "print \"Usage: tffa_join <match 1..N> (see tffa_list).\n\"",
+            &format!("print \"You are already in match {id}.\n\""),
         );
         return;
     }
-    let id = id as u8;
     let active = state::with_state(|s| s.tffa.matches[id as usize].active);
     if !active {
         tell(client_num, "print \"That match is not active.\n\"");
@@ -2591,20 +2767,23 @@ fn cmd_join(client_num: c_int, id: i32) {
         tell(client_num, "print \"That match is full.\n\"");
         return;
     }
-    let old = state::with_state(|s| s.tffa.client_match[client_num as usize]);
-    if old != id {
-        cmd_leave_silent(client_num);
-        state::with_state(|s| {
-            s.tffa.client_match[client_num as usize] = id;
-            // Fresh scoreboard for the new match (the game's PERS_SCORE
-            // accumulates across the whole map; the proxy copies are
-            // per-match).
-            s.tffa.player_score[client_num as usize] = 0;
-        });
-        reset_slot_stats(client_num);
-        broadcast_cs_players_slot(client_num);
-        refresh_cs_players_for_viewer(client_num);
+    // Every check that can refuse has passed: a playing client is moved to
+    // spectator now (which suicides them), so the instance switch is the only
+    // thing left.
+    if !travel_to_spectator(client_num) {
+        return;
     }
+    cmd_leave_silent(client_num);
+    state::with_state(|s| {
+        s.tffa.client_match[client_num as usize] = id;
+        // Fresh scoreboard for the new match (the game's PERS_SCORE
+        // accumulates across the whole map; the proxy copies are
+        // per-match).
+        s.tffa.player_score[client_num as usize] = 0;
+    });
+    reset_slot_stats(client_num);
+    broadcast_cs_players_slot(client_num);
+    refresh_cs_players_for_viewer(client_num);
     tell(client_num, &format!("print \"Joined match {id}.\n\""));
 }
 
@@ -2612,7 +2791,15 @@ fn cmd_leave(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    if !require_spectator(client_num) {
+    // Already in main: nothing to move, so nothing to put the client through
+    // the spectator step for.
+    if client_match(client_num) == MAIN_MATCH {
+        tell(client_num, "print \"You are already in the main game.\n\"");
+        return;
+    }
+    // `tffa_leave` (and `tffa_join 0`) works ingame too: the playing client is
+    // moved to spectator first.
+    if !travel_to_spectator(client_num) {
         return;
     }
     cmd_leave_silent(client_num);
@@ -3413,5 +3600,63 @@ mod tests {
         );
         // A missing `g_entities` tags nothing and does not read memory.
         assert_eq!(tag_pending(&mut tags, &table, 0, &pending), 0);
+    }
+
+    #[test]
+    fn travel_forces_spectator_only_for_playing_clients() {
+        assert_eq!(travel_move(Some(TEAM_SPECTATOR)), TravelMove::None);
+        assert_eq!(travel_move(Some(TEAM_RED)), TravelMove::ToSpectator);
+        assert_eq!(travel_move(Some(TEAM_BLUE)), TravelMove::ToSpectator);
+        // Duel/free is playing, not spectating (travel must still spectate).
+        assert_eq!(
+            travel_move(Some(crate::sdk::TEAM_FREE)),
+            TravelMove::ToSpectator
+        );
+        assert_eq!(travel_move(None), TravelMove::Refuse);
+    }
+
+    #[test]
+    fn instance_team_count_scopes_the_census_to_one_instance() {
+        // Main: 2 red + 1 blue. Instance 1: 1 red + 2 blue. A disconnected slot
+        // (and one on neither team) rounds the roster out.
+        let mut rows = [RosterRow::default(); MAX_CLIENTS];
+        let live = |team: i32, instance: u8| RosterRow {
+            connected: true,
+            team,
+            instance,
+        };
+        rows[0] = live(TEAM_RED, MAIN_MATCH);
+        rows[1] = live(TEAM_RED, MAIN_MATCH);
+        rows[2] = live(TEAM_BLUE, MAIN_MATCH);
+        rows[3] = live(TEAM_RED, 1);
+        rows[4] = live(TEAM_BLUE, 1);
+        rows[5] = live(TEAM_BLUE, 1);
+        rows[6] = live(crate::sdk::TEAM_FREE, MAIN_MATCH);
+        // A client joining main (slot 7) is censused against main alone.
+        assert_eq!(count_instance_team(7, MAIN_MATCH, &rows, TEAM_RED), 2);
+        assert_eq!(count_instance_team(7, MAIN_MATCH, &rows, TEAM_BLUE), 1);
+        // A client joining instance 1 is censused against instance 1 alone.
+        assert_eq!(count_instance_team(7, 1, &rows, TEAM_RED), 1);
+        assert_eq!(count_instance_team(7, 1, &rows, TEAM_BLUE), 2);
+        // The joining client itself is skipped, like the pristine count.
+        assert_eq!(count_instance_team(0, MAIN_MATCH, &rows, TEAM_RED), 1);
+        // A disconnected slot is not censused.
+        rows[3].connected = false;
+        assert_eq!(count_instance_team(7, 1, &rows, TEAM_RED), 0);
+    }
+
+    #[test]
+    fn join_target_accepts_created_slots_up_to_the_limit_only() {
+        // Main (0) is routed to `cmd_leave` before this resolution, so it is
+        // not a created slot.
+        assert_eq!(join_target(0, 8), None);
+        assert_eq!(join_target(-1, 8), None);
+        assert_eq!(join_target(1, 8), Some(1));
+        assert_eq!(join_target(8, 8), Some(8));
+        // The admin's `proxy_tffa_maxMatches` caps the accepted ids.
+        assert_eq!(join_target(5, 4), None);
+        assert_eq!(join_target(9, 8), None);
+        // A wrapped negative must not select the top slot.
+        assert_eq!(join_target(i32::MIN, 8), None);
     }
 }

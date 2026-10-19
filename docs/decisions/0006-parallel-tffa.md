@@ -33,6 +33,9 @@ There is no TFFA gametype in base JKA, and the engine/game own a single
 `client_match[n]` (`0` = lobby) in `ProxyState.tffa`,
 fresh per map. Commands via `GAME_CLIENT_COMMAND`: `tffa_create |
 tffa_join <id> | tffa_leave | tffa_list | tffa`.
+`tffa_join 0` selects the always-active main match (id 0), i.e. it is an
+alias of `tffa_leave` (its `enabled()` gate is skipped the same way, so a
+match can be left after the cvar/gametype changed under it).
 
 ### D-006.2 — Damage gating in the existing wrappers
 
@@ -590,9 +593,48 @@ each, 10 bots) ended with the server running and no errors.
     playing outsiders as spectator with a `(TFFA N)` prefix (truncated to
     `MAX_NETNAME`), own match + real specs untouched. Base strings are stored
     proxy-side and re-pushed on match moves / begins.
-  - *Spectators-only travel*: `tffa_create/join/leave/spec` refuse ingame
-    RED/BLUE (`/team spectator` first); moves refresh the mover's view and
-    broadcast their slot.
+  - *Travel works ingame* (2026-10-19): `tffa_create`/`tffa_join`/`tffa_leave`
+    no longer refuse RED/BLUE. A playing client goes through the pristine
+    `SetTeam` trampoline to spectator first (`set_client_spectator`, the same
+    body `move_match_to_spectator` uses — the player suicides under
+    `g_dontPenalizeTeam`, so no phantom team point), then the proxy moves their
+    instance; they re-pick a team with `/team red|blue`. Every check that can
+    refuse (bad target, inactive/full match, no free slot) runs before the
+    suicide, so a refused command never kills the player; a command naming the
+    instance the player is already in (`tffa_join 0` in main, `tffa_join N` in
+    N, `tffa_leave` in main) is a no-op with a message and takes the same
+    shortcut, so it never kills them either. `tffa_join 0` and `tffa_leave`
+    share the same path. Moves refresh the mover's view and broadcast their
+    slot. `travel_move` (the team→move decision) is unit-tested (90/90 with
+    `cargo test`); the forced-suicide path itself is *not* runtime-verified:
+    bots never issue client commands, so it needs a live client, and
+    `set_client_spectator` is the same `SetTeam` trampoline call the
+    runtime-verified `move_match_to_spectator` already makes.
+  - *Per-instance auto team balance* (2026-10-19): the client's Auto Join
+    (`team free`/empty → `PickTeam`), `g_teamAutoJoin` and `SetTeam`'s
+    `g_teamForceBalance` check all census through the game's `TeamCount`, which
+    counted the whole level — so a match's sides could be lopsided while the
+    global counts looked even (and the force-balance check could then refuse a
+    pick that was right for the instance). New game hook `TeamCount`
+    (`FN_TEAM_COUNT` `0x124a24`, prologue `55 8b ec 83 ec 18`, steal 6,
+    `GAME_HOOKS` 18 → 19): with TFFA on, `tffa::instance_team_count` censuses one
+    instance — the joining client's own match for a client-scoped call
+    (`PickTeam(clientNum)` and the force-balance check, which both pass the
+    joiner), main for a caller without a client (`-1`: the connect auto-join and
+    bot creation, both main-context) — keeping the pristine filters (skip the
+    ignored client, connected clients only) and falling through to the pristine
+    body when the feature is off or the world is not located. `PickTeam`'s
+    tie-break still reads `level.teamScores`, which TFFA keeps neutralised, so an
+    exactly even roster resolves to BLUE exactly as base JKA does on 0-0.
+    Verification: `cargo test` 90/90 (new
+    `instance_team_count_scopes_the_census_to_one_instance` over a fabricated
+    roster) plus the pinned steal fixture in `GAME_SITES`; runtime (`mp/ctf1`,
+    `g_gametype 6`, `proxy_tffa_enable 1`, `bot_enable 1` + `bot_minplayers 4`)
+    the detour attaches (`attached TeamCount @ <base>+0x124a24 (steal 6)`) and
+    the bots' auto picks still split main 2-2 (slots 0 BLUE, 1 RED, 2 BLUE, 3
+    RED) with no error. Per-instance balancing itself needs two live instances
+    (bots never issue `tffa_create`), so the gated path rests on the unit-tested
+    census plus this attach.
   - *Match end*: every finish is announced to all with final RED-BLUE +
     team lists, members return to main as spectators, and (when
     `proxy_sv_enableEndGameStats` is on) filtered personal/global stats go to

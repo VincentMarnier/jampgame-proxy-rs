@@ -765,8 +765,9 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// touch gate; `G_UseTargets2` + `G_Find` for the per-instance link gate;
 /// `G_Spawn` + `G_RunThink` for the runtime-spawned children of a world entity;
 /// `G_RunMissile` so a missile's impact (radius damage) runs in its owner's
-/// instance).
-pub static GAME_HOOKS: [Hook; 18] = [
+/// instance; `TeamCount` so the game's auto team pick and its team-balance
+/// check census the joining client's own instance).
+pub static GAME_HOOKS: [Hook; 19] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -801,6 +802,7 @@ pub static GAME_HOOKS: [Hook; 18] = [
     Hook::new("G_Spawn", crate::jampgame::FN_G_SPAWN, true),
     Hook::new("G_RunThink", crate::jampgame::FN_G_RUN_THINK, true),
     Hook::new("G_RunMissile", crate::jampgame::FN_G_RUN_MISSILE, true),
+    Hook::new("TeamCount", crate::jampgame::FN_TEAM_COUNT, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1159,6 +1161,11 @@ mod tests {
             name: "G_RunMissile",
             bytes: b"\x55\x8b\xec\x81\xec\xd8\x00\x00\x00\x89\x7d\xd0\x89\x75\xcc",
             want: 9,
+        },
+        Site {
+            name: "TeamCount",
+            bytes: b"\x55\x8b\xec\x83\xec\x18\x89\x75\xf0\x89\x5d\xf4\x8b",
+            want: 6,
         },
     ];
 
