@@ -567,6 +567,97 @@ instance their own team chat belongs to. Global `chat`/`lchat` and private
 `tell` keep their base-JKA reach, and the server log still records every
 `sayteam:` line.
 
+### D-006.8 — Matches survive `map_restart`, not a map change
+
+*Status: landed (user directive, 2026-10-21).*
+
+A `map_restart` sends everyone back to spectator for a fresh round, and the
+old proxy-side overlay was wiped with the rest of the session state, so every
+player dropped into main and had to recreate and rejoin their match. Now a
+`map_restart` keeps the overlay and puts every reconnecting player back into
+the match they were in.
+
+**Evidence for the two paths.** `SV_MapRestart_f` restarts the game progs in
+place (`codemp/server/sv_ccmds.cpp:306`), runs three settle frames
+(`:308-312`), then reconnects every retained client with
+`GAME_CLIENT_CONNECT(firstTime = qfalse)` (`:318-349`). `SV_RestartGameProgs`
+→ `SV_ShutdownGameProgs` → `GAME_SHUTDOWN` → `VM_Restart` → `SV_InitGameVM`
+→ `VM_Call(gvm, GAME_INIT, svs.time, Com_Milliseconds(), restart)`
+(`sv_game.cpp:1693`), with `restart = qtrue`. A *full* map change
+(`SV_SpawnServer` → `SV_InitGameVM(qfalse)`) passes `restart = qfalse` and
+reconnects the clients the same way (`sv_init.cpp:799`). The proxy module is
+pinned across both (D-008), so the overlay lives in statics that used to be
+reset unconditionally at `GAME_INIT` (`state::reset_session`).
+
+**Decision.** `GAME_INIT` carries the overlay only when `args[2] != 0`
+(`vmMain(GAME_INIT, levelTime, randomSeed, restart)`): the active flag of the
+created match slots and `client_match[]` (which client was in which instance).
+Everything else starts clean, because it is per round or per map:
+per-match tallies, `player_score`, the `CS_PLAYERS` base mirrors, the cs score
+dedup cache, `owned`, and the per-instance worlds. A full map change
+(`restart = false`) closes every created match and starts everyone in main,
+exactly as a fresh module load did.
+
+`state::reset_session(restart)` and `tffa::reset_round(restart)` do the carry
+(`state.rs` `tffa_after_reset`, `tffa.rs` `reset_round_state`). A carried slot
+above the live `proxy_tffa_maxMatches` (an admin may lower it before the
+restart) closes, and its members start in main. If the feature gate is off at
+`GAME_INIT` (`proxy_tffa_enable 0`, proxy disabled, or not `GT_TEAM`), nothing
+is carried.
+
+**Per-instance worlds are rebuilt.** The pristine `GAME_INIT` memsets the
+entity array and respawns the map, so no clone and no tag survives the
+restart even though the module does. `scan_world_entities` re-measures the
+map, and `tffa::restore_instances` — called at the end of `GAME_INIT`, after
+`hooks::set_enabled` attached the `G_Spawn` detour and the `G_LINKENTITY`
+trampoline, and before any client reconnects — calls `realize_instance` for
+every carried created match. It is all-or-nothing per instance like creation:
+a match whose set cannot be rebuilt is closed (`discard_instance`, no
+broadcasts: nobody is connected yet) and its members return to main. The
+players therefore reconnect into a match whose doors, plats and triggers are
+already its own again.
+
+**Settle window.** The three settle frames run *before* the reconnect burst,
+when every client slot is still empty, so a carried created match looks
+member-less and the per-frame sweep would close it. `restart_grace_frames` is
+set to 3 (`RESTART_SETTLE_FRAMES`) when a created match was carried; while it
+is non-zero `on_run_frame_post` returns before the empty-match sweep and the
+limit handling, and each frame decrements it. The first `GAME_CLIENT_CONNECT`
+of the reconnect burst clears it too, so the first frame after the burst
+sweeps normally. The countdown is the fallback for a restart with no client
+left to reconnect (an empty server restarted by rcon, then `addbot`), which no
+connect would otherwise end.
+
+**Teams.** No proxy code touches teams across the restart: the base game
+writes the session cvars at `GAME_SHUTDOWN` (`G_WriteSessionData`,
+`g_main.c:1174`) and restores `sess.sessionTeam` in `ClientConnect` for a
+non-first-time connect (`g_client.c:2304-2306`), so humans come back to their
+RED/BLUE team. Bots are re-picked by `ClientBegin(allowTeamReset = qtrue)`'s
+`PickTeam` (`g_client.c:2426-2430`), balanced inside their instance by the
+`TeamCount` hook (D-006).
+
+Observation (one-off runtime experiments, 2026-10-21, bots-only dedicated
+server, GT_TEAM, `mp/duel1`, `proxy_tffa_enable 1`, built proxy): an instance
+was created for a bot through the real `GAME_CLIENT_COMMAND` path (driven over
+rcon + gdb, because no game client was available), then:
+
+- `map_restart` → the log shows the overlay kept, the instance's world
+  re-duplicated and the summary; the client table reads `client_match[0] = 1`
+  before and after the reconnect burst (the bot is back in instance 1), and
+  `client_match[1] = 0`;
+- `map mp/duel1` (full map change) → the same state slot reads
+  `client_match[0] = 0` after the reload, and no "kept"/rebuild line appears.
+
+```text
+----- proxy-rs: parallel TFFA kept across map_restart — instances are rebuilt once the hooks are up
+----- proxy-rs: 4 interactive map entities, 961 free entity slots — room for 240 further TFFA instance(s)
+----- proxy-rs: instance 1 world: duplicated 4 of the 4 interactive map entities measured at GAME_INIT
+----- proxy-rs: parallel TFFA after map_restart: 1 instance(s) rebuilt, 0 closed
+```
+
+(`mp/duel1`'s interactive set was 4 entities; only that one carried match had a
+member.) The experiments are not part of the automated suite.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
@@ -1234,3 +1325,22 @@ instance their own team chat belongs to. Global `chat`/`lchat` and private
   delivery itself needs two live clients (the server log keeps every
   `sayteam:` line either way), so the gate rests on the unit-tested predicate
   plus the runtime-verified `GAME_CLIENT_COMMAND` acting scope.
+
+- **Map-restart persistence (2026-10-21, user directive, D-006.8):**
+  `GAME_INIT`'s restart flag now decides whether the parallel-TFFA overlay is
+  carried: created matches + `client_match[]` survive a `map_restart`, nothing
+  survives a full map change. Scores, per-player copies, cs mirrors/caches
+  and the per-instance worlds start clean; `restore_instances` rebuilds each
+  carried match's world after the hook layer attaches, before the reconnect
+  burst (a rebuild failure closes that match and returns its members to
+  main). `restart_grace_frames` keeps the empty-match sweep and limit
+  handling off during the engine's three settle frames. Teams are left to
+  the base game's session data (humans) and `PickTeam` (bots).
+  Tests: `map_restart_carries_only_the_match_overlay`,
+  `full_map_change_starts_from_a_fresh_overlay`,
+  `map_restart_keeps_open_matches_and_assignments`,
+  `reset_round_closes_matches_a_restart_does_not_keep`,
+  `restorable_instances_select_active_slots_inside_the_limit`;
+  `cargo test` 112/112, `clippy -D warnings`, `fmt --check`, i686 release
+  build green, and the carry/no-carry paths were observed on a dedicated
+  server (D-006.8).

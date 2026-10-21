@@ -221,7 +221,12 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 
     // Fresh state for this session: the pinned module survives map changes, so
     // the fresh statics a real reload used to provide are reset here instead.
-    state::reset_session();
+    // A `map_restart` (`restart != qfalse`) keeps the parallel-TFFA overlay —
+    // which matches were open and which instance each client was in — so the
+    // players land back in their matches; a full map change starts from main,
+    // exactly like a fresh module load.
+    let restart = args[2] != 0;
+    state::reset_session(restart);
 
     // Version gate: only run on the pristine engine (R-009).
     if !engine_version_matches() {
@@ -260,10 +265,12 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     register_proxy_cvars();
     update_proxy_cvars();
 
-    // Fresh round for the parallel-TFFA matches (scores reset, created
-    // matches closed, main slot re-opened). Client assignments survive a
-    // map_restart; a full map change re-dlopens the module (fresh state).
-    tffa::reset_round();
+    // Fresh round for the parallel-TFFA matches (scores reset, the main slot
+    // re-opened; a `map_restart` keeps the matches and assignments carried
+    // above, a full map change closes them). Per-instance worlds are re-measured
+    // by `scan_world_entities` below and rebuilt by `restore_instances` once the
+    // hook layer is attached.
+    tffa::reset_round(restart);
     // Measure this map's interactive-entity set (per-instance world entities,
     // D-006 extension): the gentity cost of one further instance, and thus how
     // many matches the map can still take. Map entities now exist (the pristine
@@ -280,6 +287,12 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // (the master disable switch): the proxy then stays a pure passthrough.
     // SAFETY: original module loaded, memory layer initialised; hooks attach.
     unsafe { hooks::set_enabled(state::proxy_enabled()) };
+
+    // Give the carried created matches their per-instance worlds back. This
+    // needs the `G_Spawn` detour and the `G_LINKENTITY` trampoline, so it runs
+    // after the hook layer is up; clients reconnect after the settle frames,
+    // so they find their instance already rebuilt.
+    tffa::restore_instances();
 
     response
 }

@@ -238,6 +238,18 @@ pub struct TffaState {
     /// that turn out *interactive* join an instance; the rest (temp event
     /// entities, missiles, debris) keep their tagless, shared life.
     pub spawn_pending: Vec<(u16, u8)>,
+    /// Frames left in the post-`map_restart` settle window (`0` = none).
+    /// Set by `GAME_INIT` for a `map_restart` whose open matches were carried
+    /// over: the engine runs three settle frames and reconnects the clients
+    /// *after* them (`SV_MapRestart_f`, `sv_ccmds.cpp:306-349`), so during
+    /// those frames every game client slot is still empty and every preserved
+    /// match would look member-less. While this is non-zero the per-frame
+    /// empty-match sweep (and limit handling) stays off. The first
+    /// `GAME_CLIENT_CONNECT` of the reconnect burst clears it; the countdown is
+    /// the fallback for a restart nobody was retained for (an empty server
+    /// restarted by rcon, then `addbot`), which would otherwise leave the
+    /// feature disabled for the whole map.
+    pub restart_grace_frames: u8,
 }
 
 impl Default for TffaState {
@@ -270,6 +282,7 @@ impl Default for TffaState {
             flip_buf: Vec::new(),
             acting_scope: crate::tffa::SCOPE_NONE,
             spawn_pending: Vec::new(),
+            restart_grace_frames: 0,
         }
     }
 }
@@ -364,9 +377,36 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
 /// instance instead of giving us fresh statics. This reset restores the
 /// documented semantics ("a full map change re-dlopens the module (fresh
 /// state)") on top of the pinned instance. Called at the top of `GAME_INIT`.
-pub fn reset_session() {
+///
+/// `restart` is the `GAME_INIT` restart flag: a `map_restart` (`qtrue`,
+/// `sv_ccmds.cpp:306-336`) keeps the parallel-TFFA overlay — which matches were
+/// open and which instance each client was in — while a full map change
+/// (`SV_SpawnServer` → `SV_InitGameVM(qfalse)`) starts from main, exactly as a
+/// fresh module load would. Scores, per-player copies, cs caches and the
+/// per-instance worlds are per round / per map and are never carried.
+pub fn reset_session(restart: bool) {
     let mut guard = lock();
-    *guard = None;
+    let tffa = tffa_after_reset(guard.as_ref().map(|s| &s.tffa), restart);
+    let mut next = ProxyState::default();
+    next.tffa = tffa;
+    *guard = Some(next);
+}
+
+/// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
+/// of the round that just ended only for a `map_restart`.
+///
+/// Kept separate from the lock so the carry is unit-tested directly.
+fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
+    let mut fresh = TffaState::default();
+    let Some(previous) = previous.filter(|_| restart) else {
+        return fresh;
+    };
+    // Slot 0 (main) is always active; only the created slots are carried.
+    for (i, m) in fresh.matches.iter_mut().enumerate().skip(1) {
+        m.active = previous.matches[i].active;
+    }
+    fresh.client_match = previous.client_match;
+    fresh
 }
 
 /// Heap-built per-client table: element-wise construction keeps the default
@@ -484,5 +524,53 @@ mod tests {
         with_state(|s| assert_eq!(s.svs_time, 42));
         // Reset for the next test that touches the global.
         *lock() = None;
+    }
+
+    #[test]
+    fn map_restart_carries_only_the_match_overlay() {
+        // A finished round: two created matches open, a member assigned to
+        // one of them, tallies and per-map bookkeeping left behind.
+        let mut previous = TffaState::default();
+        previous.matches[2].active = true;
+        previous.matches[2].red = 5;
+        previous.matches[2].blue = 3;
+        previous.matches[5].active = true;
+        previous.client_match[4] = 2;
+        previous.player_score[4] = 9;
+        previous.restart_grace_frames = 3;
+        previous.entity_instance[123] = 2;
+        previous.cs_scores_sent[4] = (5, 3);
+
+        let carried = tffa_after_reset(Some(&previous), true);
+        // Which matches were open and who was in them survives.
+        assert!(carried.matches[2].active);
+        assert!(carried.matches[5].active);
+        assert_eq!(carried.client_match[4], 2);
+        // Main is always open; scores, per-player copies, cs caches and the
+        // per-map clone tags are per round and start clean.
+        assert!(carried.matches[crate::tffa::MAIN_MATCH as usize].active);
+        assert_eq!(carried.matches[2].red, 0);
+        assert_eq!(carried.matches[2].blue, 0);
+        assert_eq!(carried.player_score[4], 0);
+        assert_eq!(carried.cs_scores_sent[4], (i32::MIN, i32::MIN));
+        assert_eq!(carried.restart_grace_frames, 0);
+        assert_eq!(carried.entity_instance[123], crate::tffa::ENTITY_SHARED);
+    }
+
+    #[test]
+    fn full_map_change_starts_from_a_fresh_overlay() {
+        let mut previous = TffaState::default();
+        previous.matches[1].active = true;
+        previous.client_match[3] = 1;
+
+        let fresh = tffa_after_reset(Some(&previous), false);
+        assert!(!fresh.matches[1].active);
+        assert_eq!(fresh.client_match[3], crate::tffa::MAIN_MATCH);
+
+        // The first `GAME_INIT` after a module load has no previous round at
+        // all: a restart flag there carries nothing either.
+        let first = tffa_after_reset(None, true);
+        assert!(!first.matches[1].active);
+        assert_eq!(first.client_match[3], crate::tffa::MAIN_MATCH);
     }
 }

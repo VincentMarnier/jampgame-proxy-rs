@@ -97,6 +97,9 @@ it, its members are moved to spectator and may join another match.
 `timelimit` is global: at the limit each match ends unless it is tied, and a
 tied match keeps playing (sudden death) until a frag separates the teams.
 Once no tied match with players remains, the map ends and restarts normally.
+A `map_restart` keeps the matches: every player reconnects into the match and
+team they were in, with that match's doors and triggers rebuilt, while the
+scores start from zero. A full map change starts everyone in the main game.
 `proxy_sv_lockTeams` /
 `proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
 global (per-match HUD would need a client mod).

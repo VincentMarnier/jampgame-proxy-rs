@@ -64,6 +64,12 @@ pub const TOTAL_MATCH_SLOTS: usize = 1 + MAX_MATCHES;
 /// Capacity of the per-frame player-owned entity cache (saber entities,
 /// missiles, corpses — one or a few per player).
 pub const OWNED_CAP: usize = 96;
+/// Frames the engine runs between `SV_RestartGameProgs` and the client
+/// reconnect burst of a `map_restart` (`SV_MapRestart_f`, `sv_ccmds.cpp:306-349`:
+/// three unconditional `GAME_RUN_FRAME` calls, then the connect loop). Used as
+/// the fallback length of the settle window when no client is left to reconnect
+/// and so no `GAME_CLIENT_CONNECT` can end it.
+const RESTART_SETTLE_FRAMES: u8 = 3;
 /// `scores ...` entries carry 14 ints each (`g_cmds.c:64-74`); the second
 /// int is `PERS_SCORE` (`g_cmds.c:65-66`).
 const SCORE_ENTRY_INTS: usize = 14;
@@ -1151,38 +1157,178 @@ fn clamp_global_scores() {
 // ---------------------------------------------------------------------------
 
 /// `GAME_INIT`: reset the round — match tallies and per-player copies go to
-/// zero, created matches close, the main slot reopens. Client assignments
-/// are kept (players keep their groups across a `map_restart`; a full map
-/// change re-dlopens the module and starts from a fresh state anyway).
-pub fn reset_round() {
+/// zero, the main slot reopens.
+///
+/// `restart` is the `GAME_INIT` restart flag. A `map_restart` (`qtrue`) keeps
+/// the overlay `state::reset_session` carried — which created matches were open
+/// and which instance each client was in — so the players land back in their
+/// matches; a full map change (`qfalse`) closes every created match and starts
+/// from main, exactly like a fresh module load.
+///
+/// Scores, per-player copies, cs caches and the per-instance worlds are never
+/// carried: they are per round / per map. The world bookkeeping is cleared
+/// unconditionally because the pristine `GAME_INIT` memset the entity array
+/// and respawned the map, so no clone and no tag survived it; the clones are
+/// rebuilt for the carried instances by `restore_instances` once the hook layer
+/// is attached, and `scan_world_entities` re-measures the map in between.
+pub fn reset_round(restart: bool) {
+    // `enabled()` and `max_matches()` take the state lock themselves: hoist
+    // them (the lock is non-reentrant).
+    let keep = restart && enabled();
+    let max = max_matches();
+    let mut kept = false;
     state::with_state(|s| {
-        for (i, m) in s.tffa.matches.iter_mut().enumerate() {
-            m.red = 0;
-            m.blue = 0;
-            m.active = i == MAIN_MATCH as usize;
-        }
-        s.tffa.player_score = [0; MAX_CLIENTS];
-        s.tffa.owned_count = 0;
-        s.tffa.rebuilt_stamp = 0;
-        // Re-arm the score dedup so round-start 0-0 is pushed.
-        s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
-        // New round: fraglimit handling runs again.
-        s.tffa.intermission = false;
-        s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
-        // Per-instance worlds are per map: a fresh `GAME_INIT` memset the
-        // entity array, so no clone and no tag survives it. Re-measured by
-        // `scan_world_entities` right after this call.
+        kept = reset_round_state(&mut s.tffa, keep, max);
+        // Per-instance worlds are per map (see above).
         s.tffa.entity_instance = [ENTITY_SHARED; MAX_GENTITIES];
         s.tffa.world_clone_cost = 0;
         s.tffa.world_clone_blocked = false;
         s.tffa.world_release = 0;
         s.tffa.world_cloned = 0;
         s.tffa.world_scanned = false;
+        // Only a carried overlay needs the settle window: the engine runs its
+        // frames before reconnecting the retained clients, and every preserved
+        // created match would look member-less during them.
+        s.tffa.restart_grace_frames = if kept { RESTART_SETTLE_FRAMES } else { 0 };
+    });
+    if kept {
+        eprintln!(
+            "----- proxy-rs: parallel TFFA kept across map_restart — instances are rebuilt once the hooks are up"
+        );
+    }
+}
+
+/// The match-table half of `reset_round`, split out so the carry rule is
+/// unit-tested without an engine.
+///
+/// `keep` retains the created matches carried by `state::reset_session`; `max`
+/// is the live `proxy_tffa_maxMatches` (an admin may have lowered it before the
+/// restart). Retained matches keep no tallies. Returns whether any created
+/// match survived, i.e. whether the post-restart grace window is needed.
+fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
+    for (i, m) in t.matches.iter_mut().enumerate() {
+        m.red = 0;
+        m.blue = 0;
+        if i == MAIN_MATCH as usize {
+            m.active = true;
+            continue;
+        }
+        if keep && i <= max {
+            continue;
+        }
+        // The slot is gone: its members cannot stay in it, they start in main
+        // (their game-side team is restored separately by the base game's
+        // session data on reconnect).
+        m.active = false;
+        let id = i as u8;
+        for slot in t.client_match.iter_mut() {
+            if *slot == id {
+                *slot = MAIN_MATCH;
+            }
+        }
+    }
+    t.player_score = [0; MAX_CLIENTS];
+    t.owned_count = 0;
+    t.rebuilt_stamp = 0;
+    // The bases mirror the game's last `CS_PLAYERS` broadcasts; the new round
+    // re-sends them as each client connects (and `send_all_overrides_to_client`
+    // falls back to the live configstring meanwhile), so the old round's copies
+    // must not be pushed as if they were current.
+    t.cs_players_base = core::array::from_fn(|_| String::new());
+    // Re-arm the score dedup so round-start 0-0 is pushed.
+    t.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
+    // New round: fraglimit handling runs again.
+    t.intermission = false;
+    t.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
+    t.matches
+        .iter()
+        .enumerate()
+        .any(|(i, m)| i != MAIN_MATCH as usize && m.active)
+}
+
+/// The created matches `restore_instances` must rebuild after a carry: every
+/// active one inside the live `proxy_tffa_maxMatches`. Ids above the limit were
+/// already closed (and their members returned to main) by `reset_round_state`.
+/// Pure so the selection is unit-tested.
+fn restorable_instances(matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS], max: usize) -> Vec<u8> {
+    (1..=max.min(TOTAL_MATCH_SLOTS - 1))
+        .filter(|&i| matches[i].active)
+        .map(|i| i as u8)
+        .collect()
+}
+
+/// `GAME_INIT` post-pass, after the hook layer is attached: give every carried
+/// created match its per-instance world back, so the instance a player returns
+/// to is the same isolated place it was before the `map_restart` (door, plats,
+/// triggers).
+///
+/// All-or-nothing per instance, as at creation: a match whose set cannot be
+/// rebuilt is closed and its members return to main (they still reconnect into
+/// the overlays that did come back).
+///
+/// Requires the `G_Spawn` detour and `G_LINKENTITY` trampoline, i.e. the hook
+/// layer attached (`hooks::set_enabled` at the end of `GAME_INIT`), and the
+/// pristine module loaded.
+pub fn restore_instances() {
+    if !enabled() || crate::original::base() == 0 || !crate::hooks::engine_sv::attached() {
+        return;
+    }
+    let max = max_matches();
+    let ids = state::with_state(|s| restorable_instances(&s.tffa.matches, max));
+    if ids.is_empty() {
+        return;
+    }
+    let mut restored = 0usize;
+    let mut closed = 0usize;
+    for id in ids {
+        match realize_instance(id) {
+            Ok(()) => restored += 1,
+            Err(reason) => {
+                closed += 1;
+                eprintln!(
+                    "----- proxy-rs: instance {id} could not be rebuilt after map_restart ({reason}) — closing it, its members return to main"
+                );
+                discard_instance(id);
+            }
+        }
+        // The players have not reconnected yet (`GAME_CLIENT_CONNECT` comes
+        // after the settle frames), so there is no view or team to refresh.
+    }
+    eprintln!(
+        "----- proxy-rs: parallel TFFA after map_restart: {restored} instance(s) rebuilt, {closed} closed"
+    );
+}
+
+/// Close one carried instance whose world could not be rebuilt: reset its slot
+/// and return its members to main, without the broadcasts `close_instance`
+/// makes (no client is connected yet at this point).
+fn discard_instance(id: u8) {
+    if id == MAIN_MATCH || id as usize >= TOTAL_MATCH_SLOTS {
+        return;
+    }
+    state::with_state(|s| {
+        // Nothing of this instance is live (a failed rebuild unwinds its
+        // clones), but a stale piece of the old round's bookkeeping must not
+        // keep a tag alive.
+        s.tffa.world_release |= 1u16 << id;
+        close_instance_state(
+            &mut s.tffa.matches,
+            &mut s.tffa.client_match,
+            &mut s.tffa.player_score,
+            id,
+        );
     });
 }
 /// Clear all TFFA state for a fresh first-time connect (the slot may have
 /// been used by a different player before).
 pub fn on_client_connect(client_num: c_int, first_time: bool) {
+    // The reconnect burst that follows a `map_restart` runs after the engine's
+    // settle frames (`SV_MapRestart_f`, `sv_ccmds.cpp:306-349`); its first
+    // connect ends the grace window, so the next frame sweeps empty matches
+    // normally. Cleared for a first-time connect too: a brand-new player on a
+    // carried server means the burst is over (or never had anyone to bring
+    // back).
+    state::with_state(|s| s.tffa.restart_grace_frames = 0);
     if !first_time || !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
@@ -1413,6 +1559,20 @@ pub fn on_run_frame_post() {
     // While an intermission runs (pristine timelimit exit or a solo-main
     // finish below) the map is ending: no more fraglimit handling.
     if state::with_state(|s| s.tffa.intermission) {
+        return;
+    }
+    // Post-`map_restart` settle window: the engine runs its frames *before*
+    // reconnecting the retained clients (`SV_MapRestart_f`, `sv_ccmds.cpp:306-349`),
+    // so every carried created match is temporarily member-less. Skip the
+    // sweep (and limit handling) until the first connect clears the window; a
+    // genuinely abandoned match closes on the first frame after the burst.
+    // The countdown is the fallback for a restart with nobody to reconnect.
+    let grace = state::with_state(|s| {
+        let left = s.tffa.restart_grace_frames;
+        s.tffa.restart_grace_frames = left.saturating_sub(1);
+        left
+    });
+    if grace != 0 {
         return;
     }
     // A created match whose last player went spectator or disconnected has
@@ -4870,5 +5030,74 @@ mod tests {
         // Main is never closed through this path.
         assert!(close_instance_state(&mut matches, &mut table, &mut score, MAIN_MATCH).is_empty());
         assert!(matches[MAIN_MATCH as usize].active);
+    }
+
+    /// A `map_restart` keeps the matches that were open and each client's
+    /// instance, but starts the new round with clean tallies.
+    #[test]
+    fn map_restart_keeps_open_matches_and_assignments() {
+        let mut t = state::TffaState::default();
+        t.matches[1].active = true;
+        t.matches[1].red = 4;
+        t.matches[1].blue = 2;
+        t.matches[3].active = true;
+        t.client_match[2] = 1;
+        t.client_match[5] = 3;
+        t.player_score[2] = 6;
+        t.cs_players_base[2] = r"\n\Bob\t\1".to_owned();
+
+        let kept = reset_round_state(&mut t, true, MAX_MATCHES);
+        assert!(kept);
+        // The overlay survives...
+        assert!(t.matches[1].active);
+        assert!(t.matches[3].active);
+        assert_eq!(t.client_match[2], 1);
+        assert_eq!(t.client_match[5], 3);
+        assert!(t.matches[MAIN_MATCH as usize].active);
+        // ...with the round's tallies and per-player copies gone.
+        assert_eq!((t.matches[1].red, t.matches[1].blue), (0, 0));
+        assert_eq!(t.player_score[2], 0);
+        // The last round's `CS_PLAYERS` mirrors are not current any more.
+        assert!(t.cs_players_base[2].is_empty());
+    }
+
+    /// A full map change starts from main, and so does an instance above a
+    /// lowered `proxy_tffa_maxMatches` even on a restart: its members cannot
+    /// stay in a slot that no longer exists.
+    #[test]
+    fn reset_round_closes_matches_a_restart_does_not_keep() {
+        let mut t = state::TffaState::default();
+        t.matches[1].active = true;
+        t.matches[1].red = 2;
+        t.client_match[2] = 1;
+        t.player_score[2] = 3;
+
+        assert!(!reset_round_state(&mut t, false, MAX_MATCHES));
+        assert!(!t.matches[1].active);
+        assert_eq!((t.matches[1].red, t.matches[1].blue), (0, 0));
+        assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.player_score[2], 0);
+
+        let mut t = state::TffaState::default();
+        t.matches[1].active = true;
+        t.matches[5].active = true;
+        t.client_match[2] = 5;
+
+        assert!(reset_round_state(&mut t, true, 3));
+        assert!(t.matches[1].active);
+        assert!(!t.matches[5].active);
+        assert_eq!(t.client_match[2], MAIN_MATCH);
+    }
+
+    /// Only active created slots inside the live limit get their world rebuilt.
+    #[test]
+    fn restorable_instances_select_active_slots_inside_the_limit() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[1].active = true;
+        matches[4].active = true;
+        assert_eq!(restorable_instances(&matches, MAX_MATCHES), vec![1, 4]);
+        // Above the live `proxy_tffa_maxMatches` (closed by the reset already).
+        assert_eq!(restorable_instances(&matches, 2), vec![1]);
+        assert!(restorable_instances(&matches, 0).is_empty());
     }
 }

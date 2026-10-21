@@ -55,7 +55,6 @@ pub fn set_detached() {
     HOOKS_ATTACHED.store(false, Ordering::Relaxed);
 }
 
-#[allow(dead_code)] // guard for the wrappers; consumed by future debugging paths
 pub fn attached() -> bool {
     HOOKS_ATTACHED.load(Ordering::Relaxed)
 }
