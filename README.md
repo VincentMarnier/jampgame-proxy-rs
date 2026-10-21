@@ -102,7 +102,11 @@ team they were in, with that match's doors and triggers rebuilt, while the
 scores start from zero. A full map change starts everyone in the main game.
 `proxy_sv_lockTeams` /
 `proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
-global (per-match HUD would need a client mod).
+global (per-match HUD would need a client mod). Setting `proxy_tffa_enable`
+back to `0` closes every created match: its players are moved to spectator
+with a message explaining why, the map's per-match copies go away, and
+everyone keeps playing in the main game, whose score is kept instead of
+being reset.
 
 **The world is per match.** Doors, plats, elevators, buttons, triggers and map
 items are duplicated for every match, so a door opened in one match is open only

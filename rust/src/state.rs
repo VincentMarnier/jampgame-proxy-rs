@@ -238,6 +238,11 @@ pub struct TffaState {
     /// that turn out *interactive* join an instance; the rest (temp event
     /// entities, missiles, debris) keep their tagless, shared life.
     pub spawn_pending: Vec<(u16, u8)>,
+    /// Last `proxy_tffa_enable` value the per-frame cvar mirror showed
+    /// (`crate::tffa::on_frame_start`): a non-zero → zero edge closes every
+    /// created match and returns its members to spectator, because the feature
+    /// is off from that frame on. Re-latched from the cvar at `GAME_INIT`.
+    pub enable_latched: bool,
     /// Frames left in the post-`map_restart` settle window (`0` = none).
     /// Set by `GAME_INIT` for a `map_restart` whose open matches were carried
     /// over: the engine runs three settle frames and reconnects the clients
@@ -282,6 +287,7 @@ impl Default for TffaState {
             flip_buf: Vec::new(),
             acting_scope: crate::tffa::SCOPE_NONE,
             spawn_pending: Vec::new(),
+            enable_latched: false,
             restart_grace_frames: 0,
         }
     }

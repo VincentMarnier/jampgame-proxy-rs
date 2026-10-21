@@ -3,13 +3,15 @@
 //! Match `0` is the **main TFFA**: every connected client belongs to it
 //! unless they create/join another match; it is always active and its
 //! fraglimit is enforced like any other match. Slots `1..=MAX_MATCHES` are
-//! player-created. Scores are kept proxy-side per match (team tally +
-//! per-player copy); the game's global `level.teamScores` is neutralised
-//! (see `on_add_score`) so pristine `CheckExitRules` never ends the server
-//! early, and the `scores` trap rewrite substitutes the per-player copies so
-//! alternative matches never show main-TFFA-era numbers. Every match shares
-//! the server's own `fraglimit`; `timelimit` stays global and ends
-//! everything.
+//! player-created. Setting `proxy_tffa_enable` back to `0` closes every
+//! created match and returns its members to the main game as spectators, with
+//! a message explaining why (D-006.9). Scores are kept proxy-side per match
+//! (team tally + per-player copy); the game's global `level.teamScores` is
+//! neutralised (see `on_add_score`) so pristine `CheckExitRules` never ends
+//! the server early, and the `scores` trap rewrite substitutes the per-player
+//! copies so alternative matches never show main-TFFA-era numbers. Every
+//! match shares the server's own `fraglimit`; `timelimit` stays global and
+//! ends everything.
 //!
 //! Isolation:
 //! - damage: `G_Damage`/`player_die` wrappers drop cross-match effects.
@@ -669,17 +671,22 @@ fn send_single_cs_score(viewer: c_int, index: i32, value: i32) {
     send_cs_to_client(viewer, index, &value.to_string());
 }
 
-/// Live server configstring for a player slot (fallback when the proxy base
-/// is empty, e.g. the slot was assigned while the feature was off).
-fn get_live_cs_players(slot: i32) -> Option<String> {
+/// Live server configstring `index` (`None` when the server holds no string).
+fn get_live_cs(index: i32) -> Option<String> {
     let mut buf = [0u8; 1024];
     // SAFETY: engine syscall registered; buffer writable.
-    unsafe { crate::syscall::get_configstring(CS_PLAYERS + slot, &mut buf) };
+    unsafe { crate::syscall::get_configstring(index, &mut buf) };
     let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     if n == 0 {
         return None;
     }
     String::from_utf8(buf[..n].to_vec()).ok()
+}
+
+/// Live server configstring for a player slot (fallback when the proxy base
+/// is empty, e.g. the slot was assigned while the feature was off).
+fn get_live_cs_players(slot: i32) -> Option<String> {
+    get_live_cs(CS_PLAYERS + slot)
 }
 
 /// Push every current per-viewer override to one client (fresh connects get
@@ -1179,6 +1186,10 @@ pub fn reset_round(restart: bool) {
     let mut kept = false;
     state::with_state(|s| {
         kept = reset_round_state(&mut s.tffa, keep, max);
+        // Re-latch the enable gate: an admin who set `proxy_tffa_enable 0`
+        // before the restart must not see a first-frame disable sweep for
+        // matches `reset_round_state` already closed.
+        s.tffa.enable_latched = s.cvars[CVAR_TFFA_ENABLE].integer != 0;
         // Per-instance worlds are per map (see above).
         s.tffa.entity_instance = [ENTITY_SHARED; MAX_GENTITIES];
         s.tffa.world_clone_cost = 0;
@@ -1384,13 +1395,241 @@ pub fn on_client_begin(client_num: c_int) {
 /// frame (called from `GAME_RUN_FRAME` before the frame is forwarded).
 pub fn on_frame_start() {
     state::with_state(|s| s.tffa.frame_stamp = s.tffa.frame_stamp.wrapping_add(1));
+    // `proxy_tffa_enable` turned off since the last frame (the cvar mirror was
+    // just refreshed): dissolve every created match before the game runs, so
+    // no frame plays with the isolation gates off while players are still
+    // split across instances.
+    let turned_off = state::with_state(|s| {
+        let now_on = s.cvars[CVAR_TFFA_ENABLE].integer != 0;
+        enable_turned_off(&mut s.tffa.enable_latched, now_on)
+    });
+    if turned_off {
+        disable_parallel_tffa();
+    }
+    // Closed instances give their clones back here, between game frames. Not
+    // gated on `enabled()`: a disable queues its releases a moment before this
+    // and `enabled()` is already false by then.
+    drain_world_releases();
     if enabled() {
         clamp_global_scores();
-        // Closed instances give their clones back here, between game frames.
-        drain_world_releases();
         // Defensive: a spawn recorded by a call that never reached its close
         // (nothing should) is classified rather than carried into the next map.
         flush_pending_spawns();
+    }
+}
+
+/// Remember this frame's `proxy_tffa_enable` value and report a non-zero → zero
+/// edge (an admin turned parallel TFFA off). Pure so the edge is unit-tested.
+fn enable_turned_off(latched: &mut bool, now_on: bool) -> bool {
+    let off = *latched && !now_on;
+    *latched = now_on;
+    off
+}
+
+/// The created matches an admin disable closes: every active one. Main (id 0)
+/// is implicit and stays. Pure so the selection is unit-tested.
+fn created_matches_to_close(matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS]) -> Vec<u8> {
+    matches
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| *i != MAIN_MATCH as usize && m.active)
+        .map(|(i, _)| i as u8)
+        .collect()
+}
+
+/// `proxy_tffa_enable` was turned off: hand the main game's score back to the
+/// game, close every created match, and return its members to the main game as
+/// spectators, telling each of them what happened. Main (id 0) stays — it is
+/// the pristine map's own game.
+///
+/// Runs at `GAME_RUN_FRAME` start, before the frame is forwarded: from this
+/// frame on `tffa::enabled()` is false, so every isolation gate is open and an
+/// instance left standing would be visible, solid and damageable from main.
+/// The per-viewer configstring overrides of the last TFFA frame (prefixed
+/// outsider names, forced-spectator teams, per-match HUD tallies) are undone at
+/// the end, so every client is back on the server's own strings.
+fn disable_parallel_tffa() {
+    let created = state::with_state(|s| created_matches_to_close(&s.tffa.matches));
+    if !created.is_empty() {
+        close_created_matches(&created);
+    }
+    // Main keeps playing, so the score the game owns again is main's: while the
+    // overlay ran, `level.teamScores` was held at `0` and main's tally lived
+    // proxy-side (D-006.3). Restoring it keeps the running score instead of
+    // dropping the map to 0-0, and it is what the per-viewer HUD push below
+    // carries to every client (they are all in main from here on).
+    let (red, blue) = restore_main_global_scores();
+    restore_pristine_views(red, blue);
+    state::with_state(|s| {
+        // The stored bases and caches belong to the overlay that just ended: a
+        // later re-enable falls back to the live server strings and starts with
+        // a clean dedup.
+        s.tffa.cs_players_base = core::array::from_fn(|_| String::new());
+        s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
+        s.tffa.viewer_match_cache = [MAIN_MATCH; MAX_CLIENTS];
+        s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
+        s.tffa.restart_grace_frames = 0;
+        // Gameplay while the feature is off can spawn interactive entities no
+        // tag covers, so a later re-enable must re-measure the map (the
+        // measured tag set is what an instance clones).
+        s.tffa.world_scanned = false;
+    });
+}
+
+/// Close the `created` matches: announce each on the engine log, deactivate the
+/// slots (queuing their per-instance worlds for release) and move their members
+/// to the main game. A member who was playing is sent to the spectator team with
+/// an explanation (see `disable_notice`); one who was already spectating is
+/// returned to main with the shorter notice.
+fn close_created_matches(created: &[u8]) {
+    let (connected, playing) = client_census();
+    // Members per match, taken before the close returns them to main.
+    let groups: Vec<(u8, Vec<c_int>)> = state::with_state(|s| {
+        created
+            .iter()
+            .map(|&id| {
+                let members = s
+                    .tffa
+                    .client_match
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| **m == id && connected[*i])
+                    .map(|(i, _)| i as c_int)
+                    .collect();
+                (id, members)
+            })
+            .collect()
+    });
+    for (id, group) in &groups {
+        let (red, blue) = state::with_state(|s| {
+            let m = &s.tffa.matches[*id as usize];
+            (m.red, m.blue)
+        });
+        eprintln!(
+            "----- proxy-rs: parallel TFFA disabled — closed instance {id} ({red}-{blue}), {} member(s) sent to the main game",
+            group.len()
+        );
+    }
+    // The overlay goes first: from here on every proxy view of the server is the
+    // main game's, and the per-viewer pushes below are the last TFFA-era writes
+    // of this round.
+    state::with_state(|s| {
+        for (id, _) in &groups {
+            s.tffa.world_release |= 1u16 << id;
+            close_instance_state(
+                &mut s.tffa.matches,
+                &mut s.tffa.client_match,
+                &mut s.tffa.player_score,
+                *id,
+            );
+        }
+    });
+    // Spectator move and explanation. These call into the game (`SetTeam` →
+    // `ClientUserinfoChanged` → `CS_PLAYERS`) and back into the proxy, so no
+    // state lock may be held here.
+    for (id, group) in &groups {
+        for &cn in group {
+            let was_playing = playing[cn as usize];
+            if was_playing {
+                // The same move as `/team spectator`: the player suicides and
+                // respawns spectating. Refused only for a slot with no live
+                // game entity, which has nothing to move.
+                set_client_spectator(cn);
+            }
+            reset_slot_stats(cn);
+            tell(cn, &disable_notice(*id, was_playing));
+        }
+    }
+}
+
+/// Hand the pristine team tallies back to the game with main's score, and
+/// return that score. While parallel TFFA ran, `level.teamScores` was kept
+/// neutralised (D-006.3) so the pristine `CheckExitRules` never fired early;
+/// from the disable on the game owns them again, so `0-0` would read as a score
+/// reset for the one remaining (main) game.
+///
+/// Safe with respect to `CheckExitRules`: main's tally is the value the proxy
+/// itself compared against the shared `fraglimit` every frame, so a main game
+/// that had reached the limit was already ended/promoted before a disable can
+/// be observed at the next frame start.
+fn restore_main_global_scores() -> (i32, i32) {
+    let (red, blue) = state::with_state(|s| {
+        let m = &s.tffa.matches[MAIN_MATCH as usize];
+        (m.red, m.blue)
+    });
+    let level = crate::original::level_address();
+    if level != 0 {
+        // SAFETY: `level` is the game's `level_locals_t` (0 checked above).
+        unsafe { write_global_team_scores(level, red, blue) };
+    }
+    (red, blue)
+}
+
+/// Write main's tally into the game's `level.teamScores` slots (the same fields
+/// `neutralise_global` subtracts from). Split out from
+/// `restore_main_global_scores` so the write is unit-tested on a scratch
+/// buffer, and so it is obvious the disable restores *main's* score instead of
+/// leaving the neutralised `0-0`.
+///
+/// # Safety
+/// `level` must point to the game's live `level_locals_t`.
+unsafe fn write_global_team_scores(level: usize, red: i32, blue: i32) {
+    unsafe {
+        core::ptr::write_unaligned(
+            (level + crate::sdk::OFFSET_LEVEL_TEAM_SCORES_RED) as *mut c_int,
+            red,
+        );
+        core::ptr::write_unaligned(
+            (level + crate::sdk::OFFSET_LEVEL_TEAM_SCORES_BLUE) as *mut c_int,
+            blue,
+        );
+    }
+}
+
+/// `print` text explaining a disable to one member of a closed match: the
+/// players moved out of it are told they are spectators now and how to play
+/// again, a member who was already spectating only that the match is gone.
+fn disable_notice(match_id: u8, was_playing: bool) -> String {
+    if was_playing {
+        format!(
+            "print \"Parallel TFFA was disabled by the server: match {match_id} was closed and you have been moved to spectator. Use /team red or /team blue to rejoin the main game.\n\""
+        )
+    } else {
+        format!(
+            "print \"Parallel TFFA was disabled by the server: match {match_id} was closed. You are now watching the main game.\n\""
+        )
+    }
+}
+
+/// Undo the per-viewer configstring overrides after a disable: every connected
+/// client gets the server's own `CS_PLAYERS + n` strings and the `(red, blue)`
+/// tallies the game owns again (main's), so no `(TFFA n)` prefix,
+/// forced-spectator outsider or per-match HUD tally outlives the feature.
+///
+/// The engine's own `CS_SCORES1/2` configstrings are not touched: the next
+/// pristine `CalculateRanks` (any frag, connect, team change) rewrites them from
+/// the `level.teamScores` value just restored, and a client that connects
+/// meanwhile gets them from that same call before its gamestate is sent.
+fn restore_pristine_views(red: i32, blue: i32) {
+    let connected = connected_clients();
+    let viewers: Vec<c_int> = (0..MAX_CLIENTS as c_int)
+        .filter(|v| connected[*v as usize])
+        .collect();
+    if viewers.is_empty() {
+        return;
+    }
+    let bases: [Option<String>; MAX_CLIENTS] =
+        core::array::from_fn(|slot| get_live_cs(CS_PLAYERS + slot as i32));
+    let red = red.to_string();
+    let blue = blue.to_string();
+    for viewer in viewers {
+        for (slot, base) in bases.iter().enumerate() {
+            if let Some(base) = base {
+                send_cs_to_client(viewer, CS_PLAYERS + slot as i32, base);
+            }
+        }
+        send_cs_to_client(viewer, CS_SCORES1, &red);
+        send_cs_to_client(viewer, CS_SCORES2, &blue);
     }
 }
 
@@ -4981,6 +5220,161 @@ mod tests {
             }
             assert_eq!(*byte, 0x5a, "reset touched byte {i}");
         }
+    }
+
+    /// Only a non-zero → zero flip of `proxy_tffa_enable` shuts the matches
+    /// down: turning it on, leaving it on/off, and the frames after a disable
+    /// all stay quiet (a repeated shutdown would re-send every message and
+    /// reset the overlay every frame).
+    #[test]
+    fn disable_edge_only_fires_on_a_nonzero_to_zero_flip() {
+        let mut latched = false;
+        // Off at start and still off: nothing to close.
+        assert!(!enable_turned_off(&mut latched, false));
+        // Turning the feature on is not a disable...
+        assert!(!enable_turned_off(&mut latched, true));
+        assert!(!enable_turned_off(&mut latched, true));
+        // ...turning it off is exactly one...
+        assert!(enable_turned_off(&mut latched, false));
+        // ...and the next frame must not repeat it.
+        assert!(!enable_turned_off(&mut latched, false));
+        // A later re-enable/disable shuts down again.
+        assert!(!enable_turned_off(&mut latched, true));
+        assert!(enable_turned_off(&mut latched, false));
+    }
+
+    /// A disable closes every created match (active slots only) and leaves the
+    /// main game standing with its own tallies, while the closed instances'
+    /// members come back to main with clean per-match stats.
+    #[test]
+    fn a_disable_closes_every_created_match_but_main() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize] = state::TffaMatch {
+            active: true,
+            red: 5,
+            blue: 3,
+        };
+        matches[1] = state::TffaMatch {
+            active: true,
+            red: 2,
+            blue: 1,
+        };
+        matches[4] = state::TffaMatch {
+            active: true,
+            red: 0,
+            blue: 0,
+        };
+        // A slot above a lowered `proxy_tffa_maxMatches` is still an open
+        // match: a disable closes it like any other (only `map_restart`'s carry
+        // applies the limit).
+        matches[TOTAL_MATCH_SLOTS - 1].active = true;
+        // An inactive slot stays out of the sweep (and main is never one).
+        assert_eq!(
+            created_matches_to_close(&matches),
+            vec![1, 4, TOTAL_MATCH_SLOTS as u8 - 1]
+        );
+
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[0] = 1;
+        table[7] = 4;
+        table[9] = TOTAL_MATCH_SLOTS as u8 - 1;
+        let mut score = [0i32; MAX_CLIENTS];
+        score[0] = 9;
+        score[7] = 2;
+        score[9] = 4;
+        for id in created_matches_to_close(&matches) {
+            close_instance_state(&mut matches, &mut table, &mut score, id);
+        }
+        assert!(matches[MAIN_MATCH as usize].active);
+        assert_eq!(
+            (
+                matches[MAIN_MATCH as usize].red,
+                matches[MAIN_MATCH as usize].blue
+            ),
+            (5, 3)
+        );
+        assert!(matches.iter().skip(1).all(|m| !m.active));
+        assert!(matches.iter().skip(1).all(|m| m.red == 0 && m.blue == 0));
+        assert_eq!(table[0], MAIN_MATCH);
+        assert_eq!(table[7], MAIN_MATCH);
+        assert_eq!(table[9], MAIN_MATCH);
+        assert_eq!(score[0], 0);
+        assert_eq!(score[7], 0);
+        assert_eq!(score[9], 0);
+        // Nothing left for a second pass to close.
+        assert!(created_matches_to_close(&matches).is_empty());
+    }
+
+    /// The message a member of a closed match receives explains what happened:
+    /// a player is told they are spectating now and how to play again, a
+    /// spectator is only told the match is gone.
+    #[test]
+    fn disable_notice_explains_the_spectator_move() {
+        let moved = disable_notice(3, true);
+        assert!(moved.starts_with("print \""));
+        assert!(moved.contains("match 3"));
+        assert!(moved.contains("moved to spectator"));
+        assert!(moved.contains("/team red"));
+        assert!(moved.ends_with("\n\""));
+        let watching = disable_notice(3, false);
+        assert!(watching.contains("match 3"));
+        assert!(!watching.contains("moved to spectator"));
+        assert!(watching.contains("main game"));
+        // No quote or newline can break the `print "..."` wire format.
+        for text in [moved, watching] {
+            assert_eq!(text.matches('"').count(), 2);
+            assert_eq!(text.matches('\n').count(), 1);
+        }
+    }
+
+    /// The disable hands main's tally back to `level.teamScores` instead of
+    /// leaving the neutralised `0-0`: the write lands exactly on the RED/BLUE
+    /// slots the neutraliser subtracts from and touches nothing around them, so
+    /// the pristine `CheckExitRules`/scoreboard/`CalculateRanks` continue from
+    /// the running score.
+    #[test]
+    fn disable_restores_main_tally_into_the_global_scores() {
+        // A `level_locals_t` scratch buffer around the three `teamScores`
+        // slots (`+44` TEAM_FREE, `+48` RED, `+52` BLUE).
+        let mut level = [0u8; 64];
+        fn read(level: *const u8, off: usize) -> c_int {
+            // SAFETY: the test buffer covers every offset it reads.
+            unsafe { core::ptr::read_unaligned(level.add(off) as *const c_int) }
+        }
+        unsafe {
+            core::ptr::write_unaligned(
+                level.as_mut_ptr().add(crate::sdk::OFFSET_LEVEL_TEAM_SCORES) as *mut c_int,
+                7,
+            );
+            core::ptr::write_unaligned(level.as_mut_ptr().add(56) as *mut c_int, 9);
+            // What the overlay left: neutralised to 0-0 (D-006.3).
+            write_global_team_scores(level.as_mut_ptr() as usize, 0, 0);
+        }
+        assert_eq!(
+            read(level.as_ptr(), crate::sdk::OFFSET_LEVEL_TEAM_SCORES_RED),
+            0
+        );
+        assert_eq!(
+            read(level.as_ptr(), crate::sdk::OFFSET_LEVEL_TEAM_SCORES_BLUE),
+            0
+        );
+
+        // Main was 5-3 when the admin turned the feature off.
+        unsafe { write_global_team_scores(level.as_mut_ptr() as usize, 5, 3) };
+        assert_eq!(
+            read(level.as_ptr(), crate::sdk::OFFSET_LEVEL_TEAM_SCORES_RED),
+            5
+        );
+        assert_eq!(
+            read(level.as_ptr(), crate::sdk::OFFSET_LEVEL_TEAM_SCORES_BLUE),
+            3
+        );
+        // Neighbouring slots are untouched (a wrong offset would clobber them).
+        assert_eq!(
+            read(level.as_ptr(), crate::sdk::OFFSET_LEVEL_TEAM_SCORES),
+            7
+        );
+        assert_eq!(read(level.as_ptr(), 56), 9);
     }
 
     /// Closing a created instance deactivates it, resets its tallies and

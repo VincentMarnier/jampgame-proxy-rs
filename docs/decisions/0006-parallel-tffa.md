@@ -658,6 +658,88 @@ rcon + gdb, because no game client was available), then:
 (`mp/duel1`'s interactive set was 4 entities; only that one carried match had a
 member.) The experiments are not part of the automated suite.
 
+### D-006.9 — Turning `proxy_tffa_enable` off closes the created matches
+
+*Status: landed (user directive, 2026-10-21).*
+
+`proxy_tffa_enable` is a live gate: every TFFA hook reads it through
+`tffa::enabled()`, so setting it to `0` during a map stops all isolation on the
+next frame. Before this change the overlay itself stayed behind — the created
+matches kept their slots, their members kept `client_match` ids, clients kept
+the `(TFFA n)` prefixes and forced-spectator `CS_PLAYERS` overrides, the
+per-match HUD tallies and the per-instance world clones stayed in the map — so
+players would have been left in instances that no longer isolated anything,
+with dangling doors/triggers duplicated into the shared world.
+
+**Decision.** The per-frame cvar mirror (`update_proxy_cvars` in
+`GAME_RUN_FRAME`) is observed by `tffa::on_frame_start` through the
+`enable_latched` flag: a non-zero → zero edge runs `disable_parallel_tffa`
+before the frame is forwarded. Main (`0`) is implicit and never closes; every
+active created slot is deactivated, its tallies and per-player copies reset, and
+its per-instance clone set queued for release (`drain_world_releases` now runs
+unconditionally at frame start, since `enabled()` is already false on that
+frame). Re-latching happens in `reset_round`, so a `GAME_INIT` with the cvar
+already `0` does not produce a spurious first-frame sweep.
+
+Every connected member of a closed match is returned to the main game
+(`client_match = 0`, stats reset). A member who was playing is moved to the
+spectator team through the pristine `SetTeam` trampoline — the same move
+`/team spectator` makes, so they suicide and respawn spectating — and receives a
+`print` explaining that parallel TFFA was disabled, which match closed, and that
+`/team red|blue` rejoins the main game. A member who was already spectating gets
+the shorter notice (the match is gone, they are watching main). The engine log
+gets one line per closed instance with its final tally and member count.
+
+**Client views.** The last TFFA frame's per-viewer overrides are undone
+explicitly (`restore_pristine_views(red, blue)`): every connected client
+receives the server's own `CS_PLAYERS + n` strings from the live configstrings
+and main's restored `CS_SCORES1/2` tally, so no `(TFFA n)` prefix,
+forced-spectator outsider or per-match HUD tally survives. The stored bases,
+score dedup cache and viewer-match cache are cleared (`cs_players_base` empty ⇒
+a later re-enable falls back to the live strings, exactly like a mid-map
+enable). `world_scanned` is cleared too:
+gameplay while the feature is off can spawn interactive entities that carry no
+tag, so a later re-enable must re-measure the map before it clones it.
+
+**Scores after the disable.** The pristine `level.teamScores` had been kept
+neutralised (`0`) by D-006.3 while TFFA owned the scoring, and the main match's
+tally lived proxy-side. Leaving them there made the one remaining game read as a
+score reset the moment the game owned scoring again, so the disable writes
+main's tally back into `level.teamScores` (`restore_main_global_scores` →
+`write_global_team_scores`, the same `+48`/`+52` slots `neutralise_global`
+subtracts from) and every client's mini HUD is pushed that value
+(`restore_pristine_views(red, blue)`). From then on pristine `AddScore`,
+`CheckExitRules`, `CalculateRanks`, the scoreboard header and `PickTeam`'s
+tie-break all continue from main's running score. This is safe: main's tally is
+the exact value the proxy compared against the shared `fraglimit` every frame,
+so a main game that reached the limit had already been ended or promoted before
+a disable can be seen at the next frame start. The tally is restored even when
+no created match was open (an enable/disable on main alone is the same reset
+otherwise), and the engine's `CS_SCORES1/2` configstrings are left alone: the
+next pristine `CalculateRanks` (any frag, connect, team change — a connect
+calls it before the gamestate is sent) rewrites them from the restored value.
+Per-player `PERS_SCORE` was reset when each player joined a created match and is
+not merged back: for players who never left main it already matches main's tally,
+and there is no single number that makes a created match's history agree with
+main's.
+
+**Re-enable.** The disable only gives the score *to* the game: main's proxy tally
+is left untouched, so `tffa_list` still reports the main game's tally and a later
+`proxy_tffa_enable 1` on the same map resumes the overlay from that number (with
+`clamp_global_scores` neutralising the game's slot again, exactly like a mid-map
+enable). Frags scored while the feature was off are therefore the game's, not the
+overlay's — the two scoring systems are never merged.
+
+Tests: `disable_edge_only_fires_on_a_nonzero_to_zero_flip` (only the 1 → 0 edge
+fires, once), `a_disable_closes_every_created_match_but_main` (every active
+created slot closes and its members return to main; main keeps its tallies),
+`disable_notice_explains_the_spectator_move` (both message shapes, wire-safe) and
+`disable_restores_main_tally_into_the_global_scores` (main's `5-3` lands on the
+RED/BLUE slots, neighbours untouched, a `0-0` neutralisation is replaced).
+The spectator move itself is the runtime-verified `move_match_to_spectator`
+trampoline path; the disable as a whole needs a live admin + live client on a
+real server, which the automated suite cannot drive.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
@@ -1344,3 +1426,21 @@ member.) The experiments are not part of the automated suite.
   `cargo test` 112/112, `clippy -D warnings`, `fmt --check`, i686 release
   build green, and the carry/no-carry paths were observed on a dedicated
   server (D-006.8).
+
+- **Live disable (2026-10-21, user directive, D-006.9):** setting
+  `proxy_tffa_enable` back to `0` closes every created match on the next frame
+  before the frame is forwarded, returns its members to main as spectators
+  (pristine `SetTeam` trampoline) with a per-client `print`, releases the
+  per-instance clone sets, restores every client's base `CS_PLAYERS`, and hands
+  main's running tally back to the pristine `level.teamScores` + HUD (so the one
+  remaining game does not read as a score reset). Main keeps playing with the
+  pristine scoreboard from that score. `enable_latched` (re-latched at
+  `GAME_INIT`) makes the 1 → 0 edge fire exactly once; `drain_world_releases`
+  moved out of the `enabled()` guard at frame start so the disable can hand its
+  clones back. Tests: `disable_edge_only_fires_on_a_nonzero_to_zero_flip`,
+  `a_disable_closes_every_created_match_but_main`,
+  `disable_notice_explains_the_spectator_move`,
+  `disable_restores_main_tally_into_the_global_scores`; `cargo test` 116/116,
+  `clippy -D warnings`, `fmt --check` and the i686 release build are green.
+  The spectator move + message path needs a live admin and client, so it is
+  not runtime-verified.
