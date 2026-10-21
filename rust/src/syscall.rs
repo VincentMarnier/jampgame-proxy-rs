@@ -100,7 +100,8 @@ pub unsafe fn call_engine(command: c_int, args: &[c_int]) -> c_int {
 /// engine fills the cmd, `G_NAV_LOAD` frees the previous nav graph before it
 /// loads the next one (map-change memory leak), `G_SEND_SERVER_COMMAND`
 /// `scores ...` messages are rewritten per viewer while parallel TFFA matches
-/// are active, and `G_SET_CONFIGSTRING` for `CS_SCORES1/2` + `CS_PLAYERS` fans
+/// run and gain the TaystJK 15th `deaths` int (`crate::scoreboard`), and
+/// `G_SET_CONFIGSTRING` for `CS_SCORES1/2` + `CS_PLAYERS` fans
 /// out per-viewer `cs` corrections (own-match mini HUD and own-side client
 /// names; another match's players are kept out of the viewer's team overlay).
 /// All are then forwarded normally.
@@ -179,7 +180,8 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         }
         // `G_SEND_SERVER_COMMAND(int clientNum, const char*)`: rewrite the
         // per-viewer `scores ...` message while parallel TFFA matches run so
-        // each match sees only its own roster and scores, and drop a team
+        // each match sees only its own roster and scores, append the TaystJK
+        // deaths field to every `scores` message, and drop a team
         // chat (`tchat`/`ltchat`) aimed at a viewer of another match. Global
         // chat stays server-wide.
         // Pristine fraglimit notices (`Red|Blue|<name> …HIT_THE_KILL_LIMIT…`)
@@ -213,44 +215,56 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     {
                         return 0;
                     }
+                    // The scoreboard rewrite runs on the message the viewer
+                    // will actually receive: the parallel-TFFA rewrite first
+                    // (it parses the stock 14-int entry layout and substitutes
+                    // the viewer's match), then the TaystJK deaths field on
+                    // the result. Broadcast scores (`-1`) skip the per-viewer
+                    // TFFA rewrite but still carry the deaths field.
+                    let mut rewritten: Option<String> = None;
                     if a0 >= 0 && (a0 as usize) < crate::sdk::MAX_CLIENTS {
-                        if let Some(rewritten) =
-                            crate::tffa::rewrite_scores_for_viewer(text_str, a0)
-                        {
+                        if let Some(scores) = crate::tffa::rewrite_scores_for_viewer(text_str, a0) {
                             // The client groups the roster by its local
                             // CS_PLAYERS team data; re-push the demotions so a
                             // lost/overwritten override cannot show another
                             // match's player on this viewer's RED/BLUE side.
                             crate::tffa::refresh_cs_players_for_scores(a0);
-                            if let Ok(cmsg) = std::ffi::CString::new(rewritten) {
-                                // SAFETY: engine syscall registered; cmsg outlives
-                                // the call (the engine copies into
-                                // reliableCommands synchronously).
-                                let response = unsafe {
-                                    engine_syscall_call(
-                                        command,
-                                        [
-                                            a0,
-                                            cmsg.as_ptr() as c_int,
-                                            a2,
-                                            a3,
-                                            a4,
-                                            a5,
-                                            a6,
-                                            a7,
-                                            a8,
-                                            a9,
-                                            a10,
-                                            a11,
-                                            a12,
-                                            a13,
-                                            a14,
-                                            a15,
-                                        ],
-                                    )
-                                };
-                                return response;
-                            }
+                            rewritten = Some(scores);
+                        }
+                    }
+                    let source = rewritten.as_deref().unwrap_or(text_str);
+                    if let Some(with_deaths) = crate::scoreboard::rewrite_command(source) {
+                        rewritten = Some(with_deaths);
+                    }
+                    if let Some(out) = rewritten {
+                        if let Ok(cmsg) = std::ffi::CString::new(out) {
+                            // SAFETY: engine syscall registered; cmsg outlives
+                            // the call (the engine copies into
+                            // reliableCommands synchronously).
+                            let response = unsafe {
+                                engine_syscall_call(
+                                    command,
+                                    [
+                                        a0,
+                                        cmsg.as_ptr() as c_int,
+                                        a2,
+                                        a3,
+                                        a4,
+                                        a5,
+                                        a6,
+                                        a7,
+                                        a8,
+                                        a9,
+                                        a10,
+                                        a11,
+                                        a12,
+                                        a13,
+                                        a14,
+                                        a15,
+                                    ],
+                                )
+                            };
+                            return response;
                         }
                     }
                 }

@@ -475,6 +475,18 @@ fn client_of(client_num: c_int) -> usize {
     unsafe { ent_client(base + client_num as usize * crate::sdk::SIZEOF_GENTITY) }
 }
 
+/// `client->ps.persistant[PERS_KILLED]` of a client slot — the game's own
+/// death count, read live at `scores`-send time by `crate::scoreboard`. Slots
+/// without a client yet (or an unlocated game) read as `0`.
+pub(crate) fn pers_killed(client_num: c_int) -> c_int {
+    let client = client_of(client_num);
+    if client == 0 {
+        return 0;
+    }
+    // SAFETY: client came from a live gentity's `client` pointer.
+    unsafe { ps_persistant(client, PERS_KILLED) }
+}
+
 /// `(proxy.g_entities + n)->client->pers.netname`, colour-stripped into `out`.
 fn client_clean_netname(client_num: c_int, out: &mut [u8]) {
     let client = client_of(client_num);

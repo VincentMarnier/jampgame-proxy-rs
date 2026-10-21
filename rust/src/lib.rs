@@ -35,6 +35,7 @@ mod jampgame;
 mod original;
 mod patch;
 mod rules;
+mod scoreboard;
 mod sdk;
 mod shared_api;
 mod state;
@@ -116,6 +117,10 @@ pub unsafe extern "C" fn vmMain(
         GAME_RUN_FRAME => {
             state::set_svs_time(a0);
             update_proxy_cvars();
+            // Keep the serverinfo feature bit in step with the master switch
+            // (a runtime disable makes existing clients fall back to the
+            // pristine 14-int parse).
+            scoreboard::sync_serverinfo();
             // SAFETY: original module loaded, memory layer initialised.
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
             if state::proxy_enabled() {
@@ -264,6 +269,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // has run its own registration, which is idempotent on the engine side.
     register_proxy_cvars();
     update_proxy_cvars();
+    // Advertise `taystJKinfo` bit 7 before the engine builds `CS_SERVERINFO`
+    // for this spawn (`SV_SpawnServer` runs its settle frames, then sets the
+    // configstring, both after `GAME_INIT`).
+    scoreboard::sync_serverinfo();
 
     // Fresh round for the parallel-TFFA matches (scores reset, the main slot
     // re-opened; a `map_restart` keeps the matches and assignments carried
@@ -301,6 +310,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 /// redirect left open by an rcon map change, forward the shutdown, then unload
 /// the original module (`Proxy_Main.cpp:128-160`).
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
+    // Drop the serverinfo feature bit: the engine's cvar table outlives this
+    // module, and a pristine module loaded next must not keep advertising the
+    // 15-int scoreboard parse.
+    scoreboard::clear_serverinfo();
     // Undo any team-size rule override before the module is unloaded: game cvars
     // persist across maps, so a rule value would otherwise leak into the next
     // round (no-op when no rule is applied).
@@ -361,6 +374,11 @@ fn register_proxy_cvars() {
                 syscall::cvar_register(cvar, name, default, sdk::CVAR_ARCHIVE);
             }
         }
+        // The TaystJK feature key is not a proxy cvar: it lives in the
+        // serverinfo (read by every cgame) and its value is owned by
+        // `scoreboard::sync_serverinfo`.
+        // SAFETY: the mirror is stable within the state.
+        unsafe { scoreboard::register_cvar(&mut s.taystjk_info as *mut sdk::VmCvar) };
     });
 }
 

@@ -25,3 +25,6 @@
   `CNavigator::Load` appends without clearing, and the port's
   `CNavigator::Load` hook runs after the forwarded `GAME_INIT` already loaded
   the nav data. Fix: free through the always-active `G_NAV_LOAD` syscall arm.
+- `0009-taystjk-scoreboard-deaths.md` — TaystJK compatibility: advertise
+  `taystJKinfo` bit 7 (`TAYSTJK_INFO_SCORE_DEATHS`) in the server info and
+  append `PERS_KILLED` as the 15th `scores` int, always on with the proxy.

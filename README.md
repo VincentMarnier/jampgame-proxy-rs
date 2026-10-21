@@ -46,6 +46,22 @@ Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
 `proxy_sv_disableKillCmd`).
 
+### TaystJK scoreboard deaths
+
+While `proxy_sv_enable` is `1`, the proxy advertises `taystJKinfo 128`
+(`TAYSTJK_INFO_SCORE_DEATHS`) in the server info and appends each player's
+death count as a 15th int to every `scores` command. That is what
+[TaystJK](https://github.com/taysta/TaystJK)'s cgame uses to show an up-to-date
+K/D on the tab scoreboard; the stock game module only sends 14 ints and never
+advertises the key. The death count is the game's own
+`ps.persistant[PERS_KILLED]`, read when the scoreboard is sent.
+
+The server info key is server-wide, so every client must run a cgame that
+understands it (TaystJK): a stock JA+/jaPRO cgame ignores the key and would
+misparse the extra int. The proxy therefore cannot serve both kinds of cgame at
+once; turn `proxy_sv_enable` off on a server that must stay stock-client
+compatible.
+
 ### Per-team-size rules
 
 `proxy_sv_teamSizeRules` overrides the limits for the size the round actually

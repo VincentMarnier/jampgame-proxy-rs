@@ -26,6 +26,11 @@ pub const MAX_TOKEN_CHARS: usize = 1024;
 pub const MAX_CVAR_VALUE_STRING: usize = 256;
 pub const MAX_OSPATH: usize = 4096; // PATH_MAX on Linux
 pub const CVAR_ARCHIVE: u32 = 0x0000_0001;
+/// `CVAR_SERVERINFO` (`q_shared.h:1786`): included in `CS_SERVERINFO`.
+pub const CVAR_SERVERINFO: u32 = 0x0000_0004;
+/// `CVAR_ROM` (`q_shared.h:1794`): display only, set by code with a forced
+/// `Cvar_Set` but never from the console.
+pub const CVAR_ROM: u32 = 0x0000_0040;
 pub const Q_COLOR_ESCAPE: u8 = b'^';
 /// `BIG_INFO_STRING` (`q_shared.h:360`) — bounds the tokenizer copy.
 pub const BIG_INFO_STRING: usize = 8192;

@@ -347,6 +347,10 @@ pub struct ProxyState {
     pub svs_time: i32,
     pub clients: Box<[ClientEntry]>,
     pub cvars: [VmCvar; PROXY_CVARS.len()],
+    /// `taystJKinfo` serverinfo key mirror (`crate::scoreboard`): the proxy sets
+    /// bit 7 (`TAYSTJK_INFO_SCORE_DEATHS`) while it is enabled, so TaystJK
+    /// cgames select the 15-int `scores` parse.
+    pub taystjk_info: VmCvar,
     pub jump_start_time: [i32; MAX_CLIENTS],
     pub team_lock: TeamLock,
     /// The `proxy_sv_teamSizeRules` rule most recently written, so the per-frame
@@ -431,6 +435,7 @@ impl ProxyState {
             svs_time: 0,
             clients: default_clients(),
             cvars: core::array::from_fn(|_| VmCvar::default()),
+            taystjk_info: VmCvar::default(),
             jump_start_time: [0; MAX_CLIENTS],
             team_lock: TeamLock::default(),
             last_team_rule: None,
