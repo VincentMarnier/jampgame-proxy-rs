@@ -144,8 +144,8 @@ pub struct TffaMatch {
 ///
 /// `cs_players_base[n]` is the last `CS_PLAYERS + n` info string the game set
 /// (via `G_SET_CONFIGSTRING`); per-viewer `cs` overrides (prefixed names,
-/// outsiders forced to spectator) are derived from it so the unified
-/// scoreboard can show every match while keeping own teams intact.
+/// outsiders forced to spectator) are derived from it so another match's
+/// player never shows up in the viewer's team overlay.
 #[derive(Debug, Clone)]
 pub struct TffaState {
     pub matches: [TffaMatch; crate::tffa::TOTAL_MATCH_SLOTS],
@@ -173,6 +173,12 @@ pub struct TffaState {
     /// when spectating (game follow) changes your instance without any proxy
     /// command.
     pub viewer_match_cache: [u8; MAX_CLIENTS],
+    /// Match whose final scoreboard each viewer must see, captured just before
+    /// the pristine `BeginIntermission` moves clients and stops following
+    /// (`tffa::snapshot_intermission_boards`). Without it a spectator watching
+    /// another match would fall back to their own (often empty) match when the
+    /// final `scores` message is built and read e.g. `TIED AT 0`.
+    pub intermission_boards: [u8; MAX_CLIENTS],
     /// Set when any intermission begins (pristine timelimit exit or the
     /// proxy-triggered solo-main finish); cleared on `GAME_INIT`. While set,
     /// fraglimit handling stays off — the map is ending.
@@ -253,6 +259,7 @@ impl Default for TffaState {
             cs_players_base: core::array::from_fn(|_| String::new()),
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
+            intermission_boards: [0; MAX_CLIENTS],
             intermission: false,
             entity_instance: [crate::tffa::ENTITY_SHARED; MAX_GENTITIES],
             world_clone_cost: 0,

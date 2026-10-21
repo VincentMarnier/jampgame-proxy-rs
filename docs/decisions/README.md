@@ -15,9 +15,13 @@
   `timelimit`/`fraglimit`/`capturelimit` overrides at round start, nearest
   smaller size fallback, independent of the lock boolean.
 - `0006-parallel-tffa.md` — parallel TFFA matches: per-match score copies,
-  per-viewer `scores`/`cs` rewrites, and physics isolation via trace
-  interception.
+  per-viewer `scores`/`cs` rewrites, physics isolation via trace
+  interception, and per-match team chat.
 - `0007-map-change-module-pinning.md` — map-change crash: rcon commands run
   inside our `SVC_RemoteCommand` wrapper, the engine `dlclose`s the proxy
   mid-call, and the stale return faults. Fix: pin the module for the process
   lifetime and reset per-session state at `GAME_INIT`.
+- `0008-nav-load-leak.md` — map-change / `map_restart` nav-graph leak:
+  `CNavigator::Load` appends without clearing, and the port's
+  `CNavigator::Load` hook runs after the forwarded `GAME_INIT` already loaded
+  the nav data. Fix: free through the always-active `G_NAV_LOAD` syscall arm.

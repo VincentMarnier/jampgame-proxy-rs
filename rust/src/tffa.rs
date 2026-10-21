@@ -27,21 +27,27 @@
 //!   sounds (`G_SoundAtLoc`, item respawns) and `EV_GLOBAL_SOUND` broadcasts
 //!   stay audible everywhere.
 //! - scoreboard: `G_SEND_SERVER_COMMAND` trap rewrites `scores ...` per
-//!   viewer with the per-player per-match score copies.
-//! - chat is intentionally left global.
+//!   viewer with the per-player per-match score copies. The roster is unified
+//!   (every connected client is listed, so players can see who is in which
+//!   match); players of other matches are grouped as spectators through
+//!   per-viewer `CS_PLAYERS` demotions re-pushed just before the scoreboard.
+//! - team chat: the same trap drops per-viewer `tchat`/`ltchat` commands whose
+//!   recipient is in another match (`team_chat_visible`), using the acting
+//!   scope the `GAME_CLIENT_COMMAND` forward opens for the sender. Global
+//!   `chat` stays server-wide, and `tell` stays private as in base JKA.
 
-use core::ffi::{c_char, c_int};
+use core::ffi::{CStr, c_char, c_int};
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
-    CON_DISCONNECTED, CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ENTITYNUM_MAX_NORMAL,
-    ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME,
-    MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR,
-    OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2,
-    OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY, OFFSET_GENTITY_NEXT_TRAIN,
-    OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS,
-    OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED,
-    OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
+    CON_CONNECTED, CON_DISCONNECTED, CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2,
+    ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS,
+    MAX_GENTITIES, MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS,
+    OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY,
+    OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
+    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN,
+    OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER,
+    OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
     OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM,
     OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
     OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM,
@@ -83,6 +89,33 @@ pub fn client_match(client_num: i32) -> u8 {
         return MAIN_MATCH;
     }
     state::with_state(|s| s.tffa.client_match[client_num as usize])
+}
+
+/// Whether a server command is a team chat message. `G_SayTo` sends `SAY_TEAM`
+/// as `tchat` (plain) or `ltchat` (with a location prefix)
+/// (`g_cmds.c:1511-1522`); global `chat`/`lchat` are not team chat.
+pub fn is_team_chat(command: &str) -> bool {
+    command.starts_with("tchat ") || command.starts_with("ltchat ")
+}
+
+/// Pure team-chat gate: a `tchat`/`ltchat` sent by a client in `sender_match`
+/// may only reach a client in that same match. `SCOPE_NONE` (no attributable
+/// sender) and out-of-range recipients (a broadcast) are left alone, so chat
+/// generated outside a scoped client command keeps its old reach.
+pub fn team_chat_visible_in(
+    sender_match: u8,
+    recipient: c_int,
+    client_match: &[u8; MAX_CLIENTS],
+) -> bool {
+    if sender_match == SCOPE_NONE || !(0..MAX_CLIENTS as c_int).contains(&recipient) {
+        return true;
+    }
+    client_match[recipient as usize] == sender_match
+}
+
+/// `team_chat_visible_in` against the live client table.
+pub fn team_chat_visible(sender_match: u8, recipient: c_int) -> bool {
+    state::with_state(|s| team_chat_visible_in(sender_match, recipient, &s.tffa.client_match))
 }
 
 /// What a viewer sees: their own match, else the followed player's match
@@ -165,11 +198,13 @@ pub fn fraglimit_hit(red: i32, blue: i32, fraglimit: i32) -> bool {
 // scores trap rewrite
 // ---------------------------------------------------------------------------
 
-/// Rewrite a `scores ...` server command for `viewer`:
-/// unified roster — every connected client is listed (outsiders appear in the
-/// spectator section client-side via the per-viewer `CS_PLAYERS` team
-/// override), the team header is the viewer's own match red/blue, and each
-/// entry's `PERS_SCORE` is the per-match copy.
+/// Rewrite a `scores ...` server command for `viewer`: unified roster — every
+/// connected client is listed, the team header is the viewer's board match
+/// red/blue, and each entry's `PERS_SCORE` is the per-match copy. Players of
+/// other matches are shown as spectators by the per-viewer `CS_PLAYERS`
+/// overrides (name prefixed `(TFFA N)`), which are re-pushed right before the
+/// scoreboard is sent (`refresh_cs_players_for_scores`), so an outsider can
+/// never be grouped into the viewer's RED/BLUE side.
 /// Returns `None` when the input is not a scores command or does not parse
 /// (caller then passes the original through).
 pub fn rewrite_scores_for_viewer(text: &str, viewer: c_int) -> Option<String> {
@@ -188,7 +223,7 @@ pub fn rewrite_scores_for_viewer(text: &str, viewer: c_int) -> Option<String> {
     if entries.len() % SCORE_ENTRY_INTS != 0 {
         return None;
     }
-    let viewer_match = effective_match(viewer);
+    let viewer_match = viewer_board_match(viewer);
     let (mred, mblue, player_scores) = state::with_state(|s| {
         let m = &s.tffa.matches[viewer_match as usize];
         (m.red, m.blue, s.tffa.player_score)
@@ -196,11 +231,13 @@ pub fn rewrite_scores_for_viewer(text: &str, viewer: c_int) -> Option<String> {
     Some(filter_scores(mred, mblue, &player_scores, &nums[3..]))
 }
 
-/// Pure `scores ...` rewrite (no global state): keep every entry, substitute
-/// per-match red/blue header and each player's per-match score copy.
-/// Outsider-vs-own separation happens client-side via the per-viewer
-/// `CS_PLAYERS` team override (outsiders forced to spectator with a
-/// `(TFFA N)` name prefix), so the tab lists everyone.
+/// Pure `scores ...` rewrite (no global state): keep every entry (unified
+/// roster), substitute the per-match red/blue header and each player's
+/// per-match score copy. Outsider-vs-own separation happens in the viewer's
+/// client-side team data (the per-viewer `CS_PLAYERS` team override), so the
+/// tab lists everyone while only the viewer's match players count as playing.
+/// Entries naming an out-of-range client are kept untouched (the game never
+/// emits one, and dropping data would be worse than passing it through).
 pub fn filter_scores(
     red: i32,
     blue: i32,
@@ -227,6 +264,56 @@ pub fn filter_scores(
         out.push_str(&format!(" {v}"));
     }
     out
+}
+
+/// Match whose scoreboard `viewer` sees. Normally the follow-aware
+/// `effective_match`; while an intermission runs, the match captured just
+/// before the pristine `BeginIntermission` stopped following
+/// (`snapshot_intermission_boards`), so a spectator watching another match
+/// keeps that match's final board instead of falling back to their own
+/// (often empty) one and reading e.g. `TIED AT 0`. The captured match must
+/// still be active (a finished match already had its tally reset); otherwise
+/// the normal rule applies.
+fn viewer_board_match(viewer: c_int) -> u8 {
+    let effective = effective_match(viewer);
+    if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
+        return effective;
+    }
+    state::with_state(|s| {
+        let board = s.tffa.intermission_boards[viewer as usize];
+        let board_active = s.tffa.matches.get(board as usize).is_some_and(|m| m.active);
+        pick_board_match(effective, board, board_active, s.tffa.intermission)
+    })
+}
+
+/// Pure board choice: during an intermission keep the match captured for the
+/// viewer when it is still active, otherwise use the follow-aware match.
+fn pick_board_match(effective: u8, board: u8, board_active: bool, intermission: bool) -> u8 {
+    if intermission && board_active {
+        board
+    } else {
+        effective
+    }
+}
+
+/// Capture each connected viewer's follow-aware match before the pristine
+/// `BeginIntermission` runs: it stops following (dropping the watched match)
+/// before it sends the final `scores` message, so the scoreboard rewrite needs
+/// the pre-move value (`viewer_board_match`).
+pub fn snapshot_intermission_boards() {
+    if !enabled() {
+        return;
+    }
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    let mut boards = [MAIN_MATCH; MAX_CLIENTS];
+    for viewer in viewers {
+        boards[viewer as usize] = effective_match(viewer);
+    }
+    state::with_state(|s| s.tffa.intermission_boards = boards);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,9 +400,11 @@ pub fn prefixed_name(orig: &str, player_match: u8) -> String {
 
 /// Rewrite a `CS_PLAYERS + n` info string for `viewer`:
 /// playing outsiders (`player_match != viewer_match`, base team RED/BLUE)
-/// get a `(TFFA N)` name prefix and are forced to spectator so the team
-/// scoreboard lists them in the spectator section; everyone else (own match,
-/// real spectators) is left untouched. Returns `None` when no change.
+/// get a `(TFFA N)` name prefix and are forced to spectator. The `scores`
+/// rewrite already leaves them out of the scoreboard, so this keeps them out
+/// of the viewer's team overlay (and names them as another match's player if
+/// any other client-side surface shows them). Everyone else (own match, real
+/// spectators) is left untouched. Returns `None` when no change.
 pub fn rewrite_cs_players_for_viewer(
     base: &str,
     player_match: u8,
@@ -370,9 +459,9 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
 }
 
 /// Record a `CS_PLAYERS + n` base string the game just set, then push the
-/// per-viewer variants (prefixed outsiders) to every connected client.
-/// Call after the trap has been forwarded so the engine broadcast lands
-/// first and our per-viewer corrections win.
+/// per-viewer variants (prefixed outsiders forced to spectator) to every
+/// connected client. Call after the trap has been forwarded so the engine
+/// broadcast lands first and our per-viewer corrections win.
 pub fn on_set_cs_players(slot: i32, value: &str) {
     if !enabled() {
         return;
@@ -685,6 +774,69 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
 }
 
+/// Re-push the `CS_PLAYERS` demotions (prefix + spectator team) for `viewer`
+/// right before a `scores ...` message is forwarded.
+///
+/// The tab scoreboard groups entries by each client's `cgs.clientinfo[].team`,
+/// which comes from `CS_PLAYERS`; an override sent when the base changed can be
+/// lost (reliable-buffer pressure during connect/team churn, a gamestate
+/// resync, or a base the viewer processed after it). When that happens an
+/// outsider is grouped on the viewer's RED/BLUE side even though the proxy had
+/// classified them as another match's player. Re-sending the demotions first
+/// (reliable commands are ordered) makes the team data correct at the moment
+/// the scoreboard is parsed, and it stays correct afterwards. Only playing
+/// outsiders need a push — same-match players and real spectators already have
+/// the base string — so the burst is bounded by the other matches' rosters.
+pub fn refresh_cs_players_for_scores(viewer: c_int) {
+    if !enabled() {
+        return;
+    }
+    if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
+        return;
+    }
+    // Same board match the `scores` rewrite uses (follow-aware, and the
+    // pre-intermission capture while the final board is built).
+    let viewer_match = viewer_board_match(viewer);
+    let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
+        state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
+    // Fall back to the live configstring for a slot whose base was assigned
+    // while the feature was off (they are clientinfo sources too).
+    for (slot, base) in bases.iter_mut().enumerate() {
+        if base.is_empty() {
+            if let Some(live) = get_live_cs_players(slot as i32) {
+                *base = live.clone();
+                state::with_state(|s| {
+                    s.tffa.cs_players_base[slot] = live;
+                });
+            }
+        }
+    }
+    for (slot, value) in demotions_for_viewer(viewer_match, &table, &bases) {
+        send_cs_to_client(viewer, CS_PLAYERS + slot, &value);
+    }
+}
+
+/// The `CS_PLAYERS` demotions one viewer's scoreboard needs, as
+/// `(slot, rewritten info string)`: every playing outsider with a known base
+/// string. Pure (match table + stored bases), so the delivery loop stays a
+/// plain send loop and the rule is unit-tested without an engine.
+fn demotions_for_viewer(
+    viewer_match: u8,
+    table: &[u8; MAX_CLIENTS],
+    bases: &[String; MAX_CLIENTS],
+) -> Vec<(i32, String)> {
+    let mut out = Vec::new();
+    for (slot, base) in bases.iter().enumerate() {
+        if table[slot] == viewer_match || base.is_empty() {
+            continue;
+        }
+        if let Some(modified) = rewrite_cs_players_for_viewer(base, table[slot], viewer_match) {
+            out.push((slot as i32, modified));
+        }
+    }
+    out
+}
+
 /// Clear accumulated stats for one slot (match moves/finish start the next
 /// instance clean; cross-match damage is never recorded anyway, so only
 /// same-instance history is dropped — for the mover as viewer and for others
@@ -693,27 +845,62 @@ fn reset_slot_stats(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    state::with_state(|s| {
-        let n = client_num as usize;
-        s.clients[n].game_stats = [crate::state::GameStats::default(); MAX_CLIENTS];
-        for other in 0..MAX_CLIENTS {
-            s.clients[other].game_stats[n] = crate::state::GameStats::default();
-        }
-        s.clients[n].team_kills = 0;
-        s.clients[n].team_killed = 0;
-        s.clients[n].team_damages_given = 0;
-        s.clients[n].team_damages_taken = 0;
-    });
+    state::with_state(|s| reset_client_stats(&mut s.clients, client_num));
     reset_game_scores(client_num);
 }
 
-/// Reset the game's own per-player score counters for one slot
+/// The proxy-side part of a match move shared by `cmd_join`/`cmd_create`:
+/// assign the client to `id`, clear its per-match score copy and clear its
+/// `proxy_sv_enableEndGameStats` row/column and team counters (see
+/// `reset_client_stats`). The game-side `PERS_SCORE`/`PERS_KILLED` reset is
+/// separate (`reset_game_scores`, needs the located entities). Pure so the
+/// join move is unit-tested.
+fn assign_client_instance(
+    client_match: &mut [u8; MAX_CLIENTS],
+    player_score: &mut [i32; MAX_CLIENTS],
+    clients: &mut [crate::state::ClientEntry],
+    client_num: c_int,
+    id: u8,
+) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    let n = client_num as usize;
+    client_match[n] = id;
+    player_score[n] = 0;
+    reset_client_stats(clients, client_num);
+}
+
+/// The end-game-stats half of `reset_slot_stats` (`proxy_sv_enableEndGameStats`):
+/// clear the mover's whole row (what they did to others) and whole column
+/// (what others did to them), and their team counters. This is what
+/// `cmd_join`/`cmd_create`/`cmd_leave` run on an instance switch, so a player
+/// carries no kills, deaths or damage from the match they just left into the
+/// next match's final sheet. Pure over the client table for the join test.
+fn reset_client_stats(clients: &mut [crate::state::ClientEntry], client_num: c_int) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    let n = client_num as usize;
+    if n >= clients.len() {
+        return;
+    }
+    clients[n].game_stats = [crate::state::GameStats::default(); MAX_CLIENTS];
+    for client in clients.iter_mut().take(MAX_CLIENTS) {
+        client.game_stats[n] = crate::state::GameStats::default();
+    }
+    clients[n].team_kills = 0;
+    clients[n].team_killed = 0;
+    clients[n].team_damages_given = 0;
+    clients[n].team_damages_taken = 0;
+}
+
+/// Zero the game's own per-player score counters for one slot
 /// (`ps.persistant[PERS_SCORE/PERS_KILLED]` accumulate all map, which would
 /// otherwise trip pristine `CheckExitRules`' per-player fraglimit as soon as
 /// any limit is set — and would show stale totals on the per-match HUD).
 /// Mirrors the proxy per-match copies (reset alongside them on every move).
 fn reset_game_scores(client_num: c_int) {
-    use crate::sdk::{OFFSET_GCLIENT_PS, OFFSET_PS_PERSISTANT, PERS_KILLED, PERS_SCORE};
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
@@ -727,7 +914,23 @@ fn reset_game_scores(client_num: c_int) {
     if client == 0 {
         return;
     }
-    // SAFETY: client is a valid gclient_t; persistant slots are plain ints.
+    // SAFETY: client came from a live gentity's `client` pointer.
+    unsafe { reset_game_scores_at(client) };
+}
+
+/// Write zero to `ps.persistant[PERS_SCORE]` and `PERS_KILLED` in one
+/// `gclient_t`. Split from `reset_game_scores` (which locates the client) so
+/// the write can be tested on a scratch buffer without game memory.
+///
+/// # Safety
+/// `client` must be 0 or point to a valid `gclient_t`.
+unsafe fn reset_game_scores_at(client: usize) {
+    use crate::sdk::{OFFSET_GCLIENT_PS, OFFSET_PS_PERSISTANT, PERS_KILLED, PERS_SCORE};
+    if client == 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees a valid gclient_t; persistant slots are
+    // plain ints.
     unsafe {
         core::ptr::write_unaligned(
             (client + OFFSET_GCLIENT_PS + OFFSET_PS_PERSISTANT + PERS_SCORE * 4) as *mut c_int,
@@ -965,6 +1168,7 @@ pub fn reset_round() {
         s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
         // New round: fraglimit handling runs again.
         s.tffa.intermission = false;
+        s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
         // Per-instance worlds are per map: a fresh `GAME_INIT` memset the
         // entity array, so no clone and no tag survives it. Re-measured by
         // `scan_world_entities` right after this call.
@@ -988,6 +1192,7 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
         s.tffa.cs_players_base[client_num as usize].clear();
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
+        s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
     });
 }
 
@@ -1002,6 +1207,7 @@ pub fn on_client_disconnect(client_num: c_int) {
         s.tffa.cs_players_base[client_num as usize].clear();
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
+        s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
     });
     // The slot is free: other viewers' stale prefixed views of it will be
     // refreshed when the game clears `CS_PLAYERS + n` (empty base). Push an
@@ -1042,12 +1248,147 @@ pub fn on_frame_start() {
     }
 }
 
-/// Per-frame: finish matches that hit the shared fraglimit. Sub-match
-/// instances are announced to **everyone** with final teams/scores, members
-/// moved back to main as spectators, stats printed to members + spectators.
-/// When the main itself finishes, the lowest-id still-played TFFA becomes the
-/// new main; with no other active TFFA the map ends via pristine intermission
-/// (final scoreboard + standard stats for all).
+/// Whether the shared timelimit has expired, mirroring pristine
+/// `CheckExitRules` (`g_main.c:2664-2677`): `timelimit > 0`, not warmup, and
+/// `level.time - level.startTime >= timelimit * 60000`.
+fn timelimit_expired() -> bool {
+    // SAFETY: engine syscall registered.
+    let minutes = unsafe { crate::syscall::cvar_variable_integer_value(c"timelimit") };
+    if minutes <= 0 {
+        return false;
+    }
+    let level = crate::original::level_address();
+    if level == 0 {
+        return false;
+    }
+    // SAFETY: level is the game's level_locals_t; all three fields are ints.
+    let (time, start, warmup) = unsafe {
+        (
+            read_i32(level + crate::sdk::OFFSET_LEVEL_TIME),
+            read_i32(level + crate::sdk::OFFSET_LEVEL_START_TIME),
+            read_i32(level + crate::sdk::OFFSET_LEVEL_WARMUP_TIME),
+        )
+    };
+    if warmup != 0 {
+        return false;
+    }
+    // i64: a large admin `timelimit` must not wrap the multiplication.
+    i64::from(time) - i64::from(start) >= i64::from(minutes) * 60_000
+}
+
+/// Why an active match ends this frame: the shared fraglimit, or the shared
+/// timelimit once it expired **and the match is no longer tied**. A tied match
+/// keeps playing (per-match sudden death); it ends as soon as a frag makes the
+/// teams differ. `None` means it continues.
+fn match_finish_reason(
+    red: i32,
+    blue: i32,
+    fraglimit: i32,
+    timelimit_expired: bool,
+) -> Option<&'static str> {
+    if fraglimit_hit(red, blue, fraglimit) {
+        Some("fraglimit")
+    } else if timelimit_expired && red != blue {
+        Some("timelimit")
+    } else {
+        None
+    }
+}
+
+/// Whether any active match still needs the map: tied **and** with at least
+/// one playing client (a tied match left with spectators only can never
+/// untie). Once this is false after the timelimit, every game is over and the
+/// map restarts normally.
+fn has_continuing_match(
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    playing: &[bool; MAX_CLIENTS],
+) -> bool {
+    matches.iter().enumerate().any(|(id, m)| {
+        m.active
+            && m.red == m.blue
+            && client_match
+                .iter()
+                .zip(playing)
+                .any(|(cm, playing)| *playing && *cm == id as u8)
+    })
+}
+
+/// Lowest-id active created match with connected members, for promoting into
+/// the main slot when main ends. Pure so the closure path is unit-testable.
+fn promotion_candidate(
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    connected: &[bool; MAX_CLIENTS],
+    max: usize,
+) -> Option<(u8, i32, i32, Vec<c_int>)> {
+    for i in 1..=max {
+        if i >= matches.len() {
+            break;
+        }
+        let m = &matches[i];
+        if !m.active {
+            continue;
+        }
+        let members: Vec<c_int> = client_match
+            .iter()
+            .enumerate()
+            .filter(|(ci, mm)| **mm == i as u8 && connected[*ci])
+            .map(|(ci, _)| ci as c_int)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        return Some((i as u8, m.red, m.blue, members));
+    }
+    None
+}
+
+/// Migrate a promoted match's tallies and members into the main slot: main
+/// carries the surviving game, the promoted id becomes an inactive empty slot,
+/// and its members are assigned to main. The old main's members were already
+/// sent to spectator before this runs (`move_match_to_spectator`), so both
+/// groups end up in the surviving (main) game as players or spectators.
+fn promote_into_main(
+    matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &mut [u8; MAX_CLIENTS],
+    id: u8,
+    red: i32,
+    blue: i32,
+    members: &[c_int],
+) {
+    let main = &mut matches[MAIN_MATCH as usize];
+    main.red = red;
+    main.blue = blue;
+    main.active = true;
+    let promoted = &mut matches[id as usize];
+    promoted.red = 0;
+    promoted.blue = 0;
+    promoted.active = false;
+    for cn in members {
+        if let Some(slot) = client_match.get_mut(*cn as usize) {
+            *slot = MAIN_MATCH;
+        }
+    }
+}
+
+/// A new TFFA may not be created once the shared timelimit expired: the map
+/// is winding down (untied matches are closed, a tied one is in sudden death)
+/// and must end, not grow a fresh game. Pure for the `cmd_create` test.
+fn create_allowed(timelimit_expired: bool) -> bool {
+    !timelimit_expired
+}
+
+/// Per-frame: finish matches that hit the shared fraglimit, and — after the
+/// shared timelimit expires — every match that is not tied. A tied match keeps
+/// playing (per-match sudden death) until a frag separates the teams; once no
+/// active tied match with players is left, the map ends via the normal
+/// intermission/restart.
+/// Sub-match instances are announced to **everyone** with final teams/scores,
+/// members moved back to main as spectators, stats printed to members +
+/// spectators. When the main itself finishes, the lowest-id still-played TFFA
+/// becomes the new main; with no other active TFFA the map ends via pristine
+/// intermission (final scoreboard + standard stats for all).
 /// Runs after the frame is forwarded so scores from this frame are visible.
 pub fn on_run_frame_post() {
     if !enabled() {
@@ -1074,15 +1415,24 @@ pub fn on_run_frame_post() {
     if state::with_state(|s| s.tffa.intermission) {
         return;
     }
+    // A created match whose last player went spectator or disconnected has
+    // nothing left to host: close it (main is implicit and never closes).
+    // Runs before the limit early-return so it also holds with no limits.
+    close_empty_created_matches();
     // SAFETY: engine syscall registered.
     let fraglimit = unsafe { crate::syscall::cvar_variable_integer_value(c"fraglimit") };
-    if fraglimit <= 0 {
+    let limit_expired = timelimit_expired();
+    if fraglimit <= 0 && !limit_expired {
         return;
     }
+    // Authoritative game-side census (includes bots and connecting clients).
+    let (connected, playing) = client_census();
     struct Finished {
         id: u8,
         red: i32,
         blue: i32,
+        /// `"fraglimit"` or `"timelimit"` (for the end-of-match line).
+        reason: &'static str,
         members: Vec<c_int>,
         red_names: Vec<String>,
         blue_names: Vec<String>,
@@ -1090,50 +1440,54 @@ pub fn on_run_frame_post() {
     let mut finished: Vec<Finished> = Vec::new();
     state::with_state(|s| {
         for (i, m) in s.tffa.matches.iter().enumerate() {
-            if m.active && fraglimit_hit(m.red, m.blue, fraglimit) {
-                let id = i as u8;
-                // Only live assignments: free slots default to main and would
-                // otherwise inflate main finishes to 30 "members" (reliable
-                // overflow + SetTeam on empty entities).
-                let members: Vec<c_int> = s
-                    .tffa
-                    .client_match
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, m)| **m == id && s.clients[*i].is_connected)
-                    .map(|(i, _)| i as c_int)
-                    .collect();
-                // Team split + names from the stored CS_PLAYERS bases (game
-                // `t` team + `n` netname at last update).
-                let mut red_names = Vec::new();
-                let mut blue_names = Vec::new();
-                for cn in &members {
-                    let base = &s.tffa.cs_players_base[*cn as usize];
-                    let team = base.is_empty().then_some(None).unwrap_or_else(|| {
-                        info_value(base, "t").and_then(|t| t.parse::<i32>().ok())
-                    });
-                    let name = if base.is_empty() {
-                        format!("player{cn}")
-                    } else {
-                        announce_name(
-                            &info_value(base, "n").unwrap_or_else(|| format!("player{cn}")),
-                        )
-                    };
-                    match team {
-                        Some(TEAM_RED) => red_names.push(name),
-                        Some(TEAM_BLUE) => blue_names.push(name),
-                        _ => {}
-                    }
-                }
-                finished.push(Finished {
-                    id,
-                    red: m.red,
-                    blue: m.blue,
-                    members,
-                    red_names,
-                    blue_names,
-                });
+            if !m.active {
+                continue;
             }
+            let Some(reason) = match_finish_reason(m.red, m.blue, fraglimit, limit_expired) else {
+                continue;
+            };
+            let id = i as u8;
+            // Only live assignments: free slots default to main and would
+            // otherwise inflate main finishes to 30 "members" (reliable
+            // overflow + SetTeam on empty entities).
+            let members: Vec<c_int> = s
+                .tffa
+                .client_match
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| **m == id && connected[*i])
+                .map(|(i, _)| i as c_int)
+                .collect();
+            // Team split + names from the stored CS_PLAYERS bases (game
+            // `t` team + `n` netname at last update).
+            let mut red_names = Vec::new();
+            let mut blue_names = Vec::new();
+            for cn in &members {
+                let base = &s.tffa.cs_players_base[*cn as usize];
+                let team = base
+                    .is_empty()
+                    .then_some(None)
+                    .unwrap_or_else(|| info_value(base, "t").and_then(|t| t.parse::<i32>().ok()));
+                let name = if base.is_empty() {
+                    format!("player{cn}")
+                } else {
+                    announce_name(&info_value(base, "n").unwrap_or_else(|| format!("player{cn}")))
+                };
+                match team {
+                    Some(TEAM_RED) => red_names.push(name),
+                    Some(TEAM_BLUE) => blue_names.push(name),
+                    _ => {}
+                }
+            }
+            finished.push(Finished {
+                id,
+                red: m.red,
+                blue: m.blue,
+                reason,
+                members,
+                red_names,
+                blue_names,
+            });
         }
         for f in &finished {
             // Main keeps its final tallies for the intermission scoreboard
@@ -1150,6 +1504,14 @@ pub fn on_run_frame_post() {
         }
     });
     if finished.is_empty() {
+        // No match ended this frame: after the timelimit the map lives only
+        // while a tied match still has players.
+        if limit_expired {
+            let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
+            if !has_continuing_match(&matches, &table, &playing) {
+                crate::hooks::game::run_begin_intermission();
+            }
+        }
         return;
     }
     // Sub-matches first: announce to all, stats to members + spectators,
@@ -1170,115 +1532,108 @@ pub fn on_run_frame_post() {
             f.blue_names.join(", ")
         };
         announce_to_all(&format!(
-            "print \"TFFA {} ended: RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator.\n\"",
-            f.id, f.red, f.blue, red_list, blue_list
+            "print \"TFFA {} ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator.\n\"",
+            f.id, f.reason, f.red, f.blue, red_list, blue_list
         ));
         crate::hooks::game::print_tffa_match_stats(&f.members);
         move_match_to_spectator(f.id);
     }
-    let Some(main) = finished.iter().find(|f| f.id == MAIN_MATCH) else {
-        return;
-    };
-    if main.members.is_empty() {
-        // Nobody home (connect churn window): drop the stale lead silently so
-        // it cannot re-fire every frame; the next real frag starts clean.
-        state::with_state(|s| {
-            s.tffa.matches[MAIN_MATCH as usize].red = 0;
-            s.tffa.matches[MAIN_MATCH as usize].blue = 0;
-        });
-        return;
-    }
-    {
-        // Lowest-id still-played TFFA becomes the new main.
-        let max = max_matches();
-        let candidate: Option<(u8, i32, i32, Vec<c_int>)> = state::with_state(|s| {
-            for i in 1..=max {
-                if i >= s.tffa.matches.len() {
-                    break;
-                }
-                let m = &s.tffa.matches[i];
-                if !m.active {
-                    continue;
-                }
-                let members: Vec<c_int> = s
-                    .tffa
-                    .client_match
-                    .iter()
-                    .enumerate()
-                    .filter(|(ci, mm)| **mm == i as u8 && s.clients[*ci].is_connected)
-                    .map(|(ci, _)| ci as c_int)
-                    .collect();
-                if members.is_empty() {
-                    continue;
-                }
-                return Some((i as u8, m.red, m.blue, members));
-            }
-            None
-        });
-        if let Some((id, red, blue, members)) = candidate {
-            // Main ends like any other instance first: final scores, team
-            // lists, stats tables, members back to spectator. Only then does
-            // the candidate migrate into the emptied main slot.
-            let red_list = if main.red_names.is_empty() {
-                "-".to_owned()
-            } else {
-                main.red_names.join(", ")
-            };
-            let blue_list = if main.blue_names.is_empty() {
-                "-".to_owned()
-            } else {
-                main.blue_names.join(", ")
-            };
-            announce_to_all(&format!(
-                "print \"main (TFFA 0) ended: RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator.\n\"",
-                main.red, main.blue, red_list, blue_list
-            ));
-            crate::hooks::game::print_tffa_match_stats(&main.members);
-            move_match_to_spectator(MAIN_MATCH);
+    if let Some(main) = finished.iter().find(|f| f.id == MAIN_MATCH) {
+        if main.members.is_empty() {
+            // Nobody home (connect churn window): drop the stale lead silently
+            // so it cannot re-fire every frame; the next real frag starts
+            // clean. At the timelimit the check below then ends a map that has
+            // no players left.
             state::with_state(|s| {
-                s.tffa.matches[MAIN_MATCH as usize].red = red;
-                s.tffa.matches[MAIN_MATCH as usize].blue = blue;
-                s.tffa.matches[MAIN_MATCH as usize].active = true;
-                s.tffa.matches[id as usize].red = 0;
-                s.tffa.matches[id as usize].blue = 0;
-                s.tffa.matches[id as usize].active = false;
-                // The promoted instance's own world does not become main's:
-                // its players see the pristine map entity set from here on, and
-                // its clone set is given back at the next frame start.
-                s.tffa.world_release |= 1u16 << id;
-                for cn in &members {
-                    s.tffa.client_match[*cn as usize] = MAIN_MATCH;
-                }
+                s.tffa.matches[MAIN_MATCH as usize].red = 0;
+                s.tffa.matches[MAIN_MATCH as usize].blue = 0;
             });
-            for cn in &members {
-                broadcast_cs_players_slot(*cn);
-                refresh_cs_players_for_viewer(*cn);
+        } else {
+            // Lowest-id still-played TFFA becomes the new main.
+            let max = max_matches();
+            let candidate = state::with_state(|s| {
+                promotion_candidate(&s.tffa.matches, &s.tffa.client_match, &connected, max)
+            });
+            if let Some((id, red, blue, members)) = candidate {
+                // Main ends like any other instance first: final scores, team
+                // lists, stats tables, members back to spectator. Only then does
+                // the candidate migrate into the emptied main slot.
+                let red_list = if main.red_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    main.red_names.join(", ")
+                };
+                let blue_list = if main.blue_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    main.blue_names.join(", ")
+                };
+                announce_to_all(&format!(
+                    "print \"main (TFFA 0) ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator.\n\"",
+                    main.reason, main.red, main.blue, red_list, blue_list
+                ));
+                crate::hooks::game::print_tffa_match_stats(&main.members);
+                move_match_to_spectator(MAIN_MATCH);
+                state::with_state(|s| {
+                    promote_into_main(
+                        &mut s.tffa.matches,
+                        &mut s.tffa.client_match,
+                        id,
+                        red,
+                        blue,
+                        &members,
+                    );
+                    // The promoted instance's own world does not become main's:
+                    // its players see the pristine map entity set from here on, and
+                    // its clone set is given back at the next frame start.
+                    s.tffa.world_release |= 1u16 << id;
+                });
+                for cn in &members {
+                    broadcast_cs_players_slot(*cn);
+                    refresh_cs_players_for_viewer(*cn);
+                }
+                on_set_cs_scores();
+                announce_to_all(&format!(
+                    "print \"TFFA {id} becomes the new main (RED {red} - BLUE {blue}).\n\""
+                ));
+                // At the timelimit the promoted match may itself be untied or
+                // player-less; the check below then ends the map. A tied one
+                // keeps it running.
+            } else {
+                // Solo main finish (no other active TFFA): end the map normally so
+                // the final scoreboard shows. Members stay in their teams with final
+                // tallies intact (no reset, no spectator move, no per-instance
+                // stats — pristine intermission prints the standard tables for all).
+                let red_list = if main.red_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    main.red_names.join(", ")
+                };
+                let blue_list = if main.blue_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    main.blue_names.join(", ")
+                };
+                announce_to_all(&format!(
+                    "print \"main (TFFA 0) ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Final scoreboard incoming.\n\"",
+                    main.reason, main.red, main.blue, red_list, blue_list
+                ));
+                crate::hooks::game::run_begin_intermission();
+                return;
             }
-            on_set_cs_scores();
-            announce_to_all(&format!(
-                "print \"TFFA {id} becomes the new main (RED {red} - BLUE {blue}).\n\""
-            ));
-            return;
         }
-        // Solo main finish (no other active TFFA): end the map normally so
-        // the final scoreboard shows. Members stay in their teams with final
-        // tallies intact (no reset, no spectator move, no per-instance
-        // stats — pristine intermission prints the standard tables for all).
-        let red_list = if main.red_names.is_empty() {
-            "-".to_owned()
-        } else {
-            main.red_names.join(", ")
-        };
-        let blue_list = if main.blue_names.is_empty() {
-            "-".to_owned()
-        } else {
-            main.blue_names.join(", ")
-        };
-        announce_to_all(&format!(
-            "print \"main (TFFA 0) ended: RED {} - BLUE {}. RED: {} | BLUE: {}. Final scoreboard incoming.\n\"",
-            main.red, main.blue, red_list, blue_list
-        ));
-        crate::hooks::game::run_begin_intermission();
+    }
+
+    // After the timelimit the map lives only while at least one active match
+    // is tied and still has playing members. `playing` is re-read because the
+    // handling above moved finished matches to spectator and may have
+    // promoted a tied contender into main. When nothing continues, every game
+    // is over: run the normal intermission (final scoreboard + map restart).
+    if limit_expired {
+        let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
+        if !has_continuing_match(&matches, &table, &playing_clients()) {
+            crate::hooks::game::run_begin_intermission();
+        }
     }
 }
 
@@ -1310,13 +1665,13 @@ fn announce_name(raw: &str) -> String {
     String::from_utf8_lossy(&bytes[..n]).into_owned()
 }
 
-/// Send one client to the spectator team through the pristine `SetTeam` body
-/// (trampoline, not the wrapper → no recursion, no teamlock block: spectator
-/// requests always pass). This is the same move `/team spectator` makes, so
-/// the player suicides and respawns spectating. Returns false when the client
-/// has no live game entity (a free slot's `ent->client` is null and the game
-/// body would deref it) or the trampoline is not attached.
-fn set_client_spectator(client_num: c_int) -> bool {
+/// Send one client to a team through the pristine `SetTeam` body
+/// (trampoline, not the wrapper → no recursion, no teamlock block: the proxy
+/// only asks for spectator/red/blue on a match it just prepared). `team` is
+/// the same C string `/team` takes. Returns false when the client has no live
+/// game entity (a free slot's `ent->client` is null and the game body would
+/// deref it) or the trampoline is not attached.
+fn set_client_team(client_num: c_int, team: &CStr) -> bool {
     if crate::original::base() == 0 {
         return false;
     }
@@ -1336,9 +1691,17 @@ fn set_client_spectator(client_num: c_int) -> bool {
     }
     let original: unsafe extern "C" fn(usize, *const c_char) =
         unsafe { core::mem::transmute(tramp) };
-    // SAFETY: ent points into g_entities; spectator string is static.
-    unsafe { original(ent, c"spectator".as_ptr()) };
+    // SAFETY: ent points into g_entities; `team` is a static C string.
+    unsafe { original(ent, team.as_ptr()) };
     true
+}
+
+/// Send one client to the spectator team through the pristine `SetTeam` body
+/// (trampoline, not the wrapper → no recursion, no teamlock block: spectator
+/// requests always pass). This is the same move `/team spectator` makes, so
+/// the player suicides and respawns spectating.
+fn set_client_spectator(client_num: c_int) -> bool {
+    set_client_team(client_num, c"spectator")
 }
 
 /// Force every member of a match to spectator through the pristine `SetTeam`
@@ -1349,12 +1712,13 @@ fn move_match_to_spectator(match_id: u8) {
     if g_entities == 0 {
         return;
     }
+    let connected = connected_clients();
     let members: Vec<c_int> = state::with_state(|s| {
         s.tffa
             .client_match
             .iter()
             .enumerate()
-            .filter(|(i, m)| **m == match_id && s.clients[*i].is_connected)
+            .filter(|(i, m)| **m == match_id && connected[*i])
             .map(|(i, _)| i as c_int)
             .collect()
     });
@@ -1590,6 +1954,18 @@ fn ensure_world_scanned() -> bool {
     state::with_state(|s| s.tffa.world_scanned)
 }
 
+/// Claim a slot's per-instance world before (re)using it. A closed match
+/// keeps its clone set until the next frame start; if the slot is re-created
+/// before that release runs, the pending release must be cancelled — otherwise
+/// it would free the clones the new match is using. Returns whether the set is
+/// already live (reuse) and clears any queued release for the slot either way
+/// (a slot with no set has nothing to release).
+fn claim_world(pending: &mut u16, cloned: u16, instance: u8) -> bool {
+    let bit = 1u16 << instance;
+    *pending &= !bit;
+    cloned & bit != 0
+}
+
 /// Duplicate the map's whole interactive set for `instance`, or report why this
 /// instance cannot exist. All-or-nothing: a partial set would leave some
 /// doors/triggers shared, activatable from every instance.
@@ -1608,15 +1984,16 @@ pub fn realize_instance(instance: u8) -> Result<(), &'static str> {
         return Err("not a match slot");
     }
     let (g_entities, blocked, done, cost) = state::with_state(|s| {
+        let done = claim_world(&mut s.tffa.world_release, s.tffa.world_cloned, instance);
         (
             s.located_game_data.g_entities,
             s.tffa.world_clone_blocked,
-            s.tffa.world_cloned,
+            done,
             s.tffa.world_clone_cost,
         )
     });
     let bit = 1u16 << instance;
-    if done & bit != 0 {
+    if done {
         // The set survived the instance that used it (a closed match keeps its
         // world until the next map): reuse it.
         return Ok(());
@@ -1824,9 +2201,17 @@ pub enum SoundAttribution {
 pub fn sound_attribution(event: c_int) -> SoundAttribution {
     use crate::sdk::{
         EV_ENTITY_SOUND, EV_GENERAL_SOUND, EV_GLOBAL_SOUND, EV_GLOBAL_TEAM_SOUND, EV_MUTE_SOUND,
+        EV_PREDEFSOUND,
     };
     match event {
         EV_GENERAL_SOUND => SoundAttribution::Stamped,
+        // `G_PreDefSound` (`w_force.c:40-49`) builds its event with plain
+        // `G_TempEntity`, so it has no owner field: attribute it at
+        // construction from the acting scope (the force jump runs inside the
+        // player's think). Without this it fell through to the generic
+        // owner-fields rule, whose memset zeros resolve to client 0, and the
+        // sound was silenced in every other match.
+        EV_PREDEFSOUND => SoundAttribution::Stamped,
         EV_ENTITY_SOUND => SoundAttribution::Emitter,
         EV_GLOBAL_SOUND | EV_GLOBAL_TEAM_SOUND | EV_MUTE_SOUND => SoundAttribution::Broadcast,
         _ => SoundAttribution::None,
@@ -1894,14 +2279,36 @@ pub fn end_sound_source(previous: u8) {
 /// attribute the fresh slot to the pending source and consume it. Every
 /// construction stamps, so a slot reuse never keeps a stale attribution.
 pub fn stamp_temp_source(te: usize) {
+    stamp_temp_source_event(te, -1);
+}
+
+/// `G_TempEntity` wrapper's stamping rule: a pending `G_Sound` handshake wins;
+/// otherwise an `EV_PREDEFSOUND` constructed while an acting scope is open
+/// belongs to that instance (force jump/protect/absorb sounds), and every
+/// other direct `G_TempEntity` call stays a world/map sound. Consumes the
+/// pending source in every case.
+pub fn stamp_temp_source_event(te: usize, event: c_int) {
     state::with_state(|s| {
         let Some(num) = ent_num_of(s.located_game_data.g_entities, te) else {
             return;
         };
-        let source = s.tffa.pending_sound_source;
+        let source = temp_stamp_source(s.tffa.pending_sound_source, event, s.tffa.acting_scope);
         s.tffa.pending_sound_source = SOURCE_WORLD;
         s.tffa.sound_source[num as usize] = source;
     });
+}
+
+/// Pure stamping rule (unit-tested): the `G_Sound` handshake beats everything;
+/// an owner-less `EV_PREDEFSOUND` takes the open acting scope (no scope → world
+/// sound, audible everywhere); anything else is a world sound.
+pub fn temp_stamp_source(pending: u8, event: c_int, scope: u8) -> u8 {
+    if pending != SOURCE_WORLD {
+        return pending;
+    }
+    if event == crate::sdk::EV_PREDEFSOUND && scope != SCOPE_NONE {
+        return scope;
+    }
+    SOURCE_WORLD
 }
 
 // ---------------------------------------------------------------------------
@@ -2640,13 +3047,112 @@ fn max_group_size() -> usize {
 }
 
 fn match_size(match_id: u8) -> usize {
-    state::with_state(|s| {
-        s.tffa
-            .client_match
-            .iter()
-            .filter(|m| **m == match_id)
-            .count()
-    })
+    let table = state::with_state(|s| s.tffa.client_match);
+    counted_match_size(match_id, &table, &connected_clients())
+}
+
+/// Connected clients (`pers.connected != CON_DISCONNECTED`), read from game
+/// memory like the pristine `CalculateRanks`/`TeamCount`. Bots must count too
+/// (they can bypass the proxy's `GAME_CLIENT_BEGIN` flag when the game adds
+/// them), so the proxy's own `is_connected` mirror is only a fallback for the
+/// bootstrap window where the world is not located yet.
+fn connected_clients() -> [bool; MAX_CLIENTS] {
+    client_census().0
+}
+
+/// Playing clients only (connected and not spectators), for the timelimit
+/// continuation check.
+fn playing_clients() -> [bool; MAX_CLIENTS] {
+    client_census().1
+}
+
+/// Connected clients and, separately, **playing** clients (connected and not
+/// on the spectator team — the pristine `numPlayingClients` filter). The
+/// timelimit continuation asks whether a tied match still has someone who can
+/// change its score; a match left with only spectators can never untie.
+fn client_census() -> ([bool; MAX_CLIENTS], [bool; MAX_CLIENTS]) {
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities == 0 {
+        return (
+            state::with_state(|s| core::array::from_fn(|i| s.clients[i].is_connected)),
+            [false; MAX_CLIENTS],
+        );
+    }
+    let mut connected = [false; MAX_CLIENTS];
+    let mut playing = [false; MAX_CLIENTS];
+    for i in 0..MAX_CLIENTS {
+        let ent = g_entities + i * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array.
+        let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+        if client == 0 {
+            continue;
+        }
+        // SAFETY: client is a valid gclient_t; both fields are plain ints.
+        let conn = unsafe { read_i32(client + OFFSET_GCLIENT_PERS + OFFSET_PERS_CONNECTED) };
+        // SAFETY: as above.
+        let team = unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) };
+        connected[i] = conn != CON_DISCONNECTED;
+        playing[i] = conn == CON_CONNECTED && team != TEAM_SPECTATOR;
+    }
+    (connected, playing)
+}
+
+/// Pure census of one match: connected clients assigned to it only (free and
+/// disconnected slots default to main and must not inflate its player count).
+fn counted_match_size(
+    match_id: u8,
+    client_match: &[u8; MAX_CLIENTS],
+    connected: &[bool; MAX_CLIENTS],
+) -> usize {
+    client_match
+        .iter()
+        .zip(connected)
+        .filter(|(m, connected)| **m == match_id && **connected)
+        .count()
+}
+
+/// Pure `tffa_list` body: the main line counts only connected players in main
+/// (not the free slots that also default to `MAIN_MATCH`), and every active
+/// created match counts only its connected members.
+fn render_match_list(
+    max: usize,
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    connected: &[bool; MAX_CLIENTS],
+) -> String {
+    let mut out = String::from("Matches:");
+    for (i, m) in matches.iter().enumerate() {
+        let id = i as u8;
+        if id != MAIN_MATCH && i > max {
+            break;
+        }
+        if id != MAIN_MATCH && !m.active {
+            continue;
+        }
+        let size = counted_match_size(id, client_match, connected);
+        if id == MAIN_MATCH {
+            out.push_str(&format!(
+                "\n0 (main): {size} players, {}-{}^7",
+                m.red, m.blue
+            ));
+        } else {
+            out.push_str(&format!("\n{id}: {size} players, {}-{}^7", m.red, m.blue));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Team a creator joins in a just-created match: the smaller of its two tally
+/// sides, red on a tie (a fresh slot is 0-0, so creators start red unless a
+/// stale tally somehow survived — they should not). Pure for the test.
+fn create_team(red: i32, blue: i32) -> i32 {
+    if blue < red { TEAM_BLUE } else { TEAM_RED }
+}
+
+/// The pristine `SetTeam` argument for a team constant.
+fn team_name(team: i32) -> &'static CStr {
+    if team == TEAM_BLUE { c"blue" } else { c"red" }
 }
 
 fn cmd_create(client_num: c_int) {
@@ -2658,6 +3164,17 @@ fn cmd_create(client_num: c_int) {
         return;
     }
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    // Once the shared timelimit expired the map is winding down: untied
+    // matches are closed and a tied one is playing sudden death. Letting
+    // someone open a fresh match would keep the map alive past the end; only
+    // the surviving match may finish.
+    if !create_allowed(timelimit_expired()) {
+        tell(
+            client_num,
+            "print \"The timelimit has expired; no new TFFA match can be created. Wait for the running match to finish.\n\"",
+        );
         return;
     }
     // Hoisted: `max_matches()` itself takes the state lock, and `with_state`
@@ -2710,18 +3227,42 @@ fn cmd_create(client_num: c_int) {
         m.active = true;
         m.red = 0;
         m.blue = 0;
-        s.tffa.client_match[client_num as usize] = id;
-        s.tffa.player_score[client_num as usize] = 0;
+        assign_client_instance(
+            &mut s.tffa.client_match,
+            &mut s.tffa.player_score,
+            &mut s.clients,
+            client_num,
+            id,
+        );
     });
+    reset_game_scores(client_num);
     // New assignment: other viewers need the prefixed view of this slot,
     // and the creator needs their own match's scores/names.
-    reset_slot_stats(client_num);
+    // The creator plays from the start. A created match with nobody in game
+    // is closed again by `close_empty_created_matches`, so leaving them a
+    // spectator would undo the creation on the next frame; join them to the
+    // smaller side (red on the fresh 0-0 slot), exactly like `/team red|blue`.
+    let team = state::with_state(|s| {
+        let m = &s.tffa.matches[id as usize];
+        create_team(m.red, m.blue)
+    });
+    if !set_client_team(client_num, team_name(team)) {
+        // No live game entity or no `SetTeam` trampoline: the match would be
+        // empty and swept shut next frame. Undo it now and say why.
+        close_instance(id);
+        tell(
+            client_num,
+            &format!("print \"Cannot create match {id}: could not join a team.\n\""),
+        );
+        return;
+    }
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
     tell(
         client_num,
         &format!(
-            "print \"Created match {id}. Team up with /team red|blue, invite others with tffa_join {id}.\n\""
+            "print \"Created match {id} and joined {} team. Invite others with tffa_join {id}.\n\"",
+            if team == TEAM_BLUE { "BLUE" } else { "RED" }
         ),
     );
 }
@@ -2775,13 +3316,15 @@ fn cmd_join(client_num: c_int, id: i32) {
     }
     cmd_leave_silent(client_num);
     state::with_state(|s| {
-        s.tffa.client_match[client_num as usize] = id;
-        // Fresh scoreboard for the new match (the game's PERS_SCORE
-        // accumulates across the whole map; the proxy copies are
-        // per-match).
-        s.tffa.player_score[client_num as usize] = 0;
+        assign_client_instance(
+            &mut s.tffa.client_match,
+            &mut s.tffa.player_score,
+            &mut s.clients,
+            client_num,
+            id,
+        );
     });
-    reset_slot_stats(client_num);
+    reset_game_scores(client_num);
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
     tell(client_num, &format!("print \"Joined match {id}.\n\""));
@@ -2809,37 +3352,135 @@ fn cmd_leave(client_num: c_int) {
 }
 
 fn cmd_leave_silent(client_num: c_int) {
+    let old = state::with_state(|s| s.tffa.client_match[client_num as usize]);
     state::with_state(|s| {
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
     });
+    // A created match nobody is left in game in has nothing to host: close it
+    // instead of leaving an empty "active" slot in `tffa_list`. Main is
+    // implicit and never closes.
+    close_if_empty(old);
+}
+
+/// Close created match `id` once none of its members is in game (connected
+/// and off the spectator team). Main is implicit and never closes.
+fn close_if_empty(id: u8) {
+    if id == MAIN_MATCH || !enabled() || id as usize >= TOTAL_MATCH_SLOTS {
+        return;
+    }
+    let (_, playing) = client_census();
+    let empty = state::with_state(|s| {
+        s.tffa.matches[id as usize].active
+            && !s
+                .tffa
+                .client_match
+                .iter()
+                .zip(playing)
+                .any(|(m, p)| p && *m == id)
+    });
+    if empty {
+        close_instance(id);
+    }
+}
+
+/// Pure part of `close_instance`: reset the slot, deactivate it and return
+/// everyone still assigned (spectators) to main, reporting the moved clients.
+/// Main and out-of-range ids are a no-op.
+fn close_instance_state(
+    matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &mut [u8; MAX_CLIENTS],
+    player_score: &mut [i32; MAX_CLIENTS],
+    id: u8,
+) -> Vec<c_int> {
+    let mut moved = Vec::new();
+    if id == MAIN_MATCH || id as usize >= TOTAL_MATCH_SLOTS {
+        return moved;
+    }
+    for (cn, m) in client_match.iter_mut().enumerate() {
+        if *m == id {
+            *m = MAIN_MATCH;
+            player_score[cn] = 0;
+            moved.push(cn as c_int);
+        }
+    }
+    let m = &mut matches[id as usize];
+    m.red = 0;
+    m.blue = 0;
+    m.active = false;
+    moved
+}
+
+/// Close one created match: reset its tallies, free the slot and give its
+/// per-instance world back at the next frame start. Remaining assigned
+/// members are spectators (the caller only closes matches with nobody in
+/// game), so they return to main without another `SetTeam` move; their views
+/// and per-match stats are refreshed for the main game.
+fn close_instance(id: u8) {
+    if id == MAIN_MATCH || id as usize >= TOTAL_MATCH_SLOTS {
+        return;
+    }
+    let moved = state::with_state(|s| {
+        s.tffa.world_release |= 1u16 << id;
+        close_instance_state(
+            &mut s.tffa.matches,
+            &mut s.tffa.client_match,
+            &mut s.tffa.player_score,
+            id,
+        )
+    });
+    if moved.is_empty() {
+        return;
+    }
+    for cn in moved {
+        reset_slot_stats(cn);
+        broadcast_cs_players_slot(cn);
+        refresh_cs_players_for_viewer(cn);
+    }
+    on_set_cs_scores();
+}
+
+/// Created matches with no client in game: every member left the team (or
+/// left/disconnected) and only spectators remain. Pure so the per-frame sweep
+/// is unit-tested; main (id 0) is never reported.
+fn empty_created_matches(
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    playing: &[bool; MAX_CLIENTS],
+) -> Vec<u8> {
+    matches
+        .iter()
+        .enumerate()
+        .filter(|(id, m)| *id != MAIN_MATCH as usize && m.active)
+        .filter(|(id, _)| {
+            !client_match
+                .iter()
+                .zip(playing)
+                .any(|(cm, p)| *p && *cm == *id as u8)
+        })
+        .map(|(id, _)| id as u8)
+        .collect()
+}
+
+/// Per-frame sweep: a created match whose last player went spectator or
+/// disconnected closes itself (main stays). Catches moves made by the game
+/// (`/team spectator`, forced spectator, disconnect) that no proxy command
+/// sees.
+fn close_empty_created_matches() {
+    let (_, playing) = client_census();
+    let empty = state::with_state(|s| {
+        empty_created_matches(&s.tffa.matches, &s.tffa.client_match, &playing)
+    });
+    for id in empty {
+        close_instance(id);
+    }
 }
 
 fn cmd_list(client_num: c_int) {
     // Hoisted before `with_state` (same non-reentrancy as `cmd_create`).
     let max = max_matches();
-    let mut out = String::from("Matches:");
-    state::with_state(|s| {
-        for (i, m) in s.tffa.matches.iter().enumerate() {
-            if i == MAIN_MATCH as usize {
-                let size = s.tffa.client_match.iter().filter(|c| **c == 0).count();
-                out.push_str(
-                    format!("\n0 (main): {size} players, {}-{}^7", m.red, m.blue).as_str(),
-                );
-                continue;
-            }
-            if i > max {
-                break;
-            }
-            let id = i as u8;
-            if !m.active {
-                continue;
-            }
-            let size = s.tffa.client_match.iter().filter(|c| **c == id).count();
-            out.push_str(format!("\n{id}: {size} players, {}-{}^7", m.red, m.blue).as_str());
-        }
-    });
-    out.push('\n');
+    let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
+    let out = render_match_list(max, &matches, &table, &connected_clients());
     tell(client_num, &format!("print \"{out}\""));
 }
 
@@ -2868,9 +3509,45 @@ mod tests {
     }
 
     #[test]
+    fn team_chat_stays_inside_the_senders_instance() {
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[1] = 1;
+        table[2] = 1;
+        table[3] = 2;
+        // Same match: delivered (the pristine G_SayTo already handles the team).
+        assert!(team_chat_visible_in(MAIN_MATCH, 0, &table));
+        assert!(team_chat_visible_in(MAIN_MATCH, 4, &table));
+        assert!(team_chat_visible_in(1, 1, &table));
+        assert!(team_chat_visible_in(1, 2, &table));
+        // Cross-match: dropped, in both directions.
+        assert!(!team_chat_visible_in(MAIN_MATCH, 1, &table));
+        assert!(!team_chat_visible_in(1, 0, &table));
+        assert!(!team_chat_visible_in(1, 3, &table));
+        assert!(!team_chat_visible_in(2, 2, &table));
+        // No attributable sender (no scope) and broadcast recipients: left
+        // alone, so an unscoped game-generated team chat keeps its old reach.
+        assert!(team_chat_visible_in(SCOPE_NONE, 1, &table));
+        assert!(team_chat_visible_in(1, -1, &table));
+        assert!(team_chat_visible_in(1, MAX_CLIENTS as c_int, &table));
+    }
+
+    #[test]
+    fn team_chat_commands_are_the_tchat_shapes_only() {
+        assert!(is_team_chat("tchat \"^1Bob^7: hi\""));
+        assert!(is_team_chat("ltchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
+        // Global chat and unrelated commands are not team chat.
+        assert!(!is_team_chat("chat \"^1Bob^7: hi\""));
+        assert!(!is_team_chat("lchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
+        assert!(!is_team_chat("print \"tchat hi\""));
+        assert!(!is_team_chat("tchatty"));
+        assert!(!is_team_chat(""));
+    }
+
+    #[test]
     fn sound_attribution_classifies_temp_events() {
         use SoundAttribution::*;
         assert_eq!(sound_attribution(crate::sdk::EV_GENERAL_SOUND), Stamped);
+        assert_eq!(sound_attribution(crate::sdk::EV_PREDEFSOUND), Stamped);
         assert_eq!(sound_attribution(crate::sdk::EV_ENTITY_SOUND), Emitter);
         assert_eq!(sound_attribution(crate::sdk::EV_GLOBAL_SOUND), Broadcast);
         assert_eq!(
@@ -2915,6 +3592,142 @@ mod tests {
         assert!(fraglimit_hit(3, 10, 10));
         assert!(!fraglimit_hit(9, 9, 10));
         assert!(!fraglimit_hit(10, 10, 0));
+    }
+
+    /// The requested timelimit rule: at the shared limit an untied match ends,
+    /// a tied one continues (per-match sudden death) until a frag separates
+    /// the teams. The fraglimit keeps its own semantics (a 15-15 at fraglimit
+    /// 15 ends).
+    #[test]
+    fn timelimit_ends_untied_matches_only() {
+        // Before the limit: nothing ends on time.
+        assert_eq!(match_finish_reason(15, 13, 0, false), None);
+        assert_eq!(match_finish_reason(15, 15, 0, false), None);
+        // At the limit: untied ends, tied continues.
+        assert_eq!(match_finish_reason(15, 13, 0, true), Some("timelimit"));
+        assert_eq!(match_finish_reason(13, 15, 0, true), Some("timelimit"));
+        assert_eq!(match_finish_reason(15, 15, 0, true), None);
+        assert_eq!(match_finish_reason(0, 0, 0, true), None);
+        // Shared fraglimit still ends on its own, including a tied 15-15.
+        assert_eq!(match_finish_reason(15, 13, 15, false), Some("fraglimit"));
+        assert_eq!(match_finish_reason(15, 15, 15, false), Some("fraglimit"));
+        // A fraglimit hit is reported as such even at the limit.
+        assert_eq!(match_finish_reason(15, 13, 15, true), Some("fraglimit"));
+    }
+
+    /// The requested end-of-timelimit flow: main is not tied and closes, the
+    /// tied instance survives (promoted into the main slot), its game keeps
+    /// waiting for a winner, and no fresh instance may be opened while the map
+    /// is winding down.
+    #[test]
+    fn timelimit_main_ends_and_tied_instance_continues() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].red = 5;
+        matches[MAIN_MATCH as usize].blue = 3;
+        matches[1].active = true;
+        matches[1].red = 7;
+        matches[1].blue = 7;
+
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut connected = [false; MAX_CLIENTS];
+        let mut playing = [false; MAX_CLIENTS];
+        // Main: clients 0 and 1. Instance 1: clients 2 and 3.
+        for c in [0usize, 1] {
+            connected[c] = true;
+            playing[c] = true;
+        }
+        for c in [2usize, 3] {
+            connected[c] = true;
+            playing[c] = true;
+            table[c] = 1;
+        }
+
+        // At the timelimit main (5-3) closes; instance 1 (7-7) continues.
+        assert_eq!(match_finish_reason(5, 3, 0, true), Some("timelimit"));
+        assert_eq!(match_finish_reason(7, 7, 0, true), None);
+
+        // Closing main sends its players to spectator
+        // (`move_match_to_spectator`), so they no longer count as playing.
+        playing[0] = false;
+        playing[1] = false;
+        assert!(has_continuing_match(&matches, &table, &playing));
+
+        // Main's closure promotes the lowest-id tied instance with members.
+        let (id, red, blue, members) =
+            promotion_candidate(&matches, &table, &connected, 8).expect("instance 1 survives");
+        assert_eq!((id, red, blue), (1, 7, 7));
+        assert_eq!(members, vec![2, 3]);
+        promote_into_main(&mut matches, &mut table, id, red, blue, &members);
+
+        // The surviving game now lives in the main slot; the old id is empty.
+        assert!(matches[MAIN_MATCH as usize].active);
+        assert_eq!(
+            (
+                matches[MAIN_MATCH as usize].red,
+                matches[MAIN_MATCH as usize].blue
+            ),
+            (7, 7)
+        );
+        assert!(!matches[1].active);
+        assert_eq!((matches[1].red, matches[1].blue), (0, 0));
+        // Both old-main spectators and the surviving players share the main
+        // context; only instance 1's players are still playing.
+        assert_eq!(table[0], MAIN_MATCH);
+        assert_eq!(table[1], MAIN_MATCH);
+        assert_eq!(table[2], MAIN_MATCH);
+        assert_eq!(table[3], MAIN_MATCH);
+        assert!(!playing[0] && !playing[1]);
+        assert!(playing[2] && playing[3]);
+
+        // The map waits for the tied match: no intermission while it can still
+        // untie.
+        assert!(has_continuing_match(&matches, &table, &playing));
+
+        // No new TFFA instance may be created after the timelimit expired;
+        // before it (or with `timelimit 0`) creation stays available.
+        assert!(!create_allowed(true));
+        assert!(create_allowed(false));
+    }
+
+    /// The map keeps running only while a tied match still has someone who can
+    /// change the score; a tied match left with spectators only cannot untie.
+    #[test]
+    fn only_a_tied_match_with_players_continues() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].red = 5;
+        matches[MAIN_MATCH as usize].blue = 5;
+        matches[2].active = true;
+        matches[2].red = 7;
+        matches[2].blue = 7;
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut playing = [false; MAX_CLIENTS];
+        // One player in main, one in instance 2.
+        table[0] = MAIN_MATCH;
+        playing[0] = true;
+        table[1] = 2;
+        playing[1] = true;
+        assert!(has_continuing_match(&matches, &table, &playing));
+
+        // Tied main with no playing members, tied instance with playing ones:
+        // the instance keeps the map alive.
+        playing[0] = false;
+        assert!(has_continuing_match(&matches, &table, &playing));
+        // Last tied player becomes a spectator: everything is over.
+        playing[1] = false;
+        assert!(!has_continuing_match(&matches, &table, &playing));
+
+        // An untied match does not continue even with players.
+        matches[MAIN_MATCH as usize].blue = 4;
+        playing[0] = true;
+        matches[2].active = false;
+        assert!(!has_continuing_match(&matches, &table, &playing));
+
+        // A tied but inactive match does not continue.
+        matches[MAIN_MATCH as usize].blue = 5;
+        matches[MAIN_MATCH as usize].active = false;
+        assert!(!has_continuing_match(&matches, &table, &playing));
     }
 
     /// Per-instance world entities (D-006 extension): a fabricated
@@ -3435,6 +4248,22 @@ mod tests {
         assert_eq!(free_world_slots(0), 0);
     }
 
+    /// Re-creating a slot before its queued world release runs must cancel the
+    /// release: otherwise `drain_world_releases` would free the clones the new
+    /// match just started using. A live set is reported for reuse.
+    #[test]
+    fn reactivating_a_slot_cancels_its_pending_world_release() {
+        let mut pending = (1u16 << 3) | (1u16 << 4);
+        assert!(claim_world(&mut pending, 1 << 3, 3));
+        assert_eq!(pending, 1 << 4);
+        // No live set: no reuse, but a stale pending bit is still cleared.
+        assert!(!claim_world(&mut pending, 0, 4));
+        assert_eq!(pending, 0);
+        // Already released (no bit, no set): claim is a no-op.
+        assert!(!claim_world(&mut pending, 0, 5));
+        assert_eq!(pending, 0);
+    }
+
     fn sample_entry(client: i32, score: i32) -> Vec<i32> {
         vec![client, score, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
@@ -3445,10 +4274,9 @@ mod tests {
         entries.extend(sample_entry(1, 7));
         entries.extend(sample_entry(4, 9));
         let pscores = [3; MAX_CLIENTS];
-        // Unified roster: everyone is listed, global PERS_SCORE values
-        // (5,7,9) replaced by the per-match copies (3); header is the
-        // viewer's own match tallies. Outsider-vs-own separation happens
-        // client-side via the CS_PLAYERS team override.
+        // Unified roster: every client is listed (so a viewer can see who is
+        // in the other matches), global PERS_SCORE values (5, 7, 9) replaced
+        // by the per-match copies (3); the header is the viewer's match.
         let out = filter_scores(11, 22, &pscores, &entries);
         let nums: Vec<i32> = out
             .strip_prefix("scores ")
@@ -3464,6 +4292,99 @@ mod tests {
         assert_eq!(nums[3 + 14 + SCORE_ENTRY_SCORE], 3);
         assert_eq!(nums[3 + 28], 4);
         assert_eq!(nums[3 + 28 + SCORE_ENTRY_SCORE], 3);
+
+        // An entry naming a client outside the table is passed through
+        // untouched (the game never emits one).
+        let odd = sample_entry(MAX_CLIENTS as i32 + 3, 9);
+        let out = filter_scores(0, 0, &pscores, &odd);
+        assert_eq!(
+            out,
+            format!(
+                "scores 1 0 0 {}",
+                odd.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        );
+    }
+
+    #[test]
+    fn intermission_board_keeps_the_watched_match_only_when_active() {
+        // Normal play: the follow-aware match always wins.
+        assert_eq!(pick_board_match(0, 2, true, false), 0);
+        // Intermission: the captured board wins while the match is active
+        // (a spectator watching match 2's 15-13 finish keeps that board).
+        assert_eq!(pick_board_match(MAIN_MATCH, 2, true, true), 2);
+        // A finished (reset) match falls back to the viewer's own match.
+        assert_eq!(pick_board_match(MAIN_MATCH, 2, false, true), MAIN_MATCH);
+    }
+
+    #[test]
+    fn temp_stamp_prefers_the_sound_handshake_then_the_scope() {
+        use crate::sdk::EV_GENERAL_SOUND;
+        // `G_Sound`'s pending attribution always wins (even for another event).
+        assert_eq!(temp_stamp_source(1, EV_GENERAL_SOUND, SCOPE_NONE), 1);
+        assert_eq!(
+            temp_stamp_source(1, crate::sdk::EV_PREDEFSOUND, MAIN_MATCH),
+            1
+        );
+        // An owner-less `EV_PREDEFSOUND` takes the open acting scope.
+        assert_eq!(
+            temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_PREDEFSOUND, 2),
+            2
+        );
+        // No scope (or another event) stays a world sound.
+        assert_eq!(
+            temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_PREDEFSOUND, SCOPE_NONE),
+            SOURCE_WORLD
+        );
+        assert_eq!(
+            temp_stamp_source(SOURCE_WORLD, EV_GENERAL_SOUND, 2),
+            SOURCE_WORLD
+        );
+    }
+
+    #[test]
+    fn scoreboard_demotions_cover_exactly_the_playing_outsiders() {
+        // Real CS_PLAYERS shape captured from a running GT_TEAM server.
+        let blue_main = "n\\TIE Pilot\\t\\2\\model\\stormpilot\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_2\\st2\\none\\dt\\0\\sdt\\0";
+        let red_instance = "n\\Alora\\t\\1\\model\\alora\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_4\\st2\\single_4\\dt\\0\\sdt\\0";
+        let real_spectator = "n\\Spec\\t\\3\\model\\kyle\\c1\\0\\c2\\0";
+        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases[0] = blue_main.to_owned(); // plays main, blue
+        bases[1] = red_instance.to_owned(); // plays instance 1, red
+        bases[2] = real_spectator.to_owned(); // spectator in main
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[1] = 1;
+
+        // Instance-1 viewer: the main player must be demoted (prefixed +
+        // spectator), the instance-1 player is own, the real spectator is
+        // already spectator and stays untouched.
+        let out = demotions_for_viewer(1, &table, &bases);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 0);
+        assert_eq!(
+            info_value(&out[0].1, "n").as_deref(),
+            Some("(TFFA 0) TIE Pilot")
+        );
+        assert_eq!(info_value(&out[0].1, "t").as_deref(), Some("3"));
+        // The rest of the info string survives (model/colors/team task ...).
+        assert_eq!(
+            info_value(&out[0].1, "model").as_deref(),
+            Some("stormpilot")
+        );
+        assert_eq!(info_value(&out[0].1, "st2").as_deref(), Some("none"));
+
+        // Main viewer: only instance-1's player is an outsider.
+        let out = demotions_for_viewer(MAIN_MATCH, &table, &bases);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 1);
+        assert_eq!(
+            info_value(&out[0].1, "n").as_deref(),
+            Some("(TFFA 1) Alora")
+        );
+        assert_eq!(info_value(&out[0].1, "t").as_deref(), Some("3"));
     }
 
     #[test]
@@ -3658,5 +4579,296 @@ mod tests {
         assert_eq!(join_target(9, 8), None);
         // A wrapped negative must not select the top slot.
         assert_eq!(join_target(i32::MIN, 8), None);
+    }
+
+    /// Reported bug: on a 32-slot server with 3 connected players, `tffa_list`
+    /// showed 32 in main because every free slot defaults to `MAIN_MATCH`.
+    /// Player counts are censused over connected clients only.
+    #[test]
+    fn tffa_list_counts_only_connected_players() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].red = 5;
+        matches[MAIN_MATCH as usize].blue = 3;
+        matches[1].active = true;
+        matches[1].red = 2;
+        matches[1].blue = 1;
+
+        // 29 free slots keep the default `MAIN_MATCH`; only 3 are connected.
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut connected = [false; MAX_CLIENTS];
+        for c in connected.iter_mut().take(3) {
+            *c = true;
+        }
+        // Instance 1: two connected members, plus a disconnected stale slot.
+        table[3] = 1;
+        table[4] = 1;
+        table[5] = 1;
+        connected[3] = true;
+        connected[4] = true;
+
+        let out = render_match_list(8, &matches, &table, &connected);
+        assert!(out.contains("0 (main): 3 players, 5-3"), "{out}");
+        assert!(
+            !out.contains("0 (main): 32 players"),
+            "free slots must not count as main players: {out}"
+        );
+        assert!(out.contains("\n1: 2 players, 2-1"), "{out}");
+        assert_eq!(counted_match_size(MAIN_MATCH, &table, &connected), 3);
+        assert_eq!(counted_match_size(1, &table, &connected), 2);
+
+        // Exact reported shape: 32 slots, 3 connected, nothing else.
+        let table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut connected = [false; MAX_CLIENTS];
+        for c in connected.iter_mut().take(3) {
+            *c = true;
+        }
+        let out = render_match_list(8, &matches, &table, &connected);
+        assert!(out.contains("0 (main): 3 players"), "{out}");
+    }
+
+    #[test]
+    fn creator_joins_the_smaller_side_red_on_a_tie() {
+        // A freshly created slot is 0-0, so its creator starts red.
+        assert_eq!(create_team(0, 0), TEAM_RED);
+        assert_eq!(create_team(2, 2), TEAM_RED);
+        // Later creations keep the sides balanced (the smaller side wins).
+        assert_eq!(create_team(0, 1), TEAM_RED);
+        assert_eq!(create_team(1, 0), TEAM_BLUE);
+        assert_eq!(team_name(TEAM_RED).to_bytes(), b"red");
+        assert_eq!(team_name(TEAM_BLUE).to_bytes(), b"blue");
+    }
+
+    /// A created match with nobody in game (only spectators, or no members)
+    /// is reported for closure; main is implicit and never closes.
+    #[test]
+    fn empty_created_matches_close_but_main_stays() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[1].active = true;
+        matches[1].red = 3;
+        matches[1].blue = 2;
+        matches[2].active = true; // spectator only
+        matches[3].active = true; // no member at all
+        matches[4].active = false; // already closed
+
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut playing = [false; MAX_CLIENTS];
+        // Main has one player; match 1 has one player; match 2 has only a
+        // spectator assigned.
+        playing[0] = true;
+        table[1] = 1;
+        playing[1] = true;
+        table[2] = 2;
+
+        assert_eq!(
+            empty_created_matches(&matches, &table, &playing),
+            vec![2, 3]
+        );
+
+        // Main keeps running even when everyone there is a spectator.
+        playing[0] = false;
+        assert_eq!(
+            empty_created_matches(&matches, &table, &playing),
+            vec![2, 3]
+        );
+    }
+
+    /// Requested: joining another TFFA instance starts the mover's
+    /// `proxy_sv_enableEndGameStats` sheet from zero — no kills, deaths or
+    /// damage carried over, in either direction — and the scoreboard's
+    /// per-match score copy starts at zero. `cmd_join` performs this through
+    /// `assign_client_instance` (`reset_client_stats` + assignment).
+    #[test]
+    fn joining_another_instance_resets_end_game_stats() {
+        use crate::state::{ClientEntry, GameStats};
+        let mut client_match = [MAIN_MATCH; MAX_CLIENTS];
+        let mut player_score = [0i32; MAX_CLIENTS];
+        let mut clients = [ClientEntry::default(); MAX_CLIENTS];
+        let me = 3usize;
+        let opponent = 0usize;
+        let other = 5usize;
+
+        // I am leaving match 1 for match 2 and already have a per-match score.
+        client_match[me] = 1;
+        player_score[me] = 12;
+
+        // My row: what I did to opponents. My column: what they did to me.
+        clients[me].game_stats[opponent] = GameStats {
+            killed: 4,
+            killed_by: 2,
+            damages_given: 210,
+            damages_taken: 90,
+        };
+        clients[opponent].game_stats[me] = GameStats {
+            killed: 2,
+            killed_by: 4,
+            damages_given: 90,
+            damages_taken: 210,
+        };
+        clients[me].game_stats[other] = GameStats {
+            killed: 1,
+            killed_by: 0,
+            damages_given: 50,
+            damages_taken: 0,
+        };
+        clients[other].game_stats[me] = GameStats {
+            killed: 0,
+            killed_by: 1,
+            damages_given: 0,
+            damages_taken: 50,
+        };
+        // Stats between two other players, and another player's own team
+        // counters, must survive my move.
+        clients[opponent].game_stats[other] = GameStats {
+            killed: 7,
+            killed_by: 6,
+            damages_given: 42,
+            damages_taken: 24,
+        };
+        clients[opponent].team_kills = 5;
+        // My team counters are match-local too.
+        clients[me].team_kills = 3;
+        clients[me].team_killed = 2;
+        clients[me].team_damages_given = 300;
+        clients[me].team_damages_taken = 120;
+
+        assign_client_instance(
+            &mut client_match,
+            &mut player_score,
+            &mut clients,
+            me as c_int,
+            2,
+        );
+
+        // The move itself: new instance, per-match score copy reset.
+        assert_eq!(client_match[me], 2);
+        assert_eq!(player_score[me], 0);
+        // Neither my row nor my column keeps a kill, death or damage point.
+        for slot in 0..MAX_CLIENTS {
+            let row = clients[me].game_stats[slot];
+            assert_eq!(
+                (
+                    row.killed,
+                    row.killed_by,
+                    row.damages_given,
+                    row.damages_taken
+                ),
+                (0, 0, 0, 0),
+                "my row vs slot {slot} survived the move"
+            );
+            let column = clients[slot].game_stats[me];
+            assert_eq!(
+                (
+                    column.killed,
+                    column.killed_by,
+                    column.damages_given,
+                    column.damages_taken
+                ),
+                (0, 0, 0, 0),
+                "slot {slot}'s record of me survived the move"
+            );
+        }
+        assert_eq!(
+            (
+                clients[me].team_kills,
+                clients[me].team_killed,
+                clients[me].team_damages_given,
+                clients[me].team_damages_taken
+            ),
+            (0, 0, 0, 0)
+        );
+
+        // Other players' mutual stats and their own team counters are intact.
+        let kept = clients[opponent].game_stats[other];
+        assert_eq!(
+            (
+                kept.killed,
+                kept.killed_by,
+                kept.damages_given,
+                kept.damages_taken
+            ),
+            (7, 6, 42, 24)
+        );
+        assert_eq!(clients[opponent].team_kills, 5);
+    }
+
+    /// The game-side half of the same move: `PERS_SCORE`/`PERS_KILLED` (the
+    /// final K/D columns) are zeroed, and nothing around them is touched.
+    #[test]
+    fn joining_another_instance_resets_game_score_and_deaths() {
+        use crate::sdk::{OFFSET_GCLIENT_PS, OFFSET_PS_PERSISTANT, PERS_KILLED, PERS_SCORE};
+        let score_at = OFFSET_GCLIENT_PS + OFFSET_PS_PERSISTANT + PERS_SCORE * 4;
+        let killed_at = OFFSET_GCLIENT_PS + OFFSET_PS_PERSISTANT + PERS_KILLED * 4;
+        let end = score_at.max(killed_at) + 4;
+        let mut client = vec![0x5au8; end];
+        let base = client.as_mut_ptr() as usize;
+        // SAFETY: the scratch buffer covers both persistant slots.
+        unsafe {
+            write_i32(base + score_at, 9);
+            write_i32(base + killed_at, 4);
+            reset_game_scores_at(base);
+        }
+
+        // SAFETY: the same scratch buffer, still alive and not aliased.
+        unsafe {
+            assert_eq!(read_i32(base + score_at), 0);
+            assert_eq!(read_i32(base + killed_at), 0);
+        }
+        for (i, byte) in client.iter().enumerate() {
+            if (score_at..score_at + 4).contains(&i) || (killed_at..killed_at + 4).contains(&i) {
+                continue;
+            }
+            assert_eq!(*byte, 0x5a, "reset touched byte {i}");
+        }
+    }
+
+    /// Closing a created instance deactivates it, resets its tallies and
+    /// returns its remaining (spectating) members to main with clean stats.
+    #[test]
+    fn closing_an_instance_returns_its_spectators_to_main() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize] = state::TffaMatch {
+            active: true,
+            red: 4,
+            blue: 2,
+        };
+        matches[1] = state::TffaMatch {
+            active: true,
+            red: 3,
+            blue: 1,
+        };
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[0] = 1;
+        table[1] = 1;
+        table[2] = MAIN_MATCH;
+        let mut score = [0i32; MAX_CLIENTS];
+        score[0] = 7;
+        score[1] = 2;
+        score[2] = 5;
+
+        let moved = close_instance_state(&mut matches, &mut table, &mut score, 1);
+        assert_eq!(moved, vec![0, 1]);
+        assert!(!matches[1].active);
+        assert_eq!((matches[1].red, matches[1].blue), (0, 0));
+        // Main and another main member are untouched.
+        assert!(matches[MAIN_MATCH as usize].active);
+        assert_eq!(
+            (
+                matches[MAIN_MATCH as usize].red,
+                matches[MAIN_MATCH as usize].blue
+            ),
+            (4, 2)
+        );
+        assert_eq!(table[0], MAIN_MATCH);
+        assert_eq!(table[1], MAIN_MATCH);
+        assert_eq!(table[2], MAIN_MATCH);
+        assert_eq!(score[0], 0);
+        assert_eq!(score[1], 0);
+        assert_eq!(score[2], 5);
+
+        // Main is never closed through this path.
+        assert!(close_instance_state(&mut matches, &mut table, &mut score, MAIN_MATCH).is_empty());
+        assert!(matches[MAIN_MATCH as usize].active);
     }
 }

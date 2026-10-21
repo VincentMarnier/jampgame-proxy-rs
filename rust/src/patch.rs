@@ -766,8 +766,10 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// `G_Spawn` + `G_RunThink` for the runtime-spawned children of a world entity;
 /// `G_RunMissile` so a missile's impact (radius damage) runs in its owner's
 /// instance; `TeamCount` so the game's auto team pick and its team-balance
-/// check census the joining client's own instance).
-pub static GAME_HOOKS: [Hook; 19] = [
+/// check census the joining client's own instance; `ScoreIsTied` so the
+/// pristine `CheckExitRules` defers the shared timelimit to the proxy's
+/// per-match sudden-death rule).
+pub static GAME_HOOKS: [Hook; 20] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -803,6 +805,7 @@ pub static GAME_HOOKS: [Hook; 19] = [
     Hook::new("G_RunThink", crate::jampgame::FN_G_RUN_THINK, true),
     Hook::new("G_RunMissile", crate::jampgame::FN_G_RUN_MISSILE, true),
     Hook::new("TeamCount", crate::jampgame::FN_TEAM_COUNT, true),
+    Hook::new("ScoreIsTied", crate::jampgame::FN_SCORE_IS_TIED, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1165,6 +1168,11 @@ mod tests {
         Site {
             name: "TeamCount",
             bytes: b"\x55\x8b\xec\x83\xec\x18\x89\x75\xf0\x89\x5d\xf4\x8b",
+            want: 6,
+        },
+        Site {
+            name: "ScoreIsTied",
+            bytes: b"\x55\x8b\xec\x83\xec\x08\x89\x75\xfc\xa1\x50\x00\x00\x00",
             want: 6,
         },
     ];

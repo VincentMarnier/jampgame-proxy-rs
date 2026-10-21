@@ -69,13 +69,13 @@ feeds are broadcast temp entities keyed by victim, so they are hidden the
 same way with no trap parsing. World/static entities always kept. Lobby
 (`None`) sees lobby. Technique stays D-002.1-compliant (no body copy).
 
-### D-006.5 — Scoreboard rewrite at the trap, chat untouched
+### D-006.5 — Scoreboard rewrite at the trap, global chat untouched
 
 `G_SEND_SERVER_COMMAND` forwarder rewrites per-viewer `scores ...` (14 ints
 per entry, `g_cmds.c:64`): keep only same-match entries, substitute the
 viewer's per-match red/blue. `SendScoreboardMessageToAllClients` thus fans
-out correctly with no game detour. Chat (`say`/`say_team`/`tell`) is
-deliberately not filtered.
+out correctly with no game detour. Global chat (`say`) and private `tell` are
+deliberately not filtered; team chat is (D-006.7).
 
 ### D-006.6 — Per-instance interactive world entities (doors, escalators, triggers)
 
@@ -542,6 +542,31 @@ their dropper's match, and 18 996 scoped box queries dropped 3 291
 foreign-tagged entries. The soak (300 s, two instance worlds live with a bot in
 each, 10 bots) ended with the server running and no errors.
 
+### D-006.7 — Team chat isolated per match, global chat still global
+
+*Status: landed (user directive, 2026-10-21).*
+
+`say_team` reaches clients as the game's per-recipient `tchat`/`ltchat`
+server command (`G_SayTo`, `g_cmds.c:1475-1525`), one trap call per client,
+after its own `OnSameTeam` filter. The `G_SEND_SERVER_COMMAND` forwarder now
+drops such a command when its recipient belongs to another match, so blue in
+main no longer reaches blue in a created match (nor the reverse), and the
+spectators — one `TEAM_SPECTATOR` team across the whole server — are split the
+same way.
+
+The sender's match is the acting scope the `GAME_CLIENT_COMMAND` forward
+already opens (`open_client_scope`, D-006.6 S9), so no new detour is needed
+and real clients and bots are both covered: a bot's `say_team` goes through
+the engine's `SV_ExecuteClientCommand` → `GAME_CLIENT_COMMAND` path like any
+client's (`sv_bot.cpp:584-586`). With no scope open, an unattributable
+`tchat`/`ltchat` is left untouched — the same fail-open rule as the link,
+query and touch gates. The gate keys on the client's own match assignment
+(`client_match`), not on `effective_match`: follow-spectating a player of
+another match changes what a spectator sees (scores, snapshots), not which
+instance their own team chat belongs to. Global `chat`/`lchat` and private
+`tell` keep their base-JKA reach, and the server log still records every
+`sayteam:` line.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
@@ -598,7 +623,9 @@ each, 10 bots) ended with the server running and no errors.
     `SetTeam` trampoline to spectator first (`set_client_spectator`, the same
     body `move_match_to_spectator` uses — the player suicides under
     `g_dontPenalizeTeam`, so no phantom team point), then the proxy moves their
-    instance; they re-pick a team with `/team red|blue`. Every check that can
+    instance; they re-pick a team with `/team red|blue`. Creation is the
+    exception since 2026-10-21: `tffa_create` joins the creator's side
+    immediately (see the create/empty-match entry below). Every check that can
     refuse (bad target, inactive/full match, no free slot) runs before the
     suicide, so a refused command never kills the player; a command naming the
     instance the player is already in (`tffa_join 0` in main, `tffa_join N` in
@@ -640,7 +667,7 @@ each, 10 bots) ended with the server running and no errors.
     `proxy_sv_enableEndGameStats` is on) filtered personal/global stats go to
     members + spectators. A finished main promotes the lowest-id still-played
     TFFA to the new main (scores + members migrate); with no candidate the
-    server just keeps the unified scoreboard until `timelimit`.
+    server just keeps the current scoreboard until `timelimit`.
 - **Bugfix round (2026-09-1x, six live-client reports):**
   - *Mini HUD stuck*: pristine `AddScore` runs `CalculateRanks` (broadcast +
     per-viewer corrections) *before* the wrapper bumps the proxy tallies, so
@@ -1006,3 +1033,204 @@ each, 10 bots) ended with the server running and no errors.
   dropper's match with it on; 18 996 scoped box queries dropping 3 291
   foreign-tagged entries) and a 300 s soak with two instance worlds live (no
   errors, server still running).
+- **Live-report round (2026-10-20, three reports):**
+  - *Force-jump sound missing in non-main matches.* The force-jump sound is
+    `EV_PREDEFSOUND` (`PDSOUND_FORCEJUMP` → `sound/weapons/force/jump.mp3`,
+    `cg_event.c:2589-2625`) built by `G_PreDefSound` (`w_force.c:40-49`) with a
+    plain `G_TempEntity`, so the temp entity carries no owner.
+    `sound_attribution` did not classify the event, so the snapshot filter fell
+    through to the generic temp-event owner rule: the memset `s.owner` /
+    `s.otherEntityNum*` zeros resolved to client 0, and the sound was dropped
+    for every viewer whose match was not client 0's. `EV_PREDEFSOUND` (`40`,
+    counted from the pinned `EV_SABER_BLOCK 31`) is now `Stamped`, and the
+    `G_TempEntity` detour stamps it with the **open acting scope** — the
+    player's think is the scope those calls run in (`ClientThink_real`, S9) —
+    via `tffa::temp_stamp_source` (the `G_Sound` handshake still wins; no scope
+    means the old world-sound behaviour, audible everywhere). Unit tests:
+    classification, the pure stamping rule, and a `snapshot_keep` fixture over a
+    constructed `EV_PREDEFSOUND` entity (foreign stamp hidden, world stamp kept).
+    `G_SoundTempEntity` keeps the pending handshake unchanged.
+  - *A player of another match appeared on the scoreboard.* (2026-10-20;
+    corrected 2026-10-21 after operator feedback.) The roster stays **unified**:
+    an earlier attempt filtered `scores` to the viewer's match, which hid the
+    other matches' players entirely and is wrong — the tab is also how players
+    see who is where. The real symptom was that a **main player was grouped on
+    another instance's BLUE side** while actually playing only in main. The tab
+    groups entries by each client's `cgs.clientinfo[].team`, which comes from
+    the per-viewer `CS_PLAYERS` override; an override sent when the base changed
+    can be lost (reliable-buffer pressure during connect/team churn, a gamestate
+    resync, or a base the viewer processed afterwards), and then the outsider is
+    grouped with the viewer's team. Every `scores ...` message now re-pushes
+    that viewer's demotions first (`tffa::refresh_cs_players_for_scores` →
+    pure `demotions_for_viewer`): each playing outsider with a known
+    `CS_PLAYERS` base gets the `(TFFA N)` name prefix and `t=3`, ordered before
+    the board on the same reliable stream, so the grouping cannot be stale.
+    Same-match players and real spectators keep the base string. Tests:
+    `scoreboard_demotions_cover_exactly_the_playing_outsiders` over the real
+    captured info-string shape (main blue viewed from instance 1, instance red
+    viewed from main, a real spectator) plus the unified `filter_scores` test
+    (every entry kept, per-match `PERS_SCORE` substituted, out-of-range entry
+    untouched).
+  - *Timelimit held the map in sudden death at 15-13.* `G_RunFrame` calls
+    `CheckExitRules` every frame (shipped `0x8a67f`; the SDK source has the same
+    call) and its first test is `ScoreIsTied`, which for team games compares
+    `level.teamScores`. TFFA neutralises those globals to `0-0`
+    (`clamp_global_scores` / `neutralise_global`), so the check was always
+    "tied" and `CheckExitRules` returned before the `timelimit` test — the map
+    could never end on time (the pristine global log line read `red:0 blue:0`).
+    New game hook `ScoreIsTied` (`0x88a74`, prologue `55 8b ec 83 ec 08 89 75
+    fc`, steal 6, sole semantic caller `CheckExitRules`; `GAME_HOOKS` 19 → 20)
+    answered "not tied" under TFFA at this point, so the pristine timelimit
+    path ran unchanged (TIMELIMIT_HIT print, log, 2 s intermission delay, final
+    board). (Superseded 2026-10-21: the hook now answers "tied" and the proxy
+    owns the timelimit per match — see below.)
+    Runtime differential on `mp/duel1`, `g_gametype 6`, `timelimit 1`,
+    `fraglimit 0`, two same-team bots with friendly fire off (no frags, globals
+    `0-0`, `numPlayingClients = 2`): the pre-fix build logged no exit after
+    60 s; the fixed build logged `Exit: Timelimit hit.` at 60 s. The pristine
+    `red:0 blue:0` log line stays — the globals are deliberately neutralised;
+    the per-viewer `scores` message carries the real per-match tallies.
+  - *Final board for a watching spectator.* `BeginIntermission` calls
+    `MoveClientToIntermission` (which stops following) **before**
+    `SendScoreboardMessageToAllClients`, so a spectator following a match was
+    dropped back to their own (often empty) main match exactly when the final
+    `scores` message was built: the header read `TIED AT 0` while the board
+    listed the watched match's players and scores. `run_begin_intermission` now
+    captures each connected viewer's follow-aware match
+    (`tffa::snapshot_intermission_boards`) before the pristine body and the
+    rewrite uses it while that match is still active
+    (`tffa::pick_board_match`, unit-tested). The intermission flag is also set
+    before the pristine call so the rewrite sees it.
+  - Verification: `cargo test` 93/93, `clippy -D warnings` clean, `fmt --check`
+    clean, i686 release build staged; engine smoke green with all 20 detours
+    attached (`attached ScoreIsTied @ <base>+0x88a74 (steal 6)`, steal fixture
+    `55 8b ec 83 ec 08 89 75 fc` pinned in `GAME_SITES`). The force-jump sound
+    itself still needs a live two-instance listen: bots do not force-jump
+    (instrumented `EV_PREDEFSOUND` stamping stayed silent in 35 s on
+    `mp/duel1` and 60 s on `mp/ctf2` with 4/6 bots), so that report rests on the
+    source classification plus the unit/snapshot tests.
+
+- **`tffa_list` main player count (2026-10-21, live report).** `client_match`
+  defaults to `MAIN_MATCH` for every slot, so the main line counted all free
+  slots as players: a 32-slot server with 3 connected players printed
+  `0 (main): 32 players`. Counting now goes through the game's authoritative
+  connectivity (`pers.connected != CON_DISCONNECTED`, the same filter pristine
+  `TeamCount` uses) for main and created matches alike (`connected_clients` /
+  `counted_match_size` / `render_match_list`). That also counts bots, which the
+  game adds with direct `ClientConnect`/`ClientBegin` calls and so can bypass
+  the proxy's `GAME_CLIENT_BEGIN` flag. `match_size` (the `proxy_tffa_maxGroupSize`
+  check) uses the same census, so a disconnected slot cannot occupy capacity.
+  Test: `tffa_list_counts_only_connected_players` (29 free main slots + 3
+  connected → main 3; an assigned-but-disconnected instance slot is not
+  counted). Runtime: 32-slot `mp/duel1`, `bot_minplayers 3` →
+  `0 (main): 3 players`.
+
+- **Per-match timelimit / tied sudden death (2026-10-21, requested rule).**
+  At the shared timelimit a TFFA now ends only when its teams differ; a tied
+  match keeps playing (per-match sudden death) until a frag separates the
+  teams. The `ScoreIsTied` hook answers **tied** under TFFA so pristine
+  `CheckExitRules` never ends the map itself; `tffa::on_run_frame_post` reads
+  `level.time`/`level.startTime`/`level.warmupTime` against the `timelimit`
+  cvar (`tffa::timelimit_expired`, offsets pinned in `sdk.rs`) and finishes
+  every active match whose `match_finish_reason` is `"timelimit"` (untied) or
+  `"fraglimit"` (unchanged shared fraglimit). Tie is checked on the proxy
+  tallies, so a neutralised global score cannot interfere.
+  Finished sub-matches are announced with the reason
+  (`TFFA N ended (timelimit): …`), get their stats and are moved to spectator
+  as before; a finished main promotes the lowest-id still-active (tied) match
+  into the main slot (`promotion_candidate`/`promote_into_main`), so the old
+  main's players spectate the surviving game while its players keep playing.
+  Once the limit has expired `tffa_create` is refused (`create_allowed`): the
+  map must wind down, not grow a fresh match that would keep it alive.
+  When no active match is both tied and has **playing** clients
+  (`playing_clients` = connected and not spectator; `has_continuing_match`),
+  every game is over and the normal intermission runs
+  (`run_begin_intermission`) → final scoreboard and the usual map restart. An
+  empty main (0-0, everyone back as spectators) therefore cannot keep the map
+  alive forever, and a tied match left with only spectators cannot either.
+  `timelimit 0` and the fraglimit keep their previous behaviour.
+  Tests: `timelimit_ends_untied_matches_only` (15-13 ends at the limit, 15-15
+  continues, fraglimit precedence, before-limit no-op),
+  `only_a_tied_match_with_players_continues` (tied+players continues, tied
+  without players does not, untied/inactive does not) and
+  `timelimit_main_ends_and_tied_instance_continues` (main 5-3 closes, its
+  players become spectators, the tied 7-7 instance is promoted into main and
+  keeps the map waiting, and creation is refused). Runtime (`mp/duel1`,
+  `timelimit 1`, `fraglimit 0`, two same-team bots with friendly fire off):
+  at 82 s the map was still running (score 0-0, no `Exit: Timelimit hit.`);
+  adding a blue bot produced 1-0 and the proxy logged
+  `main (TFFA 0) ended (timelimit): RED 1 - BLUE 0. … Final scoreboard
+  incoming.` A control with `fraglimit 1` still logs
+  `main (TFFA 0) ended (fraglimit): RED 0 - BLUE 1. …`.
+
+- **Create joins the game; empty created matches close (2026-10-21,
+  requested behaviour).** `tffa_create` no longer leaves the creator as a
+  spectator waiting for `/team red|blue`: the creator is put on the new
+  match's smaller side immediately (`create_team`: red on a tie, and a fresh
+  slot is 0-0) through the pristine `SetTeam` trampoline (`set_client_team`,
+  the same body `set_client_spectator` used; the spectator helper now delegates
+  to it). This also keeps the creation meaningful under the second rule: a
+  created match with **nobody in game** is closed, so a creator left
+  spectating would have been swept shut on the next frame.
+  "In game" is the `client_census` playing filter (connected and off the
+  spectator team), not merely "assigned": a match whose last player goes
+  spectator (`/team spectator`), leaves (`tffa_leave` / `tffa_join`
+  elsewhere) or disconnects closes itself, returning any remaining
+  spectators to main. It is enforced twice: synchronously in
+  `cmd_leave_silent` (`close_if_empty`, before a create/join can need the
+  freed slot) and per frame in `on_run_frame_post`
+  (`close_empty_created_matches`, which catches moves made by the game with no
+  proxy command). Main is implicit and never closes; closing queues the
+  instance's clone set for release at the next frame start
+  (`world_release`) and zeroes its tallies (`close_instance_state`).
+  Re-creating a slot before that release runs cancels it (`claim_world`), so
+  the new match keeps the clones it was just handed instead of losing them at
+  the next frame start.
+  Consequence to keep in mind: a match can only be joined while someone is
+  playing there — `tffa_join` into a spectator-only match is impossible
+  because such a match no longer exists.
+  Tests: `creator_joins_the_smaller_side_red_on_a_tie`,
+  `empty_created_matches_close_but_main_stays` (main never reported; a
+  spectator-only and an empty created slot are),
+  `closing_an_instance_returns_its_spectators_to_main` (inactive 0-0 slot,
+  spectators back in main with zeroed copies, main untouched) and
+  `reactivating_a_slot_cancels_its_pending_world_release`. The live
+  `SetTeam` call itself needs a real client (bots never issue `tffa_create`);
+  it is the same trampoline call the runtime-verified spectator move already
+  makes, and the join/create travel tests stay unit-level.
+
+- **Join clears end-game stats — now pinned (2026-10-21, requested test).**
+  Switching TFFA instances already ran `reset_slot_stats`, but nothing tested
+  that the mover's kills, deaths and `proxy_sv_enableEndGameStats` sheet start
+  clean in the new match. The reset is now split into testable pieces:
+  `reset_client_stats` clears the mover's whole `game_stats` row (what they
+  did to others) and column (what others did to them) plus
+  `team_kills`/`team_killed`/`team_damages_given`/`team_damages_taken`;
+  `assign_client_instance` is the join/create move itself (assign
+  `client_match`, zero the per-match `player_score` copy, clear the end-game
+  stats); and `reset_game_scores_at` is the `PERS_SCORE`/`PERS_KILLED` write
+  (`reset_game_scores` locates the client and calls it). Other players' mutual
+  stats and their own team counters are deliberately untouched.
+  Tests: `joining_another_instance_resets_end_game_stats` (row and column for
+  every slot, team counters, `client_match` and `player_score`; a stat between
+  two other players survives) and
+  `joining_another_instance_resets_game_score_and_deaths` (both persistant
+  slots zeroed on a scratch `gclient_t`, neighbouring bytes unchanged).
+  `cargo test` 105/105, `clippy -D warnings`, `fmt --check`, i686 build and
+  engine smoke green.
+
+- **Team-chat isolation (2026-10-21, user directive):** `tffa::is_team_chat`
+  recognises the two team-chat shapes (`tchat `/`ltchat `) and
+  `team_chat_visible_in`/`team_chat_visible` gate a recipient against the
+  sender's acting scope over the live `client_match` table. The existing
+  `G_SEND_SERVER_COMMAND` arm applies it before the `scores` rewrite; no new
+  hook, no game-memory write, and the `enabled()` gate keeps the cost to one
+  cvar read per trap when TFFA is off. Tests:
+  `team_chat_stays_inside_the_senders_instance` (same match delivered,
+  both directions cross-match dropped, no-scope/broadcast left alone) and
+  `team_chat_commands_are_the_tchat_shapes_only` (global `chat`/`lchat` and
+  unrelated prints untouched); `cargo test` 107/107, `clippy -D warnings`,
+  `fmt --check` and the i686 release build are green. The cross-instance
+  delivery itself needs two live clients (the server log keeps every
+  `sayteam:` line either way), so the gate rests on the unit-tested predicate
+  plus the runtime-verified `GAME_CLIENT_COMMAND` acting scope.

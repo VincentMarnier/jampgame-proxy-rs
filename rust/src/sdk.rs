@@ -66,6 +66,8 @@ pub const GT_CTF: i32 = 8;
 
 // clientConnected_t (g_local.h:366-371): `pers.connected` values.
 pub const CON_DISCONNECTED: i32 = 0;
+/// Fully connected (pristine `numPlayingClients` counts only this state).
+pub const CON_CONNECTED: i32 = 2;
 
 // PERS_* (server.h:16-18), STAT_* (q_shared.h) used by the stats printer.
 pub const PERS_SCORE: usize = 0;
@@ -113,6 +115,9 @@ pub const G_GET_USERINFO: i32 = 22;
 pub const G_SET_USERINFO: i32 = 23;
 pub const G_GET_USERCMD: i32 = 40;
 pub const G_NAV_FREE: i32 = 201;
+/// `G_NAV_LOAD` (`g_public.h:298-300`, right after `G_NAV_FREE`): the game's
+/// single nav load (`g_main.c:1034`).
+pub const G_NAV_LOAD: i32 = 202;
 
 /// Trace-family traps (`g_public.h:182-185,235`; compiled-oracle verified —
 /// `G_TRACE` 27, `G_G2TRACE` 28, `G_TRACECAPSULE` 49, all forwarding to
@@ -380,6 +385,10 @@ pub const CONTENTS_SOLID: i32 = 0x0000_0001;
 pub const EV_SABER_HIT: i32 = 30;
 pub const EV_SABER_BLOCK: i32 = 31;
 pub const EV_SABER_CLASHFLARE: i32 = 32;
+/// `G_PreDefSound`'s event (`w_force.c:40-49`: force jump, protect and absorb
+/// sounds). Built by `G_TempEntity`, so it carries no owner of its own; the
+/// proxy stamps it with the acting scope's instance (see `tffa`).
+pub const EV_PREDEFSOUND: i32 = 40;
 pub const EV_MUTE_SOUND: i32 = 74;
 pub const EV_GENERAL_SOUND: i32 = 76;
 pub const EV_GLOBAL_SOUND: i32 = 77;
@@ -540,6 +549,13 @@ pub const SPECTATOR_SCOREBOARD: i32 = 3;
 pub const OFFSET_LEVEL_TIME: usize = 32;
 /// `offsetof(level_locals_t, framenum)`.
 pub const OFFSET_LEVEL_FRAMENUM: usize = 28;
+/// `offsetof(level_locals_t, warmupTime)` (field order in SDK
+/// `g_local.h:812-832`; the shipped binary's `AddScore`/`CheckExitRules` read
+/// it at this offset).
+pub const OFFSET_LEVEL_WARMUP_TIME: usize = 16;
+/// `offsetof(level_locals_t, startTime)` — the time the map started, used by
+/// the pristine timelimit check (`g_main.c:2667`).
+pub const OFFSET_LEVEL_START_TIME: usize = 40;
 /// `offsetof(level_locals_t, teamScores)` (base of `int[TEAM_NUM_TEAMS]`,
 /// derived from the field order in SDK `g_local.h:812-832` and pinned by the
 /// existing `OFFSET_LEVEL_FRAMENUM`/`OFFSET_LEVEL_TIME` anchors:
@@ -679,6 +695,9 @@ mod tests {
         assert_eq!(G_ENTITIES_IN_BOX, 36);
         assert_eq!(G_ENTITY_CONTACT, 37);
         assert_eq!(G_ENTITY_CONTACTCAPSULE, 50);
+        // Nav traps (`g_public.h:298-300`): `G_NAV_INIT = 200` precedes them.
+        assert_eq!(G_NAV_FREE, 201);
+        assert_eq!(G_NAV_LOAD, 202);
     }
 
     #[test]
@@ -708,6 +727,7 @@ mod tests {
         assert_eq!(GT_TEAM, 6);
         assert_eq!(GT_CTF, 8);
         assert_eq!(CON_DISCONNECTED, 0);
+        assert_eq!(CON_CONNECTED, 2);
         assert_eq!(OFFSET_PERS_CONNECTED, 0);
     }
 
@@ -743,6 +763,8 @@ mod tests {
         assert_eq!(OFFSET_SESS_SESSION_TEAM, 0);
         assert_eq!(OFFSET_LEVEL_TIME, 32);
         assert_eq!(OFFSET_LEVEL_FRAMENUM, 28);
+        assert_eq!(OFFSET_LEVEL_WARMUP_TIME, 16);
+        assert_eq!(OFFSET_LEVEL_START_TIME, 40);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES, 44);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_RED, 48);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_BLUE, 52);
@@ -833,6 +855,8 @@ mod tests {
         assert_eq!(EV_SABER_HIT, 30);
         assert_eq!(EV_SABER_BLOCK, 31);
         assert_eq!(EV_SABER_CLASHFLARE, 32);
+        // `G_PreDefSound` (`w_force.c:44`): the force-jump/protect/absorb event.
+        assert_eq!(EV_PREDEFSOUND, 40);
         assert_eq!(EV_MUTE_SOUND, 74);
         assert_eq!(EV_GENERAL_SOUND, 76);
         assert_eq!(EV_GLOBAL_SOUND, 77);

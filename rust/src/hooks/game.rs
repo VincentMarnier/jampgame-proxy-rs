@@ -542,8 +542,14 @@ pub unsafe extern "C" fn begin_intermission() {
 pub fn run_begin_intermission() {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_begin_intermission);
-    unsafe { original() };
+    // Set before the pristine body: it moves every client to the intermission
+    // point (which stops following) and then sends the final scoreboard from
+    // inside the call, so the scores rewrite must already know an intermission
+    // is running to keep showing a watching spectator's match (see
+    // `tffa::viewer_board_match`). Also gates further fraglimit handling.
+    crate::tffa::snapshot_intermission_boards();
     state::with_state(|s| s.tffa.intermission = true);
+    unsafe { original() }
 
     if !end_game_stats_enabled() {
         return;
@@ -1011,9 +1017,10 @@ pub unsafe extern "C" fn g_sound_temp_entity(origin: usize, event: c_int, channe
 
 /// `gentity_t *G_TempEntity(vec3_t origin, int event)`: stamp the created
 /// temp entity — world attribution for the `G_SoundAtLoc`/`G_EntitySound`/
-/// `G_SoundOnEnt` helpers and the direct map-sound callers. Stamping every
-/// construction keeps a reused slot from inheriting a stale sound
-/// attribution.
+/// `G_SoundOnEnt` helpers and the direct map-sound callers, except an
+/// owner-less `EV_PREDEFSOUND` (`G_PreDefSound`: force jump/protect/absorb),
+/// which belongs to the acting scope's instance. Stamping every construction
+/// keeps a reused slot from inheriting a stale sound attribution.
 ///
 /// # Safety
 ///
@@ -1024,7 +1031,7 @@ pub unsafe extern "C" fn g_temp_entity(origin: usize, event: c_int) -> usize {
     let original = original_call(crate::hooks::game_hook_original_g_temp_entity);
     let te = unsafe { original(origin, event) };
     if te != 0 {
-        crate::tffa::stamp_temp_source(te);
+        crate::tffa::stamp_temp_source_event(te, event);
     }
     te
 }
@@ -1252,6 +1259,29 @@ pub unsafe extern "C" fn team_count(ignore_client_num: c_int, team: c_int) -> c_
     // SAFETY: trampoline attached at GAME_INIT; arguments forwarded unchanged.
     let original = original_call(crate::hooks::game_hook_original_team_count);
     unsafe { original(ignore_client_num, team) }
+}
+
+/// `qboolean ScoreIsTied(void)` wrapper (parallel TFFA): the pristine
+/// `CheckExitRules` consults it before the timelimit check, so answering
+/// "tied" keeps the game module from ending the map on its own. TFFA owns the
+/// shared timelimit per match instead (`tffa::on_run_frame_post`): an untied
+/// match ends at the limit, a tied match keeps playing until a frag separates
+/// the teams, and the map enters the normal intermission once no tied match
+/// with players remains. This also skips the pristine global fraglimit exits,
+/// which the proxy owns per match for the same reason.
+///
+/// # Safety
+///
+/// Entered from the game module with no arguments.
+pub unsafe extern "C" fn score_is_tied() -> c_int {
+    if crate::tffa::enabled() {
+        // "Tied": CheckExitRules returns before the timelimit/fraglimit
+        // checks. The proxy runs them per match.
+        return 1;
+    }
+    // SAFETY: trampoline attached at GAME_INIT.
+    let original = original_call(crate::hooks::game_hook_original_score_is_tied);
+    unsafe { original() }
 }
 
 #[cfg(test)]

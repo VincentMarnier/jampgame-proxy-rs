@@ -25,8 +25,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sdk::{
     CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
     G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
-    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_SEND_SERVER_COMMAND,
-    G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
+    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_NAV_FREE, G_NAV_LOAD,
+    G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -35,6 +35,17 @@ pub type EngineSyscall = unsafe extern "C" fn(c_int, ...) -> c_int;
 /// Stored engine syscall pointer, set once by `dllEntry` before any `vmMain`
 /// call. Read-only afterwards; only the single engine thread reaches it.
 static ENGINE_SYSCALL: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes unit tests that install a fake process-global engine syscall
+/// (`ENGINE_SYSCALL`) and drive traps through the forwarder.
+#[cfg(test)]
+pub(crate) static TEST_ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clear the installed engine syscall after a test (test-only).
+#[cfg(test)]
+pub(crate) fn clear_test_engine_syscall() {
+    ENGINE_SYSCALL.store(0, Ordering::Relaxed);
+}
 
 /// Record the syscall pointer delivered by the engine in `dllEntry`.
 pub fn set_engine_syscall(syscall: EngineSyscall) {
@@ -86,11 +97,12 @@ pub unsafe fn call_engine(command: c_int, args: &[c_int]) -> c_int {
 /// call (command + up to 16 words) to the engine unchanged — except for the
 /// traps the proxy intercepts (`Proxy_OriginalAPI_Wrappers.cpp:24-45`):
 /// `G_LOCATE_GAME_DATA` is recorded, `G_GET_USERCMD` is mutated after the
-/// engine fills the cmd, `G_SEND_SERVER_COMMAND` `scores ...` messages
-/// are rewritten per viewer while parallel TFFA matches are active, and
-/// `G_SET_CONFIGSTRING` for `CS_SCORES1/2` + `CS_PLAYERS` fans out per-viewer
-/// `cs` corrections (own-match mini HUD, unified scoreboard with outsiders as
-/// prefixed spectators).
+/// engine fills the cmd, `G_NAV_LOAD` frees the previous nav graph before it
+/// loads the next one (map-change memory leak), `G_SEND_SERVER_COMMAND`
+/// `scores ...` messages are rewritten per viewer while parallel TFFA matches
+/// are active, and `G_SET_CONFIGSTRING` for `CS_SCORES1/2` + `CS_PLAYERS` fans
+/// out per-viewer `cs` corrections (own-match mini HUD and own-side client
+/// names; another match's players are kept out of the viewer's team overlay).
 /// All are then forwarded normally.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jampgame_syscall_forward(
@@ -141,9 +153,35 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             }
             return response;
         }
+        // `G_NAV_LOAD(const char*, int)` (`g_main.c:1034`, the game's only nav
+        // load): the engine's `CNavigator::Load` appends every node of the
+        // parsed file to `m_nodes` without clearing the previous graph
+        // (`navigator.cpp:602-655`), so every map load, map change and
+        // `map_restart` would leak the previous map's whole nav graph. The
+        // upstream proxy freed it in a `CNavigator::Load` hook; this port has
+        // that hook too, but its hooks are attached only *after* `GAME_INIT`
+        // is forwarded, i.e. after the game's own `trap_Nav_Load` has already
+        // run — so the leak survived every map. Free here, on the game's
+        // syscall, which is active from `dllEntry` on: every load (including
+        // the first one of a map) starts from an empty graph. `Free` is
+        // idempotent, so the engine hook's own free (when it runs) is a no-op.
+        G_NAV_LOAD => {
+            if crate::state::proxy_enabled() {
+                // SAFETY: engine syscall registered; `G_NAV_FREE` takes no
+                // arguments (the surplus words are ignored by the engine).
+                unsafe {
+                    engine_syscall_call(
+                        G_NAV_FREE,
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    );
+                }
+            }
+        }
         // `G_SEND_SERVER_COMMAND(int clientNum, const char*)`: rewrite the
         // per-viewer `scores ...` message while parallel TFFA matches run so
-        // each match sees only its own roster and scores. Chat is left global.
+        // each match sees only its own roster and scores, and drop a team
+        // chat (`tchat`/`ltchat`) aimed at a viewer of another match. Global
+        // chat stays server-wide.
         // Pristine fraglimit notices (`Red|Blue|<name> …HIT_THE_KILL_LIMIT…`)
         // are swallowed under TFFA (companion to the `LogExit` hook — the
         // proxy's own `on_run_frame_post` owns ALL fraglimit endings).
@@ -153,13 +191,37 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 // SAFETY: the game passes a NUL-terminated command string.
                 let text = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
                 if let Ok(text_str) = text.to_str() {
-                    if crate::tffa::enabled() && crate::tffa::is_kill_limit_print(text_str) {
+                    // One feature read per command: the same gate covers the
+                    // kill-limit prune, the team-chat prune and the score
+                    // rewrite below.
+                    let tffa_on = crate::tffa::enabled();
+                    if tffa_on && crate::tffa::is_kill_limit_print(text_str) {
+                        return 0;
+                    }
+                    // Team chat (`say_team` → `tchat`/`ltchat`) stays inside
+                    // the sender's instance: G_SayTo already limited it to the
+                    // sender's team, and this drops the recipients of another
+                    // match (blue in main no longer reaches blue in tffa1).
+                    // Global `chat` stays server-wide. The sender is the
+                    // acting scope the `GAME_CLIENT_COMMAND` forward opened
+                    // around the game's own `ClientCommand` (`Cmd_Say_f` →
+                    // `G_Say`), which covers real clients and bots alike; with
+                    // no scope open the message is left untouched.
+                    if tffa_on
+                        && crate::tffa::is_team_chat(text_str)
+                        && !crate::tffa::team_chat_visible(crate::tffa::acting_scope(), a0)
+                    {
                         return 0;
                     }
                     if a0 >= 0 && (a0 as usize) < crate::sdk::MAX_CLIENTS {
                         if let Some(rewritten) =
                             crate::tffa::rewrite_scores_for_viewer(text_str, a0)
                         {
+                            // The client groups the roster by its local
+                            // CS_PLAYERS team data; re-push the demotions so a
+                            // lost/overwritten override cannot show another
+                            // match's player on this viewer's RED/BLUE side.
+                            crate::tffa::refresh_cs_players_for_scores(a0);
                             if let Ok(cmsg) = std::ffi::CString::new(rewritten) {
                                 // SAFETY: engine syscall registered; cmsg outlives
                                 // the call (the engine copies into
@@ -302,8 +364,8 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // `G_SET_CONFIGSTRING(int num, const char*)`: forward first (engine
         // updates `sv.configstrings` + broadcasts `cs` to all), then fan out
         // per-viewer `cs` corrections while TFFA runs so each match gets its
-        // own mini-HUD scores and unified scoreboard names. The corrections
-        // arrive after the broadcast and win per client.
+        // own mini-HUD scores and its own team-overlay client names. The
+        // corrections arrive after the broadcast and win per client.
         G_SET_CONFIGSTRING => {
             if crate::state::proxy_enabled()
                 && (a0 == CS_SCORES1
@@ -557,9 +619,33 @@ pub fn read_engine_string(buffer: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Fixed-arity shape of the variadic engine syscall (command + the 16
+    /// words `jampgame_syscall_forward` always re-passes).
+    type FixedSyscall = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+    ) -> c_int;
 
     #[test]
     fn engine_syscall_round_trips() {
+        let _guard = TEST_ENGINE_LOCK.lock().unwrap();
         // A real code pointer with a compatible cdecl word layout: transmuting
         // between fn-pointer types keeps a valid pointer, so no invalid-value
         // lint fires (a bare `0usize as fn` would be UB).
@@ -587,29 +673,64 @@ mod tests {
         // Fixed-arity cdecl fn (a valid code pointer), re-typed as the
         // variadic syscall pointer: fn-pointer-to-fn-pointer transmute keeps a
         // valid pointer, so no invalid-value lint fires.
-        let fixed: unsafe extern "C" fn(
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-        ) -> c_int = marker;
+        let fixed: FixedSyscall = marker;
         let marker: EngineSyscall = unsafe { core::mem::transmute(fixed) };
         set_engine_syscall(marker);
         assert!(matches!(engine_syscall(), Some(f) if f as usize == marker as usize));
-        ENGINE_SYSCALL.store(0, Ordering::Relaxed);
+        clear_test_engine_syscall();
         assert!(engine_syscall().is_none());
+    }
+
+    /// Commands the recorder below received, in order.
+    static RECORDED: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+
+    /// Stand-in engine syscall: records every trap and answers `G_NAV_LOAD`
+    /// with a recognizable non-zero value so the forwarding path is visible.
+    unsafe extern "C" fn recording_syscall(
+        command: c_int,
+        _a0: c_int,
+        _a1: c_int,
+        _a2: c_int,
+        _a3: c_int,
+        _a4: c_int,
+        _a5: c_int,
+        _a6: c_int,
+        _a7: c_int,
+        _a8: c_int,
+        _a9: c_int,
+        _a10: c_int,
+        _a11: c_int,
+        _a12: c_int,
+        _a13: c_int,
+        _a14: c_int,
+        _a15: c_int,
+    ) -> c_int {
+        RECORDED.lock().unwrap().push(command);
+        if command == G_NAV_LOAD { 7 } else { 0 }
+    }
+
+    #[test]
+    fn nav_load_frees_the_previous_nav_graph_first() {
+        let _guard = TEST_ENGINE_LOCK.lock().unwrap();
+        RECORDED.lock().unwrap().clear();
+        let fixed: FixedSyscall = recording_syscall;
+        let recorder: EngineSyscall = unsafe { core::mem::transmute(fixed) };
+        set_engine_syscall(recorder);
+        // The leak fix must be on by default (same state as a running proxy
+        // before the first cvar refresh).
+        assert!(crate::state::proxy_enabled());
+        // SAFETY: the recorder stands in for the engine syscall; the arguments
+        // are the ones the game passes for `trap_Nav_Load`.
+        let response = unsafe {
+            jampgame_syscall_forward(G_NAV_LOAD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        };
+        assert_eq!(response, 7, "G_NAV_LOAD's result must be forwarded");
+        assert_eq!(
+            *RECORDED.lock().unwrap(),
+            vec![G_NAV_FREE, G_NAV_LOAD],
+            "the old nav graph is freed before the new one loads"
+        );
+        clear_test_engine_syscall();
+        RECORDED.lock().unwrap().clear();
     }
 }

@@ -38,7 +38,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeams`                  | 0       | lock both teams at their round-start size when a TDM/CTF round starts even and populated (>=2 per team) |
 | `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeams` (see below) |
-| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility isolated per match, chat stays global (see below) |
+| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
 
@@ -70,24 +70,34 @@ when the effective decision actually changes. This works whether or not
 ### Parallel TFFA matches
 
 With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
-parallel matches on the same map: `tffa_create` opens a match and joins it,
+parallel matches on the same map: `tffa_create` opens a match, puts the
+creator on its smaller side (red when it is empty) and joins it,
 `tffa_join <id>` / `tffa_leave` switch matches (`tffa_join 0` returns to the
 main game, same as `tffa_leave`) and `tffa_list` shows them.
 They work while playing, not only from spectator: a travel command puts
 the player in the spectator team first (their character is killed), then
-switches the instance, so they re-pick a team with `/team red|blue`. A
+switches the instance, so after `tffa_join` they re-pick a team with
+`/team red|blue`. A created match with nobody in game there (everyone left
+or went spectator) closes itself; the main game always stays. A
 command that names the instance the player is already in changes nothing
 (no needless death). Auto team picks (`team free`, the client's
 auto-join, `g_teamAutoJoin`) balance the match being joined rather than
 the whole server, so one match's sides stay even.
 Each match is isolated: cross-match damage is
 dropped, cross-match players (and their projectiles, sabers and kill feed)
-are hidden from snapshots, and the scoreboard shows only the viewer's match
-with its own red/blue scores. Chat stays global. Every match shares the
+are hidden from snapshots, and the scoreboard lists all matches' players — so
+you can see who is where — with the other matches' players grouped as
+spectators and the red/blue header plus each player's score taken from the
+viewer's own match. Global chat is server-wide; team chat (`say_team`) stays
+inside its own match, so blue in main cannot talk to blue in a created match
+(spectators are split the same way). Every match shares the
 server's own `fraglimit` independently (the global team scores are kept
 neutralised so the pristine win check never fires early); when a match hits
 it, its members are moved to spectator and may join another match.
-`timelimit` stays global and ends everything. `proxy_sv_lockTeams` /
+`timelimit` is global: at the limit each match ends unless it is tied, and a
+tied match keeps playing (sudden death) until a frag separates the teams.
+Once no tied match with players remains, the map ends and restarts normally.
+`proxy_sv_lockTeams` /
 `proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
 global (per-match HUD would need a client mod).
 

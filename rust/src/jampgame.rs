@@ -59,6 +59,14 @@ pub const FN_ADD_SCORE: usize = 0x0013_13a4;
 /// before the `AddScore` wrapper can neutralise the bump, so neutralising
 /// alone can never win the race.
 pub const FN_LOG_EXIT: usize = 0x0008_81d4;
+/// `qboolean ScoreIsTied(void)` (nm `ScoreIsTied__Fv`, file offset `0x88a74`;
+/// prologue `55 8b ec 83 ec 08 89 75 fc`, 6 detour-safe bytes; the sole caller
+/// is `CheckExitRules` at `0x88bba`, R_386_PC32-verified). Hooked by the
+/// parallel-TFFA feature: the proxy owns the shared timelimit per match, so the
+/// wrapper answers "tied" under TFFA to keep the pristine `CheckExitRules`
+/// from ending the map before the proxy has ended the untied matches and let
+/// the tied ones play sudden death.
+pub const FN_SCORE_IS_TIED: usize = 0x0008_8a74;
 /// `void G_Sound(gentity_t*, int, int)` (nm `G_Sound__FP9gentity_siT2`, file
 /// offset `0x16e824`; prologue `55 8b ec 83 ec 20`, 6 detour-safe bytes).
 /// Parallel-TFFA sound isolation: records which match's action owns the temp

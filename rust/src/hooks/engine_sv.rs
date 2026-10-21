@@ -1225,6 +1225,44 @@ mod tests {
         ));
     }
 
+    /// `EV_PREDEFSOUND` (`G_PreDefSound`: force jump/protect/absorb) carries no
+    /// owner fields, so its only attribution is the construction-time stamp.
+    /// A stamp naming another match must hide it; a world stamp stays audible
+    /// everywhere.
+    #[test]
+    fn owner_less_predef_sound_follows_its_construction_stamp() {
+        let (game, table) = main_player_and_viewer();
+        let mut game = game;
+        let etype = crate::sdk::ET_EVENTS + crate::sdk::EV_PREDEFSOUND;
+        game.with_entity(48, etype);
+        let mut sounds = sound_table();
+        sounds[48] = 1;
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sounds,
+            &shared_table(),
+            game.base(),
+            48
+        ));
+        assert!(
+            !snapshot_keep(0, &table, &sounds, &shared_table(), game.base(), 48),
+            "a force-jump sound stamped for instance 1 must be silent in main"
+        );
+        // World attribution (no scope was open when it was built): unchanged
+        // map/world behaviour, audible in every instance.
+        for viewer_match in [0, 1, 2] {
+            assert!(snapshot_keep(
+                viewer_match,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+        }
+    }
+
     /// Per-instance world entities (D-006 extension): a tagged door/trigger is
     /// visible only inside its own instance, and tagging an entity is inert for
     /// every other instance (they keep the untagged behaviour).
