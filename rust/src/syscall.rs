@@ -219,8 +219,13 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     // will actually receive: the parallel-TFFA rewrite first
                     // (it parses the stock 14-int entry layout and substitutes
                     // the viewer's match), then the TaystJK deaths field on
-                    // the result. Broadcast scores (`-1`) skip the per-viewer
-                    // TFFA rewrite but still carry the deaths field.
+                    // the result, but only for viewers whose cgame advertised
+                    // the 15-int parse in its userinfo (`taystJKcgflags`).
+                    // Broadcast scores (`-1`) carry no single viewer: they are
+                    // fanned out per client with each client's own layout.
+                    if a0 < 0 && crate::scoreboard::broadcast_scores(text_str) {
+                        return 0;
+                    }
                     let mut rewritten: Option<String> = None;
                     if a0 >= 0 && (a0 as usize) < crate::sdk::MAX_CLIENTS {
                         if let Some(scores) = crate::tffa::rewrite_scores_for_viewer(text_str, a0) {
@@ -233,7 +238,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                         }
                     }
                     let source = rewritten.as_deref().unwrap_or(text_str);
-                    if let Some(with_deaths) = crate::scoreboard::rewrite_command(source) {
+                    if let Some(with_deaths) = crate::scoreboard::rewrite_command(source, a0) {
                         rewritten = Some(with_deaths);
                     }
                     if let Some(out) = rewritten {

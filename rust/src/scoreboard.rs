@@ -13,14 +13,21 @@
 //!   engine includes it in `CS_SERVERINFO`) and keeps bit 7 set while the
 //!   master switch is on, leaving any other module's bits untouched;
 //! - it appends `cl->ps.persistant[PERS_KILLED]` — the game's own death count,
-//!   read at send time — as the 15th int of every `scores` command.
+//!   read at send time — as the 15th int of the `scores` command, but only for
+//!   a client whose cgame advertises the 15-int layout.
 //!
-//! The key is server-wide, so every client parses the 15-int layout while the
-//! proxy is enabled. A cgame that ignores the key (stock JKA, JA+, jaPRO)
-//! would misparse it, and no userinfo field reliably identifies a TaystJK
-//! cgame: TaystJK sends `cjp_client=1.4JAPRO`, which JA+/jaPRO clients send
-//! too. Running a mixture of cgames is therefore out of scope for this
-//! feature; a server that needs stock clients turns `proxy_sv_enable` off.
+//! The layout is chosen per client, from the cgame's own userinfo: a cgame
+//! that advertises `taystJKcgflags & TAYSTJK_CGFLAG_SCORE_DEATHS` parses the
+//! 15-int form and gets it, every other cgame (older TaystJK builds, stock
+//! JKA, JA+/jaPRO) keeps the pristine 14-int message and a correct board.
+//! `taystJKinfo` bit 7 stays in the serverinfo while the proxy is enabled
+//! because that is what tells a capable cgame to parse 15 ints; cgames without
+//! the branch ignore the key entirely, so advertising it is harmless to them.
+//! A broadcast `scores` command is fanned out per client (`broadcast_scores`).
+//!
+//! No userinfo field identifies a cgame by *name* (`cjp_client=1.4JAPRO` is
+//! shared with JA+/jaPRO), which is why the capability is advertised by the
+//! cgame itself rather than inferred from a mod marker.
 
 use core::ffi::{CStr, c_int};
 
@@ -33,6 +40,14 @@ pub const TAYSTJK_INFO_SCORE_DEATHS: i32 = 1 << 7;
 
 /// Serverinfo key the TaystJK cgame reads (`cg_servercmds.c:250`).
 pub const SERVERINFO_CVAR: &CStr = c"taystJKinfo";
+
+/// Userinfo key where the TaystJK cgame advertises its capabilities
+/// (`XCVAR_DEF(taystJKcgflags, …)` in `cg_xcvar.h`).
+pub const CGFLAGS_USERINFO: &str = "taystJKcgflags";
+
+/// `TAYSTJK_CGFLAG_SCORE_DEATHS` (`bg_public.h`): the cgame parses the 15th
+/// per-client `scores` int as deaths, so the server may append it.
+pub const CGFLAG_SCORE_DEATHS: i32 = 1 << 0;
 
 /// Per-entry int count of a pristine `scores` payload.
 const BASE_ENTRY_INTS: usize = 14;
@@ -99,14 +114,72 @@ pub unsafe fn register_cvar(cvar: *mut VmCvar) {
     }
 }
 
-/// Rewrite a `scores ...` server command with the deaths field, or `None` when
-/// the command is not a scores message, the feature is off, or the layout is
-/// not recognisable (the caller then forwards the original untouched).
-pub fn rewrite_command(text: &str) -> Option<String> {
-    if !state::proxy_enabled() {
+/// Rewrite a per-client `scores ...` server command with the deaths field, or
+/// `None` when the command is not a scores message, the feature is off, the
+/// recipient does not advertise the 15-int parse, or the layout is not
+/// recognisable (the caller then forwards the original untouched).
+pub fn rewrite_command(text: &str, viewer: c_int) -> Option<String> {
+    if !state::proxy_enabled() || !client_supports_deaths(viewer) {
         return None;
     }
     append_deaths(text, crate::hooks::game::pers_killed)
+}
+
+/// Fan a broadcast `scores ...` command (`clientNum == -1`) out to every
+/// connected client with that client's own layout, because the message is
+/// shared but the layout is not: cgames that advertise
+/// `taystJKcgflags & CGFLAG_SCORE_DEATHS` parse 15 ints, every other cgame
+/// (older TaystJK builds, stock JKA, JA+, jaPRO) parses the stock 14.
+///
+/// Returns `true` when the command was handled, i.e. the caller must not
+/// forward the broadcast. Unrecognised layouts (already 15-int, malformed) are
+/// left to the caller so a game module that owns the layout keeps working.
+pub fn broadcast_scores(text: &str) -> bool {
+    if !state::proxy_enabled() || !text.starts_with("scores ") {
+        return false;
+    }
+    let Some(with_deaths) = append_deaths(text, crate::hooks::game::pers_killed) else {
+        return false;
+    };
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..crate::sdk::MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    for viewer in viewers {
+        let payload = if client_supports_deaths(viewer) {
+            &with_deaths
+        } else {
+            text
+        };
+        let Ok(cmsg) = std::ffi::CString::new(payload) else {
+            continue;
+        };
+        // SAFETY: engine syscall registered; `cmsg` is NUL-terminated.
+        unsafe { crate::syscall::send_server_command(viewer, &cmsg) };
+    }
+    true
+}
+
+/// Whether a userinfo string advertises the 15-int `scores` parse.
+pub fn userinfo_supports_deaths(userinfo: &str) -> bool {
+    crate::tffa::info_value(userinfo, CGFLAGS_USERINFO)
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .is_some_and(|flags| flags & CGFLAG_SCORE_DEATHS != 0)
+}
+
+/// Whether one client's cgame understands the 15-int `scores` layout, read
+/// live from its userinfo (the cgame re-sends the info when the flag changes).
+fn client_supports_deaths(client_num: c_int) -> bool {
+    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+        return false;
+    }
+    let mut buffer = [0u8; crate::sdk::MAX_INFO_STRING];
+    // SAFETY: engine syscall registered; the engine writes a NUL-terminated
+    // info string into `buffer`.
+    unsafe { crate::syscall::get_userinfo(client_num, &mut buffer) };
+    let info = crate::syscall::read_engine_string(&buffer);
+    userinfo_supports_deaths(&String::from_utf8_lossy(info))
 }
 
 /// Pure `scores` rewrite: turn 14-int entries into 15-int entries whose last
@@ -290,5 +363,20 @@ mod tests {
             (0..15).map(|_| entry(0, 1)).collect::<Vec<_>>().join(" ")
         );
         assert!(append_deaths(&text, |_| 0).is_none());
+    }
+
+    #[test]
+    fn userinfo_advertises_the_deaths_layout_on_bit_zero() {
+        // The cgame sets `taystJKcgflags` to its capability bitmask.
+        assert!(userinfo_supports_deaths("taystJKcgflags\\1"));
+        assert!(userinfo_supports_deaths("\\name\\Bob\\taystJKcgflags\\1"));
+        assert!(userinfo_supports_deaths("taystJKcgflags\\3"));
+        // No bit 0: the client keeps the 14-int parse.
+        assert!(!userinfo_supports_deaths("taystJKcgflags\\0"));
+        assert!(!userinfo_supports_deaths("taystJKcgflags\\2"));
+        // Missing/garbled key: never assume support.
+        assert!(!userinfo_supports_deaths("taystJKcgflags\\"));
+        assert!(!userinfo_supports_deaths("name\\Bob"));
+        assert!(!userinfo_supports_deaths(""));
     }
 }

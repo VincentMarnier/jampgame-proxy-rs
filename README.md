@@ -49,18 +49,22 @@ C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
 ### TaystJK scoreboard deaths
 
 While `proxy_sv_enable` is `1`, the proxy advertises `taystJKinfo 128`
-(`TAYSTJK_INFO_SCORE_DEATHS`) in the server info and appends each player's
-death count as a 15th int to every `scores` command. That is what
-[TaystJK](https://github.com/taysta/TaystJK)'s cgame uses to show an up-to-date
-K/D on the tab scoreboard; the stock game module only sends 14 ints and never
-advertises the key. The death count is the game's own
+(`TAYSTJK_INFO_SCORE_DEATHS`) in the server info and, for clients that opt in,
+appends each player's death count as a 15th int to the `scores` command. That
+is what [TaystJK](https://github.com/taysta/TaystJK)'s cgame uses to show an
+up-to-date K/D on the tab scoreboard; the stock game module only sends 14 ints
+and never advertises the key. The death count is the game's own
 `ps.persistant[PERS_KILLED]`, read when the scoreboard is sent.
 
-The server info key is server-wide, so every client must run a cgame that
-understands it (TaystJK): a stock JA+/jaPRO cgame ignores the key and would
-misparse the extra int. The proxy therefore cannot serve both kinds of cgame at
-once; turn `proxy_sv_enable` off on a server that must stay stock-client
-compatible.
+The deaths field is sent per client, and only to a client whose cgame
+advertises it: the proxy appends the 15th int only when the recipient's
+userinfo carries `taystJKcgflags` bit 0 (`TAYSTJK_CGFLAG_SCORE_DEATHS`, TaystJK
+cgame builds from commit `30fc5979b`, 2026-10-23). Every other client — older
+TaystJK builds, stock JKA, JA+, jaPRO — receives the pristine 14-int message,
+so mixed rosters work: updated clients see K/D, older ones keep a correct
+scoreboard instead of having the whole roster collapse onto one team. The
+`taystJKinfo 128` server info key stays advertised because that is what tells a
+capable cgame to parse the 15-int layout; cgames without support ignore it.
 
 ### Per-team-size rules
 

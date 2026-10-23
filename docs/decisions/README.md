@@ -27,4 +27,6 @@
   the nav data. Fix: free through the always-active `G_NAV_LOAD` syscall arm.
 - `0009-taystjk-scoreboard-deaths.md` — TaystJK compatibility: advertise
   `taystJKinfo` bit 7 (`TAYSTJK_INFO_SCORE_DEATHS`) in the server info and
-  append `PERS_KILLED` as the 15th `scores` int, always on with the proxy.
+  append `PERS_KILLED` as the 15th `scores` int only to clients whose userinfo
+  advertises `taystJKcgflags` bit 0 (`TAYSTJK_CGFLAG_SCORE_DEATHS`, cgame from
+  `30fc5979b`); every other client keeps the 14-int layout.
