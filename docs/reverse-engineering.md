@@ -536,6 +536,16 @@ and the documented call/imm patch shapes.
     5B + `mov r32,m32` 6B + `add r32,imm32` 6B + `cmp r32,r32` 2B + `jb rel32`
     6B = 25B, verified by the sweep), so blind NOP-ing cannot split an
     instruction. The NOP'd `call` targets `Com_Milliseconds` (`0x80744e4`).
+    The tile covers the gate's read of `0x81dc464` (`mov 0x81dc464,%edx`) and
+    its `cmp %edx,%eax` / `jb`, but **not** the following
+    `mov %eax,0x81dc464` (`0x8056b3f`, 5B), which stays and writes an undefined
+    `%eax` into the gate's slot on every rcon while the patch is applied. The
+    slot is only read by this gate (objdump sweep: the two references above are
+    its only ones). RUNTIME (2026-10-26): the pristine module drops an rcon
+    sent within 500 ms of the last accepted one, and reverting the gate without
+    clearing the slot (which held `0xedb90000`-style garbage) dropped *every*
+    rcon until the 32-bit millisecond counter caught up — the master-switch
+    rcon outage fixed in `patch::revert_inline_patches`.
     Single-byte `0x8056c7d` holds `0xbf`, the second byte of imm32 `0xbff0`
     (49136) in `movl $0xbff0,0x4(%esp)` before `Com_BeginRedirect`; patching it
     to `0x03` yields `0x03f0` (1008). Shapes match the comments in the header.
@@ -1184,7 +1194,12 @@ Proxy contract (import via `dlsym`, no rebasing of names):
 
 Inline patches (engine absolute):
 
-- NOP 25 bytes at `0x8056b26` (rcon timer block in `SVC_RemoteCommand`).
+- NOP 25 bytes at `0x8056b26` (rcon timer block in `SVC_RemoteCommand`). The
+  tile ends immediately before the unpatched `mov %eax,0x81dc464`
+  (`0x8056b3f`, 5 B), which stores whatever `%eax` holds into the gate's
+  last-accepted-rcon slot; the master-switch revert clears that slot
+  (`patch::PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR`) — see
+  `docs/inventory.md` → "Master switch" and section R-010 below.
 - Byte `0x8056c7d: bf→03` (`49136 → 1008` redirect buffer length).
 - Call retarget at `0x0805882d` (`E8 fb82ffff` → `0x080583b4`
   `SV_AddEntToSnapshot`).
@@ -1630,3 +1645,60 @@ reverted" design. Regression coverage:
 
 `High` (root cause proven by live byte read of the running engine; fix
 re-verified live across three map changes and by `engine-test.sh`).
+
+---
+
+## R-024 — `proxy_sv_enable 0` silently killed every later rcon
+
+### Finding
+
+Turning the master switch off at runtime (`rcon proxy_sv_enable 0`, or the
+equivalent console command) made the server ignore **every** following rcon
+packet, including the `proxy_sv_enable 1` meant to switch the proxy back on.
+The disable path reverts the rcon timer-block NOP at `0x8056b26` (restoring the
+pristine 500 ms flood gate) but left the gate's timestamp slot holding garbage,
+so the gate's `now < last + 500` test stayed true for ~49 days.
+
+### Evidence
+
+**BINARY** (`original/jalinuxded_1.011/linuxjampded`, objdump-verified): the
+25-byte tile the proxy NOPs is `call Com_Milliseconds` / `mov 0x81dc464,%edx` /
+`add $0x1f4,%edx` / `cmp %edx,%eax` / `jb <epilogue>`; the `mov %eax,0x81dc464`
+that stores the accepted timestamp sits just after the tile (`0x8056b3f`,
+5 B) and is **not** NOP'd. A whole-file byte search finds the address `0x81dc464`
+only in those two instructions: the slot is private to this gate.
+
+**RUNTIME** (i386 container, proxy module, live `gdb -p 1`):
+
+1. Enabled: `0x8056b26` reads `e8 …` in the pristine module, `90 × 25` with the
+   proxy attached; the pristine module answers an rcon, drops one sent within
+   500 ms, then answers again — the gate works as advertised.
+2. `rcon proxy_sv_enable 0` → one frame later the module reverted the tile and
+   logged the detach set, but `x/1xw 0x81dc464` read `0xedb90000`-style
+   garbage (while attached, the surviving store kept writing an undefined
+   `%eax` into the slot on every rcon). Every later rcon was dropped: the
+   `status` and `proxy_sv_enable 1` probes got no reply.
+3. With the slot cleared on revert, the disabled engine answers again, the
+   slot advances to a sane uptime value (`0x124b` ms) after one accepted rcon,
+   the pristine 500 ms gate drops the immediately-following one, a map change
+   keeps the timer pristine, and `proxy_sv_enable 1` re-attaches the NOP tile
+   (live `90 × 25`), the redirect length (`0x03`) and working rcon.
+
+### Fix
+
+`patch::revert_inline_patches` clears `PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR`
+(`0x81dc464`) to the pristine `0` **only when it actually restored the timer
+tile** (checked by `code_matches`), so the once-per-frame reconcile while the
+proxy stays disabled does not defeat the restored gate. Regression coverage:
+`rust/scripts/enable-toggle-test.sh` (off → rcon → map change → on, with byte
+read-backs) pins the handback end-to-end; unit tests
+`patch::tests::pristine_patch_bytes_are_consistent` (the slot address inside the
+timer tile and the store placed right after it) and
+`patch::tests::code_matches_detects_identical_and_differing_bytes` (the
+revert-once detector).
+
+### Confidence
+
+`High` (root cause proven by live byte read of the slot while attached and
+after the revert; the runtime test fails on the pre-fix module at the garbage
+timestamp read-back and passes on the fix).

@@ -28,7 +28,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 
 | cvar                                  | default | description                                                                                   |
 |---------------------------------------|---------|-----------------------------------------------------------------------------------------------|
-| `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module   |
+| `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module (RCON keeps working, with the engine's pristine 500 ms gate) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |

@@ -851,6 +851,13 @@ pub const PRISTINE_SVC_REMOTE_COMMAND_TIMER: [u8; 25] = [
     0x00, 0x3B, 0xC2, 0x0F, 0x82, 0x11, 0x02, 0x00, 0x00,
 ];
 
+/// `SVC_RemoteCommand`'s rcon flood-gate timestamp (`0x81dc464`): the
+/// `Com_Milliseconds()` value of the last accepted rcon, read by the timer
+/// block the proxy NOPs and written by the `mov %eax,0x81dc464` that follows
+/// it (which the NOP leaves in place, with `%eax` holding whatever the caller
+/// left there). Pristine value is `0` (BSS, "no rcon accepted yet").
+pub const PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR: usize = 0x081d_c464;
+
 /// `Com_BeginRedirect` buffer-size immediate (middle byte of `0xbff0`) @
 /// `0x8056c7d`: `0xbf` (49136) pristine, patched to `0x03` (1008).
 pub const PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE: u8 = 0xBF;
@@ -879,25 +886,37 @@ unsafe fn write_code_bytes(addr: usize, bytes: &[u8]) {
     }
 }
 
-/// Restore `bytes` at `addr` only when the code currently differs (avoids an
-/// `mprotect`/write pair on every reconcile while the proxy stays disabled).
+/// Whether the code at `addr` already equals `bytes`.
 ///
 /// # Safety
 ///
 /// `addr..addr+bytes.len()` must be a readable code range.
-unsafe fn restore_code_if_changed(addr: usize, bytes: &[u8]) {
-    let mut same = true;
+unsafe fn code_matches(addr: usize, bytes: &[u8]) -> bool {
     for (i, &b) in bytes.iter().enumerate() {
         // SAFETY: caller guarantees the range is readable.
         if unsafe { *(addr as *const u8).add(i) } != b {
-            same = false;
-            break;
+            return false;
         }
     }
-    if !same {
-        // SAFETY: same range; caller guarantees writability window.
-        unsafe { write_code_bytes(addr, bytes) };
+    true
+}
+
+/// Restore `bytes` at `addr` only when the code currently differs (avoids an
+/// `mprotect`/write pair on every reconcile while the proxy stays disabled).
+///
+/// Returns whether a write happened.
+///
+/// # Safety
+///
+/// `addr..addr+bytes.len()` must be a readable code range.
+unsafe fn restore_code_if_changed(addr: usize, bytes: &[u8]) -> bool {
+    // SAFETY: caller guarantees the range is readable.
+    if unsafe { code_matches(addr, bytes) } {
+        return false;
     }
+    // SAFETY: same range; caller guarantees writability window.
+    unsafe { write_code_bytes(addr, bytes) };
+    true
 }
 
 /// Restore the pristine bytes of every intra (byte/NOP/branch) patch applied
@@ -908,16 +927,28 @@ unsafe fn restore_code_if_changed(addr: usize, bytes: &[u8]) {
 /// it can be called on every reconcile while the master switch is off. Does
 /// **not** touch the detour trampolines.
 ///
+/// The rcon timer block needs one extra step: while the NOP is applied the
+/// `mov %eax,0x81dc464` right after it keeps storing an undefined `%eax` into
+/// the gate's timestamp slot, so restoring the gate without clearing the slot
+/// hands the engine a garbage "last accepted" value and its `now < last + 500`
+/// check drops every rcon until the counter wraps (~49 days). Clear the slot
+/// only on the actual revert: clearing it on every disabled frame would also
+/// defeat the pristine gate.
+///
 /// # Safety
 ///
 /// Every address must be a validated engine intra-patch site (R-010).
 pub unsafe fn revert_inline_patches() {
     // SAFETY: verified whole-instruction tile sites (R-010).
     unsafe {
-        restore_code_if_changed(
+        let timer_was_patched = restore_code_if_changed(
             crate::engine::patches::SVC_REMOTE_COMMAND_TIMER_NOP_ADDR,
             &PRISTINE_SVC_REMOTE_COMMAND_TIMER,
         );
+        if timer_was_patched {
+            // SAFETY: engine RW static, writable for the process lifetime.
+            core::ptr::write_unaligned(PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR as *mut i32, 0);
+        }
         restore_code_if_changed(
             crate::engine::patches::SVC_REMOTE_COMMAND_REDIRECT_LEN_ADDR,
             &[PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE],
@@ -1214,6 +1245,39 @@ mod tests {
         // pristine (non-patched) byte.
         assert_eq!(PRISTINE_CALL_IP_AUTHORIZE[0], 0xE8);
         assert_ne!(PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE, 0x03);
+        // The gate reads its last-accepted timestamp from the slot the revert
+        // clears: `mov 0x81dc464,%edx` at offset 5.
+        assert_eq!(PRISTINE_SVC_REMOTE_COMMAND_TIMER[5..7], [0x8B, 0x15]);
+        assert_eq!(
+            u32::from_le_bytes([
+                PRISTINE_SVC_REMOTE_COMMAND_TIMER[7],
+                PRISTINE_SVC_REMOTE_COMMAND_TIMER[8],
+                PRISTINE_SVC_REMOTE_COMMAND_TIMER[9],
+                PRISTINE_SVC_REMOTE_COMMAND_TIMER[10],
+            ]) as usize,
+            PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR
+        );
+        // ... and the `mov %eax,0x81dc464` right after the NOP'd tile (not
+        // covered by it) keeps storing `%eax` into that same slot while the
+        // proxy is attached — the reason `revert_inline_patches` clears it.
+        let timer_end = crate::engine::patches::SVC_REMOTE_COMMAND_TIMER_NOP_ADDR
+            + PRISTINE_SVC_REMOTE_COMMAND_TIMER.len();
+        assert_eq!(timer_end, 0x0805_6b3f);
+        assert!(
+            (crate::engine::ENGINE_RW_LO..crate::engine::ENGINE_RW_HI)
+                .contains(&PRISTINE_SVC_REMOTE_COMMAND_LAST_TIME_ADDR),
+            "rcon timestamp must be in the engine RW segment"
+        );
+    }
+
+    #[test]
+    fn code_matches_detects_identical_and_differing_bytes() {
+        let code = [0xE8, 0xB9, 0xD9, 0x01, 0x00];
+        // SAFETY: local array, readable for the requested length.
+        assert!(unsafe { code_matches(code.as_ptr() as usize, &code) });
+        // A differing byte anywhere in the span is detected.
+        // SAFETY: same.
+        assert!(!unsafe { code_matches(code.as_ptr() as usize, &[0xE8, 0xB9, 0x90, 0x01]) });
     }
 
     #[test]

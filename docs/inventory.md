@@ -35,6 +35,15 @@ dispatch and trap interceptions stay installed but become pure passthrough
 is `0` at `GAME_INIT`, nothing is ever hooked. No equivalent exists in the
 original proxy.
 
+Restoring the rcon timer block has one extra step: the NOP'd tile ends just
+before an unpatched `mov %eax,0x81dc464` that stores an undefined `%eax` into
+the gate's last-accepted-rcon slot while the proxy is attached, so the revert
+also writes the pristine `0` into `0x81dc464`. Without that, the restored gate
+(`now < last + 500`) treats the garbage as a recent command and drops every
+rcon for ~49 days — `proxy_sv_enable 1` included. While the proxy is off, rcon
+otherwise behaves like the pristine engine, whose own 500 ms flood gate is
+then active. `rust/scripts/enable-toggle-test.sh` pins this handback.
+
 ## Wanted
 
 ### Security fixes — explicitly named
