@@ -146,8 +146,15 @@ pub unsafe extern "C" fn vmMain(
             forward(command, &args)
         }
         GAME_CLIENT_DISCONNECT => {
+            // Per-client bookkeeping, not a feature: keep mirroring the client
+            // lifecycle whatever the master switch says. A client that
+            // connected while the switch was off would otherwise stay "not
+            // connected" in the mirror after a runtime `proxy_sv_enable 1`,
+            // and `shared_api::client_command` drops every command from an
+            // unknown client — the TAB `score` request and `netStatus`
+            // included, silently (empty scoreboard, no netStatus output).
+            shared_api::client_disconnect(a0);
             if state::proxy_enabled() {
-                shared_api::client_disconnect(a0);
                 tffa::on_client_disconnect(a0);
             }
             // A disconnecting client drops what they carry
@@ -165,9 +172,10 @@ pub unsafe extern "C" fn vmMain(
             response
         }
         GAME_CLIENT_BEGIN => {
-            if state::proxy_enabled() {
-                shared_api::client_begin(a0, a1 != 0);
-            }
+            // See GAME_CLIENT_DISCONNECT: the connected mirror outlives the
+            // master switch so a runtime enable finds the clients that began
+            // while it was off.
+            shared_api::client_begin(a0, a1 != 0);
             let response = forward(command, &args);
             if state::proxy_enabled() {
                 tffa::on_client_begin(a0);
@@ -436,3 +444,51 @@ unsafe extern "C" {
 static KEEP_SHIM: unsafe extern "C" fn(c_int, ...) -> c_int = jampgame_vm_dllsyscall;
 
 use std::ffi::CString;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_event(command: c_int, client_num: c_int) {
+        // SAFETY: `vmMain` is the engine's plain 13-word entry point; a
+        // lifecycle command only touches proxy state (and forwards, a no-op
+        // here because no original module is loaded in a unit test).
+        unsafe {
+            vmMain(command, client_num, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    fn is_connected(client_num: c_int) -> bool {
+        state::with_state(|s| s.clients[client_num as usize].is_connected)
+    }
+
+    /// A client that connects and begins while `proxy_sv_enable` is `0` must
+    /// still land in the proxy's per-client mirror.
+    ///
+    /// The mirror is what makes `shared_api::client_command` forward that
+    /// client's commands once the master switch is turned back on; before this
+    /// was fixed, a client that joined during a disabled window stayed "not
+    /// connected" forever, so every command it issued was dropped silently —
+    /// the TAB `score` request (empty scoreboard) and `netStatus`/`showNet`
+    /// (no output) included.
+    #[test]
+    fn client_mirror_survives_a_disabled_master_switch() {
+        state::set_proxy_enabled(false);
+        assert!(!state::proxy_enabled());
+
+        client_event(GAME_CLIENT_BEGIN, 5);
+        assert!(
+            is_connected(5),
+            "a client that began while the proxy was off must be mirrored"
+        );
+
+        client_event(GAME_CLIENT_DISCONNECT, 5);
+        assert!(
+            !is_connected(5),
+            "a disconnect while the proxy was off must clear the mirror"
+        );
+
+        // Restore the process-wide default for the other tests.
+        state::set_proxy_enabled(true);
+    }
+}

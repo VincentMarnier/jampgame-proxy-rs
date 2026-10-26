@@ -35,6 +35,14 @@ dispatch and trap interceptions stay installed but become pure passthrough
 is `0` at `GAME_INIT`, nothing is ever hooked. No equivalent exists in the
 original proxy.
 
+The per-client lifecycle mirror (`state.clients[n].is_connected`, set by
+`GAME_CLIENT_BEGIN` and cleared by `GAME_CLIENT_DISCONNECT`) is bookkeeping, not
+a feature: it is maintained whatever the switch says, so a runtime re-enable
+finds the clients that connected while the proxy was off. Gating it made
+`shared_api::client_command` treat those clients as unknown and silently drop
+every command they issued (`score`/TAB scoreboard, `netStatus`, chat) — see
+R-025.
+
 Restoring the rcon timer block has one extra step: the NOP'd tile ends just
 before an unpatched `mov %eax,0x81dc464` that stores an undefined `%eax` into
 the gate's last-accepted-rcon slot while the proxy is attached, so the revert

@@ -1702,3 +1702,126 @@ revert-once detector).
 `High` (root cause proven by live byte read of the slot while attached and
 after the revert; the runtime test fails on the pre-fix module at the garbage
 timestamp read-back and passes on the fix).
+
+---
+
+## R-025 — boot-disabled proxy: clients that joined while off stayed "unknown" after a runtime enable
+
+### Finding
+
+Starting the server with `proxy_sv_enable 0` and turning it to `1` later left
+every client that had connected during the disabled window in the proxy's
+"not connected" state. `shared_api::client_command` refuses commands from an
+unknown client, and `vmMain` answers `0` for that `GAME_CLIENT_COMMAND`, so
+**every** client command those clients issued was dropped silently:
+
+- the TAB scoreboard never reaches the game: the cgame asks for it with the
+  `score` client command (`cg_consolecmds.c:76`, `CG_ScoresDown_f`), which
+  `ClientCommand` turns into `Cmd_Score_f` → `DeathmatchScoreboardMessage`
+  (`g_cmds.c:3119`), so no `scores` message is ever sent — empty scoreboard;
+- `netStatus`/`showNet` (intercepted in `shared_api::client_command`) never ran
+  — no output, no error;
+- the same applied to chat, team selection and every other client command.
+
+The cause was the master switch gating the proxy's per-client lifecycle mirror:
+`shared_api::client_begin` (the only writer of
+`state.clients[n].is_connected`) and `shared_api::client_disconnect` were
+called only inside `if state::proxy_enabled()` in `vmMain`. A client that ran
+`GAME_CLIENT_BEGIN` while the switch was off was therefore never marked, and
+nothing re-marked it when the switch came back on.
+
+### Evidence
+
+**CODE** (`rust/src/lib.rs`, pre-fix): `GAME_CLIENT_BEGIN` called
+`shared_api::client_begin` only under `if state::proxy_enabled()`;
+`GAME_CLIENT_DISCONNECT` cleared the entry the same way. `GAME_CLIENT_COMMAND`
+then runs `shared_api::client_command`, whose first check is
+`if !is_connected { return false; }` (`rust/src/shared_api.rs`), and `vmMain`
+returns `0` for the command without forwarding it.
+
+**CODE** (engine + SDK): the engine sends `GAME_CLIENT_CONNECT` from
+`SV_ClientConnect`/the `SV_InitGameProgs` reconnect burst and
+`GAME_CLIENT_BEGIN` from `SV_ClientEnterWorld` (`original/jedi-academy/codemp/server/sv_client.cpp:551,1000`,
+`sv_init.cpp:799,824`) — i.e. for every engine-connected client. The handlers
+are client commands: the cgame's TAB press sends `score`
+(`cg_consolecmds.c:76`), the game maps it to `Cmd_Score_f`
+(`g_cmds.c:3119`) which sends the `scores` message (`g_cmds.c:85`); the
+netStatus pair is intercepted in the proxy's own `client_command` before
+forwarding.
+
+**CODE** (original proxy, upstream `6879974`): `Proxy_SharedAPI_ClientCommand`
+has the same `!isConnected` guard, but the original has no master switch and
+its `vmMain` always runs `Proxy_SharedAPI_ClientBegin`/`_ClientDisconnect`, so
+its mirror never misses a client. The gate was introduced by the Rust-only
+master switch.
+
+**RUNTIME** (i386 container, `jampgame-investigation:i386-bookworm`, staged
+proxy, `+set proxy_sv_enable 0 +set bot_minplayers 2`): a temporary
+`eprintln!` at the top of `vmMain` logged the commands the engine actually
+sends. Only `GAME_INIT` (0), `GAME_CLIENT_COMMAND` (6), `GAME_CLIENT_THINK`
+(7), `GAME_RUN_FRAME` (8), `GAME_CONSOLE_COMMAND` (9) and `BOTAI_START_FRAME`
+(10) appeared; **no `GAME_CLIENT_CONNECT` (2) or `GAME_CLIENT_BEGIN` (3)**.
+The bots' `ClientConnect`/`ClientBegin` console lines come from the game
+module's own `g_bot.c` (`ClientConnect`/`ClientBegin` called directly by the
+game after the engine's `addbot` console command), not from the engine's
+lifecycle events. Consequence: a bot-only test server cannot reproduce — or
+mask — this bug; it needs a client that goes through the engine's
+connect/begin path (a real player, or the `map_restart` reconnect burst).
+
+**RUNTIME (differential, the engine's own entry point)**: with the switch off
+and a bot in slot 0, the proxy's `is_connected` byte
+(`STATE → clients[0]`, i686 `ClientEntry` size 8792, flag at 8788) was read
+from the live process, then `vmMain(GAME_CLIENT_BEGIN, 0)` was invoked through
+gdb exactly as the engine would for a network client, and the byte was read
+again:
+
+| module | before the begin | after the begin |
+| --- | --- | --- |
+| fixed (this change) | `0x00` | `0x01` |
+| same source with the `proxy_sv_enable` gate put back | `0x00` | `0x00` |
+
+The server stayed up in both runs (`State.Running = true`), so the event was
+accepted, not lost to a crash.
+
+### Fix
+
+`rust/src/lib.rs`: call `shared_api::client_disconnect` and
+`shared_api::client_begin` **unconditionally**. They only mutate proxy state
+(no traps, no client-visible output), so the switch keeps meaning what it
+says — "the original game module sees exactly what it would see without the
+proxy" — while the mirror stays accurate and a runtime `proxy_sv_enable 1`
+immediately forwards those clients' commands. The user-visible handlers
+(`client_connect`'s banner, `client_userinfo_changed`'s sanitisation) stay
+gated.
+
+### Verification
+
+- `cargo test` — `tests::client_mirror_survives_a_disabled_master_switch`
+  drives `vmMain(GAME_CLIENT_BEGIN)`/`vmMain(GAME_CLIENT_DISCONNECT)` with the
+  switch off and asserts the mirror is set/cleared.
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` — clean.
+- `rust/scripts/enable-toggle-test.sh` — PASS (boot enabled, runtime off/on,
+  map change while off; the rcon handback path is unaffected).
+- Live differential on the container (table above): the fixed module records
+  the begin while the switch is off, the pre-fix rebuild does not.
+- A real-client end-to-end check (join with `proxy_sv_enable 0`, enable, press
+  TAB and run `netStatus`) needs a game client and was **not run** in this
+  session. Proposed check: with the client on the board, the scoreboard below
+  must render rows again after `proxy_sv_enable 1`, and `netStatus` must print
+  the table (zero `fps`/`packets` columns until the per-usercmd feed has data).
+
+### Known limit (same window)
+
+`GAME_CLIENT_USERINFO_CHANGED` (name/model sanitisation, "kyle" force, the
+`darksidetools` kick) is still gated on the master switch. A client that
+connected while the proxy was off keeps its raw name/model until its next
+userinfo change; it is not re-sanitised by the runtime enable. Not part of the
+reported bug, and closing it means re-running the handler for every connected
+client on the off→on edge (with the kick side effect that implies).
+
+### Confidence
+
+`High` for the root cause and the mirror fix (single writer, single reader
+chain, and the engine call sites are explicit). `Medium` for the exact
+user-visible timing of the scoreboard repaint after enabling, which the
+proposed real-client check would settle.
