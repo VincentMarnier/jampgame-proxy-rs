@@ -1052,6 +1052,71 @@ impl Default for RosterRow {
     }
 }
 
+/// Live `(red, blue)` playing-client counts per match slot, indexed by match
+/// id (`0` = main). Spectators and disconnected clients count for
+/// nothing, and inactive slots stay `(0, 0)`, so the per-team-size rules
+/// (`crate::rules`) can ignore a match nobody is playing in. Every slot is
+/// reported, not only the populated ones, so the caller decides what an empty
+/// match means. The whole table comes from one pass over the roster.
+pub fn match_team_counts() -> [(i32, i32); TOTAL_MATCH_SLOTS] {
+    let (g_entities, matches, active) = state::with_state(|s| {
+        (
+            s.located_game_data.g_entities,
+            s.tffa.client_match,
+            core::array::from_fn(|i| s.tffa.matches[i].active),
+        )
+    });
+    if g_entities == 0 {
+        return [(0, 0); TOTAL_MATCH_SLOTS];
+    }
+    let mut rows = [RosterRow::default(); MAX_CLIENTS];
+    for (i, row) in rows.iter_mut().enumerate() {
+        let ent = g_entities + i * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array.
+        let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+        if client == 0 {
+            continue;
+        }
+        // SAFETY: client is a valid gclient_t; both fields are plain ints.
+        let connected = unsafe {
+            read_i32(client + OFFSET_GCLIENT_PERS + OFFSET_PERS_CONNECTED) != CON_DISCONNECTED
+        };
+        // SAFETY: as above.
+        let team = unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) };
+        *row = RosterRow {
+            connected,
+            team,
+            instance: matches[i],
+        };
+    }
+    count_match_teams(&rows, &active)
+}
+
+/// The census itself (pure, so a test can fabricate the roster): connected
+/// clients only, RED/BLUE only, grouped by match id. Spectators (`team` neither
+/// RED nor BLUE) and inactive slots are not counted.
+fn count_match_teams(
+    rows: &[RosterRow; MAX_CLIENTS],
+    active: &[bool; TOTAL_MATCH_SLOTS],
+) -> [(i32, i32); TOTAL_MATCH_SLOTS] {
+    let mut counts = [(0, 0); TOTAL_MATCH_SLOTS];
+    for row in rows {
+        if !row.connected {
+            continue;
+        }
+        let id = row.instance as usize;
+        if id >= TOTAL_MATCH_SLOTS || !active[id] {
+            continue;
+        }
+        match row.team {
+            TEAM_RED => counts[id].0 += 1,
+            TEAM_BLUE => counts[id].1 += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
 /// The census itself (pure, so a test can fabricate the roster): the pristine
 /// `TeamCount`'s filters — skip the ignored client, count clients that are
 /// connected, on `team`, and in `instance`. TFFA is `GT_TEAM`, so the siege
@@ -4963,6 +5028,36 @@ mod tests {
         // A disconnected slot is not censused.
         rows[3].connected = false;
         assert_eq!(count_instance_team(7, 1, &rows, TEAM_RED), 0);
+    }
+
+    #[test]
+    fn match_team_counts_groups_playing_clients_by_match() {
+        let mut rows = [RosterRow::default(); MAX_CLIENTS];
+        let live = |team: i32, instance: u8| RosterRow {
+            connected: true,
+            team,
+            instance,
+        };
+        rows[0] = live(TEAM_RED, MAIN_MATCH);
+        rows[1] = live(TEAM_BLUE, MAIN_MATCH);
+        rows[2] = live(TEAM_RED, 1);
+        rows[3] = live(TEAM_RED, 1);
+        rows[4] = live(TEAM_BLUE, 1);
+        // Spectators and connecting/disconnected slots are not a team size.
+        rows[5] = live(crate::sdk::TEAM_SPECTATOR, MAIN_MATCH);
+        rows[6] = live(TEAM_RED, MAIN_MATCH);
+        rows[6].connected = false;
+        // A stale assignment to an inactive slot does not invent a match.
+        rows[7] = live(TEAM_RED, 2);
+        let mut active = [false; TOTAL_MATCH_SLOTS];
+        active[MAIN_MATCH as usize] = true;
+        active[1] = true;
+        let counts = count_match_teams(&rows, &active);
+        assert_eq!(counts[MAIN_MATCH as usize], (1, 1));
+        assert_eq!(counts[1], (2, 1));
+        assert_eq!(counts[2], (0, 0));
+        // Empty slots stay empty rather than inheriting a neighbour.
+        assert_eq!(counts[3], (0, 0));
     }
 
     #[test]

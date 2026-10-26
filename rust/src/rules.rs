@@ -13,6 +13,13 @@
 //! when the *effective* rule changes, so a stable roster issues no trap calls.
 //! This feature is independent of `proxy_sv_lockTeams`.
 //!
+//! With parallel TFFA matches on (`proxy_tffa_enable 1`), the limits are still
+//! one set of server-wide cvars, so the rule is chosen from the matches that
+//! are actually being played: when every populated match is `N vs N` with the
+//! same `N`, the rule for `N` applies (not the sum of all matches). A match
+//! nobody is playing in is ignored; a mix of sizes, or a match that is itself
+//! uneven, keeps the previously applied rule.
+//!
 //! `proxy_sv_teamSizeRules` syntax (rules separated by spaces/commas/semicolons,
 //! fields by `:`):
 //!
@@ -30,6 +37,7 @@ use crate::sdk::{TEAM_BLUE, TEAM_RED};
 use crate::state::{self, CVAR_TEAM_SIZE_RULES};
 use crate::syscall;
 use crate::teamlock;
+use crate::tffa;
 
 /// One parsed `proxy_sv_teamSizeRules` entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +133,44 @@ pub fn decide(last: Option<Rule>, rules: &[Rule], red: i32, blue: i32) -> Action
     if red < 1 || red != blue {
         return Action::None;
     }
-    match select(rules, red) {
+    decide_size(last, rules, red)
+}
+
+/// Decide for a set of parallel TFFA matches: every populated match must be
+/// `N vs N` for the same `N`.
+///
+/// Matches with no playing clients (`0 vs 0`, e.g. an empty main while the
+/// players are in a created match, or a match left spectating only) are
+/// ignored. A populated match that is uneven, or matches of different sizes,
+/// keep the previous state: the shared `timelimit`/`fraglimit`/`capturelimit`
+/// have no single size to follow, and changing them on every roster wobble
+/// would flap. Once the sizes agree, the rule for that size applies (nearest
+/// smaller defined size, restore below the smallest), exactly like the
+/// whole-server roster.
+pub fn decide_matches(last: Option<Rule>, rules: &[Rule], matches: &[(i32, i32)]) -> Action {
+    let mut size: Option<i32> = None;
+    for &(red, blue) in matches {
+        if red == 0 && blue == 0 {
+            continue;
+        }
+        if red < 1 || red != blue {
+            return Action::None;
+        }
+        match size {
+            None => size = Some(red),
+            Some(common) if common != red => return Action::None,
+            Some(_) => {}
+        }
+    }
+    match size {
+        Some(size) => decide_size(last, rules, size),
+        None => Action::None,
+    }
+}
+
+/// The rule part of the decision, once a single team size is known.
+fn decide_size(last: Option<Rule>, rules: &[Rule], team_size: i32) -> Action {
+    match select(rules, team_size) {
         Some(rule) if last != Some(rule) => Action::Apply(rule),
         Some(_) => Action::None,
         None if last.is_some() => Action::Restore,
@@ -133,26 +178,76 @@ pub fn decide(last: Option<Rule>, rules: &[Rule], red: i32, blue: i32) -> Action
     }
 }
 
+/// The roster the per-frame reconciler reads: one whole-server pair, or one
+/// pair per TFFA match slot (index = match id).
+#[derive(Debug, Clone, Copy)]
+enum Roster {
+    Global { red: i32, blue: i32 },
+    Matches([(i32, i32); tffa::TOTAL_MATCH_SLOTS]),
+}
+
+impl Roster {
+    /// Human-readable roster for the diagnostic line (only called when the
+    /// decision changes, so it may allocate).
+    fn describe(&self) -> String {
+        match self {
+            Roster::Global { red, blue } => format!("{red} vs {blue}"),
+            Roster::Matches(counts) => {
+                let populated: Vec<String> = counts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, count)| count.0 != 0 || count.1 != 0)
+                    .map(|(id, &(red, blue))| {
+                        if id == tffa::MAIN_MATCH as usize {
+                            format!("main {red} vs {blue}")
+                        } else {
+                            format!("#{id} {red} vs {blue}")
+                        }
+                    })
+                    .collect();
+                format!("tffa [{}]", populated.join(", "))
+            }
+        }
+    }
+}
+
 /// Reconcile the per-team-size rules with the roster of the current frame.
 ///
 /// Called every `GAME_RUN_FRAME` (independently of the team lock): computes the
-/// team counts, resolves the effective rule, and applies the rule, restores the
-/// server limits, or does nothing when neither changed.
+/// roster (the whole server, or every TFFA match), resolves the effective rule,
+/// and applies the rule, restores the server limits, or does nothing when
+/// neither changed.
 pub fn on_run_frame() {
-    let (red, blue) = (
-        teamlock::team_count(TEAM_RED),
-        teamlock::team_count(TEAM_BLUE),
-    );
     let value = cvar_value();
     let rules = parse(&value);
     let last = state::with_state(|s| s.last_team_rule);
-    match decide(last, &rules, red, blue) {
+    let (action, roster) = if tffa::enabled() {
+        let counts = tffa::match_team_counts();
+        (
+            decide_matches(last, &rules, &counts),
+            Roster::Matches(counts),
+        )
+    } else {
+        let (red, blue) = (
+            teamlock::team_count(TEAM_RED),
+            teamlock::team_count(TEAM_BLUE),
+        );
+        (
+            decide(last, &rules, red, blue),
+            Roster::Global { red, blue },
+        )
+    };
+    match action {
         Action::None => {}
         Action::Apply(rule) => {
             capture_base_limits();
             eprintln!(
-                "----- proxy-rs: rules apply {red} vs {blue} size={} time={:?} frag={:?} capture={:?}",
-                rule.size, rule.time_limit, rule.frag_limit, rule.capture_limit
+                "----- proxy-rs: rules apply {} size={} time={:?} frag={:?} capture={:?}",
+                roster.describe(),
+                rule.size,
+                rule.time_limit,
+                rule.frag_limit,
+                rule.capture_limit
             );
             set_limit(c"timelimit", rule.time_limit);
             set_limit(c"fraglimit", rule.frag_limit);
@@ -161,7 +256,10 @@ pub fn on_run_frame() {
         }
         Action::Restore => {
             let base = restore_base_limits();
-            eprintln!("----- proxy-rs: rules restore {red} vs {blue} -> {base:?}");
+            eprintln!(
+                "----- proxy-rs: rules restore {} -> {base:?}",
+                roster.describe()
+            );
             // Clear both the applied rule and the captured base: the next
             // Apply must re-capture the (possibly admin-changed) server limits
             // instead of restoring stale prior-map values.
@@ -409,6 +507,63 @@ mod tests {
             decide(None, &rules, 1, 1),
             Action::Apply(rule1.unwrap()),
             "an explicit 1 vs 1 rule must apply"
+        );
+    }
+
+    #[test]
+    fn matches_must_all_agree_on_the_team_size() {
+        let rules = parse("2:20:30:5,3:15:40:0");
+        let rule2 = select(&rules, 2).unwrap();
+        // Two 2 vs 2 matches read as 2 vs 2, not as the 4 vs 4 sum.
+        assert_eq!(
+            decide_matches(None, &rules, &[(2, 2), (2, 2)]),
+            Action::Apply(rule2)
+        );
+        // An empty match (main here) is ignored rather than counting as 0 vs 0.
+        assert_eq!(
+            decide_matches(None, &rules, &[(0, 0), (2, 2)]),
+            Action::Apply(rule2)
+        );
+        // Stable roster: no trap calls.
+        assert_eq!(
+            decide_matches(Some(rule2), &rules, &[(2, 2), (2, 2)]),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn mixed_or_uneven_matches_keep_the_previous_state() {
+        let rules = parse("2:20:30:5,3:15:40:0");
+        let rule2 = select(&rules, 2).unwrap();
+        let rule3 = select(&rules, 3).unwrap();
+        // Different sizes: the shared limits have no single team size.
+        assert_eq!(
+            decide_matches(None, &rules, &[(2, 2), (3, 3)]),
+            Action::None
+        );
+        assert_eq!(
+            decide_matches(Some(rule2), &rules, &[(2, 2), (3, 3)]),
+            Action::None
+        );
+        // A populated match that is itself uneven is no size either.
+        assert_eq!(
+            decide_matches(Some(rule2), &rules, &[(2, 2), (2, 3)]),
+            Action::None
+        );
+        // Nobody playing anywhere: nothing to reconcile.
+        assert_eq!(
+            decide_matches(None, &rules, &[(0, 0), (0, 0)]),
+            Action::None
+        );
+        // A unanimous size still falls back downward and restores below the
+        // smallest rule.
+        assert_eq!(
+            decide_matches(None, &rules, &[(4, 4)]),
+            Action::Apply(rule3)
+        );
+        assert_eq!(
+            decide_matches(Some(rule2), &rules, &[(1, 1)]),
+            Action::Restore
         );
     }
 }

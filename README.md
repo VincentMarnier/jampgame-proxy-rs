@@ -37,7 +37,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_antiHpTeller`               | 0       | prevents HP tellers usage                                                                       |
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeams`                  | 0       | lock both teams at their round-start size when a TDM/CTF round starts even and populated (>=2 per team) |
-| `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeams` (see below) |
+| `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeams` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
 | `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
@@ -87,6 +87,13 @@ below the smallest rule restores the server limits); they are only rewritten
 when the effective decision actually changes. This works whether or not
 `proxy_sv_lockTeams` is enabled.
 
+With parallel TFFA matches, the rule follows the matches being played rather
+than the sum of all players: empty/spectator-only matches are ignored, and a
+rule applies only when every populated match is the same `N vs N` (two 2 vs 2
+matches use the `2` rule, not the `4` one). If the matches differ in size, or a
+populated match is itself uneven, the limits keep their previous rule until the
+sizes agree again.
+
 ### Parallel TFFA matches
 
 With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
@@ -120,8 +127,10 @@ Once no tied match with players remains, the map ends and restarts normally.
 A `map_restart` keeps the matches: every player reconnects into the match and
 team they were in, with that match's doors and triggers rebuilt, while the
 scores start from zero. A full map change starts everyone in the main game.
-`proxy_sv_lockTeams` /
-`proxy_sv_teamSizeRules` stay off while TFFA is on. HUD team scores stay
+`proxy_sv_lockTeams` stays off while TFFA is on. `proxy_sv_teamSizeRules`
+keeps working: each match's own team size is used, and a rule applies when all
+matches being played have the same size (see [Per-team-size rules](#per-team-size-rules)).
+HUD team scores stay
 global (per-match HUD would need a client mod). Setting `proxy_tffa_enable`
 back to `0` closes every created match: its players are moved to spectator
 with a message explaining why, the map's per-match copies go away, and

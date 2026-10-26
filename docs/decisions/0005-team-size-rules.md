@@ -83,6 +83,32 @@ For each of `timelimit`, `fraglimit`, `capturelimit` the proxy issues
 regardless of gametype; the game itself decides which limit applies (`fraglimit`
 for `< GT_SIEGE`, `capturelimit` for `>= GT_CTF`).
 
+### D-005.5 — Parallel TFFA: one rule when every populated match agrees
+
+*Status: landed (user directive, 2026-10-26).*
+
+While `proxy_tffa_enable` runs parallel matches on the same GT_TEAM map, the
+three limits are still one set of server-wide cvars, so only one rule can be in
+effect. The roster the rules read is therefore the per-match playing-client
+census (`tffa::match_team_counts`: connected clients on RED/BLUE grouped by
+`client_match`), not the sum of all matches:
+
+- a match with no playing clients is ignored — an empty main while the players
+  are in a created 2 vs 2, or a match left spectating only;
+- every populated match must be `N vs N` for the same `N`; then the rule for
+  `N` applies, with the same downward fallback and restore-below-smallest as
+  D-005.3. Two 2 vs 2 matches therefore read as 2 vs 2, not as the 4 vs 4 sum
+  the whole-server census would produce;
+- a populated match that is itself uneven, or populated matches of different
+  sizes, keep the previously applied rule (`Action::None`), the same no-flap
+  rule as an uneven whole-server roster. When nothing has been applied yet they
+  leave the pristine limits untouched.
+
+`proxy_sv_lockTeams` stays off while TFFA is on (D-006.2); only the size rules
+run, because they can now derive a meaningful size from the instances.
+`decide` (whole-server) is unchanged for TFFA-off; `decide_matches` is the
+parallel-mode decision and is unit-tested without the engine.
+
 ## Consequences
 
 - New proxy cvar `proxy_sv_teamSizeRules` (default empty, so the feature is a
@@ -95,3 +121,7 @@ for `< GT_SIEGE`, `capturelimit` for `>= GT_CTF`).
   (`ProxyState::base_limits`) and restores them when the roster drops below every
   rule, so it does not leave a stale rule value in place. A value it set stays
   until the roster resolves to a different rule, a restore, or an admin change.
+- In parallel TFFA the reconciler reads the per-match rosters instead of the
+  whole-server count (D-005.5): a rule applies only when every populated match
+  is the same `N vs N`, so two 2 vs 2 matches use the `2` rule and mixed sizes
+  keep the previous one.

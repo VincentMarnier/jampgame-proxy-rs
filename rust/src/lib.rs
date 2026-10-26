@@ -124,13 +124,15 @@ pub unsafe extern "C" fn vmMain(
             // SAFETY: original module loaded, memory layer initialised.
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
             if state::proxy_enabled() {
-                // Team lock / size rules are global-roster features; they are
-                // meaningless (and harmful) while parallel TFFA matches share
-                // the RED/BLUE teams, so they stay off then.
+                // Team lock is a global-roster feature: it is meaningless (and
+                // harmful) while parallel TFFA matches share the RED/BLUE
+                // teams, so it stays off then. The size rules still run, but
+                // read the per-match rosters (all populated matches must agree
+                // on one team size) instead of the whole-server sum.
                 if !tffa::enabled() {
                     teamlock::on_run_frame();
-                    rules::on_run_frame();
                 }
+                rules::on_run_frame();
                 tffa::on_frame_start();
             }
             let response = forward(GAME_RUN_FRAME, &args);

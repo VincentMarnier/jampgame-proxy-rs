@@ -13,7 +13,9 @@
   snapshot, even/>=2 lock rule, `SetTeam` enforcement, and the TDM/CTF scope.
 - `0005-team-size-rules.md` — Rust-only `proxy_sv_teamSizeRules`: per-team-size
   `timelimit`/`fraglimit`/`capturelimit` overrides at round start, nearest
-  smaller size fallback, independent of the lock boolean.
+  smaller size fallback, independent of the lock boolean; with parallel TFFA it
+  uses the per-match sizes and applies one rule only when every populated match
+  agrees.
 - `0006-parallel-tffa.md` — parallel TFFA matches: per-match score copies,
   per-viewer `scores`/`cs` rewrites, physics isolation via trace
   interception, and per-match team chat.
