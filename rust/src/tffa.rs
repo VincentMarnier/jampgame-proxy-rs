@@ -1382,6 +1382,7 @@ fn discard_instance(id: u8) {
     if id == MAIN_MATCH || id as usize >= TOTAL_MATCH_SLOTS {
         return;
     }
+    crate::teamlock::clear_match(id);
     state::with_state(|s| {
         // Nothing of this instance is live (a failed rebuild unwinds its
         // clones), but a stale piece of the old round's bookkeeping must not
@@ -1589,6 +1590,11 @@ fn close_created_matches(created: &[u8]) {
             );
         }
     });
+    // A closed instance's team lock goes with it, so a later match reusing the
+    // slot does not inherit the old match's caps.
+    for (id, _) in &groups {
+        crate::teamlock::clear_match(*id);
+    }
     // Spectator move and explanation. These call into the game (`SetTeam` →
     // `ClientUserinfoChanged` → `CS_PLAYERS`) and back into the proxy, so no
     // state lock may be held here.
@@ -1967,6 +1973,13 @@ pub fn on_run_frame_post() {
             }
         }
     });
+    // A finished instance's team lock goes with it (members are moved to
+    // spectator below and the slot may be reused by a new match).
+    for f in &finished {
+        if f.id != MAIN_MATCH {
+            crate::teamlock::clear_match(f.id);
+        }
+    }
     if finished.is_empty() {
         // No match ended this frame: after the timelimit the map lives only
         // while a tied match still has players.
@@ -2052,6 +2065,9 @@ pub fn on_run_frame_post() {
                     // its clone set is given back at the next frame start.
                     s.tffa.world_release |= 1u16 << id;
                 });
+                // The promoted instance is the surviving game from here on, so
+                // its team-lock caps follow it into main.
+                crate::teamlock::promote_match(id);
                 for cn in &members {
                     broadcast_cs_players_slot(*cn);
                     refresh_cs_players_for_viewer(*cn);
@@ -3686,6 +3702,9 @@ fn cmd_create(client_num: c_int) {
         );
         return;
     }
+    // A fresh match starts unlocked: rows from a previous match in this slot
+    // must not carry over.
+    crate::teamlock::clear_match(id);
     state::with_state(|s| {
         let m = &mut s.tffa.matches[id as usize];
         m.active = true;
@@ -3884,6 +3903,7 @@ fn close_instance(id: u8) {
     if id == MAIN_MATCH || id as usize >= TOTAL_MATCH_SLOTS {
         return;
     }
+    crate::teamlock::clear_match(id);
     let moved = state::with_state(|s| {
         s.tffa.world_release |= 1u16 << id;
         close_instance_state(

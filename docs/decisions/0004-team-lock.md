@@ -38,6 +38,10 @@ defined.
 
 ### D-004.2 — Lock only even rosters with at least two players per team
 
+*Superseded by D-004.5: the threshold is now `proxy_sv_lockTeams` itself (the
+minimum team size) and the caps are per instance; the even-roster rule is
+unchanged.*
+
 `snapshot_caps(red, blue)` returns `(red, blue)` iff `red == blue && red >= 2`,
 else `(-1, -1)`. Caps are reservations: they do **not** shrink when players
 leave, so a team that drops to two still admits players up to its original cap.
@@ -69,13 +73,50 @@ move can set `proxy_sv_lockTeams 0` first.
 and `GT_CTF` (8) only. Siege's `SetTeamQuick`/`siegeDesiredTeam` round logic
 and CTY are out of scope.
 
+### D-004.5 — Minimum team size, per instance (revision, 2026-10-26)
+
+*Status: accepted (user directive). Supersedes the boolean gate of D-004.2 and
+the TFFA skip of D-006.2.*
+
+`proxy_sv_lockTeams` is now the **minimum team size** that may be locked instead
+of a boolean: `0` keeps the feature off (the old default), and `N >= 1` locks a
+round only when it starts even and each team fields at least `N` players
+(`snapshot_caps(red, blue, minimum)` = `(red, blue)` iff `red == blue && red >=
+minimum`, else `(-1, -1)`). `1` therefore locks from `1 vs 1` up, `2` reproduces
+the old `>= 2` behavior, `3` waits for `3 vs 3`, and so on.
+
+The caps are per instance: `TeamLock::caps` is one `(red, blue)` pair per TFFA
+match slot (index = match id, `0` = main) instead of one global pair. At the
+round-start snapshot each instance is evaluated against **its own** roster
+(`tffa::match_team_counts`, the same per-match census D-005.5 uses); with TFFA
+off the whole server is main. Enforcement in `SetTeam` resolves the joining
+player's match (`client_match`) and compares against that match's caps and
+census, so a full 2 vs 2 in one instance no longer refuses a join in another.
+A match created after the round started has no round-start roster, so it stays
+unlocked until the next round; slots keep no caps across a close/promotion
+(`teamlock::clear_match`/`promote_match`). The `SetTeam` wrapper therefore no
+longer needs to be skipped while TFFA is on (the skip of D-006.2 is removed from
+the `GAME_RUN_FRAME` dispatch).
+
+Runtime observation (bot-filled dedicated server, `g_gametype 6`, `mp/duel1`,
+4 bots at 2 vs 2, built proxy): `map_restart` logged `teamlock snapshot gt=6
+min=2 tffa=false -> main 2 vs 2`; a `forceteam` of a blue bot to red produced
+`teamlock join match=0 team=1 old=2 count=2 cap=2 (red=2 blue=2)` (refused); with
+`proxy_sv_lockTeams 0` the next restart logged `-> no lock`, and with `1` it
+locked the same 2 vs 2. The per-instance path is covered by the
+`snapshot_match_caps`/promotion unit tests; a live created-match lock still
+needs a real client, since bots cannot issue `tffa_create`.
+
 ## Consequences
 
 - New hook in `GAME_HOOKS` (now 6 entries) and a new proxy cvar
   (`proxy_sv_lockTeams`, default `0`, opt-in so existing servers keep pristine
-  behavior).
+  behavior). Since D-004.5 the value is the minimum team size (`0` = off) and
+  the caps are per TFFA instance, so the feature works with
+  `proxy_tffa_enable`.
 - The snapshot/enforcement logic is proxy-local (`rust/src/teamlock.rs`), so it
-  is unit-testable (`snapshot_caps`, `requested_team`) without the engine.
+  is unit-testable (`snapshot_caps`, `snapshot_match_caps`, `requested_team`)
+  without the engine.
 - Not yet runtime-verified with a real client; the build/unit gates cover the
   parsing and snapshot rules, and the engine reconnect ordering is
   source-verified.

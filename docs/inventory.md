@@ -230,7 +230,7 @@ The D-002 keep set is ported as minimal-alteration detours / intra injections
 
 | feature | cvar | address | technique |
 |---|---|---|---|
-| round-start team lock (TDM/CTF) | `proxy_sv_lockTeams` | game `+0x0012ada4` (`SetTeam`) | entry wrapper + `GAME_CLIENT_CONNECT`/`GAME_RUN_FRAME` bookkeeping |
+| round-start team lock (TDM/CTF, per TFFA instance) | `proxy_sv_lockTeams` (minimum team size, `0` = off) | game `+0x0012ada4` (`SetTeam`) | entry wrapper + `GAME_CLIENT_CONNECT`/`GAME_RUN_FRAME` bookkeeping |
 | per-team-size limits | `proxy_sv_teamSizeRules` | — (`G_CVAR_SET` = 7) | per-frame reconcile of the roster, `trap_Cvar_Set`s `timelimit`/`fraglimit`/`capturelimit` when the effective rule changes (nearest smaller size; restores the captured server limits below the smallest rule); with parallel TFFA the roster is the per-match census, and one rule applies only when every populated match is the same size |
 
 `SetTeam(gentity_t*, char*)` is nm-verified (`SetTeam__FP9gentity_sPc`) and its

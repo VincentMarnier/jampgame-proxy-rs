@@ -104,8 +104,9 @@ census (`tffa::match_team_counts`: connected clients on RED/BLUE grouped by
   rule as an uneven whole-server roster. When nothing has been applied yet they
   leave the pristine limits untouched.
 
-`proxy_sv_lockTeams` stays off while TFFA is on (D-006.2); only the size rules
-run, because they can now derive a meaningful size from the instances.
+`proxy_sv_lockTeams` works per instance while TFFA is on (D-004.5); the size
+rules run independently, because they can now derive a meaningful size from
+the instances.
 `decide` (whole-server) is unchanged for TFFA-off; `decide_matches` is the
 parallel-mode decision and is unit-tested without the engine.
 

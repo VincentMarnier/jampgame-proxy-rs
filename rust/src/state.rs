@@ -92,17 +92,32 @@ pub struct GameStats {
     pub damages_taken: i32,
 }
 
-/// Team-lock feature state (`proxy_sv_lockTeams`).
+/// Team-lock caps of one instance (TFFA match id): how many players each team
+/// may still field. `-1` means that team is not locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeamCaps {
+    pub red: i32,
+    pub blue: i32,
+}
+
+impl Default for TeamCaps {
+    fn default() -> Self {
+        TeamCaps { red: -1, blue: -1 }
+    }
+}
+
+/// Team-lock feature state (`proxy_sv_lockTeams`, the minimum team size that
+/// may be locked; `0` disables the feature).
 ///
-/// The round-start roster snapshot caps each team. `red_max`/`blue_max` are
-/// `-1` while unlocked; `pending` waits for the reconnect burst that follows a
-/// map load/map_restart; `saw_reconnect` flips on the first `firstTime ==
-/// false` `GAME_CLIENT_CONNECT` of that round (the engine reconnects every
-/// retained client before the first frame that follows).
+/// The round-start roster snapshot caps each team of every TFFA instance
+/// (`caps[0]` = main). Each pair is `-1`/`-1` while that instance is unlocked;
+/// `pending` waits for the reconnect burst that follows a map load/map_restart;
+/// `saw_reconnect` flips on the first `firstTime == false`
+/// `GAME_CLIENT_CONNECT` of that round (the engine reconnects every retained
+/// client before the first frame that follows).
 #[derive(Debug, Clone, Copy)]
 pub struct TeamLock {
-    pub red_max: i32,
-    pub blue_max: i32,
+    pub caps: [TeamCaps; crate::tffa::TOTAL_MATCH_SLOTS],
     pub pending: bool,
     pub saw_reconnect: bool,
 }
@@ -110,8 +125,7 @@ pub struct TeamLock {
 impl Default for TeamLock {
     fn default() -> Self {
         TeamLock {
-            red_max: -1,
-            blue_max: -1,
+            caps: [TeamCaps { red: -1, blue: -1 }; crate::tffa::TOTAL_MATCH_SLOTS],
             pending: true,
             saw_reconnect: false,
         }

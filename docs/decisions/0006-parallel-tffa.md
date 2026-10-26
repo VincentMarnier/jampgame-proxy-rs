@@ -42,11 +42,14 @@ match can be left after the cvar/gametype changed under it).
 `G_Damage` returns early (no pristine call, no stats) for player-vs-player
 hits across matches; environment (world/trigger, no client) always passes.
 `player_die` still runs (death/respawn real) but cross-match kills skip the
-personal-stats accounting. `teamlock` (a whole-server-roster feature) is skipped
-while TFFA is on; `teamSizeRules` keeps running and reads the per-match rosters
+personal-stats accounting. `teamlock` runs per instance (D-004.5): each match is
+snapshotted against its own round-start roster and a `SetTeam` join is checked
+against the caps of the player's own match. `teamSizeRules` keeps running and
+reads the per-match rosters
 instead of the sum of all matches (D-005.5: one rule when every populated match
 agrees on the team size). The `SetTeam` wrapper stays
-installed but inert (caps remain `-1` since the snapshot never runs).
+installed, and is inert for an instance that the round-start snapshot did not
+lock (caps remain `-1`).
 
 ### D-006.3 — Per-match scores via `AddScore` + global neutralisation
 

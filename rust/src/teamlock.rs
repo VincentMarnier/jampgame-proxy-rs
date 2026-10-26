@@ -1,17 +1,28 @@
 //! Round-start team locking (`proxy_sv_lockTeams`, TDM/CTF).
 //!
-//! When a round starts with an even, populated roster (both teams at least two
-//! players), each team is capped at its round-start size. The cap is a
-//! *reservation*: it survives players leaving, so the freed slots stay open for
-//! the same team instead of being taken by the other one. A round that starts
-//! uneven (e.g. 2 vs 3) is not locked.
+//! `proxy_sv_lockTeams` is the **minimum team size** that may be locked: `0`
+//! turns the feature off, `N` (>= 1) locks a team roster only when it starts
+//! even (`red == blue`) and both teams field at least `N` players. The caps are
+//! the round-start sizes. A cap is a *reservation*: it survives players
+//! leaving, so the freed slots stay open for the same team instead of being
+//! taken by the other one. A round that starts uneven (e.g. 2 vs 3) is not
+//! locked.
+//!
+//! The lock is **per instance**. With parallel TFFA matches
+//! (`proxy_tffa_enable`), every match is snapshotted against its own roster, so
+//! a `2 vs 2` in main and a `1 vs 1` in a created match lock at their own sizes
+//! and a join is refused against the caps of the match the joining player
+//! belongs to. With TFFA off the whole server is the one (main) instance.
 //!
 //! The trigger is the reconnect burst the engine issues when a map loads or is
 //! restarted (`SV_InitGameProgs`/`SV_RestartGameProgs`): every retained client
 //! gets `GAME_CLIENT_CONNECT` with `firstTime == qfalse` *before* the next
 //! `GAME_RUN_FRAME`, at which point the game module has restored the session
-//! teams from the `session%i` cvars. Late joins use `firstTime == qtrue` and do
-//! not retrigger the snapshot.
+//! teams from the `session%i` cvars. A `map_restart` carries the TFFA matches
+//! (D-006.8), so their rosters are observable at that same burst and each
+//! carried instance locks then. A match created later in the round has no
+//! round-start roster and stays unlocked until the next round. Late joins use
+//! `firstTime == qtrue` and do not retrigger the snapshot.
 //!
 //! Enforcement is a single `SetTeam` detour: an explicit `red`/`blue` request
 //! for a full, locked team is dropped with a message, and so is an auto pick
@@ -29,12 +40,18 @@ use crate::sdk::{
     OFFSET_GENTITY_CLIENT, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY,
     TEAM_BLUE, TEAM_RED,
 };
-use crate::state::{self, CVAR_LOCK_TEAMS};
+use crate::state::{self, CVAR_LOCK_TEAMS, TeamCaps};
 use crate::syscall;
+use crate::tffa;
 
-/// `proxy_sv_lockTeams` gate.
+/// The `proxy_sv_lockTeams` minimum team size (`0` = feature off).
+fn minimum_size() -> i32 {
+    state::with_state(|s| s.cvars[CVAR_LOCK_TEAMS].integer)
+}
+
+/// `proxy_sv_lockTeams` gate: any positive minimum turns the feature on.
 fn feature_enabled() -> bool {
-    state::with_state(|s| s.cvars[CVAR_LOCK_TEAMS].integer != 0)
+    minimum_size() >= 1
 }
 
 /// The game's `g_gametype` (engine cvar trap) — only the team modes are
@@ -46,13 +63,28 @@ fn gametype_supported() -> bool {
 }
 
 /// The round-start caps: both teams lock at their (equal) size only when each
-/// fielded at least two players; otherwise no team is locked (`-1`).
-pub fn snapshot_caps(red: i32, blue: i32) -> (i32, i32) {
-    if red >= 2 && blue >= 2 && red == blue {
+/// fielded at least `minimum` players; otherwise no team is locked (`-1`).
+/// `minimum < 1` (feature off) never locks.
+pub fn snapshot_caps(red: i32, blue: i32, minimum: i32) -> (i32, i32) {
+    if minimum >= 1 && red == blue && red >= minimum {
         (red, blue)
     } else {
         (-1, -1)
     }
+}
+
+/// Per-instance round-start caps: one pair per TFFA match slot (index = match
+/// id, `0` = main), each computed from that instance's own roster. Pure so the
+/// per-instance rule is unit-tested without the engine.
+pub fn snapshot_match_caps(
+    counts: &[(i32, i32); tffa::TOTAL_MATCH_SLOTS],
+    minimum: i32,
+) -> [TeamCaps; tffa::TOTAL_MATCH_SLOTS] {
+    core::array::from_fn(|id| {
+        let (red, blue) = counts[id];
+        let (red, blue) = snapshot_caps(red, blue, minimum);
+        TeamCaps { red, blue }
+    })
 }
 
 /// Whether an auto pick (`team free`, an empty string, or any other request the
@@ -77,28 +109,62 @@ pub fn on_client_connect(first_time: bool) {
 }
 
 /// `GAME_RUN_FRAME` bookkeeping: take the roster snapshot on the first frame
-/// after the reconnect burst (all reconnects happen before that frame).
+/// after the reconnect burst (all reconnects happen before that frame). The
+/// snapshot is taken per TFFA instance (whole server as main when TFFA is off).
 pub fn on_run_frame() {
     let ready = state::with_state(|s| s.team_lock.pending && s.team_lock.saw_reconnect);
     if !ready {
         return;
     }
     let gt = unsafe { syscall::cvar_variable_integer_value(c"g_gametype") };
-    let (red, blue) = (team_count(TEAM_RED), team_count(TEAM_BLUE));
-    let (red_max, blue_max) = if feature_enabled() && gametype_supported() {
-        snapshot_caps(red, blue)
+    let minimum = minimum_size();
+    let tffa_on = tffa::enabled();
+    let caps = if minimum >= 1 && gametype_supported() {
+        if tffa_on {
+            snapshot_match_caps(&tffa::match_team_counts(), minimum)
+        } else {
+            let mut caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
+            let (red_max, blue_max) =
+                snapshot_caps(team_count(TEAM_RED), team_count(TEAM_BLUE), minimum);
+            caps[tffa::MAIN_MATCH as usize] = TeamCaps {
+                red: red_max,
+                blue: blue_max,
+            };
+            caps
+        }
     } else {
-        (-1, -1)
+        [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS]
     };
+    let summary = describe_caps(&caps);
     eprintln!(
-        "----- proxy-rs: teamlock snapshot gt={gt} enabled={} red={red} blue={blue} -> {red_max} vs {blue_max}",
-        feature_enabled()
+        "----- proxy-rs: teamlock snapshot gt={gt} min={minimum} tffa={tffa_on} -> {summary}"
     );
     state::with_state(|s| {
-        s.team_lock.red_max = red_max;
-        s.team_lock.blue_max = blue_max;
+        s.team_lock.caps = caps;
         s.team_lock.pending = false;
     });
+}
+
+/// Diagnostic rendering of a cap table (once per round, so it may allocate).
+fn describe_caps(caps: &[TeamCaps; tffa::TOTAL_MATCH_SLOTS]) -> String {
+    let locked: Vec<String> = caps
+        .iter()
+        .enumerate()
+        .filter(|(_, caps)| caps.red >= 0 || caps.blue >= 0)
+        .map(|(id, caps)| {
+            let name = if id == tffa::MAIN_MATCH as usize {
+                "main".to_owned()
+            } else {
+                format!("#{id}")
+            };
+            format!("{name} {} vs {}", caps.red, caps.blue)
+        })
+        .collect();
+    if locked.is_empty() {
+        "no lock".to_owned()
+    } else {
+        locked.join(", ")
+    }
 }
 
 /// Count a team exactly like the game's `TeamCount` (`g_client.c:1237`): every
@@ -150,10 +216,40 @@ fn ent_client_num(ent: usize) -> c_int {
 /// caps (or `-1`s) stick forever across all later rounds.
 pub fn reset() {
     state::with_state(|s| {
-        s.team_lock.red_max = -1;
-        s.team_lock.blue_max = -1;
+        s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
         s.team_lock.pending = true;
         s.team_lock.saw_reconnect = false;
+    });
+}
+
+/// Drop the caps of a closed instance so a match later reusing its slot does
+/// not inherit the old match's lock. Main (`0`) always stays open and is
+/// ignored.
+pub fn clear_match(id: u8) {
+    if id == tffa::MAIN_MATCH {
+        return;
+    }
+    state::with_state(|s| {
+        if let Some(caps) = s.team_lock.caps.get_mut(id as usize) {
+            *caps = TeamCaps::default();
+        }
+    });
+}
+
+/// Carry a promoted instance's caps into main (it becomes the surviving game)
+/// and clear the slot it was promoted from.
+pub fn promote_match(id: u8) {
+    if id == tffa::MAIN_MATCH {
+        return;
+    }
+    state::with_state(|s| {
+        let Some(caps) = s.team_lock.caps.get(id as usize).copied() else {
+            return;
+        };
+        s.team_lock.caps[tffa::MAIN_MATCH as usize] = caps;
+        if let Some(slot) = s.team_lock.caps.get_mut(id as usize) {
+            *slot = TeamCaps::default();
+        }
     });
 }
 
@@ -233,14 +329,33 @@ fn blocked_join(ent: usize, s: *const c_char) -> Option<Block> {
     if explicit == Some(old_team) {
         return None;
     }
-    let (red_max, blue_max) = state::with_state(|s| (s.team_lock.red_max, s.team_lock.blue_max));
+    // Caps and counts are those of the instance the joining player belongs to:
+    // each TFFA match locks against its own roster (main when TFFA is off).
+    let client_num = ent_client_num(ent);
+    let match_id = if client_num >= 0 {
+        tffa::client_match(client_num)
+    } else {
+        tffa::MAIN_MATCH
+    };
+    let (red_max, blue_max) = state::with_state(|s| {
+        let caps = s
+            .team_lock
+            .caps
+            .get(match_id as usize)
+            .copied()
+            .unwrap_or_default();
+        (caps.red, caps.blue)
+    });
     if red_max < 0 && blue_max < 0 {
         return None;
     }
     if !gametype_supported() {
         return None;
     }
-    let (red_count, blue_count) = (team_count(TEAM_RED), team_count(TEAM_BLUE));
+    let (red_count, blue_count) = tffa::match_team_counts()
+        .get(match_id as usize)
+        .copied()
+        .unwrap_or((0, 0));
     let team = match explicit {
         Some(team) => {
             let (cap, count) = if team == TEAM_RED {
@@ -273,10 +388,10 @@ fn blocked_join(ent: usize, s: *const c_char) -> Option<Block> {
         blue_count
     };
     eprintln!(
-        "----- proxy-rs: teamlock join team={team} old={old_team} count={count} cap={cap} (red={red_max} blue={blue_max})"
+        "----- proxy-rs: teamlock join match={match_id} team={team} old={old_team} count={count} cap={cap} (red={red_max} blue={blue_max})"
     );
     Some(Block {
-        client_num: ent_client_num(ent),
+        client_num,
         team,
         red_max,
         blue_max,
@@ -330,17 +445,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_locks_only_even_rosters_of_at_least_two() {
-        assert_eq!(snapshot_caps(3, 3), (3, 3));
-        assert_eq!(snapshot_caps(2, 2), (2, 2));
-        assert_eq!(snapshot_caps(8, 8), (8, 8));
+    fn snapshot_locks_even_rosters_at_least_the_minimum() {
+        // Minimum 2 is the original "at least two per team" rule.
+        assert_eq!(snapshot_caps(3, 3, 2), (3, 3));
+        assert_eq!(snapshot_caps(2, 2, 2), (2, 2));
+        assert_eq!(snapshot_caps(8, 8, 2), (8, 8));
+        assert_eq!(snapshot_caps(1, 1, 2), (-1, -1));
         // Uneven rosters are never locked, even when both are populated.
-        assert_eq!(snapshot_caps(2, 3), (-1, -1));
-        assert_eq!(snapshot_caps(3, 2), (-1, -1));
-        // A team below two players cannot be locked.
-        assert_eq!(snapshot_caps(1, 1), (-1, -1));
-        assert_eq!(snapshot_caps(1, 0), (-1, -1));
-        assert_eq!(snapshot_caps(0, 0), (-1, -1));
+        assert_eq!(snapshot_caps(2, 3, 1), (-1, -1));
+        assert_eq!(snapshot_caps(3, 2, 1), (-1, -1));
+        // Minimum 1 locks a 1 vs 1; an empty round is still not locked.
+        assert_eq!(snapshot_caps(1, 1, 1), (1, 1));
+        assert_eq!(snapshot_caps(1, 0, 1), (-1, -1));
+        assert_eq!(snapshot_caps(0, 0, 1), (-1, -1));
+        // A larger minimum requires that many players per team.
+        assert_eq!(snapshot_caps(2, 2, 3), (-1, -1));
+        assert_eq!(snapshot_caps(3, 3, 3), (3, 3));
+        assert_eq!(snapshot_caps(4, 4, 3), (4, 4));
+        // `0` (and any non-positive value) disables the feature.
+        assert_eq!(snapshot_caps(4, 4, 0), (-1, -1));
+        assert_eq!(snapshot_caps(4, 4, -1), (-1, -1));
+    }
+
+    #[test]
+    fn per_match_snapshot_caps_each_instance_against_its_roster() {
+        let mut counts = [(0, 0); tffa::TOTAL_MATCH_SLOTS];
+        counts[tffa::MAIN_MATCH as usize] = (2, 2);
+        counts[1] = (1, 1);
+        counts[2] = (3, 3);
+        counts[3] = (2, 3);
+        counts[4] = (0, 0);
+
+        // Minimum 2: main and #2 lock at their own sizes, the 1 vs 1 and the
+        // uneven matches stay unlocked.
+        let caps = snapshot_match_caps(&counts, 2);
+        assert_eq!(
+            caps[tffa::MAIN_MATCH as usize],
+            TeamCaps { red: 2, blue: 2 }
+        );
+        assert_eq!(caps[1], TeamCaps { red: -1, blue: -1 });
+        assert_eq!(caps[2], TeamCaps { red: 3, blue: 3 });
+        assert_eq!(caps[3], TeamCaps { red: -1, blue: -1 });
+        assert_eq!(caps[4], TeamCaps { red: -1, blue: -1 });
+        // Untouched slots stay unlocked.
+        assert_eq!(caps[5], TeamCaps { red: -1, blue: -1 });
+
+        // Minimum 1 also locks the 1 vs 1, still not the uneven/empty ones.
+        let caps = snapshot_match_caps(&counts, 1);
+        assert_eq!(caps[1], TeamCaps { red: 1, blue: 1 });
+        assert_eq!(caps[3], TeamCaps { red: -1, blue: -1 });
+        assert_eq!(caps[4], TeamCaps { red: -1, blue: -1 });
+
+        // Feature off: nothing locks anywhere.
+        let caps = snapshot_match_caps(&counts, 0);
+        assert!(caps.iter().all(|caps| *caps == TeamCaps::default()));
+    }
+
+    #[test]
+    fn caps_follow_a_promotion_and_are_cleared_with_their_instance() {
+        state::with_state(|s| {
+            s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
+            s.team_lock.caps[1] = TeamCaps { red: 2, blue: 2 };
+            s.team_lock.caps[2] = TeamCaps { red: 3, blue: 3 };
+        });
+        promote_match(1);
+        let (main, one, two) = state::with_state(|s| {
+            (
+                s.team_lock.caps[0],
+                s.team_lock.caps[1],
+                s.team_lock.caps[2],
+            )
+        });
+        // The promoted instance's caps become main's; its own slot is cleared.
+        assert_eq!(main, TeamCaps { red: 2, blue: 2 });
+        assert_eq!(one, TeamCaps::default());
+        assert_eq!(two, TeamCaps { red: 3, blue: 3 });
+        // Closing an instance drops its caps; main keeps its own.
+        clear_match(2);
+        clear_match(tffa::MAIN_MATCH);
+        let (main, two) = state::with_state(|s| (s.team_lock.caps[0], s.team_lock.caps[2]));
+        assert_eq!(main, TeamCaps { red: 2, blue: 2 });
+        assert_eq!(two, TeamCaps::default());
     }
 
     #[test]

@@ -10,10 +10,11 @@
   encoding fix for engine addresses, and the netStatus packet-identity
   deviation.
 - `0004-team-lock.md` — Rust-only `proxy_sv_lockTeams` (TDM/CTF): reconnect-burst
-  snapshot, even/>=2 lock rule, `SetTeam` enforcement, and the TDM/CTF scope.
+  snapshot, minimum-team-size rule (per TFFA instance since D-004.5), `SetTeam`
+  enforcement, and the TDM/CTF scope.
 - `0005-team-size-rules.md` — Rust-only `proxy_sv_teamSizeRules`: per-team-size
   `timelimit`/`fraglimit`/`capturelimit` overrides at round start, nearest
-  smaller size fallback, independent of the lock boolean; with parallel TFFA it
+  smaller size fallback, independent of `proxy_sv_lockTeams`; with parallel TFFA it
   uses the per-match sizes and applies one rule only when every populated match
   agrees.
 - `0006-parallel-tffa.md` — parallel TFFA matches: per-match score copies,
