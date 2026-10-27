@@ -70,6 +70,10 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
 /// `Proxy_SharedAPI_ClientConnect` (`Proxy_SharedAPI.cpp:38-45`): announce the
 /// proxy to first-time non-bot connects.
 pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
+    if first_time {
+        // D-007 reset rule: a connect starts from an empty estimator window.
+        crate::hooks::netstatus::reset_client(client_num as usize);
+    }
     if first_time && !is_bot {
         // Same shape as the original proxy's
         // `va("print \"^5%s (^7%s^5)^7\n\"", JAMPGAMEPROXY_NAME, VERSION)`, with

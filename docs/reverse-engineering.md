@@ -1825,3 +1825,162 @@ client on the off→on edge (with the kick side effect that implies).
 chain, and the engine call sites are explicit). `Medium` for the exact
 user-visible timing of the scoreboard repaint after enabling, which the
 proposed real-client check would settle.
+
+---
+
+## R-026 — netStatus `timeNudge`: what the server can actually know
+
+### Finding
+
+`cl_timeNudge` is never transmitted to the server; its only effect is the clock
+the client stamps into its usercmds. Recovering it needs four quantities the
+old magic table conflated into one `sv_fps`-indexed constant. All four are
+derived here from engine source and confirmed against the ground-truth
+harness (`tools/runtime/a2_netstatus_groundtruth.py`, a synthetic JA MP client
+that speaks the real protocol and reproduces the real client timing loop).
+
+**1. The raw per-packet quantity is `S_j - Tbar_k`.** With `A_k` = `svs.time`
+at the frame processing the packet and `S_j` = `frames[messageAcknowledge &
+PACKET_MASK].messageSent` of the message the packet acks, `SV_UserMove` writes
+`frames[ack & PACKET_MASK].messageAcked = svs.time` *before* the
+`SV_ClientThink` loop (sv_client.cpp:1757; binary-verified at
+`0x804e7c8-0x804e7dd`: `messageAcknowledge & 0x1f`, `imul $0xc58`, store to
+`+0x21574`), so `messageAcked` and `A_k` are the same sample and
+
+```text
+-(delay_k + rtt_j) = -(Tbar_k - A_k + A_k - S_j) = S_j - Tbar_k
+```
+
+— the arrival-side frame quantization cancels **algebraically**, `A_k` is not
+needed at all.
+
+**2. The newest cmd in a packet is one frame period stale.** `CL_Frame` calls
+`CL_SendCmd()` (cl_main.cpp:1846) *before* `CL_SetCGameTime()` (:1852), and
+`cmd->serverTime = cl->serverTime` (cl_input.cpp:2144) is only written by
+`CL_SetCGameTime` (cl_cgame.cpp:2088). So a cmd created in frame *n* carries
+the clock value computed at frame *n-1*, and the packet's mean cmd age at send
+is `(s_max - Tbar) + I_cmd`, not `(n_k-1)/(2f)` — a stable `+1/f` bias
+(33 ms at client fps 30).
+
+**3. The paired RTT carries the age of the newest *message*.**
+`clc->serverMessageSequence` is the netchan sequence of the last accepted
+server message (cl_main.cpp:1521, echoed in cl_input.cpp:2464), so
+`ackdelay_j = P_k - M_j` — the age of the newest server→client message at the
+packet's send. `cl_maxpackets` (cl_input.cpp:2393) **is never transmitted to
+the server**, and `cl->snapshotMsec` is the *server's* pacing from the `snaps`
+userinfo key (sv_client.cpp:1526-1538), so the packet side must be measured
+from the observed cmd stream (`I_cmd`, `I_pkt = n_k * I_cmd`) and the message
+side from `frames[]` `messageSent` spacing.
+
+The estimator samples only the **first** packet that acks each message: its
+wait `w_j = P_first(j) - M_j` is bounded by the packet interval even when the
+message was delayed or an earlier packet was lost, and it is the residual of
+the packet grid on the client's frame grid — bounded by the *message* spacing
+when messages are denser than packets, so `E[w] = (min(I_pkt, I_msg) -
+I_cmd)/2`. Later
+packets acking the same message are not sampled: their wait correlates with
+their group size (an early message is acked sooner *and* by more packets),
+which biases a constant-wait model. Measured over the whole synthetic matrix
+(2026-10-26): 0.67 ms mean bias for this pairing vs 3.86 ms for an all-packet
+lattice model (`(I_msg - I_cmd)/2`, right on average but up to 300 ms off
+when a message is delayed) and 9.07 ms for `min(I_pkt, I_msg)/2`.
+
+**4. `CL_AdjustTimeDelta` is a systematic term, not a drift.** Its `+1`/`-2`
+walk (cl_cgame.cpp:1919-1933) keeps `cls.realtime + serverTimeDelta` just
+below `cl->snap.serverTime - 5` (cl_cgame.cpp:2099-2100). Because the walk only
+reacts at snapshot arrivals while the condition is checked every frame, the
+steady state is `E = I_msg + 5 - I_cmd` where `5` is the engine's extrapolation
+margin. Measured on the harness (predicted / measured, ms): 38.3/40.0 at
+sv_fps 20, 54.3/58.1 at 30, 57.3/57.3 at 60. Past `deltaDelta > 100`
+(cl_cgame.cpp:1913-1918) the `>> 1` fast adjust halves the delta instead of
+stepping it, so the gap saturates into a sawtooth over [50, 100] (mean 75):
+measured 71.9/70.9/73.9 ms at `snaps 10` (`I_msg` 108-145) where the slow model
+predicts 130/106/102. The plan had classified `E` as unobservable and left it
+to a ±2 ms bias floor — it is a 40-75 ms systematic term (user decision
+2026-10-26: model it).
+
+**5. `SV_Frame` runs a stepped `svs.time`** (`sv.timeResidual` accumulation,
+`svs.time += frameMsec` in the chunk loop, sv_main.cpp) and the dedicated
+early-return `NET_Sleep(frameMsec - sv.timeResidual)` aligns frames;
+`SV_SendClientMessages` runs in the same call that steps the clock. The
+send-side quantization of `messageSent` is therefore the sleep overshoot
+(~0..1 ms), not up to `frame_msec` (user decision 2026-10-26: model `q_send`
+as 0 and cover it with the bias floor).
+
+**6. `clientSnapshot_t` stride and `PACKET_BACKUP` (binary-verified).**
+`SV_CalcPings` (0x8057204) walks `cl->frames[]` with `imul $0xc58` (= 3160)
+per slot and loads `messageSent` at `+0xc4c` / `messageAcked` at `+0xc50`,
+over exactly 32 slots (`(234532-133412)/3160 = 32`); `SV_UserMove` masks the
+ack with `0x1f`. Pinned in `rust/src/sdk.rs` as
+`SIZEOF_CLIENT_SNAPSHOT_T = 3160` with the layout asserts.
+
+**7. A pairing trap in the hook layer.** `cl->messageAcknowledge` in memory is
+only updated *after* the `SV_ExecuteClientMessage` wrapper runs (the pristine
+body reads it at sv_client.cpp:1822), so the per-packet feed must use the ack
+parsed from *this* message's header — reading `cl->messageAcknowledge` pairs
+every packet with the message its predecessor acked (a one-message, `I_msg`
+sized error; caught by the ground-truth harness).
+
+### Evidence
+
+**RUNTIME** (`tools/runtime/a2_netstatus_groundtruth.sh`, real engine + Rust
+proxy in the i386 container; synthetic JA MP clients over UDP):
+
+* The client connects through `getchallenge`/`connect` (Huffman-compressed
+  OOB, `NET_OutOfBandData`), reassembles fragmented gamestate messages,
+  parses `svc_gamestate`/`svc_snapshot`/`svc_serverCommand` and feeds
+  `clc_move` packets with `cl_packetdup`-style cmd windows — the whole
+  protocol stack is a Python port of `qcommon/msg.cpp`, `huffman.cpp`,
+  `net_chan.cpp`, `cl_net_chan.cpp` (`tools/runtime/jka_proto.py`).
+* The timing loop reproduces `CL_SetCGameTime`/`CL_AdjustTimeDelta`/
+  `CL_CreateCmd`/`CL_WritePacket`/`CL_ReadyToSendPacket` (including the
+  LAN/loopback bypass and the `cl_maxpackets` clamp); ground truth is the
+  `cl_timeNudge` fed in.
+* First settled run (sv_fps 20, client 60 fps, snaps 20, cl_maxpackets 30,
+  tn -15): estimate -14.04 (error 0.96 ms), range [-18.3..-9.8] containing the
+  truth; the measured model terms match the estimator's (mean cmd age 25.00 vs
+  25.10, ack delay 16.67).
+* Server-side snapshot pacing observed: `snaps` drives it (`snapshotMsec`
+  rounded up to the `svs.time` frame grid) — the `NA_LOOPBACK ||
+  Sys_IsLANAddress` fast path of sv_snapshot.cpp:697 did **not** trigger for
+  the container's 127.0.0.1 client in the shipped binary, so `snaps` is a live
+  axis in the matrix.
+
+**REAL CLIENT (2026-10-26, `a2_netstatus_groundtruth.sh --mode real`):**
+**TaystJK** — a modern x86_64 client rebuild, the production client — at 200
+fps (`com_maxfps`), one packet per client frame (the `CL_ReadyToSendPacket`
+LAN bypass), ran `cl_timeNudge` 0 / -30 / -15 / 0 / +15
+/ +30 against `sv_fps 20`, `snaps 20`. Six settled segments, estimates +1.01 /
+-28.88 / -13.92 / +1.11 / +16.07 / +30.97: **every one within 1.12 ms of the
+true setting** (sd 0.02-0.68 within a segment), with the truth inside the
+reported range every time. The residual is a stable +1.07 ms bias — the
+send-side quantization `q_send` the model sets to 0 — inside the ±2 ms floor.
+Every model fact held live: `lag` = `I_cmd` (the one-frame-stale stamp),
+`I_pkt` = `I_cmd` (LAN bypass), `egap` = `I_msg + 5 - I_cmd` (the
+`CL_AdjustTimeDelta` walk), `samples` = `msgs` (the per-message ack pairing) —
+i.e. TaystJK preserves the 1.01 engine's client timing loop for these
+constants (its non-LAN `cl_maxpackets` path was not exercised).
+
+**ENGINE SOURCE:** the file:line references above.
+
+### Confidence
+
+`High` for the derivation, the binary layout pins and the empirical closure of
+the identity — 0.96 ms on the first settled synthetic run and ≤ 1.12 ms over
+six real-client segments. `Medium` for the generality
+of the ack-delay model `min(I_pkt, I_msg)/2`: its *mean* is phase-averaged, and
+a phase-locked low-jitter path (both processes periodic) can bias it by up to
+±min(I_pkt, I_msg)/2 — the ground-truth matrix and the real-client runs are the
+authority (report-and-decide on the range width, user 2026-10-26).
+
+### Implications
+
+* The magic table is gone (deliberate deviation, D-007.2); `netStatus` output
+  is not comparable with the original proxy's (`tools/runtime/diff_netstatus*`
+  retired with it).
+* The per-term debug logging (`proxy_sv_netStatusDebug`) that attributed the
+  residuals above was **removed at the user's request** after validation
+  (2026-10-26): the release exposes no estimator internals and registers no
+  extra cvar. The decomposition stays pinned by the unit tests in
+  `rust/src/netstatus_est.rs`, and the validation harness now scores from the
+  printed `netStatus` table.

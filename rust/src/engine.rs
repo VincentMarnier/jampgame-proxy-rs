@@ -304,21 +304,6 @@ pub unsafe fn com_end_redirect() {
     unsafe { f() };
 }
 
-/// `playerState_t* SV_GameClientNum(int)` (0x8054754) — the game module's
-/// playerState for a client (the proxy's `server.functions.SV_GameClientNum`).
-///
-/// # Safety
-///
-/// Engine-internal; `client_num` must be in range.
-pub unsafe fn sv_game_client_num(client_num: c_int) -> usize {
-    // SAFETY: pointer from the fixed engine table.
-    let f: unsafe extern "C" fn(c_int) -> usize = engine_fn!(
-        unsafe extern "C" fn(c_int) -> usize,
-        functions::SV_GAME_CLIENT_NUM
-    );
-    unsafe { f(client_num) }
-}
-
 /// `char* Cmd_Argv(int)` (0x812c264) — the engine's argv table.
 ///
 /// # Safety

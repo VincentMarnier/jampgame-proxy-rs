@@ -32,6 +32,7 @@
 mod engine;
 mod hooks;
 mod jampgame;
+mod netstatus_est;
 mod original;
 mod patch;
 mod rules;

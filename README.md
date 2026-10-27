@@ -32,7 +32,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
-| `proxy_sv_enableNetStatus`            | 0       | compute and make accessible the players network status (`netStatus`/`showNet` commands)         |
+| `proxy_sv_enableNetStatus`            | 0       | compute and make accessible the players network status (`netStatus`/`showNet` commands print the [net status](#net-status) table); when `0` the feature is completely inert — no collection, no computation, no table |
 | `proxy_sv_enableEndGameStats`         | 1       | print the personal/global/best-player stats tables at the end of a game                         |
 | `proxy_sv_antiHpTeller`               | 0       | prevents HP tellers usage                                                                       |
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
@@ -66,7 +66,43 @@ scoreboard instead of having the whole roster collapse onto one team. The
 `taystJKinfo 128` server info key stays advertised because that is what tells a
 capable cgame to parse the 15-int layout; cgames without support ignore it.
 
-### Team lock
+### Net status
+
+With `proxy_sv_enableNetStatus 1`, the `netStatus` and `showNet` commands print
+a per-player table (rate-limited to once per 500 ms, bots excluded):
+
+```text
+ping    rtt   jit  fps  pps     timeNudge snaps   rate name
+---- ------ ----- ---- ---- ------------- ---- ------ ---------------
+   0    0.0   0.0   60   30 [-17.9..-10.5]   20  25000 client0
+```
+
+* **ping** — the player's ping as the game reports it on the scoreboard.
+* **rtt** — round-trip time: how long a message needs to travel to the
+  player's game and back, in milliseconds. This is the "real" ping — the one
+  the server measures itself. Lower is better; on the same machine it reads 0.
+* **jit** — jitter: how much that round-trip time wobbles between messages.
+  A steady line to the player shows a small number; a flaky one (wifi,
+  congestion, a bad route) shows a large one. 0 means rock steady.
+* **fps** — how many moves per second the player's game produces (its frame
+  rate). A typical player is 30-125; a very fast PC might show 200.
+* **pps** — how many packets per second the player's game sends. A packet is
+  a bundle of those moves, so this is how often the game flushes them: a
+  player on `cl_maxpackets 30` sends ~30, while a player on the same machine
+  (where the game skips the packet limiter) sends one per frame, i.e. pps = fps.
+* **timeNudge** — the player's `cl_timeNudge` setting, which the client never
+  tells the server, so it is **estimated** from the clock its moves are
+  stamped with and reported as a range: the likely interval, e.g.
+  `[-17.9..-10.5]` means "between -17.9 and -10.5" (true value -15 here).
+  `-` means there is not enough data yet. Values are never clamped to ±30:
+  a reading outside that range is evidence of a modified client.
+* **snaps** — how many times per second the server sends this player a view of
+  the game (their `snaps` setting, capped by the server's `sv_fps`).
+* **rate** — the player's bandwidth setting (bytes per second the game is
+  allowed to use).
+* **name** — the player.
+
+### Team lock### Team lock
 
 `proxy_sv_lockTeams` is the minimum team size that may be locked (default `0`,
 off). When a round starts (map load or `map_restart`) with both teams even and

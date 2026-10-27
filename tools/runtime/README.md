@@ -30,6 +30,47 @@ then copy a script into the container (the `-v artifacts` mount above makes
 | `u005_semantic.gdb` | U-005 | Runs a second engine under gdb (port 29101, `+set rconPassword testpw` not `sv_rconPassword`!) with breakpoints at the engine addresses named `SV_ConnectionlessPacket`, `SV_GetChallenge`, `SVC_Info`, `SVC_Status`, `SVC_RemoteCommand`, `SV_FlushRedirect`; drive with `u005_semantic.drive.py`, which sends `getchallenge`/`getinfo`/`getstatus` and one rcon packet. |
 | `u005_hook_call.gdb` | U-005/U-001 | With the proxy loaded, breaks at the proxy's own `Proxy_SV_ConnectionlessPacket` hook (`base+0xbbb0`) and detaches on the first real query, proving live hook execution. |
 
+## netStatus harnesses (A1/A2)
+
+| Script | Question | What it does |
+| --- | --- | --- |
+| `a1_netstatus.sh` + `a1_netstatus_semantic.py` | R-022 | gdb-driven semantic check of the netStatus per-usercmd feed: injects `sv_client_think_stub` calls and one in-vivo `clc_move` (built with the engine's own `MSG_*` writers) into a live server and compares the printed table with a Python mirror of the original C++ arithmetic. |
+| `a2_netstatus_groundtruth.sh` + `a2_netstatus_groundtruth.py` + `jka_proto.py` | R-026 / D-007 | Ground-truth harness: synthetic JA MP clients speak the real protocol over UDP to `linuxjampded` + the Rust proxy and reproduce the real client timing loop (`CL_SetCGameTime`, `CL_AdjustTimeDelta`, `CL_CreateCmd`, `CL_WritePacket`, the `cl_maxpackets` packet timer and the LAN/loopback bypass) with `cl_timeNudge`, client fps, `snaps`, `cl_maxpackets`, packet mode, loss and jitter as controlled inputs. Compares the estimate against the fed-in `cl_timeNudge`. |
+
+    # one scenario (15-20 s), prints the table and the estimator's debug rows
+    tools/runtime/a2_netstatus_groundtruth.sh --mode single --sv-fps 20 \
+        --client-fps 60 --snaps 20 --cl-maxpackets 30 --tn -15 --duration 20
+
+    # the acceptance matrix (sv_fps x client fps x snaps x cl_maxpackets x
+    # LAN/non-LAN x tn, plus loss/jitter); artifacts/a2_matrix_results.json
+    tools/runtime/a2_netstatus_groundtruth.sh --mode matrix
+
+    # real-client ground truth: publishes the port so a real JA MP client can
+    # connect (set cl_timeNudge by hand, ~15 s per value, run /netStatus and
+    # copy the table it prints to your client console)
+    JAMP_PUBLISH_PORT=29191 tools/runtime/a2_netstatus_groundtruth.sh \
+        --mode real --duration 120 --sv-fps 20 --port 29191
+
+`jka_proto.py` is a byte-exact Python port of the engine's wire codec
+(`qcommon/msg.cpp` bit IO + `msg_hData` Huffman, `huffman.cpp` adaptive
+Huffman incl. the OOB `Huff_Compress` path, `net_chan.cpp` framing and
+fragment reassembly, `cl_net_chan.cpp` XOR obfuscation). It is the first
+standalone protocol codec in the repo; `a1_*` instead drives the engine's own
+`MSG_*` writers through gdb. Scoring reads the printed `netStatus` table —
+its `timeNudge` cell `[lo..hi]` is symmetric around the point estimate, and
+the harness's own `client_model_terms()` reports the ground-truth-side model
+terms (mean cmd age, measured ack delay) for comparison. The proxy exposes no
+estimator internals at runtime (`proxy_sv_netStatusDebug` was dropped at the
+user's request); a real-client run is scored from the table your client
+prints.
+
+**Retired:** `diff_netstatus.sh` / `diff_netstatus_semantic.py` compared the
+Rust table with the original proxy's table byte-for-byte. D-007 replaced the
+`timeNudge` estimator (the magic `sv_fps` table is deleted) and reworked the
+table columns, so the two outputs are no longer comparable and the differential
+is retired with the old semantics. Historical notes about it remain in
+`docs/reverse-engineering.md` (R-022 "HARNESS NOTES (diff flow)").
+
 ## Building the original proxy (for U-002/U-005-hook runs)
 
 The original proxy source (`original/jampgame-proxy/`) was removed from the

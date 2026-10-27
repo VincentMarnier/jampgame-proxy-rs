@@ -739,8 +739,10 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
         *((msg + OFFSET_MSG_BIT) as *mut c_int) = saved_bit;
     }
     if c == CLC_MOVE || c == CLC_MOVE_NO_DELTA {
-        // SAFETY: cl is a valid client_t.
-        unsafe { netstatus::mark_packet_start(cl) };
+        // SAFETY: cl is a valid client_t; `message_acknowledge` is this
+        // message's own ack (cl->messageAcknowledge is only updated when the
+        // pristine body runs).
+        unsafe { netstatus::mark_packet_start(cl, message_acknowledge) };
     }
 
     // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.

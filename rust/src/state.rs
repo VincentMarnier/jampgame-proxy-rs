@@ -67,20 +67,136 @@ pub struct LocatedGameData {
     pub g_client_size: i32,
 }
 
-/// `timenudgeData_t` (`Proxy_Header.hpp:48-54`) — netStatus delay/ping samples.
+/// One processed usercmd packet — a `clc_move`/`clc_moveNoDelta` message as
+/// the netStatus estimator sees it (D-007). The per-cmd feed fills the *open*
+/// record; `mark_packet_start` commits it and starts the next one, so the ring
+/// holds one record per usercmd message that delivered at least one cmd.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TimenudgeData {
-    pub delay_count: i32,
-    pub delay_sum: i32,
-    pub ping_sum: i32,
-    pub last_time_nudge_calculation: i32,
+pub struct PacketRecord {
+    /// Sum of the processed cmds' `serverTime` (`Tbar_k = sum / count`).
+    pub stamp_sum: i64,
+    /// `svs.time` at the frame processing the packet (`A_k`) — the same sample
+    /// the engine writes into `frames[].messageAcked` for the acked snapshot
+    /// (SV_UserMove writes it before the `SV_ClientThink` loop).
+    pub arrival: i32,
+    /// `frames[messageAcknowledge & PACKET_MASK].messageSent` of the snapshot
+    /// frame the packet acked — `0` when the slot carried no usable sample
+    /// (`messageAcked <= 0` or a stale/wrapped slot).
+    pub message_sent: i32,
+    /// Newest `serverTime` in the packet (`s_max_k`).
+    pub newest: i32,
+    /// Oldest `serverTime` in the packet (the packet's stamp span measures the
+    /// client's cmd interval exactly).
+    pub oldest: i32,
+    /// `messageAcknowledge` of the packet — the netchan sequence of the newest
+    /// server message the client had seen when it sent the packet.
+    pub msg_ack: i32,
+    /// Processed usercmds in the packet (`n_k`): new cmds only — the engine
+    /// drops `cl_packetdup` duplicates before the feed.
+    pub count: u16,
 }
 
-/// `ucmdStat_t` (`Proxy_Header.hpp:56-60`) — one per-usercmd stats ring slot.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UcmdStat {
-    pub server_time: i32,
-    pub packet_index: usize,
+/// Fixed per-packet estimation window (`netstatus`, D-007): 512 records cover
+/// the ~5 s window up to ~100 packets/s (`cl_maxpackets` max) — a faster
+/// client (LAN, one packet per frame) gets a proportionally shorter window.
+pub const PACKET_RING_LEN: usize = 512;
+
+/// Per-client netStatus estimator state (D-007). Replaces the original
+/// proxy's `timenudgeData_t`/`ucmdStat_t` accumulators: everything is a
+/// fixed-size ring, nothing allocates on the move-packet hot path.
+#[derive(Debug, Clone, Copy)]
+pub struct NetstatusState {
+    /// Committed packet records, oldest at `head` when the ring has wrapped.
+    pub packets: [PacketRecord; PACKET_RING_LEN],
+    /// Next slot to write (the ring is full once `len == PACKET_RING_LEN`).
+    pub head: usize,
+    /// Committed records currently held (`0..=PACKET_RING_LEN`).
+    pub len: usize,
+    /// The packet the per-cmd feed is currently filling.
+    pub open: PacketRecord,
+    /// `cl->snapshotMsec` seen at the last check (a change resets the window).
+    pub snapshot_msec: i32,
+    /// `sv_fps` seen at the last check (a change resets the window).
+    pub sv_fps: i32,
+    /// Set when a window reset has been requested but not yet applied (the
+    /// per-cmd feed may run mid-packet; the reset lands at the next packet).
+    pub reset_pending: bool,
+}
+
+impl Default for NetstatusState {
+    fn default() -> Self {
+        NetstatusState {
+            packets: core::array::from_fn(|_| PacketRecord::default()),
+            head: 0,
+            len: 0,
+            open: PacketRecord::default(),
+            snapshot_msec: 0,
+            sv_fps: 0,
+            reset_pending: false,
+        }
+    }
+}
+
+impl NetstatusState {
+    /// Drop every window record and the open packet (map change, connect,
+    /// disconnect, `sv_fps`/`snapshotMsec` change, netStatus off->on).
+    pub fn reset(&mut self) {
+        for record in self.packets.iter_mut() {
+            *record = PacketRecord::default();
+        }
+        self.head = 0;
+        self.len = 0;
+        self.open = PacketRecord::default();
+        self.reset_pending = false;
+    }
+
+    /// Commit the open packet (when it carried cmds) and start a new one
+    /// stamped with this frame's `svs.time`, the acked snapshot's
+    /// `messageSent`, and the acked message's netchan sequence.
+    pub fn mark_packet_start(&mut self, arrival: i32, message_sent: i32, msg_ack: i32) {
+        if self.reset_pending {
+            self.reset();
+        }
+        if self.open.count > 0 {
+            self.packets[self.head] = self.open;
+            self.head = (self.head + 1) % PACKET_RING_LEN;
+            self.len = (self.len + 1).min(PACKET_RING_LEN);
+        }
+        self.open = PacketRecord {
+            stamp_sum: 0,
+            arrival,
+            message_sent,
+            newest: i32::MIN,
+            oldest: i32::MAX,
+            msg_ack,
+            count: 0,
+        };
+    }
+
+    /// Accumulate one processed usercmd into the open packet.
+    pub fn feed_cmd(&mut self, server_time: i32) {
+        self.open.stamp_sum += server_time as i64;
+        self.open.count = self.open.count.saturating_add(1);
+        if server_time > self.open.newest {
+            self.open.newest = server_time;
+        }
+        if server_time < self.open.oldest {
+            self.open.oldest = server_time;
+        }
+    }
+
+    /// The committed records, newest last (index 0 = oldest kept).
+    pub fn records(&self) -> impl Iterator<Item = &PacketRecord> {
+        let start = (self.head + PACKET_RING_LEN - self.len) % PACKET_RING_LEN;
+        (0..self.len).map(move |i| &self.packets[(start + i) % PACKET_RING_LEN])
+    }
+
+    /// Drop everything but the `n` newest records (step-change reset: the
+    /// pre-step half of the window is discarded so the new value shows within
+    /// ~2 s). The ring is a FIFO — shrinking `len` drops from the front.
+    pub fn keep_last(&mut self, n: usize) {
+        self.len = n.min(self.len);
+    }
 }
 
 /// `GameStats_t` (`Proxy_Header.hpp:79-85`) — per-(client, opponent) tallies.
@@ -312,11 +428,10 @@ impl Default for TffaState {
 pub struct ClientEntry {
     pub is_connected: bool,
     pub clean_name: [u8; MAX_NETNAME],
-    pub timenudge_data: TimenudgeData,
-    pub timenudge: i32,
+    /// netStatus estimator state (D-007): per-packet window, fps/pps ring
+    /// semantics and the reset rules.
+    pub netstatus: NetstatusState,
     pub last_time_net_status: i32,
-    pub cmd_stats: [UcmdStat; crate::sdk::CMD_MASK],
-    pub cmd_index: usize,
     /// Monotonic packet-identity counter for the cmdStats feed: bumped once
     /// per usercmd client message by the `SV_ExecuteClientMessage` entry
     /// wrapper (see `netstatus::mark_packet_start`), reproducing the
@@ -334,11 +449,8 @@ impl Default for ClientEntry {
         ClientEntry {
             is_connected: false,
             clean_name: [0; MAX_NETNAME],
-            timenudge_data: TimenudgeData::default(),
-            timenudge: 0,
+            netstatus: NetstatusState::default(),
             last_time_net_status: 0,
-            cmd_stats: [UcmdStat::default(); crate::sdk::CMD_MASK],
-            cmd_index: 0,
             packet_counter: 0,
             game_stats: [GameStats::default(); MAX_CLIENTS],
             team_kills: 0,
@@ -549,6 +661,76 @@ mod tests {
         with_state(|s| assert_eq!(s.svs_time, 42));
         // Reset for the next test that touches the global.
         *lock() = None;
+    }
+
+    #[test]
+    fn netstatus_ring_commits_one_record_per_packet() {
+        let mut ns = NetstatusState::default();
+        // two packets: 2 cmds then 1 cmd
+        ns.mark_packet_start(1000, 900, 1);
+        ns.feed_cmd(5000);
+        ns.feed_cmd(5016);
+        ns.mark_packet_start(1033, 950, 2);
+        ns.feed_cmd(5033);
+        ns.mark_packet_start(1066, 0, 3);
+        let records: Vec<_> = ns.records().copied().collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].count, 2);
+        assert_eq!(records[0].newest, 5016);
+        assert_eq!(records[0].oldest, 5000);
+        assert_eq!(records[0].stamp_sum, 5000 + 5016);
+        assert_eq!(records[0].message_sent, 900);
+        assert_eq!(records[0].arrival, 1000);
+        assert_eq!(records[1].count, 1);
+        assert_eq!(records[1].message_sent, 950);
+        // an empty open packet (no cmds) is never committed
+        assert_eq!(ns.len, 2);
+    }
+
+    #[test]
+    fn netstatus_ring_wraps_and_keeps_the_newest() {
+        let mut ns = NetstatusState::default();
+        for i in 0..(PACKET_RING_LEN + 5) {
+            ns.mark_packet_start(i as i32, i as i32, i as i32);
+            ns.feed_cmd(i as i32);
+        }
+        // the open packet is only committed by the *next* mark_packet_start,
+        // so 516 records were committed and the ring keeps the newest 512
+        assert_eq!(ns.len, PACKET_RING_LEN);
+        let records: Vec<_> = ns.records().copied().collect();
+        assert_eq!(records.first().unwrap().arrival, 4);
+        assert_eq!(
+            records.last().unwrap().arrival,
+            (PACKET_RING_LEN + 3) as i32
+        );
+    }
+
+    #[test]
+    fn netstatus_reset_and_keep_last_drop_the_window() {
+        let mut ns = NetstatusState::default();
+        for i in 0..10usize {
+            ns.mark_packet_start(i as i32, i as i32, i as i32);
+            ns.feed_cmd(i as i32);
+        }
+        ns.keep_last(4);
+        let records: Vec<_> = ns.records().copied().collect();
+        assert_eq!(records.len(), 4);
+        // 9 committed records (the 10th is still open): 6,7,8 are kept plus
+        // the one before them
+        assert_eq!(records[0].arrival, 5);
+        // keep_last on a shorter window is a no-op clamp
+        ns.keep_last(99);
+        assert_eq!(ns.len, 4);
+        // a pending reset lands at the next packet
+        ns.reset_pending = true;
+        ns.mark_packet_start(100, 100, 4);
+        assert_eq!(ns.len, 0);
+        assert_eq!(ns.open.arrival, 100);
+        // full reset also clears the open packet
+        ns.feed_cmd(1);
+        ns.reset();
+        assert_eq!(ns.len, 0);
+        assert_eq!(ns.open.count, 0);
     }
 
     #[test]

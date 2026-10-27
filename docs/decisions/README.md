@@ -33,3 +33,10 @@
   append `PERS_KILLED` as the 15th `scores` int only to clients whose userinfo
   advertises `taystJKcgflags` bit 0 (`TAYSTJK_CGFLAG_SCORE_DEATHS`, cgame from
   `30fc5979b`); every other client keeps the 14-int layout.
+- `0010-netstatus-timenudge.md` — netStatus `timeNudge` estimator (D-007):
+  model-based estimation of the never-transmitted `cl_timeNudge` as a range,
+  the magic `sv_fps` table deleted, the correction terms re-derived from
+  engine source (cmd-stamp staleness, message-vs-packet ack delay, the
+  `CL_AdjustTimeDelta` clock gap) and the ground-truth harness; the
+  `proxy_sv_netStatusDebug` cvar the plan proposed was dropped at the user's
+  request (no estimator internals at runtime).

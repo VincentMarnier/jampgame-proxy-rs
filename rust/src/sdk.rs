@@ -43,7 +43,6 @@ pub const PACKET_MASK: usize = PACKET_BACKUP - 1;
 pub const MAX_RELIABLE_COMMANDS: usize = 128;
 pub const MAX_QPATH: usize = 64;
 pub const MAX_NAME_LENGTH: usize = 32;
-pub const CMD_MASK: usize = 1024;
 
 // clientState_t (server.h:96-103).
 pub const CS_FREE: i32 = 0;
@@ -491,6 +490,14 @@ pub const OFFSET_CLIENT_NETCHAN: usize = 234548;
 pub const OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT: usize = 3148;
 /// `offsetof(clientSnapshot_t, messageAcked)`.
 pub const OFFSET_CLIENT_SNAPSHOT_MESSAGE_ACKED: usize = 3152;
+/// `sizeof(clientSnapshot_t)` — stride of `client_t.frames[PACKET_BACKUP]`.
+///
+/// Binary-verified (R-0XX; gdb batch `disassemble /r` of the shipped
+/// `SV_CalcPings` at `0x8057204`, the R-022 tooling note): the frames walk
+/// steps `0xc58` bytes per slot and loads `messageSent` at `+0xc4c` and
+/// `messageAcked` at `+0xc50` of each slot, over exactly `PACKET_BACKUP`
+/// (32) slots — `(OFFSET_CLIENT_PING - OFFSET_CLIENT_FRAMES) / 32`.
+pub const SIZEOF_CLIENT_SNAPSHOT_T: usize = 3160;
 
 /// `offsetof(server_t, svEntities)` — `svEntity_t[MAX_GENTITIES]`.
 pub const OFFSET_SV_SV_ENTITIES: usize = 8880;
@@ -796,6 +803,36 @@ mod tests {
         assert_eq!(OFFSET_NETCHAN_REMOTE_ADDRESS, 234556);
         assert_eq!(OFFSET_NETCHAN_QPORT, 28);
         assert_eq!(OFFSET_NETCHAN_UNSENT_FRAGMENTS, 49200);
+    }
+
+    #[test]
+    fn client_snapshot_layout_matches_binary() {
+        // `cl->frames[PACKET_BACKUP]` (R-0XX binary check: SV_CalcPings at
+        // 0x8057204 walks 32 slots with a 0xc58 = 3160 stride and loads
+        // messageSent +0xc4c / messageAcked +0xc50 per slot).
+        assert_eq!(PACKET_BACKUP, 32);
+        assert_eq!(PACKET_MASK, 31);
+        assert_eq!(SIZEOF_CLIENT_SNAPSHOT_T, 3160);
+        assert_eq!(OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT, 3148);
+        assert_eq!(OFFSET_CLIENT_SNAPSHOT_MESSAGE_ACKED, 3152);
+        assert_eq!(
+            OFFSET_CLIENT_SNAPSHOT_MESSAGE_ACKED,
+            OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT + 4
+        );
+        // the frames array ends exactly where cl->ping begins
+        assert_eq!(
+            OFFSET_CLIENT_PING - OFFSET_CLIENT_FRAMES,
+            PACKET_BACKUP * SIZEOF_CLIENT_SNAPSHOT_T
+        );
+        // absolute addresses of frames[0].messageSent/messageAcked
+        assert_eq!(
+            OFFSET_CLIENT_FRAMES + OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT,
+            136560
+        );
+        assert_eq!(
+            OFFSET_CLIENT_FRAMES + OFFSET_CLIENT_SNAPSHOT_MESSAGE_ACKED,
+            136564
+        );
     }
 
     #[test]
