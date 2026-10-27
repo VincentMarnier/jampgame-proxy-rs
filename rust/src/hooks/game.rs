@@ -139,17 +139,32 @@ fn tffa_damage_blocked(targ: usize, attacker: usize) -> Option<bool> {
     if !crate::tffa::enabled() {
         return Some(false);
     }
-    let (Some(targ_num), Some(attacker_num)) = (tffa_player_slot(targ), tffa_player_slot(attacker))
-    else {
+    let targ_num = tffa_player_slot(targ);
+    let attacker_num = tffa_player_slot(attacker);
+    // End-of-match delay: once a match's outcome is decided (fraglimit, or the
+    // timelimit expired untied) its players neither deal nor take damage for
+    // `tffa::END_DELAY_MS`, exactly like pristine `G_Damage` returning on
+    // `level.intermissionQueued` "so don't allow any extra scoring"
+    // (`g_combat.c:4520-4524`). This is per match, so other instances keep
+    // fighting normally. It also covers a player's hit on a door/trigger (the
+    // victim has no client, the attacker does).
+    let (targ_match, attacker_match, ending) = state::with_state(|s| {
+        // SAFETY: `tffa_player_slot` only yields `[0, MAX_CLIENTS)` indices.
+        let targ_match = targ_num.map(|n| s.tffa.client_match[n as usize]);
+        let attacker_match = attacker_num.map(|n| s.tffa.client_match[n as usize]);
+        let ending = crate::tffa::damage_void_in(&s.tffa.matches, targ_match, attacker_match);
+        (targ_match, attacker_match, ending)
+    });
+    if ending {
+        return Some(true);
+    }
+    let (Some(targ_match), Some(attacker_match)) = (targ_match, attacker_match) else {
         return None;
     };
     if targ_num == attacker_num {
         return Some(false);
     }
-    Some(crate::tffa::damage_blocked(
-        crate::tffa::client_match(attacker_num),
-        crate::tffa::client_match(targ_num),
-    ))
+    Some(crate::tffa::damage_blocked(attacker_match, targ_match))
 }
 
 // ---------------------------------------------------------------------------

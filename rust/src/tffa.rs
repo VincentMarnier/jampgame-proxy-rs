@@ -101,6 +101,19 @@ pub fn client_match(client_num: i32) -> u8 {
     state::with_state(|s| s.tffa.client_match[client_num as usize])
 }
 
+/// Whether the match is inside its end-of-match delay: its outcome is decided
+/// (fraglimit hit or timelimit expired untied) but the pristine
+/// `LogExit` → `BeginIntermission` window has not elapsed. Damage involving its
+/// players is void until it ends (`END_DELAY_MS`).
+pub fn match_ending(match_id: u8) -> bool {
+    state::with_state(|s| {
+        s.tffa
+            .matches
+            .get(match_id as usize)
+            .is_some_and(state::TffaMatch::ending)
+    })
+}
+
 /// Whether a server command is a team chat message. `G_SayTo` sends `SAY_TEAM`
 /// as `tchat` (plain) or `ltchat` (with a location prefix)
 /// (`g_cmds.c:1511-1522`); global `chat`/`lchat` are not team chat.
@@ -187,6 +200,27 @@ fn follow_target(viewer: c_int) -> Option<c_int> {
 /// Pure damage gate: blocked unless both ends share one match.
 pub fn damage_blocked(attacker_match: u8, victim_match: u8) -> bool {
     attacker_match != victim_match
+}
+
+/// Pure end-of-match damage gate: a hit is void while either end belongs to a
+/// match serving its end-of-match delay (`TffaMatch::ending`). An absent end
+/// (a non-player entity such as a door or the world) contributes nothing, so a
+/// player in an ending match can neither deal nor take damage, while every
+/// other instance keeps fighting. Mirrors pristine `G_Damage`'s
+/// `level.intermissionQueued` early return (`g_combat.c:4520-4524`).
+pub fn damage_void_in(
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    victim_match: Option<u8>,
+    attacker_match: Option<u8>,
+) -> bool {
+    [victim_match, attacker_match]
+        .into_iter()
+        .flatten()
+        .any(|m| {
+            matches
+                .get(m as usize)
+                .is_some_and(state::TffaMatch::ending)
+        })
 }
 
 /// Pure snapshot gate: `true` = keep entity for viewer.
@@ -1293,6 +1327,9 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
     for (i, m) in t.matches.iter_mut().enumerate() {
         m.red = 0;
         m.blue = 0;
+        // A new round starts from a fresh score: no match carries a pending
+        // end-of-match delay across the restart.
+        m.end_queued_at = 0;
         if i == MAIN_MATCH as usize {
             m.active = true;
             continue;
@@ -1543,6 +1580,9 @@ fn disable_parallel_tffa() {
         s.tffa.viewer_match_cache = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.restart_grace_frames = 0;
+        // Main keeps playing: a pending end-of-match delay from before the
+        // disable must not void its damage after a later re-enable.
+        s.tffa.matches[MAIN_MATCH as usize].end_queued_at = 0;
         // Gameplay while the feature is off can spawn interactive entities no
         // tag covers, so a later re-enable must re-measure the map (the
         // measured tag set is what an instance clones).
@@ -1740,6 +1780,59 @@ fn timelimit_expired() -> bool {
     i64::from(time) - i64::from(start) >= i64::from(minutes) * 60_000
 }
 
+/// `level.time` in milliseconds (0 when the level block is not located yet).
+fn level_time() -> i32 {
+    let level = crate::original::level_address();
+    if level == 0 {
+        return 0;
+    }
+    // SAFETY: level is the game's `level_locals_t`; `time` is an int.
+    unsafe { read_i32(level + crate::sdk::OFFSET_LEVEL_TIME) }
+}
+
+/// Pristine `INTERMISSION_DELAY_TIME` (`g_local.h:41`): after `LogExit` queues
+/// the end of the game, `CheckExitRules` keeps forwarding frames for one
+/// second before `BeginIntermission` runs. The shipped binary compares against
+/// `0x3e8` (`0x88b8c`). During that window pristine `G_Damage` returns early
+/// ("don't allow any extra scoring", `g_combat.c:4520-4524`), which is the
+/// "damage is void before the game ends" behaviour a per-match TFFA end keeps.
+pub const END_DELAY_MS: i32 = 1000;
+
+/// One frame's outcome decision for an active match: `Some(reason)` when the
+/// match's end must be applied **this** frame, `None` while it is still
+/// playing or still inside the end-of-match delay.
+///
+/// The first frame a limit is hit records `end_queued_at` (the pristine
+/// `LogExit` → `BeginIntermission` delay). Later frames keep returning `None`
+/// until [`END_DELAY_MS`] elapsed; the match then stays in the proxy tables
+/// (and its scoreboard) until the caller finalises it. A limit that no longer
+/// applies (an admin raised `fraglimit` inside the window) cancels the pending
+/// end. Pure so the delay is unit-tested.
+fn queued_finish(
+    m: &mut state::TffaMatch,
+    reason: Option<&'static str>,
+    now: i32,
+) -> Option<&'static str> {
+    let Some(reason) = reason else {
+        m.end_queued_at = 0;
+        return None;
+    };
+    if m.end_queued_at == 0 {
+        // `level.time` is far past 0 in play; the clamp only keeps 0 meaning
+        // "not queued" on a fabricated/rewound clock.
+        m.end_queued_at = now.max(1);
+        return None;
+    }
+    (now - m.end_queued_at >= END_DELAY_MS).then_some(reason)
+}
+
+/// Any active match whose outcome is decided but whose end has not been
+/// applied yet. The map must not run its final intermission while one is
+/// pending (the matches still owe their one-second end window).
+fn any_match_ending(matches: &[state::TffaMatch]) -> bool {
+    matches.iter().any(|m| m.ending())
+}
+
 /// Why an active match ends this frame: the shared fraglimit, or the shared
 /// timelimit once it expired **and the match is no longer tied**. A tied match
 /// keeps playing (per-match sudden death); it ends as soon as a frag makes the
@@ -1794,6 +1887,11 @@ fn promotion_candidate(
         if !m.active {
             continue;
         }
+        // A match that already hit its limit is ending, not surviving: it must
+        // not be promoted into the main slot on its way out.
+        if m.ending() {
+            continue;
+        }
         let members: Vec<c_int> = client_match
             .iter()
             .enumerate()
@@ -1825,10 +1923,15 @@ fn promote_into_main(
     main.red = red;
     main.blue = blue;
     main.active = true;
+    // The main slot now carries the promoted *continuing* game: its own
+    // pending end (the reason it is being replaced) must not void the new
+    // game's damage.
+    main.end_queued_at = 0;
     let promoted = &mut matches[id as usize];
     promoted.red = 0;
     promoted.blue = 0;
     promoted.active = false;
+    promoted.end_queued_at = 0;
     for cn in members {
         if let Some(slot) = client_match.get_mut(*cn as usize) {
             *slot = MAIN_MATCH;
@@ -1901,6 +2004,15 @@ pub fn on_run_frame_post() {
     let fraglimit = unsafe { crate::syscall::cvar_variable_integer_value(c"fraglimit") };
     let limit_expired = timelimit_expired();
     if fraglimit <= 0 && !limit_expired {
+        // No limit is in force. An admin who raised/disabled the limit inside
+        // an end-of-match window keeps the match playing: cancel the pending
+        // end so its damage is not void forever (the limit early-return would
+        // otherwise skip the cancel pass below every frame).
+        state::with_state(|s| {
+            for m in s.tffa.matches.iter_mut() {
+                m.end_queued_at = 0;
+            }
+        });
         return;
     }
     // Authoritative game-side census (includes bots and connecting clients).
@@ -1915,16 +2027,43 @@ pub fn on_run_frame_post() {
         red_names: Vec<String>,
         blue_names: Vec<String>,
     }
-    let mut finished: Vec<Finished> = Vec::new();
+    // First pass: decide which matches that hit a limit this frame are *newly*
+    // ending (queue the pristine one-second end window) and which have been
+    // ending long enough to be applied now. A match inside the window keeps
+    // playing; its damage is void (`tffa::match_ending` in the `G_Damage`
+    // gate), so the final kill is not immediately followed by a spectator
+    // teleport — exactly like pristine `LogExit` → `BeginIntermission`.
+    let now = level_time();
+    let mut newly_ending: Vec<(u8, &'static str, i32, i32)> = Vec::new();
+    let mut due: Vec<u8> = Vec::new();
     state::with_state(|s| {
-        for (i, m) in s.tffa.matches.iter().enumerate() {
+        for (i, m) in s.tffa.matches.iter_mut().enumerate() {
             if !m.active {
                 continue;
             }
+            let reason = match_finish_reason(m.red, m.blue, fraglimit, limit_expired);
+            let was_ending = m.ending();
+            let due_now = queued_finish(m, reason, now).is_some();
+            if !was_ending && m.ending() {
+                newly_ending.push((i as u8, reason.unwrap_or("fraglimit"), m.red, m.blue));
+            }
+            if due_now {
+                due.push(i as u8);
+            }
+        }
+    });
+    for (id, reason, red, blue) in &newly_ending {
+        eprintln!(
+            "----- proxy-rs: TFFA {id} reached {reason} ({red}-{blue}) — damage void for {END_DELAY_MS} ms before the match ends"
+        );
+    }
+    let mut finished: Vec<Finished> = Vec::new();
+    state::with_state(|s| {
+        for id in &due {
+            let m = &s.tffa.matches[*id as usize];
             let Some(reason) = match_finish_reason(m.red, m.blue, fraglimit, limit_expired) else {
                 continue;
             };
-            let id = i as u8;
             // Only live assignments: free slots default to main and would
             // otherwise inflate main finishes to 30 "members" (reliable
             // overflow + SetTeam on empty entities).
@@ -1933,7 +2072,7 @@ pub fn on_run_frame_post() {
                 .client_match
                 .iter()
                 .enumerate()
-                .filter(|(i, m)| **m == id && connected[*i])
+                .filter(|(i, m)| **m == *id && connected[*i])
                 .map(|(i, _)| i as c_int)
                 .collect();
             // Team split + names from the stored CS_PLAYERS bases (game
@@ -1958,7 +2097,7 @@ pub fn on_run_frame_post() {
                 }
             }
             finished.push(Finished {
-                id,
+                id: *id,
                 red: m.red,
                 blue: m.blue,
                 reason,
@@ -1975,6 +2114,7 @@ pub fn on_run_frame_post() {
                 m.red = 0;
                 m.blue = 0;
                 m.active = false;
+                m.end_queued_at = 0;
                 // The instance is over: queue its world for release at the next
                 // frame start (members are being moved out below).
                 s.tffa.world_release |= 1u16 << f.id;
@@ -1987,13 +2127,18 @@ pub fn on_run_frame_post() {
         if f.id != MAIN_MATCH {
             crate::teamlock::clear_match(f.id);
         }
+        eprintln!(
+            "----- proxy-rs: TFFA {} ended ({}) {}-{}",
+            f.id, f.reason, f.red, f.blue
+        );
     }
     if finished.is_empty() {
         // No match ended this frame: after the timelimit the map lives only
-        // while a tied match still has players.
+        // while a tied match still has players, and not while a match that
+        // reached its limit is still serving its end-of-match delay.
         if limit_expired {
             let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
-            if !has_continuing_match(&matches, &table, &playing) {
+            if !has_continuing_match(&matches, &table, &playing) && !any_match_ending(&matches) {
                 crate::hooks::game::run_begin_intermission();
             }
         }
@@ -2032,6 +2177,7 @@ pub fn on_run_frame_post() {
             state::with_state(|s| {
                 s.tffa.matches[MAIN_MATCH as usize].red = 0;
                 s.tffa.matches[MAIN_MATCH as usize].blue = 0;
+                s.tffa.matches[MAIN_MATCH as usize].end_queued_at = 0;
             });
         } else {
             // Lowest-id still-played TFFA becomes the new main.
@@ -2119,7 +2265,9 @@ pub fn on_run_frame_post() {
     // is over: run the normal intermission (final scoreboard + map restart).
     if limit_expired {
         let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
-        if !has_continuing_match(&matches, &table, &playing_clients()) {
+        if !has_continuing_match(&matches, &table, &playing_clients())
+            && !any_match_ending(&matches)
+        {
             crate::hooks::game::run_begin_intermission();
         }
     }
@@ -3810,6 +3958,13 @@ fn cmd_join(client_num: c_int, id: i32) {
         tell(client_num, "print \"That match is not active.\n\"");
         return;
     }
+    // A match whose outcome is already decided is in its one-second end
+    // window: joining it would only move the client back to spectator when it
+    // closes.
+    if match_ending(id) {
+        tell(client_num, &format!("print \"Match {id} is ending.\n\""));
+        return;
+    }
     if match_size(id) >= max_group_size() {
         tell(client_num, "print \"That match is full.\n\"");
         return;
@@ -3914,6 +4069,7 @@ fn close_instance_state(
     m.red = 0;
     m.blue = 0;
     m.active = false;
+    m.end_queued_at = 0;
     moved
 }
 
@@ -4005,6 +4161,36 @@ mod tests {
         assert!(damage_blocked(1, MAIN_MATCH));
         // Main fights itself.
         assert!(!damage_blocked(MAIN_MATCH, MAIN_MATCH));
+    }
+
+    /// The pristine end-of-match window voids damage for the match that reached
+    /// its limit, on both ends of the hit, and only for that match: a hit
+    /// against a door/world entity (no match on that end) is still void when
+    /// the player's own match is ending, and other instances keep fighting.
+    #[test]
+    fn damage_is_void_inside_a_matches_end_delay() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[1].active = true;
+        // Instance 1 reached its fraglimit and is serving the end delay.
+        matches[1].end_queued_at = 5_000;
+        // Inside instance 1: victim, attacker or both.
+        assert!(damage_void_in(&matches, Some(1), Some(1)));
+        assert!(damage_void_in(&matches, Some(1), None));
+        assert!(damage_void_in(&matches, None, Some(1)));
+        // Main keeps playing: neither end belongs to the ending instance.
+        assert!(!damage_void_in(
+            &matches,
+            Some(MAIN_MATCH),
+            Some(MAIN_MATCH)
+        ));
+        assert!(!damage_void_in(&matches, None, None));
+        // An inactive or non-ending slot never voids anything.
+        matches[1].active = false;
+        assert!(!damage_void_in(&matches, Some(1), Some(1)));
+        matches[1].active = true;
+        matches[1].end_queued_at = 0;
+        assert!(!damage_void_in(&matches, Some(1), Some(1)));
     }
 
     #[test]
@@ -4125,6 +4311,90 @@ mod tests {
         assert!(fraglimit_hit(3, 10, 10));
         assert!(!fraglimit_hit(9, 9, 10));
         assert!(!fraglimit_hit(10, 10, 0));
+    }
+
+    /// Reported bug: the last kill of a TFFA instance moved its players to
+    /// spectator in the same frame, so the game "stopped immediately". A match
+    /// now serves the pristine `INTERMISSION_DELAY_TIME` window first: for one
+    /// second it keeps playing, with damage void (`match_ending`), and only
+    /// then is it announced and ended.
+    #[test]
+    fn a_finished_match_serves_the_pristine_end_delay() {
+        // The shipped `CheckExitRules` compares against 0x3e8 (`0x88b8c`).
+        assert_eq!(END_DELAY_MS, 1000);
+        let mut m = state::TffaMatch {
+            active: true,
+            red: 5,
+            blue: 4,
+            end_queued_at: 0,
+        };
+        // The frame the limit is reached only queues the end: play continues.
+        assert_eq!(queued_finish(&mut m, Some("fraglimit"), 10_000), None);
+        assert_eq!(m.end_queued_at, 10_000);
+        assert!(m.ending());
+        // Inside the delay nothing is applied yet.
+        assert_eq!(queued_finish(&mut m, Some("fraglimit"), 10_999), None);
+        assert!(m.ending());
+        // Exactly one second later the match is due for its announcement and
+        // spectator move.
+        assert_eq!(
+            queued_finish(&mut m, Some("fraglimit"), 11_000),
+            Some("fraglimit")
+        );
+        // A raised fraglimit inside the window cancels the pending end (and
+        // gives damage back).
+        let mut m = state::TffaMatch {
+            active: true,
+            red: 5,
+            blue: 4,
+            end_queued_at: 0,
+        };
+        assert_eq!(queued_finish(&mut m, Some("fraglimit"), 10_000), None);
+        assert_eq!(queued_finish(&mut m, None, 10_500), None);
+        assert!(!m.ending());
+        assert_eq!(m.end_queued_at, 0);
+        // A tied match at the timelimit never queues an end.
+        let mut m = state::TffaMatch {
+            active: true,
+            red: 3,
+            blue: 3,
+            end_queued_at: 0,
+        };
+        assert_eq!(queued_finish(&mut m, None, 10_000), None);
+        assert!(!m.ending());
+        assert!(!any_match_ending(core::slice::from_ref(&m)));
+    }
+
+    /// A match that already reached its limit is ending, not surviving: it
+    /// must not become the new main when the current one ends.
+    #[test]
+    fn an_ending_match_is_not_promoted_into_main() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[1].active = true;
+        matches[1].red = 2;
+        matches[1].blue = 1;
+        matches[1].end_queued_at = 5_000;
+        matches[2].active = true;
+        matches[2].red = 4;
+        matches[2].blue = 3;
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut connected = [false; MAX_CLIENTS];
+        table[0] = 1;
+        connected[0] = true;
+        table[1] = 2;
+        connected[1] = true;
+        // The lower id is ending: the surviving game is instance 2.
+        let (id, red, blue, members) =
+            promotion_candidate(&matches, &table, &connected, 8).expect("instance 2 survives");
+        assert_eq!((id, red, blue), (2, 4, 3));
+        assert_eq!(members, vec![1]);
+        // Promotion clears both slots' pending ends so the new main's damage
+        // is not void.
+        promote_into_main(&mut matches, &mut table, id, red, blue, &members);
+        assert!(!matches[MAIN_MATCH as usize].ending());
+        assert!(!matches[2].ending());
+        assert_eq!(table[1], MAIN_MATCH);
     }
 
     /// The requested timelimit rule: at the shared limit an untied match ends,
@@ -5417,16 +5687,19 @@ mod tests {
             active: true,
             red: 5,
             blue: 3,
+            ..Default::default()
         };
         matches[1] = state::TffaMatch {
             active: true,
             red: 2,
             blue: 1,
+            ..Default::default()
         };
         matches[4] = state::TffaMatch {
             active: true,
             red: 0,
             blue: 0,
+            ..Default::default()
         };
         // A slot above a lowered `proxy_tffa_maxMatches` is still an open
         // match: a disable closes it like any other (only `map_restart`'s carry
@@ -5550,11 +5823,13 @@ mod tests {
             active: true,
             red: 4,
             blue: 2,
+            ..Default::default()
         };
         matches[1] = state::TffaMatch {
             active: true,
             red: 3,
             blue: 1,
+            ..Default::default()
         };
         let mut table = [MAIN_MATCH; MAX_CLIENTS];
         table[0] = 1;

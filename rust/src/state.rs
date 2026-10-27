@@ -277,6 +277,22 @@ pub struct TffaMatch {
     pub active: bool,
     pub red: i32,
     pub blue: i32,
+    /// `level.time` when the match's outcome was decided (fraglimit hit, or
+    /// the shared timelimit expired untied), `0` while it is still being
+    /// played. The match keeps running until `tffa::END_DELAY_MS` elapsed —
+    /// the pristine `LogExit` → `BeginIntermission` delay — and its damage is
+    /// void in the meantime, exactly like the pristine
+    /// `level.intermissionQueued` window (`g_combat.c:4520-4524`).
+    pub end_queued_at: i32,
+}
+
+impl TffaMatch {
+    /// Whether the match's outcome is decided but its end-of-match delay is
+    /// still running: damage inside it is void and it has not been announced
+    /// or moved to spectator yet.
+    pub fn ending(&self) -> bool {
+        self.active && self.end_queued_at != 0
+    }
 }
 
 /// Parallel-TFFA state.
@@ -414,6 +430,7 @@ impl Default for TffaState {
                 active: i == 0,
                 red: 0,
                 blue: 0,
+                end_queued_at: 0,
             }),
             client_match: [0; MAX_CLIENTS],
             player_score: [0; MAX_CLIENTS],

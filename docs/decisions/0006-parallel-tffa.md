@@ -1597,3 +1597,61 @@ real server, which the automated suite cannot drive.
   `G_RunThink`, `g_mover.c`) damaging a protect/absorb user
   (`G_Damage` → `PDSOUND_PROTECTHIT`/`PDSOUND_ABSORBHIT`). The reported
   symptom does not ride that path.
+
+- **End-of-match damage-void window (2026-10-27, live report: "when the last
+  kill is performed in a TFFA instance, game stops immediately … normally
+  there is a small timespan where dmgs should be void").** The proxy swallowed
+  the pristine fraglimit exit (`log_exit`, above) and applied the match end in
+  the same `on_run_frame_post` as the winning frag: members were moved to
+  spectator immediately, losing the base game's `LogExit` →
+  `BeginIntermission` interval. Pristine `LogExit` only queues the end
+  (`level.intermissionQueued = level.time`, `g_main.c:2239`) and
+  `CheckExitRules` applies it `INTERMISSION_DELAY_TIME` later (`g_local.h:41`;
+  shipped compare against `0x3e8` at `0x88b8c`, `BeginIntermission` call at
+  `0x88b9d`). During that second pristine `G_Damage` returns before touching
+  health — "the intermission has allready been qualified for, so don't allow
+  any extra scoring" (`g_combat.c:4520-4524`) — which is the void-damage
+  timespan the report expected.
+
+  The overlay now mirrors it **per match**, so one instance ending does not
+  freeze the others:
+
+  - `TffaMatch::end_queued_at` records `level.time` on the first frame
+    `match_finish_reason` fires (`queued_finish`), and the existing
+    announce/stats/spectator path runs only after `tffa::END_DELAY_MS` = 1000.
+    Until then the match keeps playing (scores frozen because no damage lands)
+    and stays on the scoreboard/`tffa_list`.
+  - `tffa::damage_void_in` (pure) / the `G_Damage` TFFA gate
+    (`tffa_damage_blocked`) void any hit with a player of an ending match on
+    either end — both players, or a player's hit on a door/trigger. Other
+    matches keep fighting. `tffa_join` into an ending match is refused.
+  - The map's final intermission waits for pending ends (`any_match_ending`),
+    an ending match is not a `promotion_candidate`, and `promote_into_main`
+    clears the stamp on both slots (the new main must not inherit void damage).
+    A raised/disabled limit inside the window cancels the pending end and
+    restores damage; `close_instance_state`, `reset_round_state` and the
+    disable edge clear it with their slot too.
+  - New permanent engine-log lines make the transition observable:
+    `TFFA N reached <reason> (R-B) — damage void for 1000 ms before the match
+    ends` at queue time and `TFFA N ended (<reason>) R-B` at apply time.
+
+  Tests: `a_finished_match_serves_the_pristine_end_delay` (queue → 999 ms still
+  running → 1000 ms due; cancellation when the limit no longer applies; a tied
+  match never queues), `damage_is_void_inside_a_matches_end_delay` (either
+  end of the hit, a door/world end, other matches unaffected, inactive/cleared
+  slots) and `an_ending_match_is_not_promoted_into_main`; `cargo test`
+  168/168, `clippy -D warnings`, `fmt --check`, i686 release build.
+
+  Runtime (2026-10-27, `mp/duel1`, `g_gametype 6`, `proxy_tffa_enable 1`,
+  `bot_enable 1` + `bot_minplayers 4`, `fraglimit 1`, `d_noIntermissionWait 1`,
+  dedicated server + `docker logs -t`): five fraglimit cycles logged the queue
+  line immediately after the `Kill:` line and the `ended` line
+  **998–999 ms later** (e.g. `22:39:17.345923` → `22:39:18.345505`), where the
+  pre-fix build ended the match in the kill's own frame. This observes the main
+  path (match 0), which shares the decision/finalise loop with created
+  instances; the created-instance window and the void damage inside it were
+  not runtime-observed (a created match needs a live client to issue
+  `tffa_create` and to be the one landing the final hit), and rest on the
+  unit-tested `queued_finish`/`damage_void_in` plus the shared
+  `G_Damage` wrapper. The standard engine smoke (`rust/scripts/engine-test.sh`,
+  `mp/duel1`, feature off) passes on the same build.
