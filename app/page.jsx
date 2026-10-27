@@ -13,7 +13,7 @@ const cvars = [
   ["proxy_sv_enableRconCmdCooldown", "0", "Cooldown on RCON commands to avoid flooding", "hardening"],
   ["proxy_sv_maxCallVoteMapRestartValue", "60", "Maximum value allowed on a callvote map_restart", "votes"],
   ["proxy_sv_modelPathLength", "64", "Maximum model path length accepted from clients", "hardening"],
-  ["proxy_sv_enableNetStatus", "0", "Compute per-player network status (netStatus / showNet commands)", "observability"],
+  ["proxy_sv_enableNetStatus", "0", "Per-player network status: netStatus / showNet print the net status table; when 0 the feature is completely inert — no collection, no computation, no table", "observability"],
   ["proxy_sv_enableEndGameStats", "1", "Print personal / global / best-player stats tables at end of game", "stats"],
   ["proxy_sv_antiHpTeller", "0", "Prevent HP tellers usage", "gameplay"],
   ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "gameplay"],
@@ -112,9 +112,9 @@ export default function Home() {
             <h1>Safer servers.<br />More matches.</h1>
             <p className="tagline">
               <strong>jampgame-proxy-rs</strong> protects your Jedi Academy server
-              from exploits and cheats, adds team controls and live K/D on TaystJK
-              scoreboards, and lets more players fight at once — server-side only,
-              no downloads for players.
+              from exploits and cheats, adds team controls, an RCON player mute and
+              live K/D on TaystJK scoreboards, and lets more players fight at once —
+              server-side only, no downloads for players.
             </p>
             <div className="cta-row">
               <a className="btn" href={RELEASES}>Download release</a>
@@ -208,7 +208,7 @@ export default function Home() {
 
         {/* ---------- features ---------- */}
         <section className="block" id="features" aria-labelledby="features-title">
-          <SectionHead id="features-title" eyebrow="What you get" title="Hardening, team tools, live K/D" lede="Security guards run unless the master switch proxy_sv_enable is off. Everything else is opt-in per cvar." />
+          <SectionHead id="features-title" eyebrow="What you get" title="Hardening, team tools, live K/D" lede="Security guards run unless the master switch proxy_sv_enable is off. Everything else is opt-in per cvar or command." />
 
           <h3 className="sub">Built-in security hardening <span className="count">always on</span></h3>
           <ul className="cards danger">
@@ -278,6 +278,51 @@ export default function Home() {
               else&apos;s scoreboard breaks.
             </p>
           </div>
+
+          <h3 className="sub">Player mute <span className="count">rcon</span></h3>
+          <div className="prose">
+            <p>
+              <code>rcon mute &lt;player&gt;</code> silences a player&apos;s chat and{" "}
+              <code>rcon unmute &lt;player&gt;</code> gives it back.{" "}
+              <code>&lt;player&gt;</code> is the client number <code>status</code>{" "}
+              shows (<code>rcon mute 0</code>) or any part of the name — case- and
+              colour-code-insensitive, exact first, then a prefix, then the fragment
+              wherever it sits (<code>rcon mute ade</code> finds{" "}
+              <i>Darth Vader</i>). Names with spaces work as typed; a fragment shared
+              by several players lists the candidates, and a bare{" "}
+              <code>rcon mute</code> prints the usage and who is currently muted.
+            </p>
+            <p>
+              A muted player keeps playing normally: only <code>say</code>,{" "}
+              <code>say_team</code>, <code>tell</code> and the voice menu&apos;s{" "}
+              <code>voice_cmd</code> are dropped, and they are told they are muted.
+              Mutes are per client slot, cleared when the player leaves, kept across a{" "}
+              <code>map_restart</code>, and a full map change starts with nobody
+              muted. Like every proxy feature they need <code>proxy_sv_enable 1</code>,
+              and the same commands work in the dedicated server&apos;s own console.
+            </p>
+          </div>
+
+          <h3 className="sub" id="netstatus">Net status <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              With <code>proxy_sv_enableNetStatus 1</code>, the{" "}
+              <code>netStatus</code> and <code>showNet</code> commands print a
+              per-player table (rate-limited to once per 500 ms, bots excluded):
+            </p>
+          </div>
+          <Code
+            title="netStatus"
+            text={"ping    rtt   jit  fps  pps     timeNudge snaps   rate name\n---- ------ ----- ---- ---- ------------- ---- ------ ---------------\n   0    0.0   0.0   60   30 [-17.9..-10.5]   20  25000 client0"}
+          >
+            {"ping    rtt   jit  fps  pps     timeNudge snaps   rate name\n---- ------ ----- ---- ---- ------------- ---- ------ ---------------\n   0    0.0   0.0   60   30 [-17.9..-10.5]   20  25000 client0"}
+          </Code>
+          <ul className="tight">
+            <li><b>ping / rtt / jit</b> — the scoreboard ping, the round-trip time the server measures itself (the &ldquo;real&rdquo; ping, 0 on the same machine) and its jitter: 0 is rock steady, a flaky line shows a large number.</li>
+            <li><b>fps / pps</b> — moves per second the player&apos;s game produces and packets per second it sends. A packet bundles several moves, so pps follows <code>cl_maxpackets</code>; on the same machine the packet limiter is skipped and pps = fps.</li>
+            <li><b>timeNudge</b> — the player&apos;s <code>cl_timeNudge</code>, which the client never tells the server, so it is <b>estimated</b> and reported as a range: <code>[-17.9..-10.5]</code> means &ldquo;between -17.9 and -10.5&rdquo;, <code>-</code> means not enough data yet. Values are never clamped to ±30 — a reading outside that range is evidence of a modified client.</li>
+            <li><b>snaps / rate / name</b> — snapshots per second sent to the player (capped by the server&apos;s <code>sv_fps</code>), their bandwidth setting, and who they are.</li>
+          </ul>
         </section>
 
         <Divider />
@@ -288,7 +333,7 @@ export default function Home() {
           <div className="lifecycle" aria-label="TFFA match lifecycle">
             <div><b><i>1</i>Create</b><code>tffa_create</code> opens a match and joins its smaller side (red when empty).</div>
             <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt;</code> switches matches mid-game; <code>tffa_leave</code> or <code>tffa_join 0</code> returns to main.</div>
-            <div><b><i>3</i>Fight</b>Damage, snapshots, sabers, kill feed and items are isolated per match. Global chat stays server-wide; team chat stays in its match.</div>
+            <div><b><i>3</i>Fight</b>Damage, snapshots, sabers, force sounds, kill feed and items are isolated per match. Global chat stays server-wide; team chat stays in its match.</div>
             <div><b><i>4</i>End</b>Each match shares the server fraglimit; tied matches at the global timelimit play sudden death. A <code>map_restart</code> keeps matches.</div>
           </div>
           <div className="hook-grid">
@@ -304,7 +349,7 @@ export default function Home() {
           </div>
           <ul className="tight">
             <li><code>tffa_create</code> / <code>tffa_join &lt;id&gt;</code> / <code>tffa_leave</code> / <code>tffa_list</code> — create, join, leave, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
-            <li><code>netStatus</code> / <code>showNet</code> — print the per-player network status table (score, ping, rate, fps, packets, timeNudge, snaps, id, name; requires <code>proxy_sv_enableNetStatus 1</code>).</li>
+            <li><code>netStatus</code> / <code>showNet</code> — print the per-player net status table: ping, rtt, jitter, fps, pps, timeNudge, snaps, rate and name (see <a href="#netstatus">Net status</a>; requires <code>proxy_sv_enableNetStatus 1</code>).</li>
             <li>Auto team picks (<code>team free</code>, the client auto-join, <code>g_teamAutoJoin</code>) balance the match being joined. <code>proxy_sv_lockTeams</code> locks each match against its own round-start roster (a match created mid-round stays unlocked until the next round), and <code>proxy_sv_teamSizeRules</code> uses per-match sizes — one rule applies when every populated match is the same <code>N vs N</code>.</li>
             <li>The scoreboard lists every match&apos;s players, with the other matches grouped as spectators and the red/blue header plus each score taken from your own match. HUD team scores stay global (per-match HUD would need a client mod).</li>
           </ul>
