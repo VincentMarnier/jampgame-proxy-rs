@@ -761,9 +761,10 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
 /// victim, so they are hidden the same way without trap parsing. Sound temp
 /// entities carry no owner of their own, so they are attributed to the match
 /// that created them (the `G_Sound`/`G_TempEntity` stamp in
-/// `TffaState::sound_source`, or `s.clientNum` for `EV_ENTITY_SOUND`) and
-/// dropped the same way; map/world sounds and `EV_GLOBAL_SOUND` broadcasts
-/// stay visible/audible everywhere.
+/// `TffaState::sound_source`, or `s.clientNum` for `EV_ENTITY_SOUND` and the
+/// player respawn/teleport events `EV_PLAYER_TELEPORT_IN`/`OUT`) and dropped
+/// the same way; map/world sounds and `EV_GLOBAL_SOUND` broadcasts stay
+/// visible/audible everywhere.
 ///
 /// World/static entities are always kept. Player entities (`entNum < 32`
 /// with a live client) and owned entities (missiles/sabers via
@@ -903,8 +904,8 @@ fn snapshot_keep(
         }
         // Sound events are attributed by the emitting entity's match — the
         // creation-time stamp for `G_Sound`, `s.clientNum` for
-        // `G_EntitySound`/`G_SoundOnEnt` — while deliberate broadcasts stay
-        // audible everywhere.
+        // `G_EntitySound`/`G_SoundOnEnt` and the respawn/teleport pair — while
+        // deliberate broadcasts stay audible everywhere.
         match crate::tffa::sound_attribution(event) {
             crate::tffa::SoundAttribution::Broadcast => return true,
             crate::tffa::SoundAttribution::Stamped => {
@@ -1255,6 +1256,52 @@ mod tests {
         for viewer_match in [0, 1, 2] {
             assert!(snapshot_keep(
                 viewer_match,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+        }
+    }
+
+    /// Player respawn/teleport temp entities (`EV_PLAYER_TELEPORT_IN`/`OUT`)
+    /// carry their player in `s.clientNum` and nothing else. Before this
+    /// classification they fell through to the generic owner-field rule, whose
+    /// zero defaults resolved to client 0, so the main instance heard every
+    /// other instance's respawn `telein` sound (and instance players heard
+    /// main's when they were not in client 0's match).
+    #[test]
+    fn respawn_teleport_sound_follows_its_player_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        for event in [
+            crate::sdk::EV_PLAYER_TELEPORT_IN,
+            crate::sdk::EV_PLAYER_TELEPORT_OUT,
+        ] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            game.put_i32(48, OFFSET_ENTITY_CLIENT_NUM, 5);
+            assert!(
+                snapshot_keep(1, &table, &sound_table(), &shared_table(), game.base(), 48),
+                "event {event} must stay audible in its own instance"
+            );
+            assert!(
+                !snapshot_keep(0, &table, &sound_table(), &shared_table(), game.base(), 48),
+                "event {event} of an instance-1 player must be silent in main"
+            );
+            // The same event for a main player stays in main only.
+            game.put_i32(48, OFFSET_ENTITY_CLIENT_NUM, 0);
+            assert!(snapshot_keep(
+                0,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            assert!(!snapshot_keep(
+                1,
                 &table,
                 &sound_table(),
                 &shared_table(),

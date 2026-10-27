@@ -402,6 +402,16 @@ pub const EV_SABER_CLASHFLARE: i32 = 32;
 /// sounds). Built by `G_TempEntity`, so it carries no owner of its own; the
 /// proxy stamps it with the acting scope's instance (see `tffa`).
 pub const EV_PREDEFSOUND: i32 = 40;
+/// `EV_PLAYER_TELEPORT_IN`/`EV_PLAYER_TELEPORT_OUT` (`bg_public.h:827-830`):
+/// the player respawn / teleport / disconnect temp entities. Every game-side
+/// creator sets `s.clientNum` to the player (`g_client.c:1226,2573,3872`,
+/// `g_misc.c:189,192`, `g_cmds.c:921`, `g_main.c:1721`, `g_saga.c:849`), and
+/// `ClientSpawn` syncs `ent->s.clientNum` from `ps.clientNum` before the
+/// caller builds the event (`g_client.c:3788`). The snapshot filter therefore
+/// attributes them to that player's match: `EV_PLAYER_TELEPORT_IN` is the
+/// respawn sound (`sound/player/telein.wav`, `cg_event.c:2789`).
+pub const EV_PLAYER_TELEPORT_IN: i32 = 64;
+pub const EV_PLAYER_TELEPORT_OUT: i32 = 65;
 pub const EV_MUTE_SOUND: i32 = 74;
 pub const EV_GENERAL_SOUND: i32 = 76;
 pub const EV_GLOBAL_SOUND: i32 = 77;
@@ -914,6 +924,9 @@ mod tests {
         assert_eq!(EV_SABER_CLASHFLARE, 32);
         // `G_PreDefSound` (`w_force.c:44`): the force-jump/protect/absorb event.
         assert_eq!(EV_PREDEFSOUND, 40);
+        // Respawning/teleporting players (`sound/player/telein.wav`).
+        assert_eq!(EV_PLAYER_TELEPORT_IN, 64);
+        assert_eq!(EV_PLAYER_TELEPORT_OUT, 65);
         assert_eq!(EV_MUTE_SOUND, 74);
         assert_eq!(EV_GENERAL_SOUND, 76);
         assert_eq!(EV_GLOBAL_SOUND, 77);

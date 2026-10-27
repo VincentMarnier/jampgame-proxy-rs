@@ -1004,6 +1004,38 @@ real server, which the automated suite cannot drive.
   the `EF_PLAYER_EVENT` set legitimately carry `0` for client 0, so a
   follow-up needs the event-specific classification the sound round used
   (the `EF_PLAYER_EVENT` / saber special cases above are exactly that).
+  `EV_PLAYER_TELEPORT_IN` was fixed that way in the next round (below).
+- **Respawn/teleport sound isolation (2026-10-27, live report: "we can hear
+  other TFFA instances' respawns"):** the respawn sound is
+  `EV_PLAYER_TELEPORT_IN`, a `G_TempEntity` built by `respawn()`
+  (`g_client.c:1225-1226`) whose client-side handler plays
+  `sound/player/telein.wav` (`cg_event.c:2789`); `EV_PLAYER_TELEPORT_OUT`
+  (`teleout.wav`, `cg_event.c:2816`) is the teleport/disconnect counterpart.
+  Both carry no `s.owner`/`s.otherEntityNum*` — only `s.clientNum`, which
+  every creator sets to the player (`g_client.c:1226,2573,3872`,
+  `g_misc.c:189-192`, `g_cmds.c:921`, `g_main.c:1721`, `g_saga.c:849`;
+  `ClientSpawn` syncs it from `ps.clientNum` at `g_client.c:3788`) — so the
+  temp-event fallback resolved both zero owner fields to client 0 and kept
+  the sounds in client 0's match: the main instance heard every other
+  instance's respawns, and an instance player's respawn was silenced
+  whenever client 0 was not in their match (the residual above).
+  `tffa::sound_attribution` now classifies the pair as `Emitter`, the
+  `s.clientNum` attribution `EV_ENTITY_SOUND` already used, so the temp
+  entity (the sound *and* the spawn effect it also triggers,
+  `cg_event.c:2795`) is dropped for every other instance. Classification is
+  event-specific, so the other owner-less broadcasts stay as they are.
+  Verification: `cargo test` 162/162; the new
+  `respawn_teleport_sound_follows_its_player_match` snapshot fixture fails on
+  the pre-fix classification at both ends (an instance-1 player's respawn is
+  dropped in instance 1 and kept in main); `clippy -D warnings` clean;
+  `fmt --check` clean; i686 release build. Cross-match audio still needs the
+  live two-instance listen (bots never create split instances).
+  Related residual, not addressed here: item entities are per-instance clones
+  (D-006.6), so a positional `EV_ITEM_RESPAWN` already drops with its clone,
+  but `RespawnItem`'s *global* powerup sound (`g_items.c:2315-2328`,
+  `EV_GLOBAL_SOUND`, or `EV_GENERAL_SOUND` when the item sets `speed`, both
+  built by plain `G_TempEntity` at the item's origin and therefore stamped
+  world/broadcast) still plays in every instance.
 - Known limitations (documented, not fixed here): force
   grip/push and force-heal target selection are not trace-based and may
   still cross matches; cross-match telefrag-induced kills still die

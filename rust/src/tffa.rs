@@ -24,10 +24,12 @@
 //! - sounds: the `G_Sound`/`G_SoundTempEntity`/`G_TempEntity` detours stamp
 //!   every temp entity with the match that created it (`sound_source`), and
 //!   the snapshot filter drops cross-match `EV_GENERAL_SOUND`/
-//!   `EV_ENTITY_SOUND` events plus the predicted `EF_PLAYER_EVENT` combat
-//!   events (`EV_FIRE_WEAPON`, `EV_SABER_ATTACK`, `EV_JUMP`, ...). Map/world
-//!   sounds (`G_SoundAtLoc`, item respawns) and `EV_GLOBAL_SOUND` broadcasts
-//!   stay audible everywhere.
+//!   `EV_ENTITY_SOUND`/`EV_PLAYER_TELEPORT_IN`/`EV_PLAYER_TELEPORT_OUT` events
+//!   plus the predicted `EF_PLAYER_EVENT` combat events (`EV_FIRE_WEAPON`,
+//!   `EV_SABER_ATTACK`, `EV_JUMP`, ...). Map/world sounds (`G_SoundAtLoc`,
+//!   doors, NPC chatter) and `EV_GLOBAL_SOUND` broadcasts stay audible
+//!   everywhere; item entities are per-instance clones (D-006.6), so their
+//!   `EV_ITEM_RESPAWN` drops with the clone.
 //! - scoreboard: `G_SEND_SERVER_COMMAND` trap rewrites `scores ...` per
 //!   viewer with the per-player per-match score copies. The roster is unified
 //!   (every connected client is listed, so players can see who is in which
@@ -2669,7 +2671,9 @@ pub enum SoundAttribution {
     /// `G_Sound` sound: the creating entity's match was stamped into
     /// `TffaState::sound_source` at construction.
     Stamped,
-    /// `G_EntitySound`/`G_SoundOnEnt`: the emitting entity rides `s.clientNum`.
+    /// `G_EntitySound`/`G_SoundOnEnt` and the player respawn/teleport temp
+    /// entities (`EV_PLAYER_TELEPORT_IN`/`OUT`): the emitting player rides
+    /// `s.clientNum`.
     Emitter,
     /// Deliberate broadcast (`EV_GLOBAL_SOUND`, `EV_GLOBAL_TEAM_SOUND`,
     /// `EV_MUTE_SOUND`): head-relative map/CTF audio, or a mute that is a
@@ -2681,7 +2685,7 @@ pub enum SoundAttribution {
 pub fn sound_attribution(event: c_int) -> SoundAttribution {
     use crate::sdk::{
         EV_ENTITY_SOUND, EV_GENERAL_SOUND, EV_GLOBAL_SOUND, EV_GLOBAL_TEAM_SOUND, EV_MUTE_SOUND,
-        EV_PREDEFSOUND,
+        EV_PLAYER_TELEPORT_IN, EV_PLAYER_TELEPORT_OUT, EV_PREDEFSOUND,
     };
     match event {
         EV_GENERAL_SOUND => SoundAttribution::Stamped,
@@ -2695,7 +2699,17 @@ pub fn sound_attribution(event: c_int) -> SoundAttribution {
         // zeros resolve to client 0, and the sound was silenced in every other
         // match.
         EV_PREDEFSOUND => SoundAttribution::Stamped,
-        EV_ENTITY_SOUND => SoundAttribution::Emitter,
+        // `G_EntitySound`/`G_SoundOnEnt` (`g_utils.c:1392-1408`) and the
+        // respawn/teleport temp entities all put the player in `s.clientNum`.
+        // The teleport pair carries no `s.owner`/`s.otherEntityNum*`
+        // (`G_TempEntity` leaves them at the freed-slot memset zero), so
+        // without this they were attributed to client 0 and every instance
+        // heard the other instances' respawn `telein` sounds. `s.clientNum`
+        // is synced by `ClientSpawn` (`g_client.c:3788`) before `respawn()`
+        // builds the event, and set explicitly by every other call site.
+        EV_ENTITY_SOUND | EV_PLAYER_TELEPORT_IN | EV_PLAYER_TELEPORT_OUT => {
+            SoundAttribution::Emitter
+        }
         EV_GLOBAL_SOUND | EV_GLOBAL_TEAM_SOUND | EV_MUTE_SOUND => SoundAttribution::Broadcast,
         _ => SoundAttribution::None,
     }
@@ -4036,6 +4050,16 @@ mod tests {
         assert_eq!(sound_attribution(crate::sdk::EV_GENERAL_SOUND), Stamped);
         assert_eq!(sound_attribution(crate::sdk::EV_PREDEFSOUND), Stamped);
         assert_eq!(sound_attribution(crate::sdk::EV_ENTITY_SOUND), Emitter);
+        // Player respawn/teleport temp entities carry their player in
+        // `s.clientNum`; they must not fall through to client 0.
+        assert_eq!(
+            sound_attribution(crate::sdk::EV_PLAYER_TELEPORT_IN),
+            Emitter
+        );
+        assert_eq!(
+            sound_attribution(crate::sdk::EV_PLAYER_TELEPORT_OUT),
+            Emitter
+        );
         assert_eq!(sound_attribution(crate::sdk::EV_GLOBAL_SOUND), Broadcast);
         assert_eq!(
             sound_attribution(crate::sdk::EV_GLOBAL_TEAM_SOUND),
