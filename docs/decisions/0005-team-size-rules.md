@@ -41,7 +41,7 @@ Rules are separated by spaces/commas/semicolons; each is
 
 The rules run on every `GAME_RUN_FRAME` (`rules::on_run_frame`, called from the
 proxy's `vmMain` dispatch next to `teamlock::on_run_frame`). They are **not**
-gated on `proxy_sv_lockTeams`: the roster is recomputed each frame and the
+gated on `proxy_sv_lockTeamsAfterXSecs`: the roster is recomputed each frame and the
 effective rule follows it, so a match that becomes `2 vs 2` mid-game adopts the
 `2 vs 2` limits. The feature remains gated on the master `proxy_sv_enable`
 switch (the whole handler only runs while the proxy is enabled).
@@ -104,9 +104,9 @@ census (`tffa::match_team_counts`: connected clients on RED/BLUE grouped by
   rule as an uneven whole-server roster. When nothing has been applied yet they
   leave the pristine limits untouched.
 
-`proxy_sv_lockTeams` works per instance while TFFA is on (D-004.5); the size
-rules run independently, because they can now derive a meaningful size from
-the instances.
+`proxy_sv_lockTeamsAfterXSecs` works per instance while TFFA is on (D-004.6);
+the size rules run independently, because they can now derive a meaningful size
+from the instances.
 `decide` (whole-server) is unchanged for TFFA-off; `decide_matches` is the
 parallel-mode decision and is unit-tested without the engine.
 

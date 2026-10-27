@@ -28,7 +28,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 13] = [
     (c"proxy_sv_antiHpTeller", c"0"),
     (c"proxy_sv_minJumpTime", c"0"),
     (c"proxy_sv_enableEndGameStats", c"1"),
-    (c"proxy_sv_lockTeams", c"0"),
+    (c"proxy_sv_lockTeamsAfterXSecs", c"0"),
     (c"proxy_sv_teamSizeRules", c""),
     (c"proxy_tffa_enable", c"0"),
     (c"proxy_tffa_maxMatches", c"8"),
@@ -45,9 +45,10 @@ pub const CVAR_MODEL_PATH_LENGTH: usize = 4;
 pub const CVAR_ANTI_HP_TELLER: usize = 5;
 pub const CVAR_MIN_JUMP_TIME: usize = 6;
 pub const CVAR_ENABLE_END_GAME_STATS: usize = 7;
-pub const CVAR_LOCK_TEAMS: usize = 8;
+/// Team-lock grace delay in seconds before a round's teams lock (`0` = off).
+pub const CVAR_LOCK_TEAMS_AFTER_SECS: usize = 8;
 /// Per-team-size `timelimit`/`fraglimit`/`capturelimit` rules (reconciled every
-/// frame with the roster, independent of `proxy_sv_lockTeams`).
+/// frame with the roster, independent of `proxy_sv_lockTeamsAfterXSecs`).
 pub const CVAR_TEAM_SIZE_RULES: usize = 9;
 /// Parallel TFFA matches (`GT_TEAM` only): `0` off, non-zero on.
 pub const CVAR_TFFA_ENABLE: usize = 10;
@@ -222,20 +223,35 @@ impl Default for TeamCaps {
     }
 }
 
-/// Team-lock feature state (`proxy_sv_lockTeams`, the minimum team size that
-/// may be locked; `0` disables the feature).
+/// Team-lock feature state (`proxy_sv_lockTeamsAfterXSecs`, the grace delay in
+/// seconds before a round's teams lock; `0` disables the feature).
 ///
-/// The round-start roster snapshot caps each team of every TFFA instance
-/// (`caps[0]` = main). Each pair is `-1`/`-1` while that instance is unlocked;
+/// The round start opens a grace window: for its whole duration no team is
+/// capped, so players can still join. A player who joins a team in an instance
+/// cancels that instance's lock for the round. When the window expires, every
+/// instance still armed and not cancelled is capped at its current even roster
+/// (`caps[0]` = main). Each pair is `-1`/`-1` while that instance is unlocked.
+///
 /// `pending` waits for the reconnect burst that follows a map load/map_restart;
 /// `saw_reconnect` flips on the first `firstTime == false`
 /// `GAME_CLIENT_CONNECT` of that round (the engine reconnects every retained
-/// client before the first frame that follows).
+/// client before the first frame that follows). `armed` records the instances
+/// that existed when the grace window opened: a match created later in the round
+/// is not locked until the next round, as before.
 #[derive(Debug, Clone, Copy)]
 pub struct TeamLock {
     pub caps: [TeamCaps; crate::tffa::TOTAL_MATCH_SLOTS],
     pub pending: bool,
     pub saw_reconnect: bool,
+    /// Server time (ms) at which the grace window opened.
+    pub grace_start: i32,
+    /// Whether the grace window is counting down this round.
+    pub grace_running: bool,
+    /// Instances that existed at the round start and may still lock this round.
+    pub armed: [bool; crate::tffa::TOTAL_MATCH_SLOTS],
+    /// Instances in which a player joined during the grace window: they stay
+    /// unlocked for the whole round.
+    pub joined: [bool; crate::tffa::TOTAL_MATCH_SLOTS],
 }
 
 impl Default for TeamLock {
@@ -244,6 +260,10 @@ impl Default for TeamLock {
             caps: [TeamCaps { red: -1, blue: -1 }; crate::tffa::TOTAL_MATCH_SLOTS],
             pending: true,
             saw_reconnect: false,
+            grace_start: 0,
+            grace_running: false,
+            armed: [false; crate::tffa::TOTAL_MATCH_SLOTS],
+            joined: [false; crate::tffa::TOTAL_MATCH_SLOTS],
         }
     }
 }
@@ -663,7 +683,7 @@ mod tests {
             b"0"
         );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
-        assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS_AFTER_SECS].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_TEAM_SIZE_RULES].1.to_bytes(), b"");
         assert_eq!(PROXY_CVARS[CVAR_TFFA_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_MATCHES].1.to_bytes(), b"8");

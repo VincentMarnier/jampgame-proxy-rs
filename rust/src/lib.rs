@@ -126,9 +126,9 @@ pub unsafe extern "C" fn vmMain(
             // SAFETY: original module loaded, memory layer initialised.
             unsafe { hooks::set_enabled(state::proxy_enabled()) };
             if state::proxy_enabled() {
-                // The team lock snapshots each TFFA instance's own round-start
-                // roster (main when the feature is off), so it is compatible
-                // with parallel matches.
+                // The team lock opens each round's grace window and later caps
+                // each TFFA instance against its own roster (main when the
+                // feature is off), so it is compatible with parallel matches.
                 teamlock::on_run_frame();
                 rules::on_run_frame();
                 tffa::on_frame_start();
@@ -311,8 +311,8 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     if tffa::enabled() {
         tffa::scan_world_entities();
     }
-    // Fresh round for the team lock (caps cleared, snapshot re-armed for the
-    // reconnect burst that follows GAME_INIT).
+    // Fresh round for the team lock (caps and grace bookkeeping cleared, the
+    // window re-armed for the reconnect burst that follows GAME_INIT).
     teamlock::reset();
 
     // Attach the engine/game hook layer (D-002 keep set) after the game is up

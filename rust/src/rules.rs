@@ -11,7 +11,7 @@
 //! snapshot, so a game that becomes `2 vs 2` mid-match adopts the `2 vs 2`
 //! rules and a `4 vs 4` adopts the `4 vs 4` ones. The limits are only re-written
 //! when the *effective* rule changes, so a stable roster issues no trap calls.
-//! This feature is independent of `proxy_sv_lockTeams`.
+//! This feature is independent of `proxy_sv_lockTeamsAfterXSecs`.
 //!
 //! With parallel TFFA matches on (`proxy_tffa_enable 1`), the limits are still
 //! one set of server-wide cvars, so the rule is chosen from the matches that

@@ -27,7 +27,7 @@ docs/ holds the reverse-engineering evidence, the architecture notes and the dec
 
 - docs/decisions/0001-bootstrap-core.md — bootstrap core, the i386 4-byte stack alignment finding and the `-mstackrealign` / SSE-off workaround.
 - docs/decisions/0002-scope.md — port scope; records the cvars deliberately dropped from the original C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`, `proxy_sv_disableKillCmd`).
-- docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeams`.
+- docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeamsAfterXSecs`.
 - docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM).
 - docs/decisions/README.md — index of the decision records.
 

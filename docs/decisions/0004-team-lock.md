@@ -1,4 +1,4 @@
-# D-004 — Rust-only team lock (`proxy_sv_lockTeams`, TDM/CTF)
+# D-004 — Rust-only team lock (`proxy_sv_lockTeamsAfterXSecs`, TDM/CTF)
 
 Date: 2026-09-11. Status: accepted. Evidence: SDK `g_cmds.c:661-931`
 (`SetTeam`), `g_client.c:1237-1259` (`TeamCount`), `g_session.c` (session
@@ -36,11 +36,14 @@ once and clears `pending`. A fresh map with no reconnect burst does not lock
 until the next round/restart, which is the point at which a match roster is
 defined.
 
+*Revised by D-004.6: that first frame now opens a grace window instead of
+snapshotting immediately; the reconnect-burst trigger is unchanged.*
+
 ### D-004.2 — Lock only even rosters with at least two players per team
 
-*Superseded by D-004.5: the threshold is now `proxy_sv_lockTeams` itself (the
-minimum team size) and the caps are per instance; the even-roster rule is
-unchanged.*
+*Superseded by D-004.5 and then D-004.6: the minimum-size threshold is gone;
+the even-roster rule is unchanged, now with a minimum of one player per team
+(`red == blue && red >= 1`).*
 
 `snapshot_caps(red, blue)` returns `(red, blue)` iff `red == blue && red >= 2`,
 else `(-1, -1)`. Caps are reservations: they do **not** shrink when players
@@ -65,7 +68,7 @@ unchanged.
 Because the hook sits on the single choke point, the console
 `forceteam <player> <team>` command (`Svcmd_ForceTeam_f`, `g_svcmds.c:384-398`)
 is also subject to the cap while a lock is active; an admin who needs a forced
-move can set `proxy_sv_lockTeams 0` first.
+move can set `proxy_sv_lockTeamsAfterXSecs 0` first.
 
 ### D-004.4 — TDM/CTF only
 
@@ -107,16 +110,50 @@ locked the same 2 vs 2. The per-instance path is covered by the
 `snapshot_match_caps`/promotion unit tests; a live created-match lock still
 needs a real client, since bots cannot issue `tffa_create`.
 
+### D-004.6 — Grace delay before locking, per instance (revision, 2026-10-27)
+
+*Status: accepted (user directive). Replaces the minimum-size value of
+D-004.5.*
+
+`proxy_sv_lockTeamsAfterXSecs` is now the **grace delay in seconds** before a
+round's teams lock, not a minimum team size. `0` (the default) keeps the feature
+off. The first `GAME_RUN_FRAME` after the reconnect burst opens the window and
+records the server time; no team is capped while it runs. When the window
+expires, each eligible instance is snapshotted at its current roster with the
+even-roster rule of D-004.2/D-004.5 minus the minimum-size parameter:
+`snapshot_caps(red, blue) = (red, blue)` iff `red == blue && red >= 1`, else
+`(-1, -1)`. In other words, a lock requires that nobody joined during the
+window; `1 vs 1` locks like any larger even roster.
+
+A successful `SetTeam` that moves a player into `red`/`blue` during the window
+cancels that player's instance for the round. The wrapper reads the resulting
+session team after the pristine body, so auto picks (`team free`/empty through
+`PickTeam`) are included; a same-team no-op is not. Cancellation is per
+instance: `TeamLock::armed` marks the instances that existed at the round start
+and `TeamLock::joined` marks the ones a join cancelled. A match created after
+the round start is not armed, so it stays unlocked until the next round, as in
+D-004.5. Closing/promoting a match moves its armed/joined flags with its caps
+(`clear_match`/`promote_match`).
+
+Enforcement is unchanged (D-004.3/D-004.5): the caps remain reservations and are
+checked per instance in `SetTeam`. Turning the cvar to `0` mid-round drops any
+caps and stops the window.
+
+Runtime verification of the new timing is pending. The pure grace/arming/
+cancellation rules are unit-tested (`grace_due`, `snapshot_match_caps`); the
+timing source is `svs.time` from `GAME_RUN_FRAME` (`sv_main.cpp:911`), the same
+value every round-start frame receives.
+
 ## Consequences
 
 - New hook in `GAME_HOOKS` (now 6 entries) and a new proxy cvar
-  (`proxy_sv_lockTeams`, default `0`, opt-in so existing servers keep pristine
-  behavior). Since D-004.5 the value is the minimum team size (`0` = off) and
-  the caps are per TFFA instance, so the feature works with
+  (`proxy_sv_lockTeamsAfterXSecs`, default `0`, opt-in so existing servers keep
+  pristine behavior). Since D-004.6 the value is the grace delay in seconds
+  (`0` = off) and the caps are per TFFA instance, so the feature works with
   `proxy_tffa_enable`.
-- The snapshot/enforcement logic is proxy-local (`rust/src/teamlock.rs`), so it
-  is unit-testable (`snapshot_caps`, `snapshot_match_caps`, `requested_team`)
-  without the engine.
+- The snapshot/enforcement/grace logic is proxy-local (`rust/src/teamlock.rs`),
+  so it is unit-testable (`snapshot_caps`, `snapshot_match_caps`, `grace_due`,
+  `requested_team`) without the engine.
 - Not yet runtime-verified with a real client; the build/unit gates cover the
-  parsing and snapshot rules, and the engine reconnect ordering is
+  parsing, grace and snapshot rules, and the engine reconnect ordering is
   source-verified.

@@ -36,8 +36,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableEndGameStats`         | 1       | print the personal/global/best-player stats tables at the end of a game                         |
 | `proxy_sv_antiHpTeller`               | 0       | prevents HP tellers usage                                                                       |
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
-| `proxy_sv_lockTeams`                  | 0       | minimum per-team size (`0` = off) for the round-start team lock: a TDM/CTF round that starts even with at least that many players per team keeps its size; with parallel TFFA every instance locks against its own roster (see [Team lock](#team-lock)) |
-| `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeams` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
+| `proxy_sv_lockTeamsAfterXSecs`        | 0       | grace delay in seconds (`0` = off) before a TDM/CTF round's teams lock: teams stay open for that long; a join in an instance cancels its lock for the round, otherwise the even roster is capped at its size; with parallel TFFA every instance is handled per its own roster (see [Team lock](#team-lock)) |
+| `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeamsAfterXSecs` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
 | `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
@@ -119,27 +119,28 @@ ping    rtt   jit  fps  pps     timeNudge snaps   rate name
   allowed to use).
 * **name** — the player.
 
-### Team lock### Team lock
+### Team lock
 
-`proxy_sv_lockTeams` is the minimum team size that may be locked (default `0`,
-off). When a round starts (map load or `map_restart`) with both teams even and
-each fielding at least that many players, every team is capped at its
-round-start size so the match keeps its `N vs N` shape; an uneven start is left
-alone. `1` therefore locks from `1 vs 1` upwards, `2` from `2 vs 2`, and so on.
-A cap is a reservation: it does not shrink when players leave, so the freed
-slots stay open for the same team. A join to a full, locked team is refused
-with a message (an admin's `forceteam` is subject to the same cap while the
-lock is active). Servers that used `proxy_sv_lockTeams 1` as "on" before this
-was a minimum size should set `2` to keep the previous `2 vs 2`-and-up
-behaviour.
+`proxy_sv_lockTeamsAfterXSecs` is the grace delay, in seconds, before a round's
+teams lock (default `0`, off). When a round starts (map load or `map_restart`),
+teams stay open for that many seconds so players can still join. If a player
+joins a team in an instance during the window, that instance is **not** locked
+for the round. If nobody joins, the roster is locked when the window expires:
+each team is capped at its current size, provided the roster is even at that
+moment (a `2 vs 2` locks at 2; an uneven `2 vs 3` is left alone). A cap is a
+reservation: it does not shrink when players leave, so the freed slots stay
+open for the same team. A join to a full, locked team is refused with a message
+(an admin's `forceteam` is subject to the same cap while the lock is active).
+`0` disables the feature entirely. This cvar replaces the former
+`proxy_sv_lockTeams` minimum-team-size setting; old configs need the new name.
 
-With `proxy_tffa_enable 1` the lock runs **per instance**: every match is
-snapshotted against its own roster at the round start, so a `2 vs 2` in main and
-a `1 vs 1` in a created match lock independently, and a join is checked against
-the caps of the match the player belongs to. A match created after the round
-started has no round-start roster and stays unlocked until the next round (a
-`map_restart` keeps the matches, so their rosters are locked then). Without
-parallel TFFA the whole server is the one (main) instance.
+With `proxy_tffa_enable 1` the lock runs **per instance**: only the matches that
+existed at the round start are eligible, each is snapshotted against its own
+roster, and a join in one match cancels only that match's lock; a join is
+checked against the caps of the match the player belongs to. A match created
+after the round started has no round-start roster and stays unlocked until the
+next round (a `map_restart` keeps the matches, so they are eligible again then).
+Without parallel TFFA the whole server is the one (main) instance.
 
 ### Per-team-size rules
 
@@ -160,7 +161,7 @@ is reconciled every frame, so the limits adapt when the roster changes mid-match
 (e.g. a game that becomes 2 vs 2 adopts the 2 vs 2 rules, and dropping back
 below the smallest rule restores the server limits); they are only rewritten
 when the effective decision actually changes. This works whether or not
-`proxy_sv_lockTeams` is enabled.
+`proxy_sv_lockTeamsAfterXSecs` is enabled.
 
 With parallel TFFA matches, the rule follows the matches being played rather
 than the sum of all players: empty/spectator-only matches are ignored, and a
@@ -202,8 +203,9 @@ Once no tied match with players remains, the map ends and restarts normally.
 A `map_restart` keeps the matches: every player reconnects into the match and
 team they were in, with that match's doors and triggers rebuilt, while the
 scores start from zero. A full map change starts everyone in the main game.
-`proxy_sv_lockTeams` works per match while TFFA is on: each instance locks
-against its own round-start roster (see [Team lock](#team-lock)).
+`proxy_sv_lockTeamsAfterXSecs` works per match while TFFA is on: each instance
+is evaluated against its own roster and a join cancels only its own lock (see
+[Team lock](#team-lock)).
 `proxy_sv_teamSizeRules`
 keeps working: each match's own team size is used, and a rule applies when all
 matches being played have the same size (see [Per-team-size rules](#per-team-size-rules)).

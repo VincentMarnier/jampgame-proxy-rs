@@ -1,34 +1,42 @@
-//! Round-start team locking (`proxy_sv_lockTeams`, TDM/CTF).
+//! Round-start team locking (`proxy_sv_lockTeamsAfterXSecs`, TDM/CTF).
 //!
-//! `proxy_sv_lockTeams` is the **minimum team size** that may be locked: `0`
-//! turns the feature off, `N` (>= 1) locks a team roster only when it starts
-//! even (`red == blue`) and both teams field at least `N` players. The caps are
-//! the round-start sizes. A cap is a *reservation*: it survives players
-//! leaving, so the freed slots stay open for the same team instead of being
-//! taken by the other one. A round that starts uneven (e.g. 2 vs 3) is not
-//! locked.
+//! `proxy_sv_lockTeamsAfterXSecs` is the **grace delay in seconds** before a
+//! round's teams lock; `0` turns the feature off. When the reconnect burst that
+//! follows a map load/map_restart has reconnected the retained clients, the
+//! next frame opens the grace window: no team is capped, so players can still
+//! join. A player who joins a team in an instance during the window cancels
+//! that instance's lock for the whole round. If nobody joins, the window
+//! expires and every instance still eligible is capped at its current roster.
+//!
+//! The caps follow the even-roster rule: a roster locks only when `red == blue`
+//! and both teams field at least one player, so an uneven round (e.g. `2 vs 3`)
+//! is left alone. A cap is a *reservation*: it survives players leaving, so the
+//! freed slots stay open for the same team instead of being taken by the other
+//! one.
 //!
 //! The lock is **per instance**. With parallel TFFA matches
-//! (`proxy_tffa_enable`), every match is snapshotted against its own roster, so
-//! a `2 vs 2` in main and a `1 vs 1` in a created match lock at their own sizes
-//! and a join is refused against the caps of the match the joining player
-//! belongs to. With TFFA off the whole server is the one (main) instance.
+//! (`proxy_tffa_enable`), every match that existed at the round start is
+//! snapshotted against its own roster, and a join is refused against the caps of
+//! the match the joining player belongs to. A join in one match cancels only
+//! that match's lock. With TFFA off the whole server is the one (main) instance.
+//! A match created after the round started has no round-start roster and stays
+//! unlocked until the next round (a `map_restart` keeps the matches, so their
+//! rosters are eligible again then).
 //!
-//! The trigger is the reconnect burst the engine issues when a map loads or is
-//! restarted (`SV_InitGameProgs`/`SV_RestartGameProgs`): every retained client
-//! gets `GAME_CLIENT_CONNECT` with `firstTime == qfalse` *before* the next
+//! The round start is the reconnect burst the engine issues when a map loads or
+//! is restarted (`SV_InitGameProgs`/`SV_RestartGameProgs`): every retained
+//! client gets `GAME_CLIENT_CONNECT` with `firstTime == qfalse` *before* the next
 //! `GAME_RUN_FRAME`, at which point the game module has restored the session
-//! teams from the `session%i` cvars. A `map_restart` carries the TFFA matches
-//! (D-006.8), so their rosters are observable at that same burst and each
-//! carried instance locks then. A match created later in the round has no
-//! round-start roster and stays unlocked until the next round. Late joins use
-//! `firstTime == qtrue` and do not retrigger the snapshot.
+//! teams from the `session%i` cvars. Late joins use `firstTime == qtrue` and do
+//! not retrigger the window.
 //!
 //! Enforcement is a single `SetTeam` detour: an explicit `red`/`blue` request
 //! for a full, locked team is dropped with a message, and so is an auto pick
 //! (`team free`/empty, which the game routes through `PickTeam`) once *both*
 //! locked teams are full. Spectator changes and the game's own internal
-//! `SetTeam` calls go through unchanged.
+//! `SetTeam` calls go through unchanged. The same wrapper observes successful
+//! joins while the grace window is open and cancels the joining player's
+//! instance.
 
 use core::ffi::{CStr, c_char, c_int};
 use std::ffi::CString;
@@ -40,18 +48,18 @@ use crate::sdk::{
     OFFSET_GENTITY_CLIENT, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY,
     TEAM_BLUE, TEAM_RED,
 };
-use crate::state::{self, CVAR_LOCK_TEAMS, TeamCaps};
+use crate::state::{self, CVAR_LOCK_TEAMS_AFTER_SECS, TeamCaps, TeamLock};
 use crate::syscall;
 use crate::tffa;
 
-/// The `proxy_sv_lockTeams` minimum team size (`0` = feature off).
-fn minimum_size() -> i32 {
-    state::with_state(|s| s.cvars[CVAR_LOCK_TEAMS].integer)
+/// The `proxy_sv_lockTeamsAfterXSecs` grace delay in seconds (`<= 0` = off).
+fn delay_secs() -> i32 {
+    state::with_state(|s| s.cvars[CVAR_LOCK_TEAMS_AFTER_SECS].integer)
 }
 
-/// `proxy_sv_lockTeams` gate: any positive minimum turns the feature on.
+/// `proxy_sv_lockTeamsAfterXSecs` gate: any positive delay turns the feature on.
 fn feature_enabled() -> bool {
-    minimum_size() >= 1
+    delay_secs() > 0
 }
 
 /// The game's `g_gametype` (engine cvar trap) — only the team modes are
@@ -62,29 +70,40 @@ fn gametype_supported() -> bool {
     gametype == GT_TEAM || gametype == GT_CTF
 }
 
-/// The round-start caps: both teams lock at their (equal) size only when each
-/// fielded at least `minimum` players; otherwise no team is locked (`-1`).
-/// `minimum < 1` (feature off) never locks.
-pub fn snapshot_caps(red: i32, blue: i32, minimum: i32) -> (i32, i32) {
-    if minimum >= 1 && red == blue && red >= minimum {
+/// The round-start caps: both teams lock at their (equal, non-empty) size.
+/// Uneven or empty rosters are left unlocked (`-1`).
+pub fn snapshot_caps(red: i32, blue: i32) -> (i32, i32) {
+    if red == blue && red >= 1 {
         (red, blue)
     } else {
         (-1, -1)
     }
 }
 
-/// Per-instance round-start caps: one pair per TFFA match slot (index = match
-/// id, `0` = main), each computed from that instance's own roster. Pure so the
-/// per-instance rule is unit-tested without the engine.
+/// Per-instance caps: one pair per TFFA match slot (index = match id, `0` =
+/// main). Only instances that were armed at the round start and had no join
+/// during the grace window are snapshotted; each uses its own roster. Pure so
+/// the per-instance rule is unit-tested without the engine.
 pub fn snapshot_match_caps(
     counts: &[(i32, i32); tffa::TOTAL_MATCH_SLOTS],
-    minimum: i32,
+    armed: &[bool; tffa::TOTAL_MATCH_SLOTS],
+    joined: &[bool; tffa::TOTAL_MATCH_SLOTS],
 ) -> [TeamCaps; tffa::TOTAL_MATCH_SLOTS] {
     core::array::from_fn(|id| {
+        if !armed[id] || joined[id] {
+            return TeamCaps::default();
+        }
         let (red, blue) = counts[id];
-        let (red, blue) = snapshot_caps(red, blue, minimum);
+        let (red, blue) = snapshot_caps(red, blue);
         TeamCaps { red, blue }
     })
+}
+
+/// Whether the `delay_secs` grace window that opened at `start` has expired at
+/// server time `now` (both milliseconds). A non-positive delay never expires
+/// (the feature is off).
+pub fn grace_due(now: i32, start: i32, delay_secs: i32) -> bool {
+    delay_secs > 0 && i64::from(now.wrapping_sub(start)) >= i64::from(delay_secs) * 1000
 }
 
 /// Whether an auto pick (`team free`, an empty string, or any other request the
@@ -108,40 +127,85 @@ pub fn on_client_connect(first_time: bool) {
     state::with_state(|s| s.team_lock.saw_reconnect = true);
 }
 
-/// `GAME_RUN_FRAME` bookkeeping: take the roster snapshot on the first frame
-/// after the reconnect burst (all reconnects happen before that frame). The
-/// snapshot is taken per TFFA instance (whole server as main when TFFA is off).
+/// `GAME_RUN_FRAME` bookkeeping: open the round-start grace window on the first
+/// frame after the reconnect burst (all reconnects happen before that frame),
+/// then lock the eligible instances once the window expires.
 pub fn on_run_frame() {
     let ready = state::with_state(|s| s.team_lock.pending && s.team_lock.saw_reconnect);
-    if !ready {
+    if ready {
+        start_grace();
+    }
+    lock_after_grace();
+}
+
+/// Open this round's grace window. Only the instances that exist now are armed:
+/// a TFFA match created later in the round has no round-start roster and stays
+/// unlocked until the next round, as before.
+fn start_grace() {
+    let gt = unsafe { syscall::cvar_variable_integer_value(c"g_gametype") };
+    let delay = delay_secs();
+    let tffa_on = tffa::enabled();
+    let supported = gt == GT_TEAM || gt == GT_CTF;
+    let armed: [bool; tffa::TOTAL_MATCH_SLOTS] = state::with_state(|s| {
+        let armed = if supported && delay > 0 {
+            core::array::from_fn(|id| {
+                if tffa_on {
+                    s.tffa.matches[id].active
+                } else {
+                    id == tffa::MAIN_MATCH as usize
+                }
+            })
+        } else {
+            [false; tffa::TOTAL_MATCH_SLOTS]
+        };
+        s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
+        s.team_lock.joined = [false; tffa::TOTAL_MATCH_SLOTS];
+        s.team_lock.armed = armed;
+        s.team_lock.pending = false;
+        s.team_lock.saw_reconnect = false;
+        s.team_lock.grace_start = s.svs_time;
+        s.team_lock.grace_running = supported && delay > 0;
+        armed
+    });
+    eprintln!(
+        "----- proxy-rs: teamlock grace gt={gt} delay={delay}s tffa={tffa_on} armed={}",
+        describe_instances(&armed)
+    );
+}
+
+/// Lock every armed instance whose grace window passed without a join.
+fn lock_after_grace() {
+    if !state::with_state(|s| s.team_lock.grace_running) {
         return;
     }
-    let gt = unsafe { syscall::cvar_variable_integer_value(c"g_gametype") };
-    let minimum = minimum_size();
+    let delay = delay_secs();
+    if delay <= 0 {
+        // Turned off mid-round: drop any caps and stop waiting.
+        state::with_state(|s| {
+            s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
+            s.team_lock.grace_running = false;
+        });
+        return;
+    }
+    let (now, start) = state::with_state(|s| (s.svs_time, s.team_lock.grace_start));
+    if !grace_due(now, start, delay) {
+        return;
+    }
     let tffa_on = tffa::enabled();
-    let caps = if minimum >= 1 && gametype_supported() {
-        if tffa_on {
-            snapshot_match_caps(&tffa::match_team_counts(), minimum)
-        } else {
-            let mut caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
-            let (red_max, blue_max) =
-                snapshot_caps(team_count(TEAM_RED), team_count(TEAM_BLUE), minimum);
-            caps[tffa::MAIN_MATCH as usize] = TeamCaps {
-                red: red_max,
-                blue: blue_max,
-            };
-            caps
-        }
+    let counts = if tffa_on {
+        tffa::match_team_counts()
     } else {
-        [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS]
+        let mut counts = [(0, 0); tffa::TOTAL_MATCH_SLOTS];
+        counts[tffa::MAIN_MATCH as usize] = (team_count(TEAM_RED), team_count(TEAM_BLUE));
+        counts
     };
+    let (armed, joined) = state::with_state(|s| (s.team_lock.armed, s.team_lock.joined));
+    let caps = snapshot_match_caps(&counts, &armed, &joined);
     let summary = describe_caps(&caps);
-    eprintln!(
-        "----- proxy-rs: teamlock snapshot gt={gt} min={minimum} tffa={tffa_on} -> {summary}"
-    );
+    eprintln!("----- proxy-rs: teamlock lock delay={delay}s tffa={tffa_on} -> {summary}");
     state::with_state(|s| {
         s.team_lock.caps = caps;
-        s.team_lock.pending = false;
+        s.team_lock.grace_running = false;
     });
 }
 
@@ -151,19 +215,35 @@ fn describe_caps(caps: &[TeamCaps; tffa::TOTAL_MATCH_SLOTS]) -> String {
         .iter()
         .enumerate()
         .filter(|(_, caps)| caps.red >= 0 || caps.blue >= 0)
-        .map(|(id, caps)| {
-            let name = if id == tffa::MAIN_MATCH as usize {
-                "main".to_owned()
-            } else {
-                format!("#{id}")
-            };
-            format!("{name} {} vs {}", caps.red, caps.blue)
-        })
+        .map(|(id, caps)| format!("{} {} vs {}", instance_name(id), caps.red, caps.blue))
         .collect();
     if locked.is_empty() {
         "no lock".to_owned()
     } else {
         locked.join(", ")
+    }
+}
+
+/// Diagnostic rendering of the armed-instance flags.
+fn describe_instances(flags: &[bool; tffa::TOTAL_MATCH_SLOTS]) -> String {
+    let armed: Vec<String> = flags
+        .iter()
+        .enumerate()
+        .filter(|(_, armed)| **armed)
+        .map(|(id, _)| instance_name(id))
+        .collect();
+    if armed.is_empty() {
+        "none".to_owned()
+    } else {
+        armed.join(", ")
+    }
+}
+
+fn instance_name(id: usize) -> String {
+    if id == tffa::MAIN_MATCH as usize {
+        "main".to_owned()
+    } else {
+        format!("#{id}")
     }
 }
 
@@ -211,46 +291,106 @@ fn ent_client_num(ent: usize) -> c_int {
     idx as c_int
 }
 
-/// Reset the round state for a new map (`GAME_INIT`): caps cleared, snapshot
-/// re-armed for the next reconnect burst. Without this the first snapshot's
-/// caps (or `-1`s) stick forever across all later rounds.
+/// Reset the round state for a new map (`GAME_INIT`): caps and the grace
+/// bookkeeping cleared, the window re-armed for the next reconnect burst.
+/// Without this the previous round's caps (or cancellation) stick across all
+/// later rounds.
 pub fn reset() {
-    state::with_state(|s| {
-        s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
-        s.team_lock.pending = true;
-        s.team_lock.saw_reconnect = false;
-    });
+    state::with_state(|s| s.team_lock = TeamLock::default());
 }
 
-/// Drop the caps of a closed instance so a match later reusing its slot does
-/// not inherit the old match's lock. Main (`0`) always stays open and is
-/// ignored.
+/// Drop the lock state of a closed instance so a match later reusing its slot
+/// does not inherit the old match's lock or grace cancellation. Main (`0`)
+/// always stays open and is ignored.
 pub fn clear_match(id: u8) {
     if id == tffa::MAIN_MATCH {
         return;
     }
+    let id = id as usize;
     state::with_state(|s| {
-        if let Some(caps) = s.team_lock.caps.get_mut(id as usize) {
+        if let Some(caps) = s.team_lock.caps.get_mut(id) {
             *caps = TeamCaps::default();
+        }
+        if let Some(armed) = s.team_lock.armed.get_mut(id) {
+            *armed = false;
+        }
+        if let Some(joined) = s.team_lock.joined.get_mut(id) {
+            *joined = false;
         }
     });
 }
 
-/// Carry a promoted instance's caps into main (it becomes the surviving game)
-/// and clear the slot it was promoted from.
+/// Carry a promoted instance's lock state into main (it becomes the surviving
+/// game) and clear the slot it was promoted from, so the surviving game keeps
+/// the promoted instance's caps and its grace cancellation.
 pub fn promote_match(id: u8) {
-    if id == tffa::MAIN_MATCH {
+    if id == tffa::MAIN_MATCH || id as usize >= tffa::TOTAL_MATCH_SLOTS {
         return;
     }
+    let id = id as usize;
     state::with_state(|s| {
-        let Some(caps) = s.team_lock.caps.get(id as usize).copied() else {
-            return;
-        };
-        s.team_lock.caps[tffa::MAIN_MATCH as usize] = caps;
-        if let Some(slot) = s.team_lock.caps.get_mut(id as usize) {
-            *slot = TeamCaps::default();
-        }
+        let main = tffa::MAIN_MATCH as usize;
+        s.team_lock.caps[main] = s.team_lock.caps[id];
+        s.team_lock.armed[main] = s.team_lock.armed[id];
+        s.team_lock.joined[main] = s.team_lock.joined[id];
+        s.team_lock.caps[id] = TeamCaps::default();
+        s.team_lock.armed[id] = false;
+        s.team_lock.joined[id] = false;
     });
+}
+
+/// The client's session team, or `None` when `ent` carries no live client.
+fn client_team(ent: usize) -> Option<i32> {
+    if ent == 0 {
+        return None;
+    }
+    // SAFETY: ent is a valid gentity_t* passed by the game.
+    let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+    if client == 0 {
+        return None;
+    }
+    // SAFETY: client is a valid gclient_t.
+    Some(unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) })
+}
+
+/// A player joined a team in `match_id` during the grace window: that instance
+/// stays unlocked for the rest of the round. Only the first join is logged, and
+/// only for an instance the round start armed.
+fn cancel_grace(match_id: u8) {
+    let id = match_id as usize;
+    let cancelled = state::with_state(|s| {
+        if !s.team_lock.grace_running || id >= tffa::TOTAL_MATCH_SLOTS {
+            return false;
+        }
+        if !s.team_lock.armed[id] || s.team_lock.joined[id] {
+            return false;
+        }
+        s.team_lock.joined[id] = true;
+        true
+    });
+    if cancelled {
+        eprintln!("----- proxy-rs: teamlock join match={match_id} -> not locked this round");
+    }
+}
+
+/// Observe the outcome of a successful `SetTeam`: a move into `red`/`blue`
+/// during the grace window cancels the joining player's instance. The decision
+/// is read after the pristine body so auto picks (which the game resolves
+/// through `PickTeam`) are seen too.
+fn note_team_join(ent: usize, old_team: i32) {
+    let Some(new_team) = client_team(ent) else {
+        return;
+    };
+    if new_team == old_team || (new_team != TEAM_RED && new_team != TEAM_BLUE) {
+        return;
+    }
+    let client_num = ent_client_num(ent);
+    let match_id = if client_num >= 0 {
+        tffa::client_match(client_num)
+    } else {
+        tffa::MAIN_MATCH
+    };
+    cancel_grace(match_id);
 }
 
 /// The team an explicit `red`/`blue` request names, or `None` when the request
@@ -419,8 +559,11 @@ fn send_locked_message(block: &Block) {
     unsafe { syscall::send_server_command(block.client_num, &cmsg) };
 }
 
-/// `SetTeam(gentity_t*, char*)` entry wrapper (`proxy_sv_lockTeams`): drop a
-/// join that would exceed a locked team's cap, otherwise run the pristine body.
+/// `SetTeam(gentity_t*, char*)` entry wrapper
+/// (`proxy_sv_lockTeamsAfterXSecs`): drop a join that would exceed a locked
+/// team's cap, otherwise run the pristine body. While the round-start grace
+/// window is open, observe the resulting team and cancel the instance's lock
+/// when a player joined.
 ///
 /// # Safety
 ///
@@ -435,9 +578,19 @@ pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
     if crate::patch::GAME_HOOKS[5].original() == 0 {
         return;
     }
+    // Read the pre-call team only while the grace window can still be
+    // cancelled; after that the lock is final for the round.
+    let old_team = if state::with_state(|s| s.team_lock.grace_running) {
+        client_team(ent)
+    } else {
+        None
+    };
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(game_hook_original_set_team);
     unsafe { original(ent, s) };
+    if let Some(old_team) = old_team {
+        note_team_join(ent, old_team);
+    }
 }
 
 #[cfg(test)]
@@ -445,26 +598,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_locks_even_rosters_at_least_the_minimum() {
-        // Minimum 2 is the original "at least two per team" rule.
-        assert_eq!(snapshot_caps(3, 3, 2), (3, 3));
-        assert_eq!(snapshot_caps(2, 2, 2), (2, 2));
-        assert_eq!(snapshot_caps(8, 8, 2), (8, 8));
-        assert_eq!(snapshot_caps(1, 1, 2), (-1, -1));
-        // Uneven rosters are never locked, even when both are populated.
-        assert_eq!(snapshot_caps(2, 3, 1), (-1, -1));
-        assert_eq!(snapshot_caps(3, 2, 1), (-1, -1));
-        // Minimum 1 locks a 1 vs 1; an empty round is still not locked.
-        assert_eq!(snapshot_caps(1, 1, 1), (1, 1));
-        assert_eq!(snapshot_caps(1, 0, 1), (-1, -1));
-        assert_eq!(snapshot_caps(0, 0, 1), (-1, -1));
-        // A larger minimum requires that many players per team.
-        assert_eq!(snapshot_caps(2, 2, 3), (-1, -1));
-        assert_eq!(snapshot_caps(3, 3, 3), (3, 3));
-        assert_eq!(snapshot_caps(4, 4, 3), (4, 4));
-        // `0` (and any non-positive value) disables the feature.
-        assert_eq!(snapshot_caps(4, 4, 0), (-1, -1));
-        assert_eq!(snapshot_caps(4, 4, -1), (-1, -1));
+    fn snapshot_locks_even_populated_rosters() {
+        assert_eq!(snapshot_caps(1, 1), (1, 1));
+        assert_eq!(snapshot_caps(2, 2), (2, 2));
+        assert_eq!(snapshot_caps(3, 3), (3, 3));
+        assert_eq!(snapshot_caps(8, 8), (8, 8));
+        // Uneven and empty rosters are never locked.
+        assert_eq!(snapshot_caps(2, 3), (-1, -1));
+        assert_eq!(snapshot_caps(3, 2), (-1, -1));
+        assert_eq!(snapshot_caps(1, 0), (-1, -1));
+        assert_eq!(snapshot_caps(0, 0), (-1, -1));
     }
 
     #[test]
@@ -475,38 +618,63 @@ mod tests {
         counts[2] = (3, 3);
         counts[3] = (2, 3);
         counts[4] = (0, 0);
+        let armed = [true; tffa::TOTAL_MATCH_SLOTS];
+        let not_joined = [false; tffa::TOTAL_MATCH_SLOTS];
 
-        // Minimum 2: main and #2 lock at their own sizes, the 1 vs 1 and the
-        // uneven matches stay unlocked.
-        let caps = snapshot_match_caps(&counts, 2);
+        // Every armed instance with an even roster locks at its own size; the
+        // uneven and empty matches stay unlocked.
+        let caps = snapshot_match_caps(&counts, &armed, &not_joined);
         assert_eq!(
             caps[tffa::MAIN_MATCH as usize],
             TeamCaps { red: 2, blue: 2 }
         );
-        assert_eq!(caps[1], TeamCaps { red: -1, blue: -1 });
+        assert_eq!(caps[1], TeamCaps { red: 1, blue: 1 });
         assert_eq!(caps[2], TeamCaps { red: 3, blue: 3 });
         assert_eq!(caps[3], TeamCaps { red: -1, blue: -1 });
         assert_eq!(caps[4], TeamCaps { red: -1, blue: -1 });
         // Untouched slots stay unlocked.
         assert_eq!(caps[5], TeamCaps { red: -1, blue: -1 });
 
-        // Minimum 1 also locks the 1 vs 1, still not the uneven/empty ones.
-        let caps = snapshot_match_caps(&counts, 1);
-        assert_eq!(caps[1], TeamCaps { red: 1, blue: 1 });
-        assert_eq!(caps[3], TeamCaps { red: -1, blue: -1 });
-        assert_eq!(caps[4], TeamCaps { red: -1, blue: -1 });
+        // An instance that was not armed at the round start (a match created
+        // later) never locks this round.
+        let mut armed = [true; tffa::TOTAL_MATCH_SLOTS];
+        armed[2] = false;
+        let caps = snapshot_match_caps(&counts, &armed, &not_joined);
+        assert_eq!(caps[2], TeamCaps::default());
 
-        // Feature off: nothing locks anywhere.
-        let caps = snapshot_match_caps(&counts, 0);
-        assert!(caps.iter().all(|caps| *caps == TeamCaps::default()));
+        // A join during the grace window cancels only that instance.
+        let mut joined = [false; tffa::TOTAL_MATCH_SLOTS];
+        joined[tffa::MAIN_MATCH as usize] = true;
+        let caps = snapshot_match_caps(&counts, &armed, &joined);
+        assert_eq!(caps[0], TeamCaps::default());
+        assert_eq!(caps[1], TeamCaps { red: 1, blue: 1 });
+        assert_eq!(caps[2], TeamCaps::default());
+    }
+
+    #[test]
+    fn grace_expires_after_the_configured_seconds() {
+        // `0` (and any non-positive value) disables the feature: never due.
+        assert!(!grace_due(i32::MAX, 0, 0));
+        assert!(!grace_due(i32::MAX, 0, -5));
+        // 30 s window.
+        assert!(!grace_due(29_999, 1_000, 30));
+        assert!(grace_due(31_000, 1_000, 30));
+        assert!(grace_due(31_001, 1_000, 30));
+        // A 1 s window expires one second after the round start.
+        assert!(!grace_due(999, 0, 1));
+        assert!(grace_due(1_000, 0, 1));
     }
 
     #[test]
     fn caps_follow_a_promotion_and_are_cleared_with_their_instance() {
         state::with_state(|s| {
-            s.team_lock.caps = [TeamCaps::default(); tffa::TOTAL_MATCH_SLOTS];
+            s.team_lock = TeamLock::default();
             s.team_lock.caps[1] = TeamCaps { red: 2, blue: 2 };
             s.team_lock.caps[2] = TeamCaps { red: 3, blue: 3 };
+            // #1 is still eligible; #2 had a join and must stay unlocked.
+            s.team_lock.armed[1] = true;
+            s.team_lock.armed[2] = true;
+            s.team_lock.joined[2] = true;
         });
         promote_match(1);
         let (main, one, two) = state::with_state(|s| {
@@ -516,10 +684,19 @@ mod tests {
                 s.team_lock.caps[2],
             )
         });
-        // The promoted instance's caps become main's; its own slot is cleared.
+        // The promoted instance's caps and grace state become main's; its own
+        // slot is cleared.
         assert_eq!(main, TeamCaps { red: 2, blue: 2 });
         assert_eq!(one, TeamCaps::default());
         assert_eq!(two, TeamCaps { red: 3, blue: 3 });
+        let (armed, joined) = state::with_state(|s| {
+            (
+                (s.team_lock.armed[0], s.team_lock.armed[1]),
+                (s.team_lock.joined[0], s.team_lock.joined[1]),
+            )
+        });
+        assert_eq!(armed, (true, false));
+        assert_eq!(joined, (false, false));
         // Closing an instance drops its caps; main keeps its own.
         clear_match(2);
         clear_match(tffa::MAIN_MATCH);

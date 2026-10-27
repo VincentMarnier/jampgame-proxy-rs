@@ -37,7 +37,8 @@ pub const FN_G_ADD_EVENT: usize = 0x0016_e564;
 pub const FN_CLIENT_THINK_REAL: usize = 0x0011_c4c4;
 /// `void SetTeam(gentity_t*, char*)` (nm-verified `SetTeam__FP9gentity_sPc`),
 /// the single choke point every team change funnels through. Hooked by
-/// `proxy_sv_lockTeams` to enforce the round-start caps.
+/// `proxy_sv_lockTeamsAfterXSecs` to enforce the round-start caps and notice
+/// joins during the grace window.
 pub const FN_SET_TEAM: usize = 0x0012_ada4;
 /// `team_t TeamCount(int ignoreClientNum, team_t team)` (nm-verified
 /// `TeamCount__FiT1`, offset `0x124a24`; prologue `55 8b ec 83 ec 18`, 6
