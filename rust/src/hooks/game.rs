@@ -452,6 +452,40 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// WP_ForcePowersUpdate — parallel-TFFA force-sound attribution (entry wrapper)
+// ---------------------------------------------------------------------------
+
+/// `void WP_ForcePowersUpdate(gentity_t *self, usercmd_t *ucmd)`: open the
+/// acting scope of the player whose force powers are updated.
+///
+/// `G_RunFrame` calls this every frame for every client (`g_main.c:3949`) and
+/// NPC (`g_main.c:3976`), outside every other acting scope, and it is where
+/// the owner-less `EV_PREDEFSOUND` force sounds are built (`G_PreDefSound`:
+/// the force-jump sound `w_force.c:5390`, force grip `5398`, the knockdown
+/// getup `5200`, `G_SpecialRollGetup`'s `5070`) — the same shape as the think
+/// wrapper above: game code running on the player's behalf belongs to that
+/// player's instance. Without the scope those events take the world stamp and
+/// the force-jump sound is heard in every TFFA instance.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `WP_ForcePowersUpdate`
+/// argument list.
+pub unsafe extern "C" fn wp_force_powers_update(self_: usize, ucmd: usize) {
+    let scope = if crate::tffa::enabled() {
+        Some(crate::tffa::open_acting_scope(self_))
+    } else {
+        None
+    };
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_wp_force_powers_update);
+    unsafe { original(self_, ucmd) };
+    if let Some(previous) = scope {
+        crate::tffa::close_acting_scope(previous);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BeginIntermission — stats tables (entry wrapper)
 // ---------------------------------------------------------------------------
 

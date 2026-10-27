@@ -1222,8 +1222,10 @@ real server, which the automated suite cannot drive.
     for every viewer whose match was not client 0's. `EV_PREDEFSOUND` (`40`,
     counted from the pinned `EV_SABER_BLOCK 31`) is now `Stamped`, and the
     `G_TempEntity` detour stamps it with the **open acting scope** — the
-    player's think is the scope those calls run in (`ClientThink_real`, S9) —
-    via `tffa::temp_stamp_source` (the `G_Sound` handshake still wins; no scope
+    player's think is the scope those calls run in (`ClientThink_real`, S9)
+    (corrected 2026-10-27: the force jump runs in `G_RunFrame`'s
+    `WP_ForcePowersUpdate`, not the think — see that round below) — via
+    `tffa::temp_stamp_source` (the `G_Sound` handshake still wins; no scope
     means the old world-sound behaviour, audible everywhere). Unit tests:
     classification, the pure stamping rule, and a `snapshot_keep` fixture over a
     constructed `EV_PREDEFSOUND` entity (foreign stamp hidden, world stamp kept).
@@ -1286,7 +1288,9 @@ real server, which the automated suite cannot drive.
     itself still needs a live two-instance listen: bots do not force-jump
     (instrumented `EV_PREDEFSOUND` stamping stayed silent in 35 s on
     `mp/duel1` and 60 s on `mp/ctf2` with 4/6 bots), so that report rests on the
-    source classification plus the unit/snapshot tests.
+    source classification plus the unit/snapshot tests. (Closed 2026-10-27 —
+    the classification was right but the scope bet was not, and the sound was
+    still a world stamp: see the `WP_ForcePowersUpdate` round below.)
 
 - **`tffa_list` main player count (2026-10-21, live report).** `client_match`
   defaults to `MAIN_MATCH` for every slot, so the main line counted all free
@@ -1449,3 +1453,59 @@ real server, which the automated suite cannot drive.
   `clippy -D warnings`, `fmt --check` and the i686 release build are green.
   The spectator move + message path needs a live admin and client, so it is
   not runtime-verified.
+
+- **Force-jump sound heard across instances (2026-10-27, live report: "we can
+  still hear high jumps sounds from other instances").** The high jump is the
+  force jump: pmove sets `ps.fd.forceJumpSound` when the jump passes normal
+  height (`bg_pmove.c:1941/2341/2509/2586`), on the wall-jump/flip paths
+  (`bg_pmove.c:1725`, `bg_saber.c:1737/1986`), and `WP_ForcePowersUpdate`
+  consumes it with `G_PreDefSound(origin, PDSOUND_FORCEJUMP)`
+  (`w_force.c:5388-5391` → `sound/weapons/force/jump.mp3`,
+  `cg_event.c:2615`). The 2026-10-20 round stamped that event from the open
+  acting scope, betting the force jump runs inside the player's think. Source
+  and binary say otherwise: `WP_ForcePowersUpdate` is called only from
+  `G_RunFrame` (`g_main.c:3949` clients, `3976` NPCs — the only two call sites
+  in the shipped module, R_386_PC32 at `0x8aa67`/`0x8af69`, both inside
+  `G_RunFrame` `0x8a304..0x8b184`); the `ClientThink_real` call is commented
+  out (`g_active.c:2875`). So the event was built with **no** scope open and
+  `temp_stamp_source` gave it the world stamp (`SOURCE_WORLD`), i.e. audible in
+  every instance — the reported leak, and also why the 2026-10-20 change could
+  only move the sound from "client 0's match" to "every match" rather than
+  isolate it.
+  Fix: new game hook `WP_ForcePowersUpdate` (nm
+  `WP_ForcePowersUpdate__FP9gentity_sP9usercmd_s`, offset `0x18a554`, prologue
+  `55 8b ec 83 ec 48`, steal 6; `GAME_HOOKS` 20 → 21) opens the acting scope of
+  `self` around the pristine body — the same shape as the `ClientThink_real`
+  wrapper (game code running on a player's behalf is that player's instance).
+  It also covers the other owner-less force sounds built on that path: force
+  grip (`5398`), the knockdown getup (`5200`) and `G_SpecialRollGetup`'s
+  (`5070`, its only caller is `0x18a928` inside this function). Tests: the
+  byte fixture in `GAME_SITES` (decoder steal pin) and two wiring pins
+  (`game_hook_order_matches_the_site_fixtures`,
+  `game_trampoline_indices_match_the_hook_table`) so the new detour cannot be
+  renumbered onto another game function; `cargo test` 146/146 (was 144),
+  `clippy -D warnings`, `fmt --check` and the i686 release build green; engine
+  smoke attached all 21 detours (`attached WP_ForcePowersUpdate @
+  <base>+0x18a554 (steal 6)`).
+  Live differential (2026-10-27, `mp/ctf2`, `g_gametype 6` (GT_TEAM),
+  `proxy_tffa_enable 1`, bots `Desann`/`Reborn` on RED/BLUE): bots do not
+  force-jump, so the jump was driven directly — `ps.fd.forceJumpSound = 1` on
+  one bot's `playerState_t` under gdb (offsets `fd` 804 +
+  `forcedata_t.forceJumpSound` 328 = 1132 from an `offsetof` build against the
+  shipped `q_shared.h`; `g_entities` at module `0x6ce620`, entity 1516,
+  `.client` 864) and the next `G_RunFrame` frame played it. A one-line probe in
+  `stamp_temp_source_event` (removed after the run) then read
+  `EV_PREDEFSOUND ent=58 scope=255 stamp=255` on a build with the wrapper's
+  scope suppressed (pre-fix behaviour) and `EV_PREDEFSOUND ent=58 scope=0
+  stamp=0` with the fix: the sound goes from a world stamp (heard in every
+  instance) to the jumping player's own match, which the snapshot filter keeps
+  to that match (the `sound_visible`/`snapshot_keep` rules are the unit-tested
+  half of the chain). This closes the "needs a live listen" caveat at the
+  attribution level; a headphone listen across two instances still needs real
+  clients and was not done.
+  Residual (same world-stamp rule, deliberately not changed): an owner-less
+  `EV_PREDEFSOUND` built while no scope is open still broadcasts — e.g. a
+  mover crush (`G_RunMover` runs `G_MoverTeam` *before* its scoped
+  `G_RunThink`, `g_mover.c`) damaging a protect/absorb user
+  (`G_Damage` → `PDSOUND_PROTECTHIT`/`PDSOUND_ABSORBHIT`). The reported
+  symptom does not ride that path.

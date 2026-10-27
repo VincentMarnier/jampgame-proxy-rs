@@ -765,11 +765,13 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// touch gate; `G_UseTargets2` + `G_Find` for the per-instance link gate;
 /// `G_Spawn` + `G_RunThink` for the runtime-spawned children of a world entity;
 /// `G_RunMissile` so a missile's impact (radius damage) runs in its owner's
-/// instance; `TeamCount` so the game's auto team pick and its team-balance
+/// instance; `WP_ForcePowersUpdate` so the force sounds it builds
+/// (`G_PreDefSound`) are stamped with the updated player's instance instead of
+/// the world's; `TeamCount` so the game's auto team pick and its team-balance
 /// check census the joining client's own instance; `ScoreIsTied` so the
 /// pristine `CheckExitRules` defers the shared timelimit to the proxy's
 /// per-match sudden-death rule).
-pub static GAME_HOOKS: [Hook; 20] = [
+pub static GAME_HOOKS: [Hook; 21] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -806,6 +808,11 @@ pub static GAME_HOOKS: [Hook; 20] = [
     Hook::new("G_RunMissile", crate::jampgame::FN_G_RUN_MISSILE, true),
     Hook::new("TeamCount", crate::jampgame::FN_TEAM_COUNT, true),
     Hook::new("ScoreIsTied", crate::jampgame::FN_SCORE_IS_TIED, true),
+    Hook::new(
+        "WP_ForcePowersUpdate",
+        crate::jampgame::FN_WP_FORCE_POWERS_UPDATE,
+        true,
+    ),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1206,7 +1213,24 @@ mod tests {
             bytes: b"\x55\x8b\xec\x83\xec\x08\x89\x75\xfc\xa1\x50\x00\x00\x00",
             want: 6,
         },
+        Site {
+            name: "WP_ForcePowersUpdate",
+            bytes: b"\x55\x8b\xec\x83\xec\x48\x89\x5d\xf8\x89\x7d\xf0\x89\x75\xf4",
+            want: 6,
+        },
     ];
+
+    /// `GAME_HOOKS` is what the `game_trampoline!` macros index into and what
+    /// `attach_all`'s `game_wrappers` zips against positionally: pin the order
+    /// against the byte fixtures so a reordering cannot silently repoint an
+    /// "original" call at another game function (an ABI hazard).
+    #[test]
+    fn game_hook_order_matches_the_site_fixtures() {
+        assert_eq!(GAME_HOOKS.len(), GAME_SITES.len());
+        for (hook, site) in GAME_HOOKS.iter().zip(GAME_SITES) {
+            assert_eq!(hook.name, site.name);
+        }
+    }
 
     #[test]
     fn decoder_matches_sweep_steal_lengths() {

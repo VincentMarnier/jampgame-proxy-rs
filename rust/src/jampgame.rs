@@ -67,6 +67,21 @@ pub const FN_LOG_EXIT: usize = 0x0008_81d4;
 /// from ending the map before the proxy has ended the untied matches and let
 /// the tied ones play sudden death.
 pub const FN_SCORE_IS_TIED: usize = 0x0008_8a74;
+/// `void WP_ForcePowersUpdate(gentity_t*, usercmd_t*)` (nm
+/// `WP_ForcePowersUpdate__FP9gentity_sP9usercmd_s`, file offset `0x18a554`;
+/// prologue `55 8b ec 83 ec 48`, 6 detour-safe bytes). The per-frame
+/// force-power update `G_RunFrame` runs for every client (`g_main.c:3949`) and
+/// every NPC (`g_main.c:3976`) — the only two call sites in the shipped module
+/// (R_386_PC32 at `0x8aa67`/`0x8af69`, both inside `G_RunFrame`
+/// `0x8a304..0x8b184`) — so it runs outside every other acting scope. It is
+/// where the owner-less `EV_PREDEFSOUND` force sounds are built
+/// (`G_PreDefSound`: the force-jump sound at `w_force.c:5390`, force grip at
+/// `5398`, the knockdown getup at `5200`, and `G_SpecialRollGetup`'s `5070`
+/// through its only caller at `0x18a928` inside this function), so the
+/// parallel-TFFA wrapper opens the acting scope of `self` around the pristine
+/// body. Without it those sounds take the world stamp and are heard in every
+/// instance (the force-jump leak).
+pub const FN_WP_FORCE_POWERS_UPDATE: usize = 0x0018_a554;
 /// `void G_Sound(gentity_t*, int, int)` (nm `G_Sound__FP9gentity_siT2`, file
 /// offset `0x16e824`; prologue `55 8b ec 83 ec 20`, 6 detour-safe bytes).
 /// Parallel-TFFA sound isolation: records which match's action owns the temp

@@ -215,6 +215,11 @@ game_trampoline!(
     19,
     unsafe extern "C" fn() -> core::ffi::c_int
 );
+game_trampoline!(
+    game_hook_original_wp_force_powers_update,
+    20,
+    unsafe extern "C" fn(usize, usize)
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -332,6 +337,7 @@ pub unsafe fn attach_all() {
         game::g_run_missile as usize,
         game::team_count as usize,
         game::score_is_tied as usize,
+        game::wp_force_powers_update as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the
@@ -392,5 +398,51 @@ pub unsafe fn set_enabled(enabled: bool) {
         // the server boots with the switch off.
         // SAFETY: verified engine intra-patch sites (R-010).
         unsafe { patch::revert_inline_patches() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch;
+
+    /// The `game_trampoline!` macros above bind an "original" call by literal
+    /// index into `patch::GAME_HOOKS`, and `attach_all`'s `game_wrappers` zips
+    /// the wrappers against the same table positionally. Pin the index → name
+    /// mapping both rely on: a reordered table would silently repoint an
+    /// "original" call at another game function (an ABI hazard), which the
+    /// types cannot catch.
+    #[test]
+    fn game_trampoline_indices_match_the_hook_table() {
+        let by_index = [
+            "G_Damage",
+            "player_die",
+            "BeginIntermission",
+            "G_AddEvent",
+            "ClientThink_real",
+            "SetTeam",
+            "AddScore",
+            "LogExit",
+            "G_Sound",
+            "G_SoundTempEntity",
+            "G_TempEntity",
+            "G_FreeEntity",
+            "G_TouchTriggers",
+            "G_UseTargets2",
+            "G_Find",
+            "G_Spawn",
+            "G_RunThink",
+            "G_RunMissile",
+            "TeamCount",
+            "ScoreIsTied",
+            "WP_ForcePowersUpdate",
+        ];
+        assert_eq!(patch::GAME_HOOKS.len(), by_index.len());
+        for (index, name) in by_index.into_iter().enumerate() {
+            assert_eq!(
+                patch::GAME_HOOKS[index].name,
+                name,
+                "game_trampoline! index {index}"
+            );
+        }
     }
 }

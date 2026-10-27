@@ -2687,10 +2687,13 @@ pub fn sound_attribution(event: c_int) -> SoundAttribution {
         EV_GENERAL_SOUND => SoundAttribution::Stamped,
         // `G_PreDefSound` (`w_force.c:40-49`) builds its event with plain
         // `G_TempEntity`, so it has no owner field: attribute it at
-        // construction from the acting scope (the force jump runs inside the
-        // player's think). Without this it fell through to the generic
-        // owner-fields rule, whose memset zeros resolve to client 0, and the
-        // sound was silenced in every other match.
+        // construction from the acting scope. The force-jump sound is built by
+        // `WP_ForcePowersUpdate`, which `G_RunFrame` runs on the player's
+        // behalf (`g_main.c:3949`) and whose wrapper opens the player's
+        // instance; the think (`ClientThink_real`) covers the rest. Without
+        // this it fell through to the generic owner-fields rule, whose memset
+        // zeros resolve to client 0, and the sound was silenced in every other
+        // match.
         EV_PREDEFSOUND => SoundAttribution::Stamped,
         EV_ENTITY_SOUND => SoundAttribution::Emitter,
         EV_GLOBAL_SOUND | EV_GLOBAL_TEAM_SOUND | EV_MUTE_SOUND => SoundAttribution::Broadcast,
