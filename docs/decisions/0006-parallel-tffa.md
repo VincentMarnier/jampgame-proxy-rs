@@ -787,6 +787,104 @@ The spectator move itself is the runtime-verified `move_match_to_spectator`
 trampoline path; the disable as a whole needs a live admin + live client on a
 real server, which the automated suite cannot drive.
 
+### D-006.10 — A finished match remembers its roster and comes back on `map_restart`
+
+*Status: landed (user directive, 2026-10-28). The restart placement is
+auto-join to the old team (user choice).*
+
+When a created match ends (fraglimit or timelimit, the D-006.3/D-006 finish
+path), the proxy now remembers who was playing it and for which team, sends
+them to spectator exactly as before, and re-creates the match with those players
+on those teams at the next `map_restart`. A finished match therefore survives
+the round transition like an open one (D-006.8), instead of vanishing and
+leaving its group to recreate it by hand. Main (slot 0) is not remembered: it is
+implicit and always comes back, so only created matches need a roster.
+
+**Capture.** The finish pass already visits every connected member before
+`move_match_to_spectator` moves them to main. With the game client still live,
+each member's session team is read (`OFFSET_GCLIENT_SESS +
+OFFSET_SESS_SESSION_TEAM`) into `TffaMatch::remembered` (`TEAM_RED`/`TEAM_BLUE`
+per client slot, `REMEMBERED_NONE` = absent). Only a member who was actually
+playing is remembered: a spectator in the match was not in the game and is not
+put back on a team. The slot then becomes inactive with its world queued for
+release, as before; the roster is the only thing kept.
+
+**One instance per client.** A client is remembered by at most one instance —
+the last one they played for. Capturing a roster removes its players from every
+other finished slot's roster, and `forget_previous_instances` removes them when
+they actually play elsewhere:
+
+- a successful `SetTeam` into RED/BLUE for a client in *another* instance
+  (main included) forgets the old memory. The `SetTeam` wrapper observes this
+  (it already reads the pre-call team for `teamlock`; the read is now also done
+  when parallel TFFA is on, not only during the grace window). Spectating or
+  following in another instance is not a join and keeps the memory;
+- `tffa_create` joins the creator through the pristine `SetTeam` trampoline
+  (bypassing that wrapper), so it calls `forget_previous_instances` explicitly
+  after the successful join;
+- a disconnect, or a fresh client taking a reused slot
+  (`GAME_CLIENT_CONNECT(firstTime = qtrue)`), forgets them everywhere.
+
+**Restart.** `state::tffa_after_reset` carries `remembered` next to
+`active`/`client_match` for a `map_restart` only (a full map change drops the
+overlay, as before). `tffa::reset_round_state` then, for every created slot
+inside the live `proxy_tffa_maxMatches`:
+
+1. reactivates the slot and resets its tallies to `0-0`;
+2. assigns each remembered client to it (`client_match`) and schedules their
+   team in the one-shot `TffaState::pending_join`;
+3. clears the roster (it has been applied).
+
+`restore_instances` sees the slot as active, so the per-instance world (doors,
+plats, triggers) is rebuilt exactly like an open match's before any client
+reconnects. The settle frames of `SV_MapRestart_f` are covered by the existing
+`restart_grace_frames` (the reset returns `kept` for a reactivated match too).
+
+The team itself is restored at `GAME_CLIENT_BEGIN`, after the pristine
+`ClientBegin` has run: the client's entity and `ent->client` are live, and the
+proxy consumes `pending_join` and calls the pristine `SetTeam` body through the
+trampoline (`red`/`blue`), i.e. the same move `/team red|blue` and
+`tffa_create` make. That `SetTeam` calls `ClientUserinfoChanged` and
+`ClientBegin(qfalse)` itself (`g_cmds.c`), so the client spawns on the team,
+`CS_PLAYERS` is re-broadcast and the per-viewer rewrite (D-006.5) follows. The
+base game alone would have restored the old session team — for a finished
+match that is `TEAM_SPECTATOR`, because the finish path had sent them there —
+so the proxy's auto-join is what brings them back as players. A client with no
+`pending_join` entry is untouched: an *open* carried match still restores
+RED/BLUE through the game's session data, exactly as in D-006.8.
+
+**Lifecycle edge cases.** A lowered `proxy_tffa_maxMatches` closes a remembered
+slot above the limit (the memory dies with it, members start in main); a full
+map change drops all rosters; disabling `proxy_tffa_enable` clears them with the
+rest of the overlay (D-006.9), so a later re-enable does not resurrect a match
+from before the disable. If `realize_instance` cannot rebuild a reactivated
+instance (capacity/NPC eligibility), `discard_instance` closes it, returns its
+members to main and clears their pending auto-join. `tffa_create` prefers a slot
+with no remembered roster and only reuses (and clears) a remembered one when no
+empty slot is left, so opening a new match does not evict a waiting group while
+an empty slot exists.
+
+**Caveats.** `g_teamForceBalance 1` (default `0`) can refuse the auto-join when
+the remembered teams were lopsided by more than one (a 3v2 whose third RED
+joins before the BLUEs are back); the client stays spectator and can still
+`/team red|blue`, and the instance is kept as long as another remembered member
+plays in it (the normal empty-match sweep closes it otherwise). Bots never issue
+`tffa_*`, so created matches and therefore remembered rosters are human-only.
+The auto-join itself needs a live client and a `map_restart`, which the
+automated suite cannot drive; the tests below cover the table transitions, the
+capture predicate and the slot preference.
+
+Tests: `a_finished_match_remembers_the_teams_its_players_had` (only RED/BLUE
+members, aligned by client slot),
+`a_remembered_match_is_recreated_on_a_map_restart` (reactivation,
+`client_match`, `pending_join`, roster consumed, idempotent),
+`a_full_map_change_drops_a_remembered_roster` (full change and above-limit
+slot), `playing_for_another_instance_forgets_the_previous_one` (including main
+as the current instance) and
+`a_new_match_prefers_a_slot_without_a_remembered_roster` (empty slot first,
+reuse+clear when full). `state::tests::map_restart_carries_a_finished_matches_remembered_roster`
+covers the carry (and that the one-shot auto-join table never carries).
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`

@@ -284,6 +284,17 @@ pub struct TffaMatch {
     /// void in the meantime, exactly like the pristine
     /// `level.intermissionQueued` window (`g_combat.c:4520-4524`).
     pub end_queued_at: i32,
+    /// Roster of a finished match: the team (`TEAM_RED`/`TEAM_BLUE`) each
+    /// member played for when the match ended, `crate::tffa::REMEMBERED_NONE`
+    /// (0) for every slot that is not remembered. A finished match is inactive
+    /// for the rest of the round (its members are spectators in main); the
+    /// roster is what `map_restart` re-creates the instance from, putting each
+    /// member back on their old team (D-006.10).
+    ///
+    /// A client is remembered by at most one instance (the last one they
+    /// played for), and playing for another instance forgets the old one
+    /// (`tffa::forget_previous_instances`).
+    pub remembered: [u8; MAX_CLIENTS],
 }
 
 impl TffaMatch {
@@ -292,6 +303,14 @@ impl TffaMatch {
     /// or moved to spectator yet.
     pub fn ending(&self) -> bool {
         self.active && self.end_queued_at != 0
+    }
+
+    /// Whether this (inactive) slot still remembers the roster of the match
+    /// that finished in it, i.e. whether a `map_restart` re-creates it.
+    pub fn has_remembered(&self) -> bool {
+        self.remembered
+            .iter()
+            .any(|team| *team != crate::tffa::REMEMBERED_NONE)
     }
 }
 
@@ -345,6 +364,14 @@ pub struct TffaState {
     /// another match would fall back to their own (often empty) match when the
     /// final `scores` message is built and read e.g. `TIED AT 0`.
     pub intermission_boards: [u8; MAX_CLIENTS],
+    /// The team each client must auto-join when it begins the round a
+    /// remembered instance was re-created for (`TEAM_RED`/`TEAM_BLUE`,
+    /// `crate::tffa::REMEMBERED_NONE` = none). Filled by
+    /// `tffa::reset_round_state` from a finished match's remembered roster and
+    /// consumed by `tffa::on_client_begin` (D-006.10). Cleared for a client
+    /// that disconnects or reconnects fresh, so a reused slot never inherits
+    /// the previous occupant's team.
+    pub pending_join: [u8; MAX_CLIENTS],
     /// Set when any intermission begins (pristine timelimit exit or the
     /// proxy-triggered solo-main finish); cleared on `GAME_INIT`. While set,
     /// fraglimit handling stays off — the map is ending.
@@ -428,9 +455,7 @@ impl Default for TffaState {
         TffaState {
             matches: core::array::from_fn(|i| TffaMatch {
                 active: i == 0,
-                red: 0,
-                blue: 0,
-                end_queued_at: 0,
+                ..Default::default()
             }),
             client_match: [0; MAX_CLIENTS],
             player_score: [0; MAX_CLIENTS],
@@ -444,6 +469,7 @@ impl Default for TffaState {
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission_boards: [0; MAX_CLIENTS],
+            pending_join: [crate::tffa::REMEMBERED_NONE; MAX_CLIENTS],
             intermission: false,
             entity_instance: [crate::tffa::ENTITY_SHARED; MAX_GENTITIES],
             world_clone_cost: 0,
@@ -609,8 +635,12 @@ fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
         return fresh;
     };
     // Slot 0 (main) is always active; only the created slots are carried.
+    // A created slot carries whether it was being played *and*, for a finished
+    // one, the roster it remembers: a `map_restart` re-creates it so its
+    // members return to it (D-006.10).
     for (i, m) in fresh.matches.iter_mut().enumerate().skip(1) {
         m.active = previous.matches[i].active;
+        m.remembered = previous.matches[i].remembered;
     }
     fresh.client_match = previous.client_match;
     fresh
@@ -833,6 +863,25 @@ mod tests {
         assert_eq!(carried.cs_scores_sent[4], (i32::MIN, i32::MIN));
         assert_eq!(carried.restart_grace_frames, 0);
         assert_eq!(carried.entity_instance[123], crate::tffa::ENTITY_SHARED);
+    }
+
+    /// D-006.10: a `map_restart` carries a finished match's remembered roster
+    /// (so `tffa::reset_round_state` can re-create the instance), while a full
+    /// map change drops it. The one-shot auto-join table never carries.
+    #[test]
+    fn map_restart_carries_a_finished_matches_remembered_roster() {
+        let mut previous = TffaState::default();
+        previous.matches[1].remembered[5] = crate::sdk::TEAM_RED as u8;
+        previous.pending_join[5] = crate::sdk::TEAM_RED as u8;
+
+        let carried = tffa_after_reset(Some(&previous), true);
+        assert_eq!(carried.matches[1].remembered[5], crate::sdk::TEAM_RED as u8);
+        assert!(carried.matches[1].has_remembered());
+        assert_eq!(carried.pending_join[5], crate::tffa::REMEMBERED_NONE);
+
+        let fresh = tffa_after_reset(Some(&previous), false);
+        assert_eq!(fresh.matches[1].remembered[5], crate::tffa::REMEMBERED_NONE);
+        assert!(!fresh.matches[1].has_remembered());
     }
 
     #[test]

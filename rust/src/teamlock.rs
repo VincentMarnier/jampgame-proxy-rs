@@ -393,6 +393,24 @@ fn note_team_join(ent: usize, old_team: i32) {
     cancel_grace(match_id);
 }
 
+/// Observe a successful `SetTeam` for the parallel-TFFA roster memory
+/// (D-006.10): a move into RED/BLUE is the client actually playing for the
+/// instance they are assigned to, so every finished match that remembered them
+/// forgets them — they chose a new game, and a `map_restart` must not pull them
+/// back out of it. Spectator/follow moves are not joins and keep the memory.
+fn note_tffa_team_join(ent: usize, old_team: i32) {
+    let Some(new_team) = client_team(ent) else {
+        return;
+    };
+    if new_team == old_team || (new_team != TEAM_RED && new_team != TEAM_BLUE) {
+        return;
+    }
+    let client_num = ent_client_num(ent);
+    if client_num >= 0 {
+        tffa::forget_previous_instances(client_num);
+    }
+}
+
 /// The team an explicit `red`/`blue` request names, or `None` when the request
 /// is not a direct team join (spectator/follow/empty → the game picks a team).
 fn requested_team(s: *const c_char) -> Option<i32> {
@@ -579,8 +597,11 @@ pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
         return;
     }
     // Read the pre-call team only while the grace window can still be
-    // cancelled; after that the lock is final for the round.
-    let old_team = if state::with_state(|s| s.team_lock.grace_running) {
+    // cancelled, or when parallel TFFA needs to know a client actually joined
+    // a team (D-006.10); after the lock is final for the round and the feature
+    // is off, the read is not needed.
+    let observe_tffa = tffa::enabled();
+    let old_team = if observe_tffa || state::with_state(|s| s.team_lock.grace_running) {
         client_team(ent)
     } else {
         None
@@ -590,6 +611,9 @@ pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
     unsafe { original(ent, s) };
     if let Some(old_team) = old_team {
         note_team_join(ent, old_team);
+        if observe_tffa {
+            note_tffa_team_join(ent, old_team);
+        }
     }
 }
 
