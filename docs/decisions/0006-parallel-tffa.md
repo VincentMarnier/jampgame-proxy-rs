@@ -572,6 +572,48 @@ instance their own team chat belongs to. Global `chat`/`lchat` and private
 `tell` keep their base-JKA reach, and the server log still records every
 `sayteam:` line.
 
+**Correction (2026-10-27) — the gate must not require UTF-8.** The first
+implementation screened `tchat`/`ltchat` *inside* `CStr::to_str()`, the same
+gate the `scores` rewrite uses. `G_SayTo` embeds the client's raw chat text in
+the command, and that text is a single-byte encoding, not UTF-8: one accented
+character (`é` = `0xE9`, any byte ≥ `0x80`) made `to_str()` fail, which skipped
+the **whole** `G_SEND_SERVER_COMMAND` interception — team chat, fraglimit prune
+and score rewrite alike — and the message was forwarded to every recipient on
+the sender's team, i.e. into every instance. Reported by the user as "team
+chats are shared across TFFA instances", intermittently because only messages
+carrying a non-ASCII byte leaked.
+
+Runtime evidence (2026-10-27, `mp/ctf1`, `g_gametype 6`, `proxy_tffa_enable 1`,
+`g_teamAutoJoin 1`, three synthetic protocol clients from
+`tools/runtime/a2_netstatus_groundtruth.py`; `alpha` creates match 1, `bravo`
+creates match 2, `charlie` stays in main, all RED):
+
+- Before: `alpha` (match 1) `say_team "CAF\xe9_ACCENT"` was **received by
+  `bravo` in match 2** (and no `G_SEND_SERVER_COMMAND` interception line
+  appeared for it, confirming `to_str()` was the skip); plain-ASCII chats from
+  the same clients were correctly isolated.
+- After: the same accented message reaches only `alpha`'s own instance, and
+  `bravo`'s/`charlie`'s plain chats each stay in their own instance.
+
+Fix: the prefix/visibility gate now runs on `CStr::to_bytes()` *before* (and
+independently of) the `to_str()` gate, `tffa::is_team_chat` takes `&[u8]`, and
+`syscall::team_chat_dropped` is the single predicate the arm calls. Regression
+tests: `tffa::tests::team_chat_recognition_accepts_non_utf8_chat_text` (byte
+shapes, `0xE9`/`0xFF` payloads) and
+`syscall::tests::non_utf8_team_chat_stays_inside_the_senders_instance` (same
+message, `to_str()` asserted to fail, dropped for a foreign instance, delivered
+for the sender's own, fail-open for broadcast/no scope). `cargo test` 164/164,
+`clippy -D warnings`, `fmt --check`, i686 release build and the runtime A/B
+above are green.
+
+Two neighbouring paths were re-checked against the same class of bug and are
+**not** affected: `scores ...` messages carry only integers
+(`DeathmatchScoreboardMessage`, `g_cmds.c:25-88`), so the per-viewer score
+rewrite never sees non-ASCII bytes; and the pristine fraglimit `print` prune
+(`is_kill_limit_print`) can only miss a per-player notice whose *name* is
+non-ASCII, which leaves one cosmetic chat line while the `LogExit` hook still
+owns the ending.
+
 ### D-006.8 — Matches survive `map_restart`, not a map change
 
 *Status: landed (user directive, 2026-10-21).*
@@ -1448,6 +1490,20 @@ real server, which the automated suite cannot drive.
   delivery itself needs two live clients (the server log keeps every
   `sayteam:` line either way), so the gate rests on the unit-tested predicate
   plus the runtime-verified `GAME_CLIENT_COMMAND` acting scope.
+
+- **Team-chat UTF-8 skip fixed (2026-10-27, user bug report "team chats are
+  shared across TFFA instances"):** the screening lived inside the
+  `G_SEND_SERVER_COMMAND` arm's `CStr::to_str()` gate, so any chat text with a
+  non-UTF-8 byte (a latin-1 accented character) skipped the whole interception
+  and reached every same-team client in every instance. `tffa::is_team_chat`
+  now takes `&[u8]`, and `syscall::team_chat_dropped` screens the raw bytes
+  before the `to_str()` gate that the `scores` rewrite still needs. Reproduced
+  and re-verified end to end with three synthetic clients on `mp/ctf1` (two
+  created matches + main; see D-006.7 correction). Tests:
+  `team_chat_recognition_accepts_non_utf8_chat_text` and
+  `non_utf8_team_chat_stays_inside_the_senders_instance`; `cargo test`
+  164/164, `clippy -D warnings`, `fmt --check`, i686 release build and the
+  runtime A/B green.
 
 - **Map-restart persistence (2026-10-21, user directive, D-006.8):**
   `GAME_INIT`'s restart flag now decides whether the parallel-TFFA overlay is

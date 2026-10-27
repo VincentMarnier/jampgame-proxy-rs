@@ -93,6 +93,22 @@ pub unsafe fn call_engine(command: c_int, args: &[c_int]) -> c_int {
     }
 }
 
+/// Whether a `G_SEND_SERVER_COMMAND` team chat must be dropped for
+/// `recipient`: only clients of the sender's own instance may receive it.
+///
+/// `command` is screened on its **bytes**: the message embeds the client's raw
+/// chat text, which is a single-byte encoding (a latin-1 `é` is `0xE9`, not
+/// UTF-8). Gating this on `CStr::to_str()` skipped the whole interception for
+/// every non-UTF-8 message, so accented team chat reached every instance.
+///
+/// `tffa_on` is the feature read the caller already made for the kill-limit
+/// prune and the score rewrite (one read per command).
+fn team_chat_dropped(command: &CStr, tffa_on: bool, recipient: c_int) -> bool {
+    tffa_on
+        && crate::tffa::is_team_chat(command.to_bytes())
+        && !crate::tffa::team_chat_visible(crate::tffa::acting_scope(), recipient)
+}
+
 /// Fixed-arity continuation of the C variadic shim: forward one harvested trap
 /// call (command + up to 16 words) to the engine unchanged — except for the
 /// traps the proxy intercepts (`Proxy_OriginalAPI_Wrappers.cpp:24-45`):
@@ -192,27 +208,25 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             {
                 // SAFETY: the game passes a NUL-terminated command string.
                 let text = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
+                // One feature read per command: the same gate covers the
+                // kill-limit prune, the team-chat prune and the score rewrite
+                // below.
+                let tffa_on = crate::tffa::enabled();
+                // Team chat (`say_team` → `tchat`/`ltchat`) stays inside the
+                // sender's instance: G_SayTo already limited it to the sender's
+                // team, and this drops the recipients of another match (blue in
+                // main no longer reaches blue in tffa1). Global `chat` stays
+                // server-wide. The sender is the acting scope the
+                // `GAME_CLIENT_COMMAND` forward opened around the game's own
+                // `ClientCommand` (`Cmd_Say_f` → `G_Say`), which covers real
+                // clients and bots alike; with no scope open the message is
+                // left untouched. Screened before — and independently of — the
+                // UTF-8 gate below (`team_chat_dropped`).
+                if team_chat_dropped(text, tffa_on, a0) {
+                    return 0;
+                }
                 if let Ok(text_str) = text.to_str() {
-                    // One feature read per command: the same gate covers the
-                    // kill-limit prune, the team-chat prune and the score
-                    // rewrite below.
-                    let tffa_on = crate::tffa::enabled();
                     if tffa_on && crate::tffa::is_kill_limit_print(text_str) {
-                        return 0;
-                    }
-                    // Team chat (`say_team` → `tchat`/`ltchat`) stays inside
-                    // the sender's instance: G_SayTo already limited it to the
-                    // sender's team, and this drops the recipients of another
-                    // match (blue in main no longer reaches blue in tffa1).
-                    // Global `chat` stays server-wide. The sender is the
-                    // acting scope the `GAME_CLIENT_COMMAND` forward opened
-                    // around the game's own `ClientCommand` (`Cmd_Say_f` →
-                    // `G_Say`), which covers real clients and bots alike; with
-                    // no scope open the message is left untouched.
-                    if tffa_on
-                        && crate::tffa::is_team_chat(text_str)
-                        && !crate::tffa::team_chat_visible(crate::tffa::acting_scope(), a0)
-                    {
                         return 0;
                     }
                     // The scoreboard rewrite runs on the message the viewer
@@ -767,5 +781,43 @@ mod tests {
         );
         clear_test_engine_syscall();
         RECORDED.lock().unwrap().clear();
+    }
+
+    /// A team chat whose text is not valid UTF-8 (any latin-1 accent, e.g. a
+    /// French `é` = 0xE9) must be gated like every other team chat. The
+    /// `G_SEND_SERVER_COMMAND` arm used to screen inside `CStr::to_str()`, so a
+    /// message that was not UTF-8 skipped the interception entirely and reached
+    /// every instance.
+    #[test]
+    fn non_utf8_team_chat_stays_inside_the_senders_instance() {
+        use std::ffi::CString;
+
+        // The same shape `G_SayTo` builds (`g_cmds.c:1511-1522`), latin-1 text.
+        let chat = CString::new(b"tchat \"\x19(alpha^7\x19)\x19: ^5CAF\xe9\"".to_vec()).unwrap();
+        let text = chat.as_c_str();
+        assert!(
+            text.to_str().is_err(),
+            "the payload must not be valid UTF-8 for this test to mean anything"
+        );
+        crate::state::with_state(|s| {
+            s.tffa.client_match[0] = 1;
+            s.tffa.client_match[1] = crate::tffa::MAIN_MATCH;
+        });
+        let previous = crate::tffa::open_client_scope(0);
+        assert_eq!(previous, crate::tffa::SCOPE_NONE);
+        // Recipient 1 is in main: dropped.
+        assert!(team_chat_dropped(text, true, 1));
+        // Recipient 0 is in the sender's instance: delivered.
+        assert!(!team_chat_dropped(text, true, 0));
+        // Broadcast or no scope: the fail-open rule of every TFFA gate.
+        assert!(!team_chat_dropped(text, true, -1));
+        crate::tffa::close_acting_scope(previous);
+        assert!(!team_chat_dropped(text, true, 1));
+        // Feature off: untouched, no state read.
+        assert!(!team_chat_dropped(text, false, 1));
+        crate::state::with_state(|s| {
+            s.tffa.client_match[0] = crate::tffa::MAIN_MATCH;
+            s.tffa.client_match[1] = crate::tffa::MAIN_MATCH;
+        });
     }
 }

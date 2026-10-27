@@ -104,8 +104,14 @@ pub fn client_match(client_num: i32) -> u8 {
 /// Whether a server command is a team chat message. `G_SayTo` sends `SAY_TEAM`
 /// as `tchat` (plain) or `ltchat` (with a location prefix)
 /// (`g_cmds.c:1511-1522`); global `chat`/`lchat` are not team chat.
-pub fn is_team_chat(command: &str) -> bool {
-    command.starts_with("tchat ") || command.starts_with("ltchat ")
+///
+/// Byte-level on purpose: the command carries the client's raw chat text, which
+/// is whatever single-byte encoding the sender typed (a latin-1 `é` is `0xE9`,
+/// not valid UTF-8). Gating on `str` made the whole `G_SEND_SERVER_COMMAND`
+/// interception — team chat included — skip every non-UTF-8 message, which sent
+/// accented team chat to every instance.
+pub fn is_team_chat(command: &[u8]) -> bool {
+    command.starts_with(b"tchat ") || command.starts_with(b"ltchat ")
 }
 
 /// Pure team-chat gate: a `tchat`/`ltchat` sent by a client in `sender_match`
@@ -4034,14 +4040,30 @@ mod tests {
 
     #[test]
     fn team_chat_commands_are_the_tchat_shapes_only() {
-        assert!(is_team_chat("tchat \"^1Bob^7: hi\""));
-        assert!(is_team_chat("ltchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
+        assert!(is_team_chat(b"tchat \"^1Bob^7: hi\""));
+        assert!(is_team_chat(b"ltchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
         // Global chat and unrelated commands are not team chat.
-        assert!(!is_team_chat("chat \"^1Bob^7: hi\""));
-        assert!(!is_team_chat("lchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
-        assert!(!is_team_chat("print \"tchat hi\""));
-        assert!(!is_team_chat("tchatty"));
-        assert!(!is_team_chat(""));
+        assert!(!is_team_chat(b"chat \"^1Bob^7: hi\""));
+        assert!(!is_team_chat(b"lchat \"Bob\" \"Yavin\" \"^4\" \"hi\""));
+        assert!(!is_team_chat(b"print \"tchat hi\""));
+        assert!(!is_team_chat(b"tchatty"));
+        assert!(!is_team_chat(b""));
+    }
+
+    #[test]
+    fn team_chat_recognition_accepts_non_utf8_chat_text() {
+        // A latin-1 `é` (0xE9) is not valid UTF-8: the command must still be
+        // recognised so the per-instance gate applies to it.
+        assert!(is_team_chat(
+            b"tchat \"\x19(alpha^7\x19)\x19: ^5CAF\xe9_ACCENT\""
+        ));
+        assert!(is_team_chat(
+            b"ltchat \"alpha\" \"Tatooine\" \"^7\" \"caf\xe9\""
+        ));
+        // Only the command word matters, whatever the payload bytes are.
+        assert!(is_team_chat(b"tchat \xff\xfe"));
+        assert!(!is_team_chat(b"chat caf\xe9"));
+        assert!(!is_team_chat(b"caf\xe9 tchat "));
     }
 
     #[test]
