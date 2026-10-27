@@ -46,6 +46,23 @@ Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
 `proxy_sv_disableKillCmd`).
 
+### Player mute
+
+`rcon mute <player>` silences a player's chat; `rcon unmute <player>` gives it
+back. `<player>` is either the client number `status` shows (`rcon mute 0`) or
+any part of the player's name — case- and colour-code-insensitive, exact first,
+then a prefix, then the fragment wherever it sits in the name (`rcon mute ade`
+finds `Darth Vader`). Names with spaces work as typed (`rcon mute darth vader`);
+a fragment shared by several players is answered with the candidates and their
+numbers, and a bare `rcon mute` prints the usage and who is currently muted.
+
+A muted player keeps playing normally: only `say`, `say_team`, `tell` and the
+voice menu's `voice_cmd` are dropped, and they are told they are muted. Mutes
+are per client slot, cleared when the player leaves, and kept across a
+`map_restart`; a full map change starts with nobody muted. Like every proxy
+feature they need `proxy_sv_enable 1`, and the same commands work in the
+dedicated server's own console.
+
 ### TaystJK scoreboard deaths
 
 While `proxy_sv_enable` is `1`, the proxy advertises `taystJKinfo 128`

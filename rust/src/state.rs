@@ -428,6 +428,12 @@ impl Default for TffaState {
 pub struct ClientEntry {
     pub is_connected: bool,
     pub clean_name: [u8; MAX_NETNAME],
+    /// Admin mute (D-011): the client's `say`/`say_team`/`tell`/`voice_cmd`
+    /// commands are dropped instead of being forwarded to the game. Set and
+    /// cleared by the `mute`/`unmute` console commands, and dropped with the
+    /// rest of the entry when the client disconnects (the slot belongs to the
+    /// next player after that).
+    pub muted: bool,
     /// netStatus estimator state (D-007): per-packet window, fps/pps ring
     /// semantics and the reset rules.
     pub netstatus: NetstatusState,
@@ -449,6 +455,7 @@ impl Default for ClientEntry {
         ClientEntry {
             is_connected: false,
             clean_name: [0; MAX_NETNAME],
+            muted: false,
             netstatus: NetstatusState::default(),
             last_time_net_status: 0,
             packet_counter: 0,
@@ -522,10 +529,37 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
 /// per-instance worlds are per round / per map and are never carried.
 pub fn reset_session(restart: bool) {
     let mut guard = lock();
-    let tffa = tffa_after_reset(guard.as_ref().map(|s| &s.tffa), restart);
+    let (tffa, muted) = {
+        let previous = guard.as_ref();
+        (
+            tffa_after_reset(previous.map(|s| &s.tffa), restart),
+            mutes_after_reset(previous, restart),
+        )
+    };
     let mut next = ProxyState::default();
     next.tffa = tffa;
+    // A `map_restart` keeps every player in their slot, so an admin mute stays
+    // on the player it was issued for. A full map change drops everyone (the
+    // slots are handed to new players) and starts unmuted.
+    for (entry, muted) in next.clients.iter_mut().zip(muted) {
+        entry.muted = muted;
+    }
     *guard = Some(next);
+}
+
+/// The per-slot mute flags a `GAME_INIT` starts from: carried for a
+/// `map_restart` (client slots survive it), dropped for a full map change.
+///
+/// Kept separate from the lock so the carry is unit-tested directly.
+fn mutes_after_reset(previous: Option<&ProxyState>, restart: bool) -> [bool; MAX_CLIENTS] {
+    let mut muted = [false; MAX_CLIENTS];
+    let Some(previous) = previous.filter(|_| restart) else {
+        return muted;
+    };
+    for (carried, entry) in muted.iter_mut().zip(previous.clients.iter()) {
+        *carried = entry.muted;
+    }
+    muted
 }
 
 /// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
@@ -762,6 +796,27 @@ mod tests {
         assert_eq!(carried.cs_scores_sent[4], (i32::MIN, i32::MIN));
         assert_eq!(carried.restart_grace_frames, 0);
         assert_eq!(carried.entity_instance[123], crate::tffa::ENTITY_SHARED);
+    }
+
+    #[test]
+    fn map_restart_keeps_admin_mutes_and_a_map_change_clears_them() {
+        let mut previous = ProxyState::default();
+        previous.clients[2].is_connected = true;
+        previous.clients[2].muted = true;
+        previous.clients[5].muted = true;
+
+        // A `map_restart` keeps every player in their slot, so the mute stays
+        // on the player it was issued for.
+        let carried = mutes_after_reset(Some(&previous), true);
+        assert!(carried[2] && carried[5]);
+        assert_eq!(carried.iter().filter(|&&m| m).count(), 2);
+
+        // A full map change drops everyone: the slots go to new players and
+        // must start unmuted.
+        let fresh = mutes_after_reset(Some(&previous), false);
+        assert!(!fresh.iter().any(|&muted| muted));
+        // The first `GAME_INIT` after a module load carries nothing either.
+        assert!(!mutes_after_reset(None, true).iter().any(|&muted| muted));
     }
 
     #[test]

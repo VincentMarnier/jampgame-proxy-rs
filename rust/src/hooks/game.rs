@@ -522,7 +522,10 @@ pub(crate) fn pers_killed(client_num: c_int) -> c_int {
 }
 
 /// `(proxy.g_entities + n)->client->pers.netname`, colour-stripped into `out`.
-fn client_clean_netname(client_num: c_int, out: &mut [u8]) {
+///
+/// Shared with the admin `mute`/`unmute` name lookup (`crate::mute`), which
+/// resolves names against the players that are actually in game.
+pub(crate) fn client_clean_netname(client_num: c_int, out: &mut [u8]) {
     let client = client_of(client_num);
     if client == 0 {
         out[0] = 0;

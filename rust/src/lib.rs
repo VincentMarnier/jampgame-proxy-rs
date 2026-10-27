@@ -32,6 +32,7 @@
 mod engine;
 mod hooks;
 mod jampgame;
+mod mute;
 mod netstatus_est;
 mod original;
 mod patch;
@@ -49,8 +50,8 @@ use core::ffi::c_int;
 
 use sdk::{
     DEFAULT_BASE_GAME_FOLDER_NAME, GAME_CLIENT_BEGIN, GAME_CLIENT_COMMAND, GAME_CLIENT_CONNECT,
-    GAME_CLIENT_DISCONNECT, GAME_CLIENT_USERINFO_CHANGED, GAME_INIT, GAME_RUN_FRAME, GAME_SHUTDOWN,
-    ORIGINAL_ENGINE_VERSION, ORIGINAL_LIBRARY_NAME,
+    GAME_CLIENT_DISCONNECT, GAME_CLIENT_USERINFO_CHANGED, GAME_CONSOLE_COMMAND, GAME_INIT,
+    GAME_RUN_FRAME, GAME_SHUTDOWN, ORIGINAL_ENGINE_VERSION, ORIGINAL_LIBRARY_NAME,
 };
 use state::PROXY_CVARS;
 
@@ -188,6 +189,11 @@ pub unsafe extern "C" fn vmMain(
                 if tffa::handle_client_command(a0) {
                     return 0;
                 }
+                // A muted player's chat/voice never reaches the game's own
+                // `ClientCommand`; everything else they send still does.
+                if mute::handle_client_command(a0) {
+                    return 0;
+                }
                 if !shared_api::client_command(a0) {
                     return 0;
                 }
@@ -210,6 +216,17 @@ pub unsafe extern "C" fn vmMain(
         GAME_CLIENT_USERINFO_CHANGED => {
             if state::proxy_enabled() {
                 shared_api::client_userinfo_changed(a0);
+            }
+            forward(command, &args)
+        }
+        // rcon (`SVC_RemoteCommand` → `Cmd_ExecuteString`) and the dedicated
+        // console both hand a command the engine does not know to the game
+        // module. The proxy claims `mute`/`unmute` here: returning qtrue keeps
+        // the dedicated server from echoing the line to every client as
+        // `server: …` (g_svcmds.c:ConsoleCommand).
+        GAME_CONSOLE_COMMAND => {
+            if state::proxy_enabled() && mute::handle_console_command() {
+                return 1;
             }
             forward(command, &args)
         }

@@ -104,6 +104,10 @@ pub const DEFAULT_BASE_GAME_FOLDER_NAME: &str = "base";
 // Only the traps the proxy itself uses are listed.
 // ---------------------------------------------------------------------------
 
+/// `G_PRINT` (`g_public.h:105`): `void trap_Print(const char *string)` — the
+/// server console. During an rcon packet the engine has a `Com_BeginRedirect`
+/// open, so the text is sent back to the remote admin.
+pub const G_PRINT: i32 = 0;
 pub const G_CVAR_REGISTER: i32 = 5;
 pub const G_CVAR_UPDATE: i32 = 6;
 pub const G_CVAR_SET: i32 = 7;
@@ -172,6 +176,11 @@ pub const GAME_CLIENT_USERINFO_CHANGED: i32 = 4;
 pub const GAME_CLIENT_DISCONNECT: i32 = 5;
 pub const GAME_CLIENT_COMMAND: i32 = 6;
 pub const GAME_RUN_FRAME: i32 = 8;
+/// `GAME_CONSOLE_COMMAND` (`g_public.h`): the engine hands a command it does not
+/// know to the game module (`qcommon/cmd_console.cpp:122` → `SV_GameCommand`).
+/// The rcon path reaches it through `SVC_RemoteCommand` → `Cmd_ExecuteString`.
+/// Returning qtrue stops the engine from treating the line as a server chat.
+pub const GAME_CONSOLE_COMMAND: i32 = 9;
 
 // ---------------------------------------------------------------------------
 // Layout oracle: sizes/offsets produced by compiling the SDK headers with the
@@ -688,6 +697,9 @@ mod tests {
         assert_eq!(G_CVAR_VARIABLE_INTEGER_VALUE, 8);
         assert_eq!(G_CVAR_VARIABLE_STRING_BUFFER, 9);
         assert_eq!(G_ARGV, 11);
+        // `G_PRINT` is the first trap; the console-command reply and the
+        // `mute` feedback depend on this ordinal.
+        assert_eq!(G_PRINT, 0);
         assert_eq!(G_LOCATE_GAME_DATA, 17);
         assert_eq!(G_DROP_CLIENT, 18);
         assert_eq!(G_SEND_SERVER_COMMAND, 19);
@@ -722,6 +734,9 @@ mod tests {
         assert_eq!(GAME_CLIENT_DISCONNECT, 5);
         assert_eq!(GAME_CLIENT_COMMAND, 6);
         assert_eq!(GAME_RUN_FRAME, 8);
+        // `GAME_CLIENT_THINK` (7) sits between them; the console-command event
+        // is what carries `rcon mute`/`unmute` to the module.
+        assert_eq!(GAME_CONSOLE_COMMAND, 9);
     }
 
     #[test]

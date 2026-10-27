@@ -26,7 +26,7 @@ use crate::sdk::{
     CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
     G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
     G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_NAV_FREE, G_NAV_LOAD,
-    G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
+    G_PRINT, G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -553,6 +553,22 @@ pub unsafe fn get_configstring(index: c_int, buffer: &mut [u8]) {
             G_GET_CONFIGSTRING,
             &[index, buffer.as_mut_ptr() as c_int, buffer.len() as c_int],
         );
+    }
+}
+
+/// `trap_Print` — write `text` to the server console.
+///
+/// Inside an rcon packet the engine is redirecting `Com_Printf` into its reply
+/// buffer (`SVC_RemoteCommand` → `Com_BeginRedirect`), so this is how an
+/// `rcon` command answers the admin. Outside one it lands on the dedicated
+/// console.
+///
+/// # Safety
+///
+/// `text` must be NUL-terminated; the engine syscall pointer must be registered.
+pub unsafe fn print(text: &CStr) {
+    unsafe {
+        call_engine(G_PRINT, &[text.as_ptr() as c_int]);
     }
 }
 

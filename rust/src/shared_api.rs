@@ -96,10 +96,16 @@ pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
 /// client's proxy-side bookkeeping.
 pub fn client_disconnect(client_num: c_int) {
     state::with_state(|s| {
-        if (0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num)
-            && s.clients[client_num as usize].is_connected
-        {
-            s.clients[client_num as usize] = Default::default();
+        if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+            return;
+        }
+        let entry = &mut s.clients[client_num as usize];
+        // An admin mute never outlives the player who earned it. This runs even
+        // when the connect mirror never saw the slot begin: bots are added by
+        // the game module itself and do not raise `GAME_CLIENT_BEGIN`.
+        entry.muted = false;
+        if entry.is_connected {
+            *entry = Default::default();
             // Drop any in-progress jump-hold so a new client reusing the slot
             // is not forced to jump by a stale timer.
             s.jump_start_time[client_num as usize] = 0;

@@ -40,3 +40,8 @@
   `CL_AdjustTimeDelta` clock gap) and the ground-truth harness; the
   `proxy_sv_netStatusDebug` cvar the plan proposed was dropped at the user's
   request (no estimator internals at runtime).
+- `0011-player-mute.md` — admin `mute`/`unmute` console (rcon) commands: claimed
+  at `GAME_CONSOLE_COMMAND`, target by client number or name (exact, then unique
+  prefix, colour codes ignored), per-slot flag cleared on disconnect and carried
+  across `map_restart`, enforced by dropping `say`/`say_team`/`tell`/`voice_cmd`
+  in `GAME_CLIENT_COMMAND`.
