@@ -206,7 +206,11 @@ match (red/blue there, main included) is forgotten by the old one.
 `timelimit` is global: at the limit each match ends unless it is tied, and a
 tied match keeps playing (sudden death) until a frag separates the teams
 (an untied match ends through the same one-second damage-void window).
-Once no tied match with players remains, the map ends and restarts normally.
+When a tied match keeps the map alive, a finished untied match's members are
+moved to spectator as usual. When **no** tied match with players remains, the
+whole map ends instead: every match keeps its players and tallies through the
+final scoreboard — so each player reads their own instance's result instead of
+being sent to main — and the map then restarts normally.
 A `map_restart` keeps the matches: every player reconnects into the match and
 team they were in — including a match that had already finished, which is
 re-created from its remembered group and puts each player back on their old

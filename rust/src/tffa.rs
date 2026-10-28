@@ -2009,16 +2009,186 @@ fn create_allowed(timelimit_expired: bool) -> bool {
     !timelimit_expired
 }
 
+/// One match's end-of-match facts, captured from the live game state before
+/// anything is moved or reset: the connected members, the team each of them
+/// played for, and the per-team name lists for the announcement. Shared by the
+/// per-match finish path and by [`finish_map_keeping_matches`].
+struct Finished {
+    id: u8,
+    red: i32,
+    blue: i32,
+    /// `"fraglimit"` or `"timelimit"` (for the end-of-match line).
+    reason: &'static str,
+    members: Vec<c_int>,
+    /// Team each member played for when the match ended (`TEAM_RED` /
+    /// `TEAM_BLUE`), aligned with `members`; every other team is
+    /// `REMEMBERED_NONE` and is not remembered (a spectator was not in the
+    /// game, D-006.10).
+    teams: Vec<u8>,
+    red_names: Vec<String>,
+    blue_names: Vec<String>,
+}
+
+/// Snapshot one match's end-of-match facts. `connected` keeps free slots out:
+/// they default to main and would otherwise inflate a finish to 30 "members"
+/// (reliable overflow + `SetTeam` on empty entities).
+fn collect_result(
+    state: &state::ProxyState,
+    id: u8,
+    red: i32,
+    blue: i32,
+    reason: &'static str,
+    connected: &[bool; MAX_CLIENTS],
+) -> Finished {
+    let members: Vec<c_int> = state
+        .tffa
+        .client_match
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| **m == id && connected[*i])
+        .map(|(i, _)| i as c_int)
+        .collect();
+    // Team split + names from the stored CS_PLAYERS bases (game `t` team +
+    // `n` netname at last update).
+    let g_entities = state.located_game_data.g_entities;
+    let mut teams = Vec::with_capacity(members.len());
+    let mut red_names = Vec::new();
+    let mut blue_names = Vec::new();
+    for cn in &members {
+        let team = session_team_at(g_entities, *cn);
+        teams.push(match team {
+            Some(TEAM_RED) => TEAM_RED as u8,
+            Some(TEAM_BLUE) => TEAM_BLUE as u8,
+            _ => REMEMBERED_NONE,
+        });
+        let base = &state.tffa.cs_players_base[*cn as usize];
+        let team = base
+            .is_empty()
+            .then_some(None)
+            .unwrap_or_else(|| info_value(base, "t").and_then(|t| t.parse::<i32>().ok()));
+        let name = if base.is_empty() {
+            format!("player{cn}")
+        } else {
+            announce_name(&info_value(base, "n").unwrap_or_else(|| format!("player{cn}")))
+        };
+        match team {
+            Some(TEAM_RED) => red_names.push(name),
+            Some(TEAM_BLUE) => blue_names.push(name),
+            _ => {}
+        }
+    }
+    Finished {
+        id,
+        red,
+        blue,
+        reason,
+        members,
+        teams,
+        red_names,
+        blue_names,
+    }
+}
+
+/// Whether the shared timelimit is ending the **whole map**: the limit expired
+/// and no active match is still tied with a player who could untie it. Every
+/// game is decided, so there is nothing left to play for; the map ends as a
+/// whole (one intermission, every match intact) instead of ending match by
+/// match, which would move each instance's players to main as spectators
+/// before the final `scores` message and hand them main's board.
+/// Pure so the choice is unit-tested.
+fn map_ends_at_timelimit(
+    limit_expired: bool,
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    playing: &[bool; MAX_CLIENTS],
+) -> bool {
+    limit_expired && !has_continuing_match(matches, client_match, playing)
+}
+
+/// Whether some active match is still inside its end-of-match window
+/// ([`END_DELAY_MS`]): the map's final intermission must wait for it, exactly
+/// like `any_match_ending` gates the per-match path.
+fn any_match_waiting(matches: &[state::TffaMatch], now: i32) -> bool {
+    matches
+        .iter()
+        .any(|m| m.ending() && now - m.end_queued_at < END_DELAY_MS)
+}
+
+/// End the map while keeping every match — and its members — intact: announce
+/// each result, print the per-instance end-game tables, then run the pristine
+/// intermission.
+///
+/// Used when the timelimit expired with no tied match left to play. The
+/// per-match path (`move_match_to_spectator`) would deactivate each slot and
+/// move its players into main as spectators before `BeginIntermission` builds
+/// the final board, so every instance player would read main's scoreboard.
+/// Here nothing is moved or reset: `snapshot_intermission_boards` captures each
+/// viewer's own match and the `scores` rewrite shows its tallies, and the
+/// `map_restart` carry (D-006.8) keeps the instances with their members, so the
+/// next round starts in the same game instead of in main as a spectator.
+fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
+    let results = state::with_state(|s| {
+        (0..TOTAL_MATCH_SLOTS)
+            .filter(|i| s.tffa.matches[*i].active)
+            .map(|i| {
+                let m = &s.tffa.matches[i];
+                // A match that hit the fraglimit before the timelimit keeps
+                // that reason; a tied slot nobody played in ends with the map.
+                let reason =
+                    match_finish_reason(m.red, m.blue, fraglimit, true).unwrap_or("timelimit");
+                collect_result(s, i as u8, m.red, m.blue, reason, connected)
+            })
+            .collect::<Vec<Finished>>()
+    });
+    for f in &results {
+        if f.members.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "----- proxy-rs: TFFA {} ended ({}) {}-{} — map over, players keep their own final scoreboard",
+            f.id, f.reason, f.red, f.blue
+        );
+        let red_list = if f.red_names.is_empty() {
+            "-".to_owned()
+        } else {
+            f.red_names.join(", ")
+        };
+        let blue_list = if f.blue_names.is_empty() {
+            "-".to_owned()
+        } else {
+            f.blue_names.join(", ")
+        };
+        let label = if f.id == MAIN_MATCH {
+            "main (TFFA 0)".to_owned()
+        } else {
+            format!("TFFA {}", f.id)
+        };
+        announce_to_all(&format!(
+            "print \"{label} ended ({}): RED {} - BLUE {}. RED: {red_list} | BLUE: {blue_list}. Final scoreboard incoming.\n\"",
+            f.reason, f.red, f.blue
+        ));
+        // Per-instance tables only: the pristine intermission below already
+        // prints the standard tables for everyone (main included), as it does
+        // for a solo-main finish.
+        if f.id != MAIN_MATCH {
+            crate::hooks::game::print_tffa_match_stats(&f.members);
+        }
+    }
+    crate::hooks::game::run_begin_intermission();
+}
+
 /// Per-frame: finish matches that hit the shared fraglimit, and — after the
 /// shared timelimit expires — every match that is not tied. A tied match keeps
 /// playing (per-match sudden death) until a frag separates the teams; once no
-/// active tied match with players is left, the map ends via the normal
-/// intermission/restart.
-/// Sub-match instances are announced to **everyone** with final teams/scores,
-/// members moved back to main as spectators, stats printed to members +
-/// spectators. When the main itself finishes, the lowest-id still-played TFFA
-/// becomes the new main; with no other active TFFA the map ends via pristine
-/// intermission (final scoreboard + standard stats for all).
+/// active tied match with players is left, the whole map ends
+/// ([`finish_map_keeping_matches`]) and no instance player is moved out, so
+/// each of them keeps their own final scoreboard.
+/// While a tied match keeps the map alive, sub-match instances are announced to
+/// **everyone** with final teams/scores, members moved back to main as
+/// spectators, stats printed to members + spectators. When the main itself
+/// finishes, the lowest-id still-played TFFA becomes the new main; with no
+/// other active TFFA the map ends via pristine intermission (final scoreboard +
+/// standard stats for all).
 /// Runs after the frame is forwarded so scores from this frame are visible.
 pub fn on_run_frame_post() {
     if !enabled() {
@@ -2080,21 +2250,6 @@ pub fn on_run_frame_post() {
     }
     // Authoritative game-side census (includes bots and connecting clients).
     let (connected, playing) = client_census();
-    struct Finished {
-        id: u8,
-        red: i32,
-        blue: i32,
-        /// `"fraglimit"` or `"timelimit"` (for the end-of-match line).
-        reason: &'static str,
-        members: Vec<c_int>,
-        /// Team each member played for when the match ended (`TEAM_RED` /
-        /// `TEAM_BLUE`), aligned with `members`; every other team is
-        /// `REMEMBERED_NONE` and is not remembered (a spectator was not in the
-        /// game, D-006.10).
-        teams: Vec<u8>,
-        red_names: Vec<String>,
-        blue_names: Vec<String>,
-    }
     // First pass: decide which matches that hit a limit this frame are *newly*
     // ending (queue the pristine one-second end window) and which have been
     // ending long enough to be applied now. A match inside the window keeps
@@ -2125,6 +2280,27 @@ pub fn on_run_frame_post() {
             "----- proxy-rs: TFFA {id} reached {reason} ({red}-{blue}) — damage void for {END_DELAY_MS} ms before the match ends"
         );
     }
+    // Timelimit reached with no tied match left to play: every game is decided,
+    // so the **map** ends. Finishing the matches one by one would move each
+    // instance's players to main as spectators and deactivate their slot before
+    // `BeginIntermission` builds the final `scores` message, so they would read
+    // main's board instead of their own. Keep every match (and its members)
+    // intact through the intermission instead: each viewer keeps their own
+    // instance's final scoreboard, and the next `map_restart` carries the
+    // instance with them (D-006.8) rather than dropping them into main.
+    // An end-of-match window already running (`fraglimit`, or the timelimit
+    // queue above) is served first — damage void, exactly like the pristine
+    // exit delay.
+    {
+        let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
+        if map_ends_at_timelimit(limit_expired, &matches, &table, &playing) {
+            if any_match_waiting(&matches, now) {
+                return;
+            }
+            finish_map_keeping_matches(&connected, fraglimit);
+            return;
+        }
+    }
     let mut finished: Vec<Finished> = Vec::new();
     state::with_state(|s| {
         for id in &due {
@@ -2132,56 +2308,7 @@ pub fn on_run_frame_post() {
             let Some(reason) = match_finish_reason(m.red, m.blue, fraglimit, limit_expired) else {
                 continue;
             };
-            // Only live assignments: free slots default to main and would
-            // otherwise inflate main finishes to 30 "members" (reliable
-            // overflow + SetTeam on empty entities).
-            let members: Vec<c_int> = s
-                .tffa
-                .client_match
-                .iter()
-                .enumerate()
-                .filter(|(i, m)| **m == *id && connected[*i])
-                .map(|(i, _)| i as c_int)
-                .collect();
-            // Team split + names from the stored CS_PLAYERS bases (game
-            // `t` team + `n` netname at last update).
-            let g_entities = s.located_game_data.g_entities;
-            let mut teams = Vec::with_capacity(members.len());
-            let mut red_names = Vec::new();
-            let mut blue_names = Vec::new();
-            for cn in &members {
-                let team = session_team_at(g_entities, *cn);
-                teams.push(match team {
-                    Some(TEAM_RED) => TEAM_RED as u8,
-                    Some(TEAM_BLUE) => TEAM_BLUE as u8,
-                    _ => REMEMBERED_NONE,
-                });
-                let base = &s.tffa.cs_players_base[*cn as usize];
-                let team = base
-                    .is_empty()
-                    .then_some(None)
-                    .unwrap_or_else(|| info_value(base, "t").and_then(|t| t.parse::<i32>().ok()));
-                let name = if base.is_empty() {
-                    format!("player{cn}")
-                } else {
-                    announce_name(&info_value(base, "n").unwrap_or_else(|| format!("player{cn}")))
-                };
-                match team {
-                    Some(TEAM_RED) => red_names.push(name),
-                    Some(TEAM_BLUE) => blue_names.push(name),
-                    _ => {}
-                }
-            }
-            finished.push(Finished {
-                id: *id,
-                red: m.red,
-                blue: m.blue,
-                reason,
-                members,
-                teams,
-                red_names,
-                blue_names,
-            });
+            finished.push(collect_result(s, *id, m.red, m.blue, reason, &connected));
         }
         for f in &finished {
             // Main keeps its final tallies for the intermission scoreboard
@@ -4730,6 +4857,84 @@ mod tests {
         matches[MAIN_MATCH as usize].blue = 5;
         matches[MAIN_MATCH as usize].active = false;
         assert!(!has_continuing_match(&matches, &table, &playing));
+    }
+
+    /// The requested timelimit end (operator report: instance players were sent
+    /// to spectator/main and lost their final scoreboard): when no game is tied,
+    /// the **map** ends as a whole and nobody is moved out, so each viewer's
+    /// intermission board stays their own instance's.
+    #[test]
+    fn timelimit_with_nothing_tied_ends_the_map_with_every_match_intact() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].red = 5;
+        matches[MAIN_MATCH as usize].blue = 3;
+        matches[1].active = true;
+        matches[1].red = 7;
+        matches[1].blue = 2;
+        // A tied instance nobody plays in cannot untie, so it does not keep the
+        // map alive.
+        matches[2].active = true;
+        matches[2].red = 4;
+        matches[2].blue = 4;
+
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut playing = [false; MAX_CLIENTS];
+        for c in [0usize, 1] {
+            playing[c] = true;
+        }
+        for c in [2usize, 3] {
+            table[c] = 1;
+            playing[c] = true;
+        }
+        for c in [4usize, 5] {
+            table[c] = 2; // spectators of the tied match
+        }
+
+        // Every game is decided: the map is over, not the matches one by one.
+        assert!(map_ends_at_timelimit(true, &matches, &table, &playing));
+        // Before the limit nothing ends on time.
+        assert!(!map_ends_at_timelimit(false, &matches, &table, &playing));
+        // No slot was deactivated or reset, so the intermission capture keeps
+        // each viewer's own match (instance 1's player reads its 7-2 board,
+        // main's its 5-3) instead of main's.
+        assert!(matches[1].active && matches[MAIN_MATCH as usize].active);
+        assert_eq!(pick_board_match(MAIN_MATCH, 1, matches[1].active, true), 1);
+        assert_eq!(pick_board_match(1, 1, matches[1].active, true), 1);
+        assert_eq!(
+            pick_board_match(
+                MAIN_MATCH,
+                MAIN_MATCH,
+                matches[MAIN_MATCH as usize].active,
+                true
+            ),
+            MAIN_MATCH
+        );
+
+        // A tied game with a playing member keeps the map waiting: the
+        // per-match path still applies (untied instances return to main as
+        // spectators).
+        playing[4] = true;
+        assert!(!map_ends_at_timelimit(true, &matches, &table, &playing));
+    }
+
+    /// The map-end intermission waits for every end-of-match window that is
+    /// already running (the pristine damage-void second), then ends once.
+    #[test]
+    fn the_map_end_waits_for_an_end_of_match_window() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].end_queued_at = 10_000;
+        // Just queued: still serving its window.
+        assert!(any_match_waiting(&matches, 10_000));
+        assert!(any_match_waiting(&matches, 10_999));
+        // Window served: the map may end.
+        assert!(!any_match_waiting(&matches, 11_000));
+        // A rewound clock must wait, not skip the window.
+        assert!(any_match_waiting(&matches, 9_000));
+        // An inactive slot's stale stamp is not a window.
+        matches[MAIN_MATCH as usize].active = false;
+        assert!(!any_match_waiting(&matches, 10_500));
     }
 
     /// Per-instance world entities (D-006 extension): a fabricated

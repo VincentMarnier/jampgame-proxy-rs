@@ -1753,3 +1753,57 @@ covers the carry (and that the one-shot auto-join table never carries).
   unit-tested `queued_finish`/`damage_void_in` plus the shared
   `G_Damage` wrapper. The standard engine smoke (`rust/scripts/engine-test.sh`,
   `mp/duel1`, feature off) passes on the same build.
+
+- **Timelimit map end keeps each instance's final scoreboard (2026-10-28,
+  live report: "when timelimit is reached, if no game is tied, I don't want
+  people in TFFA instances to be sent to spec/sent to the main TFFA. I want
+  them to be able to enjoy their scoreboard too").** Before this round the
+  timelimit finalised matches one by one: every untied match announced, printed
+  its tables and ran `move_match_to_spectator`, which deactivates the slot,
+  resets its temporary player copies and moves its members into main as
+  spectators. `run_begin_intermission` then ran with those slots inactive, so
+  `viewer_board_match` (`pick_board_match` requires an active captured match)
+  fell back to main and every instance player read main's board — an empty or
+  0-0 one — instead of the match they had just played.
+  New rule: when the timelimit expired and **no active match is still tied with
+  a player who could untie it** (`map_ends_at_timelimit` = `limit_expired &&
+  !has_continuing_match`), the whole map ends, not the matches: the decision
+  pass still queues each match's end (the 1 s damage-void window, unchanged),
+  `any_match_waiting` holds the intermission until every queued window has
+  served, and `finish_map_keeping_matches` then logs/announces each match's
+  result (`… — map over, players keep their own final scoreboard`), prints the
+  per-instance tables (created matches only; the intermission's standard tables
+  cover main, as in the solo-main finish) and calls
+  `run_begin_intermission` **without** deactivating slots, resetting tallies,
+  clearing remembered rosters or moving anyone. Consequences, all intended:
+  `snapshot_intermission_boards` captures each viewer's own active match, so
+  the final `scores` message shows their instance's header and per-match
+  scores; the `map_restart` carry (D-006.8) keeps the instances with their
+  members (`client_match` untouched, teams from the base game's session data),
+  so the next round resumes the same games instead of leaving everyone a
+  spectator in main. A tied match that keeps the map alive is unchanged: its
+  untied siblings still finish through the per-match spectator path. Fraglimit
+  finishes before the timelimit are unchanged.
+  Refactor: the per-match result snapshot (`members`/`teams`/team name lists)
+  moved into `collect_result` + a module-level `Finished`, shared by the
+  per-match path and the map-end path; behaviour of the former is unchanged.
+  Tests: `timelimit_with_nothing_tied_ends_the_map_with_every_match_intact`
+  (untied main + untied instance + a tied instance nobody plays in → map end;
+  no slot deactivated, so `pick_board_match` keeps instance 1's board and
+  main's; a tied match with a playing member → not a map end) and
+  `the_map_end_waits_for_an_end_of_match_window` (queued, still waiting, due,
+  rewound clock, inactive stale stamp); `cargo test` 176/176,
+  `clippy -D warnings`, `fmt --check`, i686 release build.
+  Runtime (2026-10-28, `mp/duel1`, `g_gametype 6`, `proxy_tffa_enable 1`,
+  `bot_enable 1` + `bot_minplayers 4`, `timelimit 1`, `fraglimit 0`): the
+  queue line fired, then 998–1000 ms later the new
+  `TFFA 0 ended (timelimit) 1-0 — map over, players keep their own final
+  scoreboard` line plus `main (TFFA 0) ended (timelimit): … Final scoreboard
+  incoming.`, no spectator moves; with `d_noIntermissionWait 1` the map
+  restarted and a second timelimit round logged the same pair. Created matches
+  are not runtime-observed here: bots never issue `tffa_create`, so the
+  per-instance board half rests on the unit-tested predicate plus the
+  already-runtime-verified `snapshot_intermission_boards`/`pick_board_match`
+  chain (2026-10-20 round) and needs a live two-instance finish to confirm
+  end to end. The standard engine smoke (`rust/scripts/engine-test.sh`,
+  `mp/duel1`, feature off) passes on the same build.
