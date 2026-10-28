@@ -17,7 +17,7 @@ const cvars = [
   ["proxy_sv_enableEndGameStats", "1", "Print personal / global / best-player stats tables at end of game", "stats"],
   ["proxy_sv_antiHpTeller", "0", "Prevent HP tellers usage", "gameplay"],
   ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "gameplay"],
-  ["proxy_sv_lockTeams", "0", "Minimum per-team size for the round-start lock (0 = off); every match locks against its own roster when TFFA is on", "teams"],
+  ["proxy_sv_lockTeamsAfterXSecs", "0", "Grace delay in seconds before a round's teams lock (0 = off); teams stay open for that long, and a join in a match cancels its lock for the round", "teams"],
   ["proxy_sv_teamSizeRules", "(empty)", "Per-team-size timelimit / fraglimit / capturelimit overrides, reconciled as the roster changes; per match under TFFA", "teams"],
   ["proxy_tffa_enable", "0", "Run parallel self-organized TFFA matches on one GT_TEAM map: per-match world, teams, chat and scores", "tffa"],
   ["proxy_tffa_maxMatches", "8", "Maximum parallel TFFA matches", "tffa"],
@@ -228,29 +228,34 @@ export default function Home() {
           <h3 className="sub">Round-start team lock</h3>
           <div className="prose">
             <p>
-              <code>proxy_sv_lockTeams</code> is the minimum per-team size that may be
-              locked (default <code>0</code>, off). When a round starts — map load or{" "}
-              <code>map_restart</code> — with both teams even and each fielding at least
-              that many players, every team is capped at its round-start size so the match
-              keeps its <code>N vs N</code> shape; an uneven start is left alone.{" "}
-              <code>1</code> locks from <code>1 vs 1</code> upwards, <code>2</code> from{" "}
-              <code>2 vs 2</code>. A cap is a reservation: it does not shrink when players
+              <code>proxy_sv_lockTeamsAfterXSecs</code> is a grace delay, in
+              seconds, before a round&apos;s teams lock (default <code>0</code>,
+              off). When a round starts — map load or <code>map_restart</code> —
+              teams stay open for that long. A player who joins a team in a match
+              during the window cancels that match&apos;s lock for the round. If
+              nobody joins, each team is capped at its current size when the window
+              expires, provided the roster is even at that moment (a{" "}
+              <code>2 vs 2</code> locks at 2; an uneven <code>2 vs 3</code> is left
+              alone). A cap is a reservation: it does not shrink when players
               leave, and a join to a full, locked team is refused (an admin&apos;s{" "}
-              <code>forceteam</code> is subject to the same cap). With parallel TFFA every
-              match locks against its own roster.
+              <code>forceteam</code> is subject to the same cap). With parallel
+              TFFA the lock runs per match: only matches that existed at the round
+              start are eligible, and a join in one match cancels only that
+              match&apos;s lock.
             </p>
           </div>
           <p className="note">
-            Upgrading? <code>proxy_sv_lockTeams</code> is a minimum size now. If you used{" "}
-            <code>1</code> as &ldquo;on&rdquo;, set <code>2</code> to keep the previous{" "}
-            <code>2 vs 2</code>-and-up behaviour.
+            Upgrading? <code>proxy_sv_lockTeams</code> is now{" "}
+            <code>proxy_sv_lockTeamsAfterXSecs</code> and its meaning changed: the
+            value is a grace delay in seconds, not a minimum team size. Old configs
+            need the new name; <code>0</code> still means off.
           </p>
 
           <h3 className="sub">Per-team-size rules</h3>
           <div className="prose">
             <p>
               <code>proxy_sv_teamSizeRules</code> overrides limits for the size the round actually
-              started at, independently of <code>proxy_sv_lockTeams</code>. Rules are separated by
+              started at, independently of <code>proxy_sv_lockTeamsAfterXSecs</code>. Rules are separated by
               spaces/commas as <code>size:timelimit:fraglimit:capturelimit</code> (empty or{" "}
               <code>-</code> leaves a limit untouched). No exact rule? The nearest{" "}
               <em>smaller</em> defined size applies; below every defined size the server&apos;s
@@ -334,11 +339,11 @@ export default function Home() {
             <div><b><i>1</i>Create</b><code>tffa_create</code> opens a match and joins its smaller side (red when empty).</div>
             <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt;</code> switches matches mid-game; <code>tffa_leave</code> or <code>tffa_join 0</code> returns to main.</div>
             <div><b><i>3</i>Fight</b>Damage, snapshots, sabers, force sounds, kill feed and items are isolated per match. Global chat stays server-wide; team chat stays in its match.</div>
-            <div><b><i>4</i>End</b>Each match shares the server fraglimit; tied matches at the global timelimit play sudden death. A <code>map_restart</code> keeps matches.</div>
+            <div><b><i>4</i>End</b>Each match shares the server fraglimit: a finished match plays on for one second with damage void before its players go to spectator. Tied matches at the global timelimit play sudden death; when none is tied, the map ends and every player keeps their own match&apos;s final scoreboard.</div>
           </div>
           <div className="hook-grid">
             <div className="hook-card"><b>Own world per match</b><p>Doors, plats, elevators, buttons, triggers and map items are duplicated, and runtime spawns belong to the match that created them. Maps with NPC or vehicle actors take no parallel matches; <code>tffa_create</code> is refused when the entity slots cannot hold another set.</p></div>
-            <div className="hook-card"><b>Survives map_restart</b><p>Every player reconnects into their match and team, with that match&apos;s doors and triggers rebuilt and the scores from zero. A full map change starts everyone in main.</p></div>
+            <div className="hook-card"><b>Survives map_restart</b><p>Every player returns to their own match id and team — including a finished match, recreated from its remembered group — with that match&apos;s doors and triggers rebuilt and the scores from zero. A full map change starts everyone in main.</p></div>
             <div className="hook-card"><b>Closes cleanly</b><p>An emptied created match closes itself. <code>proxy_tffa_enable 0</code> moves created-match players to spectator with a message; everyone keeps playing in main.</p></div>
           </div>
           <h3 className="sub">Player commands <span className="count">tap to copy</span></h3>
@@ -350,7 +355,9 @@ export default function Home() {
           <ul className="tight">
             <li><code>tffa_create</code> / <code>tffa_join &lt;id&gt;</code> / <code>tffa_leave</code> / <code>tffa_list</code> — create, join, leave, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
             <li><code>netStatus</code> / <code>showNet</code> — print the per-player net status table: ping, rtt, jitter, fps, pps, timeNudge, snaps, rate and name (see <a href="#netstatus">Net status</a>; requires <code>proxy_sv_enableNetStatus 1</code>).</li>
-            <li>Auto team picks (<code>team free</code>, the client auto-join, <code>g_teamAutoJoin</code>) balance the match being joined. <code>proxy_sv_lockTeams</code> locks each match against its own round-start roster (a match created mid-round stays unlocked until the next round), and <code>proxy_sv_teamSizeRules</code> uses per-match sizes — one rule applies when every populated match is the same <code>N vs N</code>.</li>
+            <li>Auto team picks (<code>team free</code>, the client auto-join, <code>g_teamAutoJoin</code>) balance the match being joined. <code>proxy_sv_lockTeamsAfterXSecs</code> locks each match against its own roster once the grace delay expires (a join in it cancels its lock; a match created mid-round stays unlocked until the next round), and <code>proxy_sv_teamSizeRules</code> uses per-match sizes — one rule applies when every populated match is the same <code>N vs N</code>.</li>
+            <li>A match that reaches the fraglimit keeps playing for one second with its damage void, then its players move to spectator. It remembers who played and for which team, so the next <code>map_restart</code> brings the match back with them — while a full map change drops it.</li>
+            <li>At the global timelimit, tied matches keep playing sudden death. When no tied match with players remains, the whole map ends with every match intact: each player reads their own instance&apos;s final scoreboard instead of being sent to main, and the next <code>map_restart</code> resumes the same games.</li>
             <li>The scoreboard lists every match&apos;s players, with the other matches grouped as spectators and the red/blue header plus each score taken from your own match. HUD team scores stay global (per-match HUD would need a client mod).</li>
           </ul>
         </section>
