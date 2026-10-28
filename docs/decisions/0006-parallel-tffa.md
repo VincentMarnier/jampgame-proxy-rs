@@ -638,7 +638,8 @@ reset unconditionally at `GAME_INIT` (`state::reset_session`).
 
 **Decision.** `GAME_INIT` carries the overlay only when `args[2] != 0`
 (`vmMain(GAME_INIT, levelTime, randomSeed, restart)`): the active flag of the
-created match slots and `client_match[]` (which client was in which instance).
+created match slots, `client_match[]` (which client was in which instance) and,
+since D-006.11, each client's `home` id and the finished-game rosters.
 Everything else starts clean, because it is per round or per map:
 per-match tallies, `player_score`, the `CS_PLAYERS` base mirrors, the cs score
 dedup cache, `owned`, and the per-instance worlds. A full map change
@@ -797,8 +798,11 @@ path), the proxy now remembers who was playing it and for which team, sends
 them to spectator exactly as before, and re-creates the match with those players
 on those teams at the next `map_restart`. A finished match therefore survives
 the round transition like an open one (D-006.8), instead of vanishing and
-leaving its group to recreate it by hand. Main (slot 0) is not remembered: it is
-implicit and always comes back, so only created matches need a roster.
+leaving its group to recreate it by hand. Main (slot 0) was not remembered by
+this change: it is implicit and always comes back, so only created matches were
+thought to need a roster. That held for a solo main finish (its players keep
+their teams) but not when a promotion replaced the main game — corrected in
+D-006.11.
 
 **Capture.** The finish pass already visits every connected member before
 `move_match_to_spectator` moves them to main. With the game client still live,
@@ -809,19 +813,18 @@ playing is remembered: a spectator in the match was not in the game and is not
 put back on a team. The slot then becomes inactive with its world queued for
 release, as before; the roster is the only thing kept.
 
-**One instance per client.** A client is remembered by at most one instance —
-the last one they played for. Capturing a roster removes its players from every
-other finished slot's roster, and `forget_previous_instances` removes them when
-they actually play elsewhere:
+**One id per client.** A client is remembered by at most one id — the last one
+they played for. Capturing a roster removes its players from every other slot's
+roster, and `forget_return_rosters` drops the *team* memory (not the id, see
+D-006.11) when they play again or make an explicit move:
 
-- a successful `SetTeam` into RED/BLUE for a client in *another* instance
-  (main included) forgets the old memory. The `SetTeam` wrapper observes this
-  (it already reads the pre-call team for `teamlock`; the read is now also done
-  when parallel TFFA is on, not only during the grace window). Spectating or
-  following in another instance is not a join and keeps the memory;
-- `tffa_create` joins the creator through the pristine `SetTeam` trampoline
-  (bypassing that wrapper), so it calls `forget_previous_instances` explicitly
-  after the successful join;
+- a successful `SetTeam` into RED/BLUE is the client playing again, so the team a
+  finished game remembered for them is stale. The `SetTeam` wrapper observes
+  this (it already reads the pre-call team for `teamlock`; the read is now also
+  done when parallel TFFA is on, not only during the grace window).
+  Spectating/following is not a join and keeps the memory;
+- `tffa_create`/`tffa_join`/`tffa_leave` are explicit moves: they change the
+  client's id (`home`, D-006.11) and clear the old roster;
 - a disconnect, or a fresh client taking a reused slot
   (`GAME_CLIENT_CONNECT(firstTime = qtrue)`), forgets them everywhere.
 
@@ -875,15 +878,104 @@ automated suite cannot drive; the tests below cover the table transitions, the
 capture predicate and the slot preference.
 
 Tests: `a_finished_match_remembers_the_teams_its_players_had` (only RED/BLUE
-members, aligned by client slot),
+members, aligned by client slot, only the game's own id),
 `a_remembered_match_is_recreated_on_a_map_restart` (reactivation,
 `client_match`, `pending_join`, roster consumed, idempotent),
 `a_full_map_change_drops_a_remembered_roster` (full change and above-limit
-slot), `playing_for_another_instance_forgets_the_previous_one` (including main
-as the current instance) and
-`a_new_match_prefers_a_slot_without_a_remembered_roster` (empty slot first,
-reuse+clear when full). `state::tests::map_restart_carries_a_finished_matches_remembered_roster`
-covers the carry (and that the one-shot auto-join table never carries).
+slot), `playing_again_forgets_the_remembered_team` (the team memory, not the
+id) and `a_new_match_prefers_a_slot_without_a_waiting_group` (empty slot first,
+reuse+clear when full, a live promoted id reserved).
+`state::tests::map_restart_carries_a_finished_matches_remembered_roster` covers
+the carry (and that the one-shot auto-join table never carries).
+
+### D-006.11 — Match ids are identities, not runtime slots (promotion)
+
+*Status: landed (bug report + user directive, 2026-10-28).*
+
+Reported: "If TFFA 0 reaches frag limit without being the last active instance,
+people in it won't be sent back to TFFA 0 on restart." The user's requirement is
+stricter than "return them somewhere": **TFFA 0 stays TFFA 0 and TFFA 1 stays
+TFFA 1 on `map_restart`**, and so on for every id. The main slot is only a
+runtime convenience ("for player to easily join and for entity not being
+duplicated for nothing"); it must not renumber the groups.
+
+A main game that ends while another created match is active is **replaced** by
+the lowest-id still-played one (`promotion_candidate`/`promote_into_main`,
+D-006.6/D-006.10): its members are sent to spectator by
+`move_match_to_spectator(MAIN_MATCH)`, the promoted game's members are assigned
+`client_match = 0`, and the promoted slot is deactivated. Two things therefore
+lost the original grouping:
+
+- the old main's players had no roster at all (main was "implicit and always
+  comes back", D-006.10), so they reconnected as spectators;
+- the promoted game lived in slot 0, so its players reconnected as *main* — the
+  old TFFA 0 — instead of their own TFFA 1. A second promotion compounded it.
+
+**Decision: a per-client identity.** `TffaState::home[client]` holds the TFFA id
+a client belongs to, next to the runtime `client_match`. It changes **only** on
+an explicit instance move (`tffa_create`/`tffa_join`/`tffa_leave`, a closed
+match returning its members to main, a disconnect/fresh connect) — never on a
+promotion, a finish's move to spectator, or a team join. A per-slot
+`TffaState::main_origin` records the id of the game currently running in the
+main slot (0 when main hosts its own).
+
+- **Finished rosters are keyed by identity, not by runtime slot.** A finish
+  captures `roster_from_members(..., home, identity)` (identity = the slot id
+  for a created match, `main_origin` for main) and stores it with
+  `store_return_roster` in the slot of that id. A promoted game's roster
+  therefore lands in its original created slot; the entry filter keeps the old
+  main's spectators (runtime members of the promoted game, another id) out of
+  it. `promote_into_main` only clears the *promoted* slot's bookkeeping.
+- **The restart puts every client back in its id.** `state::tffa_after_reset`
+  carries `home` and the rosters. `reset_round_state` assigns
+  `client_match = home`, resets `main_origin = 0`, keeps main open and consumes
+  its roster into `pending_join`, and reactivates every created id inside the
+  live `proxy_tffa_maxMatches` that was open, finished (roster) **or whose game
+  lives in the main slot after a promotion** (home members). A reactivated id's
+  world is rebuilt by `restore_instances` like any other carried instance; a
+  still-playing group keeps its session team, a finished one is auto-joined
+  from `pending_join` at `GAME_CLIENT_BEGIN` exactly as in D-006.10. Main's
+  tallies and every match's tallies still start at 0-0.
+- **The live promoted id is reserved.** Its slot is inactive at runtime but its
+  group is still playing, so `select_create_slot` never hands it to a new match
+  (`reserved = main_origin`). A *finished* group's slot is still reusable only
+  when no idle slot exists, and `cmd_create` then clears its clients' `home`, so
+  a new match does not inherit the old group at the next restart.
+- **Playing again drops only the remembered team, not the id.**
+  `forget_return_rosters` (the `SetTeam` observer and the explicit commands)
+  clears the slot rosters for that client, so a stale team cannot override what
+  they picked; `map_restart` still returns them to their own id.
+- **Lifecycle.** A full map change, a `proxy_tffa_enable` disable and a
+  disconnect/fresh connect drop the identities with the rest of the overlay; a
+  lowered `proxy_tffa_maxMatches` closes the ids above it and returns their
+  clients to main. A promoted game that cannot have its world rebuilt
+  (`discard_instance`) returns its group to main too.
+- **Labels.** `Finished` carries the identity, so the end-of-match lines name
+  the real match (`TFFA 1` for a promoted game) instead of always `main
+  (TFFA 0)`; `main (TFFA 0)` remains for main's own game.
+
+Corrected 2026-10-28: the first implementation of this fix (main's roster stored
+in slot 0) restored the players' *teams* but not their *ids* — exactly the user's
+report. D-006.10's "implicit and always comes back" is true of main's slot
+only; the group it carried does not come back with it.
+
+Tests: `a_finished_game_remembers_its_players_under_its_own_id` (identity-keyed
+capture, cross-id filter, merge),
+`a_promoted_game_returns_to_its_own_id_on_a_map_restart` (TFFA 0 → slot 0,
+promoted TFFA 1 → slot 1, `pending_join` for both),
+`a_live_promoted_game_returns_to_its_own_id` (still playing: no auto-join,
+session team kept), `main_finishers_come_back_on_their_teams_after_a_map_restart`,
+`playing_again_forgets_the_remembered_team`,
+`promoting_a_created_match_keeps_the_other_ids_rosters`,
+`a_full_map_change_drops_a_remembered_roster` (also clears `home`),
+`a_new_match_prefers_a_slot_without_a_waiting_group` (live promoted id
+reserved) and the extended
+`state::tests::map_restart_carries_a_finished_matches_remembered_roster`
+(`home` carried, `main_origin` runtime-only). `cargo test` 181/181,
+`clippy -D warnings`, `fmt --check`, the i686 release build and the engine smoke
+test are green. The auto-join itself still needs a live client and a
+`map_restart`, which the automated suite cannot drive; it is the same
+`SetTeam`-after-`ClientBegin` path D-006.10 already uses for created matches.
 
 ## Consequences
 

@@ -915,13 +915,14 @@ fn reset_slot_stats(client_num: c_int) {
 }
 
 /// The proxy-side part of a match move shared by `cmd_join`/`cmd_create`:
-/// assign the client to `id`, clear its per-match score copy and clear its
-/// `proxy_sv_enableEndGameStats` row/column and team counters (see
-/// `reset_client_stats`). The game-side `PERS_SCORE`/`PERS_KILLED` reset is
-/// separate (`reset_game_scores`, needs the located entities). Pure so the
-/// join move is unit-tested.
+/// assign the client to `id` (both its runtime slot and its identity), clear
+/// its per-match score copy and clear its `proxy_sv_enableEndGameStats`
+/// row/column and team counters (see `reset_client_stats`). The game-side
+/// `PERS_SCORE`/`PERS_KILLED` reset is separate (`reset_game_scores`, needs the
+/// located entities). Pure so the join move is unit-tested.
 fn assign_client_instance(
     client_match: &mut [u8; MAX_CLIENTS],
+    home: &mut [u8; MAX_CLIENTS],
     player_score: &mut [i32; MAX_CLIENTS],
     clients: &mut [crate::state::ClientEntry],
     client_num: c_int,
@@ -932,6 +933,7 @@ fn assign_client_instance(
     }
     let n = client_num as usize;
     client_match[n] = id;
+    home[n] = id;
     player_score[n] = 0;
     reset_client_stats(clients, client_num);
 }
@@ -1333,54 +1335,90 @@ pub fn reset_round(restart: bool) {
 /// The match-table half of `reset_round`, split out so the carry rule is
 /// unit-tested without an engine.
 ///
-/// `keep` retains the created matches carried by `state::reset_session`; `max`
-/// is the live `proxy_tffa_maxMatches` (an admin may have lowered it before the
-/// restart). Retained matches keep no tallies. A finished match that remembered
-/// its roster is re-created from it: the slot is reactivated, its members are
-/// assigned back to it and their old team is scheduled in `pending_join`
-/// (D-006.10). Returns whether any created match survived, i.e. whether the
-/// post-restart grace window is needed.
+/// `keep` retains the overlay carried by `state::reset_session`; `max` is the
+/// live `proxy_tffa_maxMatches` (an admin may have lowered it before the
+/// restart). Retained matches keep no tallies.
+///
+/// Every client returns to its **home id** (`TffaState::home`): a game promoted
+/// into the main slot was runtime-assigned to main, but its TFFA id never
+/// changed, so TFFA 0 stays TFFA 0 and TFFA 1 stays TFFA 1 across the restart
+/// (D-006.11). A created id that was open, finished (remembered roster) or
+/// promoted is reactivated; its remembered members are assigned back to it and
+/// their old team is scheduled in `pending_join` (D-006.10). Main stays open and
+/// consumes its roster the same way. Returns whether any created match
+/// survived, i.e. whether the post-restart grace window is needed.
 fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
     // Auto-joins are scheduled for the round being initialised only.
     t.pending_join = [REMEMBERED_NONE; MAX_CLIENTS];
+    // Main hosts its own id again: the promoted game goes back to its slot.
+    t.main_origin = MAIN_MATCH;
+    if keep {
+        // The runtime assignment is a slot, the home is the identity: undo every
+        // promotion (and every finished match's return to main) here.
+        for (cn, home) in t.home.iter().copied().enumerate() {
+            t.client_match[cn] = home;
+        }
+    } else {
+        // A full map change drops identities with the rest of the overlay.
+        t.home = [MAIN_MATCH; MAX_CLIENTS];
+    }
     for (i, m) in t.matches.iter_mut().enumerate() {
         m.red = 0;
         m.blue = 0;
         // A new round starts from a fresh score: no match carries a pending
         // end-of-match delay across the restart.
         m.end_queued_at = 0;
+        // A promoted game's slot is inactive at runtime but its identity still
+        // has clients (assigned to main); it must come back as its own match.
+        let has_home_members = t.home.iter().any(|home| *home as usize == i);
         if i == MAIN_MATCH as usize {
             m.active = true;
+            // Main consumes its identity's roster: the players a finished main
+            // game sent to spectator come back on their teams (D-006.11).
+            if keep {
+                for (cn, team) in m.remembered.iter().copied().enumerate() {
+                    if team == REMEMBERED_NONE {
+                        continue;
+                    }
+                    t.client_match[cn] = MAIN_MATCH;
+                    t.home[cn] = MAIN_MATCH;
+                    t.pending_join[cn] = team;
+                }
+            }
             m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
             continue;
         }
-        // A finished match's remembered roster is the memory a `map_restart`
-        // re-creates it from (D-006.10): reactivate it and put every remembered
-        // member back in it, on the team they played for.
-        if keep && i <= max && m.has_remembered() {
+        // A created id survives when its match was open, when it finished
+        // (remembered roster) or when its game lives on in the main slot after a
+        // promotion (home members) — all inside the live limit.
+        let survives = keep && i <= max && (m.active || m.has_remembered() || has_home_members);
+        if survives {
             m.active = true;
             for (cn, team) in m.remembered.iter().copied().enumerate() {
                 if team == REMEMBERED_NONE {
                     continue;
                 }
                 t.client_match[cn] = i as u8;
+                t.home[cn] = i as u8;
                 t.pending_join[cn] = team;
             }
             m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
-        }
-        if keep && i <= max && m.active {
-            m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
             continue;
         }
-        // The slot is gone: its members cannot stay in it, they start in main
+        // The id is gone: its clients cannot stay in it, they start in main
         // (their game-side team is restored separately by the base game's
         // session data on reconnect). Its remembered roster dies with it.
         m.active = false;
         m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
         let id = i as u8;
-        for slot in t.client_match.iter_mut() {
-            if *slot == id {
-                *slot = MAIN_MATCH;
+        // A promoted id above the lowered limit has its clients assigned to
+        // main, not to its slot, so both tables are checked here.
+        for cn in 0..MAX_CLIENTS {
+            if t.home[cn] == id {
+                t.home[cn] = MAIN_MATCH;
+            }
+            if t.client_match[cn] == id {
+                t.client_match[cn] = MAIN_MATCH;
             }
         }
     }
@@ -1472,6 +1510,7 @@ fn discard_instance(id: u8) {
         let moved = close_instance_state(
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
+            &mut s.tffa.home,
             &mut s.tffa.player_score,
             id,
         );
@@ -1634,11 +1673,13 @@ fn disable_parallel_tffa() {
         s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.restart_grace_frames = 0;
         // The disable dissolves the overlay: a finished match's remembered
-        // roster (D-006.10) must not bring an instance back after a later
-        // re-enable.
-        for m in s.tffa.matches.iter_mut().skip(1) {
+        // roster and every client's identity (D-006.10, D-006.11) must not bring
+        // an instance back after a later re-enable. Main hosts its own id again.
+        for m in s.tffa.matches.iter_mut() {
             m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
         }
+        s.tffa.home = [MAIN_MATCH; MAX_CLIENTS];
+        s.tffa.main_origin = MAIN_MATCH;
         s.tffa.pending_join = [REMEMBERED_NONE; MAX_CLIENTS];
         // Main keeps playing: a pending end-of-match delay from before the
         // disable must not void its damage after a later re-enable.
@@ -1693,6 +1734,7 @@ fn close_created_matches(created: &[u8]) {
             close_instance_state(
                 &mut s.tffa.matches,
                 &mut s.tffa.client_match,
+                &mut s.tffa.home,
                 &mut s.tffa.player_score,
                 *id,
             );
@@ -2014,7 +2056,12 @@ fn create_allowed(timelimit_expired: bool) -> bool {
 /// played for, and the per-team name lists for the announcement. Shared by the
 /// per-match finish path and by [`finish_map_keeping_matches`].
 struct Finished {
+    /// The runtime slot the game was played in.
     id: u8,
+    /// The TFFA id the game belongs to: `id` for a created match, and
+    /// `TffaState::main_origin` for the main slot (a game promoted into it
+    /// keeps its own id, D-006.11).
+    identity: u8,
     red: i32,
     blue: i32,
     /// `"fraglimit"` or `"timelimit"` (for the end-of-match line).
@@ -2079,6 +2126,11 @@ fn collect_result(
     }
     Finished {
         id,
+        identity: if id == MAIN_MATCH {
+            state.tffa.main_origin
+        } else {
+            id
+        },
         red,
         blue,
         reason,
@@ -2086,6 +2138,17 @@ fn collect_result(
         teams,
         red_names,
         blue_names,
+    }
+}
+
+/// Human label for a game's TFFA id in announcements. Main is "main (TFFA 0)"
+/// when it hosts its own game; a created match promoted into the main slot
+/// keeps its own id (D-006.11).
+fn match_label(identity: u8) -> String {
+    if identity == MAIN_MATCH {
+        "main (TFFA 0)".to_owned()
+    } else {
+        format!("TFFA {identity}")
     }
 }
 
@@ -2146,7 +2209,7 @@ fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
         }
         eprintln!(
             "----- proxy-rs: TFFA {} ended ({}) {}-{} — map over, players keep their own final scoreboard",
-            f.id, f.reason, f.red, f.blue
+            f.identity, f.reason, f.red, f.blue
         );
         let red_list = if f.red_names.is_empty() {
             "-".to_owned()
@@ -2158,11 +2221,7 @@ fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
         } else {
             f.blue_names.join(", ")
         };
-        let label = if f.id == MAIN_MATCH {
-            "main (TFFA 0)".to_owned()
-        } else {
-            format!("TFFA {}", f.id)
-        };
+        let label = match_label(f.identity);
         announce_to_all(&format!(
             "print \"{label} ended ({}): RED {} - BLUE {}. RED: {red_list} | BLUE: {blue_list}. Final scoreboard incoming.\n\"",
             f.reason, f.red, f.blue
@@ -2170,7 +2229,7 @@ fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
         // Per-instance tables only: the pristine intermission below already
         // prints the standard tables for everyone (main included), as it does
         // for a solo-main finish.
-        if f.id != MAIN_MATCH {
+        if f.identity != MAIN_MATCH {
             crate::hooks::game::print_tffa_match_stats(&f.members);
         }
     }
@@ -2260,6 +2319,7 @@ pub fn on_run_frame_post() {
     let mut newly_ending: Vec<(u8, &'static str, i32, i32)> = Vec::new();
     let mut due: Vec<u8> = Vec::new();
     state::with_state(|s| {
+        let main_origin = s.tffa.main_origin;
         for (i, m) in s.tffa.matches.iter_mut().enumerate() {
             if !m.active {
                 continue;
@@ -2268,7 +2328,12 @@ pub fn on_run_frame_post() {
             let was_ending = m.ending();
             let due_now = queued_finish(m, reason, now).is_some();
             if !was_ending && m.ending() {
-                newly_ending.push((i as u8, reason.unwrap_or("fraglimit"), m.red, m.blue));
+                let identity = if i == MAIN_MATCH as usize {
+                    main_origin
+                } else {
+                    i as u8
+                };
+                newly_ending.push((identity, reason.unwrap_or("fraglimit"), m.red, m.blue));
             }
             if due_now {
                 due.push(i as u8);
@@ -2316,13 +2381,12 @@ pub fn on_run_frame_post() {
             if f.id != MAIN_MATCH {
                 // Remember who played this match and for which team: a
                 // `map_restart` re-creates the instance and puts them back on
-                // those teams (D-006.10). A client is remembered by at most one
-                // instance — the last one they played for — so this capture
-                // drops them from every other finished slot's roster.
-                let roster = roster_from_members(&f.members, &f.teams);
-                let target = f.id as usize;
+                // those teams (D-006.10). The roster is stored under the game's
+                // identity (the slot id for a created match) and the client is
+                // remembered by one id only.
+                let roster = roster_from_members(&f.members, &f.teams, &s.tffa.home, f.identity);
                 for (j, other) in s.tffa.matches.iter_mut().enumerate() {
-                    if j != target {
+                    if j != f.identity as usize {
                         for (cn, team) in roster.iter().enumerate() {
                             if *team != REMEMBERED_NONE {
                                 other.remembered[cn] = REMEMBERED_NONE;
@@ -2330,7 +2394,7 @@ pub fn on_run_frame_post() {
                         }
                     }
                 }
-                let m = &mut s.tffa.matches[target];
+                let m = &mut s.tffa.matches[f.identity as usize];
                 m.red = 0;
                 m.blue = 0;
                 m.active = false;
@@ -2350,7 +2414,7 @@ pub fn on_run_frame_post() {
         }
         eprintln!(
             "----- proxy-rs: TFFA {} ended ({}) {}-{}",
-            f.id, f.reason, f.red, f.blue
+            f.identity, f.reason, f.red, f.blue
         );
     }
     if finished.is_empty() {
@@ -2421,12 +2485,24 @@ pub fn on_run_frame_post() {
                     main.blue_names.join(", ")
                 };
                 announce_to_all(&format!(
-                    "print \"main (TFFA 0) ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator.\n\"",
-                    main.reason, main.red, main.blue, red_list, blue_list
+                    "print \"{} ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Players returned to main as spectator; they return here on the next map restart.\n\"",
+                    match_label(main.identity),
+                    main.reason,
+                    main.red,
+                    main.blue,
+                    red_list,
+                    blue_list
                 ));
                 crate::hooks::game::print_tffa_match_stats(&main.members);
+                // The players this game sent to spectator are remembered under
+                // **its own id** (D-006.11), not under the main slot: the group
+                // comes back to the same TFFA id at the next `map_restart`, even
+                // though the surviving game takes the main slot over below.
+                let home = state::with_state(|s| s.tffa.home);
+                let roster = roster_from_members(&main.members, &main.teams, &home, main.identity);
                 move_match_to_spectator(MAIN_MATCH);
                 state::with_state(|s| {
+                    store_return_roster(&mut s.tffa.matches, main.identity, &roster);
                     promote_into_main(
                         &mut s.tffa.matches,
                         &mut s.tffa.client_match,
@@ -2435,6 +2511,10 @@ pub fn on_run_frame_post() {
                         blue,
                         &members,
                     );
+                    // The surviving game keeps its id while it runs in the main
+                    // slot: a restart puts it back in its own slot, and until
+                    // then that slot must not be handed to a new match.
+                    s.tffa.main_origin = id;
                     // The promoted instance's own world does not become main's:
                     // its players see the pristine map entity set from here on, and
                     // its clone set is given back at the next frame start.
@@ -2470,8 +2550,13 @@ pub fn on_run_frame_post() {
                     main.blue_names.join(", ")
                 };
                 announce_to_all(&format!(
-                    "print \"main (TFFA 0) ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Final scoreboard incoming.\n\"",
-                    main.reason, main.red, main.blue, red_list, blue_list
+                    "print \"{} ended ({}): RED {} - BLUE {}. RED: {} | BLUE: {}. Final scoreboard incoming.\n\"",
+                    match_label(main.identity),
+                    main.reason,
+                    main.red,
+                    main.blue,
+                    red_list,
+                    blue_list
                 ));
                 crate::hooks::game::run_begin_intermission();
                 return;
@@ -2612,66 +2697,96 @@ fn move_match_to_spectator(match_id: u8) {
     on_set_cs_scores();
 }
 
-/// Build a finished match's remembered roster from its members and their
-/// teams. Only a member who was actually playing (RED/BLUE) is remembered — a
-/// spectator was not "in the game" — and everything else stays
-/// `REMEMBERED_NONE`. Pure so the capture is unit-tested.
-fn roster_from_members(members: &[c_int], teams: &[u8]) -> [u8; MAX_CLIENTS] {
+/// Build a finished game's remembered roster from its members and their teams,
+/// restricted to the clients whose identity is `identity` (D-006.11).
+///
+/// Only a member who was actually playing (RED/BLUE) is remembered — a
+/// spectator was not "in the game". The identity filter matters when a game
+/// runs in the main slot after promoting a created match: the old main's
+/// spectators are still `client_match = 0`, i.e. runtime members of that game,
+/// but they belong to (and return to) another id. Pure so the capture is
+/// unit-tested.
+fn roster_from_members(
+    members: &[c_int],
+    teams: &[u8],
+    home: &[u8; MAX_CLIENTS],
+    identity: u8,
+) -> [u8; MAX_CLIENTS] {
     let mut roster = [REMEMBERED_NONE; MAX_CLIENTS];
     for (cn, team) in members.iter().zip(teams) {
         if *team == REMEMBERED_NONE || !(0..MAX_CLIENTS as c_int).contains(cn) {
             continue;
         }
-        roster[*cn as usize] = *team;
+        let n = *cn as usize;
+        if home[n] != identity {
+            continue;
+        }
+        roster[n] = *team;
     }
     roster
 }
 
-/// Drop a client from every finished match's remembered roster and from the
-/// pending auto-join table. Used when they disconnect or a fresh client takes
-/// their slot: no instance may put them back on a team at the next
-/// `map_restart` (D-006.10).
+/// Store a finished game's roster under its **identity slot** (D-006.10,
+/// D-006.11), so a `map_restart` brings the group back to the same TFFA id —
+/// even when the game was promoted into the main slot, which stores it in the
+/// original created slot instead of `0`. Entries are merged: a `REMEMBERED_NONE`
+/// (a spectator) never erases a team the same client was remembered with.
+fn store_return_roster(
+    matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
+    identity: u8,
+    roster: &[u8; MAX_CLIENTS],
+) {
+    let Some(slot) = matches.get_mut(identity as usize) else {
+        return;
+    };
+    for (cn, team) in roster.iter().copied().enumerate() {
+        if team != REMEMBERED_NONE {
+            slot.remembered[cn] = team;
+        }
+    }
+}
+
+/// Drop a client from every finished game's remembered roster, from the
+/// pending auto-join table and from its identity. Used when they disconnect or
+/// a fresh client takes their slot: no id may put them back on a team at the
+/// next `map_restart` (D-006.10, D-006.11).
 fn forget_client_everywhere(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
     let cn = client_num as usize;
     state::with_state(|s| {
-        for m in s.tffa.matches.iter_mut().skip(1) {
+        for m in s.tffa.matches.iter_mut() {
             m.remembered[cn] = REMEMBERED_NONE;
         }
         s.tffa.pending_join[cn] = REMEMBERED_NONE;
+        s.tffa.home[cn] = MAIN_MATCH;
     });
 }
 
-/// The client started playing for another instance (their current one):
-/// every finished match that remembered them forgets them, so a `map_restart`
-/// does not pull them out of the match they chose. Joining the instance that
-/// remembers them keeps the memory (they are back where they were).
-pub fn forget_previous_instances(client_num: c_int) {
+/// Drop every remembered return team for one client (D-006.10, D-006.11),
+/// without changing the id they belong to. Called on an explicit instance move
+/// and when the client plays again (a team join), so a stale entry cannot
+/// override what they chose; a `map_restart` still returns them to their id
+/// through `TffaState::home`.
+pub fn forget_return_rosters(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    let current = client_match(client_num);
-    state::with_state(|s| {
-        forget_previous_instances_in(&mut s.tffa.matches, client_num as usize, current)
-    });
+    state::with_state(|s| forget_return_rosters_in(&mut s.tffa.matches, client_num as usize));
 }
 
-/// Pure part of `forget_previous_instances`: clear `client_num` from every
-/// match except `current`.
-fn forget_previous_instances_in(
+/// Pure part of `forget_return_rosters`: clear `client_num` from every slot's
+/// roster.
+fn forget_return_rosters_in(
     matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
     client_num: usize,
-    current: u8,
 ) {
     if client_num >= MAX_CLIENTS {
         return;
     }
-    for (i, m) in matches.iter_mut().enumerate() {
-        if i as u8 != current {
-            m.remembered[client_num] = REMEMBERED_NONE;
-        }
+    for m in matches.iter_mut() {
+        m.remembered[client_num] = REMEMBERED_NONE;
     }
 }
 
@@ -4117,21 +4232,29 @@ fn team_name(team: i32) -> &'static CStr {
 }
 
 /// The slot `tffa_create` opens, or `None` when every slot up to `max` is in
-/// use. Slots are `1..=max` (matching `cmd_list`), a slot is free when it is
-/// inactive and no client is still assigned to it, and one that remembers a
-/// finished match's roster (D-006.10) is only taken when no free slot without a
-/// memory is left — a new match must not evict a group waiting for the next
-/// `map_restart` while an empty slot is available. Pure so the preference is
-/// unit-tested.
+/// use. Slots are `1..=max` (matching `cmd_list`); a slot is free when it is
+/// inactive and no client is still assigned to it. A slot whose clients are
+/// waiting to return to it — a finished match's roster (D-006.10), or a game
+/// promoted into the main slot (D-006.11) — is only taken when no free slot
+/// without such a group is left, so a new match does not evict a waiting group
+/// while an empty slot is available. `reserved` is the id of the live promoted
+/// game (it is still being played in main) and is never handed out at all.
+/// Pure so the preference is unit-tested.
 fn select_create_slot(
     matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
     client_match: &[u8; MAX_CLIENTS],
+    home: &[u8; MAX_CLIENTS],
     max: usize,
+    reserved: u8,
 ) -> Option<u8> {
-    let free = |i: usize| !matches[i].active && client_match.iter().all(|c| *c != i as u8);
+    let free = |i: usize| {
+        i as u8 != reserved && !matches[i].active && client_match.iter().all(|c| *c != i as u8)
+    };
+    let waiting = |i: usize| home.iter().any(|h| *h == i as u8);
     let last = max.min(TOTAL_MATCH_SLOTS - 1);
     (1..=last)
-        .find(|&i| free(i) && !matches[i].has_remembered())
+        .find(|&i| free(i) && !waiting(i) && !matches[i].has_remembered())
+        .or_else(|| (1..=last).find(|&i| free(i) && !waiting(i)))
         .or_else(|| (1..=last).find(|&i| free(i)))
         .map(|i| i as u8)
 }
@@ -4162,7 +4285,15 @@ fn cmd_create(client_num: c_int) {
     // is non-reentrant — calling it inside the closure below deadlocks the
     // engine thread (the `tffa_list`/`tffa_create` server crash).
     let max = max_matches();
-    let id = state::with_state(|s| select_create_slot(&s.tffa.matches, &s.tffa.client_match, max));
+    let id = state::with_state(|s| {
+        select_create_slot(
+            &s.tffa.matches,
+            &s.tffa.client_match,
+            &s.tffa.home,
+            max,
+            s.tffa.main_origin,
+        )
+    });
     let Some(id) = id else {
         tell(client_num, "print \"No free match slot.\n\"");
         return;
@@ -4191,6 +4322,14 @@ fn cmd_create(client_num: c_int) {
     // must not carry over.
     crate::teamlock::clear_match(id);
     state::with_state(|s| {
+        // Reusing a slot a finished group is waiting for (only done when no
+        // idle slot is left) evicts that group: its clients stay in main and no
+        // longer return here on the next restart.
+        for home in s.tffa.home.iter_mut() {
+            if *home == id {
+                *home = MAIN_MATCH;
+            }
+        }
         let m = &mut s.tffa.matches[id as usize];
         m.active = true;
         m.red = 0;
@@ -4200,6 +4339,7 @@ fn cmd_create(client_num: c_int) {
         m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
         assign_client_instance(
             &mut s.tffa.client_match,
+            &mut s.tffa.home,
             &mut s.tffa.player_score,
             &mut s.clients,
             client_num,
@@ -4227,10 +4367,10 @@ fn cmd_create(client_num: c_int) {
         );
         return;
     }
-    // The creator plays here now: any finished match that still remembered
-    // them forgets them (D-006.10). The trampoline above bypasses the
+    // The creator plays here now: any finished game that still remembered them
+    // forgets their return (D-006.10). The trampoline above bypasses the
     // `SetTeam` wrapper, so this cannot rely on that observer.
-    forget_previous_instances(client_num);
+    forget_return_rosters(client_num);
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
     tell(
@@ -4300,12 +4440,15 @@ fn cmd_join(client_num: c_int, id: i32) {
     state::with_state(|s| {
         assign_client_instance(
             &mut s.tffa.client_match,
+            &mut s.tffa.home,
             &mut s.tffa.player_score,
             &mut s.clients,
             client_num,
             id,
         );
     });
+    // The old id's roster must not pull them back at the restart.
+    forget_return_rosters(client_num);
     reset_game_scores(client_num);
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
@@ -4316,15 +4459,21 @@ fn cmd_leave(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    // Already in main: nothing to move, so nothing to put the client through
-    // the spectator step for.
-    if client_match(client_num) == MAIN_MATCH {
+    let (slot, home) = state::with_state(|s| {
+        (
+            s.tffa.client_match[client_num as usize],
+            s.tffa.home[client_num as usize],
+        )
+    });
+    // Already in main, runtime and identity: nothing to move.
+    if slot == MAIN_MATCH && home == MAIN_MATCH {
         tell(client_num, "print \"You are already in the main game.\n\"");
         return;
     }
     // `tffa_leave` (and `tffa_join 0`) works ingame too: the playing client is
-    // moved to spectator first.
-    if !travel_to_spectator(client_num) {
+    // moved to spectator first. A player whose game was promoted into main is
+    // already there at runtime; leaving only drops its id, so no suicide.
+    if slot != MAIN_MATCH && !travel_to_spectator(client_num) {
         return;
     }
     cmd_leave_silent(client_num);
@@ -4334,11 +4483,16 @@ fn cmd_leave(client_num: c_int) {
 }
 
 fn cmd_leave_silent(client_num: c_int) {
-    let old = state::with_state(|s| s.tffa.client_match[client_num as usize]);
-    state::with_state(|s| {
+    let old = state::with_state(|s| {
+        let old = s.tffa.client_match[client_num as usize];
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
+        s.tffa.home[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
+        old
     });
+    // Leaving is an explicit move: no finished game may pull them back to
+    // their old id at the next restart.
+    forget_return_rosters(client_num);
     // A created match nobody is left in game in has nothing to host: close it
     // instead of leaving an empty "active" slot in `tffa_list`. Main is
     // implicit and never closes.
@@ -4367,11 +4521,13 @@ fn close_if_empty(id: u8) {
 }
 
 /// Pure part of `close_instance`: reset the slot, deactivate it and return
-/// everyone still assigned (spectators) to main, reporting the moved clients.
-/// Main and out-of-range ids are a no-op.
+/// everyone still assigned (spectators) to main — runtime slot *and* identity,
+/// because the id is gone — reporting the moved clients. Main and out-of-range
+/// ids are a no-op.
 fn close_instance_state(
     matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
     client_match: &mut [u8; MAX_CLIENTS],
+    home: &mut [u8; MAX_CLIENTS],
     player_score: &mut [i32; MAX_CLIENTS],
     id: u8,
 ) -> Vec<c_int> {
@@ -4384,6 +4540,9 @@ fn close_instance_state(
             *m = MAIN_MATCH;
             player_score[cn] = 0;
             moved.push(cn as c_int);
+        }
+        if home[cn] == id {
+            home[cn] = MAIN_MATCH;
         }
     }
     let m = &mut matches[id as usize];
@@ -4411,6 +4570,7 @@ fn close_instance(id: u8) {
         close_instance_state(
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
+            &mut s.tffa.home,
             &mut s.tffa.player_score,
             id,
         )
@@ -5920,6 +6080,7 @@ mod tests {
     fn joining_another_instance_resets_end_game_stats() {
         use crate::state::{ClientEntry, GameStats};
         let mut client_match = [MAIN_MATCH; MAX_CLIENTS];
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
         let mut player_score = [0i32; MAX_CLIENTS];
         let mut clients = [ClientEntry::default(); MAX_CLIENTS];
         let me = 3usize;
@@ -5928,6 +6089,7 @@ mod tests {
 
         // I am leaving match 1 for match 2 and already have a per-match score.
         client_match[me] = 1;
+        home[me] = 1;
         player_score[me] = 12;
 
         // My row: what I did to opponents. My column: what they did to me.
@@ -5972,14 +6134,16 @@ mod tests {
 
         assign_client_instance(
             &mut client_match,
+            &mut home,
             &mut player_score,
             &mut clients,
             me as c_int,
             2,
         );
 
-        // The move itself: new instance, per-match score copy reset.
+        // The move itself: new instance and identity, per-match score copy reset.
         assert_eq!(client_match[me], 2);
+        assert_eq!(home[me], 2);
         assert_eq!(player_score[me], 0);
         // Neither my row nor my column keeps a kill, death or damage point.
         for slot in 0..MAX_CLIENTS {
@@ -6123,8 +6287,12 @@ mod tests {
         score[0] = 9;
         score[7] = 2;
         score[9] = 4;
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
+        home[0] = 1;
+        home[7] = 4;
+        home[9] = TOTAL_MATCH_SLOTS as u8 - 1;
         for id in created_matches_to_close(&matches) {
-            close_instance_state(&mut matches, &mut table, &mut score, id);
+            close_instance_state(&mut matches, &mut table, &mut home, &mut score, id);
         }
         assert!(matches[MAIN_MATCH as usize].active);
         assert_eq!(
@@ -6239,12 +6407,15 @@ mod tests {
         table[0] = 1;
         table[1] = 1;
         table[2] = MAIN_MATCH;
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
+        home[0] = 1;
+        home[1] = 1;
         let mut score = [0i32; MAX_CLIENTS];
         score[0] = 7;
         score[1] = 2;
         score[2] = 5;
 
-        let moved = close_instance_state(&mut matches, &mut table, &mut score, 1);
+        let moved = close_instance_state(&mut matches, &mut table, &mut home, &mut score, 1);
         assert_eq!(moved, vec![0, 1]);
         assert!(!matches[1].active);
         assert_eq!((matches[1].red, matches[1].blue), (0, 0));
@@ -6260,12 +6431,18 @@ mod tests {
         assert_eq!(table[0], MAIN_MATCH);
         assert_eq!(table[1], MAIN_MATCH);
         assert_eq!(table[2], MAIN_MATCH);
+        // The id is gone, so its clients' identities return to main too.
+        assert_eq!(home[0], MAIN_MATCH);
+        assert_eq!(home[1], MAIN_MATCH);
         assert_eq!(score[0], 0);
         assert_eq!(score[1], 0);
         assert_eq!(score[2], 5);
 
         // Main is never closed through this path.
-        assert!(close_instance_state(&mut matches, &mut table, &mut score, MAIN_MATCH).is_empty());
+        assert!(
+            close_instance_state(&mut matches, &mut table, &mut home, &mut score, MAIN_MATCH)
+                .is_empty()
+        );
         assert!(matches[MAIN_MATCH as usize].active);
     }
 
@@ -6280,6 +6457,8 @@ mod tests {
         t.matches[3].active = true;
         t.client_match[2] = 1;
         t.client_match[5] = 3;
+        t.home[2] = 1;
+        t.home[5] = 3;
         t.player_score[2] = 6;
         t.cs_players_base[2] = r"\n\Bob\t\1".to_owned();
 
@@ -6307,23 +6486,27 @@ mod tests {
         t.matches[1].active = true;
         t.matches[1].red = 2;
         t.client_match[2] = 1;
+        t.home[2] = 1;
         t.player_score[2] = 3;
 
         assert!(!reset_round_state(&mut t, false, MAX_MATCHES));
         assert!(!t.matches[1].active);
         assert_eq!((t.matches[1].red, t.matches[1].blue), (0, 0));
         assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.home[2], MAIN_MATCH);
         assert_eq!(t.player_score[2], 0);
 
         let mut t = state::TffaState::default();
         t.matches[1].active = true;
         t.matches[5].active = true;
         t.client_match[2] = 5;
+        t.home[2] = 5;
 
         assert!(reset_round_state(&mut t, true, 3));
         assert!(t.matches[1].active);
         assert!(!t.matches[5].active);
         assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.home[2], MAIN_MATCH);
     }
 
     /// Only active created slots inside the live limit get their world rebuilt.
@@ -6338,16 +6521,30 @@ mod tests {
         assert!(restorable_instances(&matches, 0).is_empty());
     }
 
-    /// D-006.10: a match that ended remembers who was playing and for which
-    /// team; a spectator in it is not remembered.
+    /// D-006.10/D-006.11: a game that ended remembers who was playing, for
+    /// which team, and only for the clients whose identity is that game's —
+    /// a spectator is not remembered, and neither is a client another game owns
+    /// (the old main's spectator in a promoted main game).
     #[test]
     fn a_finished_match_remembers_the_teams_its_players_had() {
-        let members = vec![2, 5, 7];
-        let teams = vec![TEAM_RED as u8, REMEMBERED_NONE, TEAM_BLUE as u8];
-        let roster = roster_from_members(&members, &teams);
+        let members = vec![2, 5, 7, 9];
+        let teams = vec![
+            TEAM_RED as u8,
+            REMEMBERED_NONE,
+            TEAM_BLUE as u8,
+            TEAM_RED as u8,
+        ];
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
+        home[2] = 1;
+        home[5] = 1;
+        home[7] = 1;
+        // Client 9 belongs to another id: it is a runtime member only.
+        home[9] = 3;
+        let roster = roster_from_members(&members, &teams, &home, 1);
         assert_eq!(roster[2], TEAM_RED as u8);
         assert_eq!(roster[7], TEAM_BLUE as u8);
         assert_eq!(roster[5], REMEMBERED_NONE);
+        assert_eq!(roster[9], REMEMBERED_NONE);
         // Out-of-range members (never in `members` in practice) are ignored.
         assert_eq!(roster.iter().filter(|t| **t != REMEMBERED_NONE).count(), 2);
     }
@@ -6362,6 +6559,8 @@ mod tests {
         t.matches[1].remembered[4] = TEAM_BLUE as u8;
         t.client_match[3] = MAIN_MATCH;
         t.client_match[4] = MAIN_MATCH;
+        t.home[3] = 1;
+        t.home[4] = 1;
 
         let kept = reset_round_state(&mut t, true, MAX_MATCHES);
         assert!(kept);
@@ -6370,6 +6569,7 @@ mod tests {
         assert_eq!(t.client_match[4], 1);
         assert_eq!(t.pending_join[3], TEAM_RED as u8);
         assert_eq!(t.pending_join[4], TEAM_BLUE as u8);
+        assert_eq!(t.home[3], 1);
         assert_eq!((t.matches[1].red, t.matches[1].blue), (0, 0));
         // Applied once: the instance is now a normal active match.
         assert!(!t.matches[1].has_remembered());
@@ -6377,65 +6577,254 @@ mod tests {
         assert_eq!(t.pending_join[3], REMEMBERED_NONE);
     }
 
-    /// A full map change (or a lowered match limit) drops the memory: those
-    /// players reconnect in main and are not auto-joined anywhere.
+    /// D-006.11: a finished game's roster is stored under the game's TFFA id,
+    /// not under the slot it ran in. The identity filter keeps the old main's
+    /// spectators (runtime members of a promoted main game) out of the promoted
+    /// game's roster, and a `REMEMBERED_NONE` entry never erases a team.
+    #[test]
+    fn a_finished_game_remembers_its_players_under_its_own_id() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
+        // Clients 2, 3 belong to TFFA 0 (the game being replaced); client 4
+        // belongs to TFFA 1 and is only a runtime member of this main game.
+        home[2] = MAIN_MATCH;
+        home[3] = MAIN_MATCH;
+        home[4] = 1;
+        home[5] = 1;
+
+        let roster = roster_from_members(
+            &[2, 3, 4],
+            &[TEAM_RED as u8, TEAM_BLUE as u8, TEAM_RED as u8],
+            &home,
+            MAIN_MATCH,
+        );
+        store_return_roster(&mut matches, MAIN_MATCH, &roster);
+        assert_eq!(matches[MAIN_MATCH as usize].remembered[2], TEAM_RED as u8);
+        assert_eq!(matches[MAIN_MATCH as usize].remembered[3], TEAM_BLUE as u8);
+        assert_eq!(
+            matches[MAIN_MATCH as usize].remembered[4], REMEMBERED_NONE,
+            "another id's client must not join this roster"
+        );
+
+        // The promoted game's roster goes to its own (created) slot.
+        let promoted = roster_from_members(
+            &[2, 4, 5],
+            &[TEAM_BLUE as u8, TEAM_RED as u8, TEAM_BLUE as u8],
+            &home,
+            1,
+        );
+        store_return_roster(&mut matches, 1, &promoted);
+        assert_eq!(matches[1].remembered[4], TEAM_RED as u8);
+        assert_eq!(matches[1].remembered[5], TEAM_BLUE as u8);
+        assert_eq!(matches[1].remembered[2], REMEMBERED_NONE);
+        // Merging keeps an earlier entry for the same client.
+        let later = roster_from_members(&[4], &[REMEMBERED_NONE], &home, 1);
+        store_return_roster(&mut matches, 1, &later);
+        assert_eq!(matches[1].remembered[4], TEAM_RED as u8);
+        // Main's roster is untouched by the promoted id's capture.
+        assert_eq!(matches[MAIN_MATCH as usize].remembered[2], TEAM_RED as u8);
+    }
+
+    /// D-006.11 (the reported bug): TFFA 0 finishes, TFFA 1 is promoted into
+    /// main and finishes too. The restart puts each original group back in its
+    /// own id — TFFA 0 in slot 0, TFFA 1 in slot 1 — with its own team.
+    #[test]
+    fn a_promoted_game_returns_to_its_own_id_on_a_map_restart() {
+        let mut t = state::TffaState::default();
+        // Runtime end state: everyone is assigned to main; TFFA 0's players are
+        // spectators remembered in slot 0, TFFA 1's players are remembered in
+        // slot 1, and main is running TFFA 1's identity.
+        t.matches[MAIN_MATCH as usize].remembered[2] = TEAM_RED as u8;
+        t.matches[MAIN_MATCH as usize].remembered[3] = TEAM_BLUE as u8;
+        t.matches[1].remembered[4] = TEAM_RED as u8;
+        t.matches[1].remembered[5] = TEAM_BLUE as u8;
+        t.client_match = [MAIN_MATCH; MAX_CLIENTS];
+        t.home[2] = MAIN_MATCH;
+        t.home[3] = MAIN_MATCH;
+        t.home[4] = 1;
+        t.home[5] = 1;
+        t.main_origin = 1;
+
+        assert!(reset_round_state(&mut t, true, MAX_MATCHES));
+        // Two groups, two ids.
+        assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.client_match[3], MAIN_MATCH);
+        assert_eq!(t.client_match[4], 1);
+        assert_eq!(t.client_match[5], 1);
+        assert!(t.matches[1].active);
+        assert_eq!(t.pending_join[2], TEAM_RED as u8);
+        assert_eq!(t.pending_join[3], TEAM_BLUE as u8);
+        assert_eq!(t.pending_join[4], TEAM_RED as u8);
+        assert_eq!(t.pending_join[5], TEAM_BLUE as u8);
+        // Main hosts its own game again; the promoted game is back in its slot.
+        assert_eq!(t.main_origin, MAIN_MATCH);
+        assert!(!t.matches[1].has_remembered());
+        assert!(!t.matches[MAIN_MATCH as usize].has_remembered());
+    }
+
+    /// D-006.11: a promoted game that is still being played (no finished
+    /// roster) also returns to its own id; its players keep their session team.
+    #[test]
+    fn a_live_promoted_game_returns_to_its_own_id() {
+        let mut t = state::TffaState::default();
+        // TFFA 1 was promoted (its slot inactive), its players are runtime
+        // members of main; TFFA 0 finished earlier and waits in main.
+        t.home[4] = 1;
+        t.home[5] = 1;
+        t.client_match[4] = MAIN_MATCH;
+        t.client_match[5] = MAIN_MATCH;
+        t.matches[MAIN_MATCH as usize].remembered[2] = TEAM_RED as u8;
+        t.home[2] = MAIN_MATCH;
+        t.main_origin = 1;
+
+        assert!(reset_round_state(&mut t, true, MAX_MATCHES));
+        assert!(t.matches[1].active);
+        assert_eq!(t.client_match[4], 1);
+        assert_eq!(t.client_match[5], 1);
+        // A still-playing client keeps the team the base game restores.
+        assert_eq!(t.pending_join[4], REMEMBERED_NONE);
+        assert_eq!(t.pending_join[5], REMEMBERED_NONE);
+        // The finished TFFA 0 group is in main.
+        assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.pending_join[2], TEAM_RED as u8);
+    }
+
+    /// D-006.11: main's (identity 0) return roster is consumed by a
+    /// `map_restart` — each client auto-joins its old team in main, main stays
+    /// open — and dropped by a full map change.
+    #[test]
+    fn main_finishers_come_back_on_their_teams_after_a_map_restart() {
+        let mut t = state::TffaState::default();
+        t.matches[MAIN_MATCH as usize].remembered[2] = TEAM_RED as u8;
+        t.matches[MAIN_MATCH as usize].remembered[3] = TEAM_BLUE as u8;
+
+        let _ = reset_round_state(&mut t, true, MAX_MATCHES);
+        assert!(t.matches[MAIN_MATCH as usize].active);
+        assert!(!t.matches[MAIN_MATCH as usize].has_remembered());
+        assert_eq!(t.client_match[2], MAIN_MATCH);
+        assert_eq!(t.client_match[3], MAIN_MATCH);
+        assert_eq!(t.pending_join[2], TEAM_RED as u8);
+        assert_eq!(t.pending_join[3], TEAM_BLUE as u8);
+        // Consumed once: a second restart has nothing left to apply.
+        let _ = reset_round_state(&mut t, true, MAX_MATCHES);
+        assert_eq!(t.pending_join[2], REMEMBERED_NONE);
+
+        let mut t = state::TffaState::default();
+        t.matches[MAIN_MATCH as usize].remembered[2] = TEAM_RED as u8;
+        assert!(!reset_round_state(&mut t, false, MAX_MATCHES));
+        assert!(!t.matches[MAIN_MATCH as usize].has_remembered());
+        assert_eq!(t.pending_join[2], REMEMBERED_NONE);
+    }
+
+    /// D-006.11: playing again drops the remembered return team (so a stale
+    /// entry cannot override the team the client chose); the id itself is kept,
+    /// so the restart still returns them to their own TFFA.
+    #[test]
+    fn playing_again_forgets_the_remembered_team() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].remembered[4] = TEAM_RED as u8;
+        matches[2].remembered[4] = TEAM_BLUE as u8;
+        forget_return_rosters_in(&mut matches, 4);
+        assert_eq!(matches[MAIN_MATCH as usize].remembered[4], REMEMBERED_NONE);
+        assert_eq!(matches[2].remembered[4], REMEMBERED_NONE);
+        // Another client's memory is untouched.
+        matches[2].remembered[5] = TEAM_BLUE as u8;
+        forget_return_rosters_in(&mut matches, 4);
+        assert_eq!(matches[2].remembered[5], TEAM_BLUE as u8);
+    }
+
+    /// D-006.11: promotion keeps the identity rosters — the finished game's
+    /// memory lives in its own slot and the promoted slot is the one cleared.
+    #[test]
+    fn promoting_a_created_match_keeps_the_other_ids_rosters() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[MAIN_MATCH as usize].remembered[5] = TEAM_RED as u8;
+        matches[1].active = true;
+        matches[1].remembered[6] = TEAM_BLUE as u8;
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[0] = 1;
+        promote_into_main(&mut matches, &mut table, 1, 2, 1, &[0]);
+        // Main's slot is now TFFA 1's game, but TFFA 0's roster (slot 0) and the
+        // promoted slot's own bookkeeping are separate: the promoted slot is
+        // cleared, the finishing ids keep their memory.
+        assert_eq!(matches[MAIN_MATCH as usize].remembered[5], TEAM_RED as u8);
+        assert!(!matches[1].has_remembered());
+        assert_eq!(table[0], MAIN_MATCH);
+    }
+
+    /// A full map change (or a lowered match limit) drops the memory and the
+    /// identities: those players reconnect in main and are not auto-joined.
     #[test]
     fn a_full_map_change_drops_a_remembered_roster() {
         let mut t = state::TffaState::default();
         t.matches[2].remembered[6] = TEAM_RED as u8;
+        t.home[6] = 2;
         assert!(!reset_round_state(&mut t, false, MAX_MATCHES));
         assert!(!t.matches[2].active);
         assert!(!t.matches[2].has_remembered());
         assert_eq!(t.pending_join[6], REMEMBERED_NONE);
+        assert_eq!(t.home[6], MAIN_MATCH);
 
         let mut t = state::TffaState::default();
         t.matches[5].remembered[6] = TEAM_BLUE as u8;
+        t.home[6] = 5;
         assert!(!reset_round_state(&mut t, true, 3));
         assert!(!t.matches[5].active);
         assert!(!t.matches[5].has_remembered());
         assert_eq!(t.client_match[6], MAIN_MATCH);
+        assert_eq!(t.home[6], MAIN_MATCH);
         assert_eq!(t.pending_join[6], REMEMBERED_NONE);
     }
 
-    /// D-006.10: playing for another instance forgets the old one, while the
-    /// instance the client is currently in keeps its roster entry.
+    /// A new match takes an empty slot first and only evicts a waiting group
+    /// when no empty slot is left; the id of a live promoted game is never
+    /// handed out.
     #[test]
-    fn playing_for_another_instance_forgets_the_previous_one() {
-        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
-        matches[1].remembered[4] = TEAM_RED as u8;
-        matches[2].remembered[4] = TEAM_BLUE as u8;
-        forget_previous_instances_in(&mut matches, 4, 2);
-        assert_eq!(matches[1].remembered[4], REMEMBERED_NONE);
-        assert_eq!(matches[2].remembered[4], TEAM_BLUE as u8);
-
-        // Joining main (instance 0) forgets every created instance.
-        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
-        matches[1].remembered[4] = TEAM_RED as u8;
-        matches[2].remembered[4] = TEAM_BLUE as u8;
-        forget_previous_instances_in(&mut matches, 4, MAIN_MATCH);
-        assert_eq!(matches[1].remembered[4], REMEMBERED_NONE);
-        assert_eq!(matches[2].remembered[4], REMEMBERED_NONE);
-    }
-
-    /// A new match takes an empty slot first and only evicts a remembered
-    /// roster when no empty slot is left.
-    #[test]
-    fn a_new_match_prefers_a_slot_without_a_remembered_roster() {
+    fn a_new_match_prefers_a_slot_without_a_waiting_group() {
         let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
         matches[MAIN_MATCH as usize].active = true;
         matches[1].remembered[0] = TEAM_RED as u8;
         let table = [MAIN_MATCH; MAX_CLIENTS];
+        let mut home = [MAIN_MATCH; MAX_CLIENTS];
+        home[0] = 1;
 
-        assert_eq!(select_create_slot(&matches, &table, MAX_MATCHES), Some(2));
-        // Only the remembered slot is left: the new match reuses it (and
-        // `cmd_create` clears the old roster).
-        assert_eq!(select_create_slot(&matches, &table, 1), Some(1));
+        assert_eq!(
+            select_create_slot(&matches, &table, &home, MAX_MATCHES, MAIN_MATCH),
+            Some(2)
+        );
+        // Only the waiting slot is left: the new match reuses it (and
+        // `cmd_create` clears the old roster and identity).
+        assert_eq!(
+            select_create_slot(&matches, &table, &home, 1, MAIN_MATCH),
+            Some(1)
+        );
 
         // An active or still-assigned slot is never taken.
         matches[1].active = true;
         let mut table = [MAIN_MATCH; MAX_CLIENTS];
         table[3] = 2;
         matches[2].remembered[0] = TEAM_RED as u8;
-        assert_eq!(select_create_slot(&matches, &table, 2), None);
+        home[0] = 2;
+        assert_eq!(
+            select_create_slot(&matches, &table, &home, 2, MAIN_MATCH),
+            None
+        );
+
+        // A game promoted into the main slot keeps its own id reserved, even
+        // though its slot is inactive and nobody is assigned to it.
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        let free_table = [MAIN_MATCH; MAX_CLIENTS];
+        let no_home = [MAIN_MATCH; MAX_CLIENTS];
+        assert_eq!(
+            select_create_slot(&matches, &free_table, &no_home, 2, 1),
+            Some(2)
+        );
+        assert_eq!(
+            select_create_slot(&matches, &free_table, &no_home, 1, 1),
+            None,
+            "the live promoted id is reserved"
+        );
     }
 }

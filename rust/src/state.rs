@@ -284,16 +284,14 @@ pub struct TffaMatch {
     /// void in the meantime, exactly like the pristine
     /// `level.intermissionQueued` window (`g_combat.c:4520-4524`).
     pub end_queued_at: i32,
-    /// Roster of a finished match: the team (`TEAM_RED`/`TEAM_BLUE`) each
-    /// member played for when the match ended, `crate::tffa::REMEMBERED_NONE`
-    /// (0) for every slot that is not remembered. A finished match is inactive
-    /// for the rest of the round (its members are spectators in main); the
-    /// roster is what `map_restart` re-creates the instance from, putting each
-    /// member back on their old team (D-006.10).
-    ///
-    /// A client is remembered by at most one instance (the last one they
-    /// played for), and playing for another instance forgets the old one
-    /// (`tffa::forget_previous_instances`).
+    /// Roster of a finished game of **this slot's identity**: the team
+    /// (`TEAM_RED`/`TEAM_BLUE`) each member played for when the game ended,
+    /// `crate::tffa::REMEMBERED_NONE` (0) for every slot that is not
+    /// remembered. The roster is stored under the game's TFFA id — not under
+    /// the slot it was running in — so the group comes back to the same id at
+    /// the next `map_restart`, with each member on their old team (D-006.10,
+    /// D-006.11). A client is remembered by at most one id
+    /// (`tffa::forget_return_rosters`).
     pub remembered: [u8; MAX_CLIENTS],
 }
 
@@ -305,8 +303,10 @@ impl TffaMatch {
         self.active && self.end_queued_at != 0
     }
 
-    /// Whether this (inactive) slot still remembers the roster of the match
-    /// that finished in it, i.e. whether a `map_restart` re-creates it.
+    /// Whether this slot still remembers the roster of the game of its identity
+    /// that finished: a `map_restart` re-creates the slot from it (or, for main,
+    /// puts the remembered players back on their teams without deactivating
+    /// it).
     pub fn has_remembered(&self) -> bool {
         self.remembered
             .iter()
@@ -335,6 +335,21 @@ impl TffaMatch {
 pub struct TffaState {
     pub matches: [TffaMatch; crate::tffa::TOTAL_MATCH_SLOTS],
     pub client_match: [u8; MAX_CLIENTS],
+    /// The TFFA id each client belongs to (`0` = main), independent of the slot
+    /// their game currently runs in. It changes only on an explicit instance
+    /// move (`tffa_create`/`tffa_join`/`tffa_leave`, or a closed match returning
+    /// them to main), never when a match is promoted into the main slot or when
+    /// the client picks a team. A `map_restart` returns every client to this id
+    /// (`tffa::reset_round_state`), so TFFA 0 stays TFFA 0 and TFFA 1 stays
+    /// TFFA 1 even after a promotion moved their games around (D-006.11).
+    pub home: [u8; MAX_CLIENTS],
+    /// The TFFA id whose game currently runs in the **main slot** (D-006.11).
+    /// A finished main game is replaced by the lowest-id still-played created
+    /// match, whose members are runtime-assigned to main (`client_match = 0`)
+    /// while their `home` keeps their own id. `0` when main hosts its own game.
+    /// Used to store a finished game's roster under its identity and to keep
+    /// the live promoted id's slot from being handed to a new match.
+    pub main_origin: u8,
     pub player_score: [i32; MAX_CLIENTS],
     pub frame_stamp: u32,
     pub rebuilt_stamp: u32,
@@ -458,6 +473,8 @@ impl Default for TffaState {
                 ..Default::default()
             }),
             client_match: [0; MAX_CLIENTS],
+            home: [0; MAX_CLIENTS],
+            main_origin: crate::tffa::MAIN_MATCH,
             player_score: [0; MAX_CLIENTS],
             frame_stamp: 0,
             rebuilt_stamp: 0,
@@ -626,7 +643,11 @@ fn mutes_after_reset(previous: Option<&ProxyState>, restart: bool) -> [bool; MAX
 }
 
 /// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
-/// of the round that just ended only for a `map_restart`.
+/// of the round that just ended only for a `map_restart`: which created matches
+/// were open, which id each client belongs to (its `home`, which survives a
+/// promotion, D-006.11), and the rosters a finished game remembers (D-006.10).
+/// The runtime-only `main_origin` is not carried: after the restart the main
+/// slot hosts its own id (0) again.
 ///
 /// Kept separate from the lock so the carry is unit-tested directly.
 fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
@@ -634,15 +655,20 @@ fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
     let Some(previous) = previous.filter(|_| restart) else {
         return fresh;
     };
-    // Slot 0 (main) is always active; only the created slots are carried.
-    // A created slot carries whether it was being played *and*, for a finished
-    // one, the roster it remembers: a `map_restart` re-creates it so its
-    // members return to it (D-006.10).
-    for (i, m) in fresh.matches.iter_mut().enumerate().skip(1) {
-        m.active = previous.matches[i].active;
+    // Slot 0 (main) is always active; only its roster is carried, for the
+    // players a finished main game sent to spectator before a created match
+    // was promoted over it (D-006.11) — a `map_restart` puts them back on their
+    // teams without reactivating anything. A created slot carries whether it
+    // was being played *and*, for a finished one, the roster it remembers: a
+    // `map_restart` re-creates it so its members return to it (D-006.10).
+    for (i, m) in fresh.matches.iter_mut().enumerate() {
+        if i != crate::tffa::MAIN_MATCH as usize {
+            m.active = previous.matches[i].active;
+        }
         m.remembered = previous.matches[i].remembered;
     }
     fresh.client_match = previous.client_match;
+    fresh.home = previous.home;
     fresh
 }
 
@@ -873,15 +899,40 @@ mod tests {
         let mut previous = TffaState::default();
         previous.matches[1].remembered[5] = crate::sdk::TEAM_RED as u8;
         previous.pending_join[5] = crate::sdk::TEAM_RED as u8;
+        previous.home[5] = 1;
+        // D-006.11: the roster of a finished *main* game is carried too, and a
+        // promoted game's identity survives the restart.
+        previous.matches[crate::tffa::MAIN_MATCH as usize].remembered[6] =
+            crate::sdk::TEAM_BLUE as u8;
+        previous.home[7] = 3;
 
         let carried = tffa_after_reset(Some(&previous), true);
         assert_eq!(carried.matches[1].remembered[5], crate::sdk::TEAM_RED as u8);
         assert!(carried.matches[1].has_remembered());
+        assert_eq!(
+            carried.matches[crate::tffa::MAIN_MATCH as usize].remembered[6],
+            crate::sdk::TEAM_BLUE as u8
+        );
+        assert_eq!(carried.home[5], 1);
+        assert_eq!(carried.home[7], 3);
         assert_eq!(carried.pending_join[5], crate::tffa::REMEMBERED_NONE);
+        // The runtime slot assignment is not an identity: main always hosts its
+        // own id again after the restart.
+        assert_eq!(
+            carried.main_origin,
+            crate::tffa::MAIN_MATCH,
+            "main_origin is runtime-only"
+        );
 
         let fresh = tffa_after_reset(Some(&previous), false);
         assert_eq!(fresh.matches[1].remembered[5], crate::tffa::REMEMBERED_NONE);
         assert!(!fresh.matches[1].has_remembered());
+        assert_eq!(
+            fresh.matches[crate::tffa::MAIN_MATCH as usize].remembered[6],
+            crate::tffa::REMEMBERED_NONE
+        );
+        assert_eq!(fresh.home[5], crate::tffa::MAIN_MATCH);
+        assert_eq!(fresh.home[7], crate::tffa::MAIN_MATCH);
     }
 
     #[test]

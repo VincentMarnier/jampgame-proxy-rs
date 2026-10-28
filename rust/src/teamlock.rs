@@ -394,10 +394,12 @@ fn note_team_join(ent: usize, old_team: i32) {
 }
 
 /// Observe a successful `SetTeam` for the parallel-TFFA roster memory
-/// (D-006.10): a move into RED/BLUE is the client actually playing for the
-/// instance they are assigned to, so every finished match that remembered them
-/// forgets them — they chose a new game, and a `map_restart` must not pull them
-/// back out of it. Spectator/follow moves are not joins and keep the memory.
+/// (D-006.10, D-006.11): a move into RED/BLUE is the client playing again, so a
+/// team a finished game remembered for them is stale and the auto-join must not
+/// override what they chose. The id they belong to does not change here — a
+/// player's `home` only moves with an explicit `tffa_*` command — so a
+/// `map_restart` still returns them to their own TFFA. Spectator/follow moves
+/// are not joins and keep the memory.
 fn note_tffa_team_join(ent: usize, old_team: i32) {
     let Some(new_team) = client_team(ent) else {
         return;
@@ -407,7 +409,7 @@ fn note_tffa_team_join(ent: usize, old_team: i32) {
     }
     let client_num = ent_client_num(ent);
     if client_num >= 0 {
-        tffa::forget_previous_instances(client_num);
+        tffa::forget_return_rosters(client_num);
     }
 }
 
