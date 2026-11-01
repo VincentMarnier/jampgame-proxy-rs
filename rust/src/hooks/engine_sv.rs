@@ -634,6 +634,17 @@ pub unsafe extern "C" fn sv_send_client_game_state(cl: usize) {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::engine_hook_original_sv_send_client_game_state);
     unsafe { original(cl) };
+    // A (re)sent gamestate carries the server's **base** configstrings, not the
+    // proxy's per-viewer `CS_PLAYERS` overrides: whatever this client held is
+    // gone from its `cgs`. Drop the proxy's record of it and re-push on the next
+    // frame (a mid-game resend of an outdated client message), so the next
+    // scoreboard request does not rely on values the client no longer has.
+    if crate::tffa::enabled() {
+        let client_num = client_num_from_addr(cl);
+        if client_num < crate::sdk::MAX_CLIENTS {
+            crate::tffa::forget_view_overrides(client_num as c_int);
+        }
+    }
     if orig_state != crate::sdk::CS_CONNECTED {
         // SAFETY: cl is a valid client_t.
         unsafe { *((cl + OFFSET_CLIENT_STATE) as *mut c_int) = orig_state };

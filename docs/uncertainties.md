@@ -444,3 +444,49 @@ trampolines execute and `mprotect` on engine `.text` pages succeeded
   R-018 smoke test there when a deployment target is chosen.
 - If W^X blocks `RWX`, switch to `RW→RX` flip and re-test; document in
   `docs/decisions/`.
+
+---
+
+## U-009 — "Lag spikes on death / while watching scores" (parallel TFFA)
+
+### Question
+
+Players on a parallel-TFFA server (several matches) report a momentary spike
+"on death and sometimes when watching scores", felt only by the player
+concerned. Is the proxy causing it, and which half?
+
+### Classification
+
+**important — one half fixed and unit-pinned, the other half not reproduced.**
+
+**SOURCE / STATIC (scoreboard request).** Every `scores ...` message triggered
+`refresh_cs_players_for_scores`, which re-sent one full `CS_PLAYERS` info
+string (~150-250 bytes) **per playing outsider** on every request. A viewer
+with ~25 outsiders in other matches therefore received ~5 KB of reliable
+commands plus the ~1 KB `scores` message in one frame; reliable commands are
+queued ahead of snapshots. This is the shape of a self-inflicted spike on the
+requesting client and is what D-006.13 removes (per-viewer record, only
+changed values pushed).
+
+**SOURCE (death).** Dying runs pristine `CalculateRanks`, which rewrites only
+`CS_SCORES1/2`; the proxy adds at most two small per-viewer corrections, and
+the client does not request `scores` on death (`CG_ScoresDown_f` is bound to
+`+scores`, `cg_consolecmds.c:66-86`). So no proxy burst exists on death.
+
+**INFERRED (death).** A dead client draws the scoreboard, and that path calls
+`CG_LoadDeferredPlayers` → `CG_ActualLoadDeferredPlayers`
+(`cg_players.c:1947-1978`, `cg_view.c:2452-2456`), which loads **every**
+deferred player model in one frame. That is stock cgame behaviour (the reason
+`cg_forceModel` exists) and a client-side frame hitch, not proxy traffic. It is
+not claimed to be fixed by D-006.13.
+
+### Cheapest experiment
+
+- Client-side: reproduce a death/scoreboard-open with `cg_deferPlayers 0`
+  (or `cg_forceModel 1`). If the death spike disappears and the tab spike
+  remains, the death half is the deferred-model load; with D-006.13 the tab
+  half should then be empty (no proxy `cs` traffic on a steady roster).
+- Server-side: on a live multi-match server, count `G_SEND_SERVER_COMMAND`
+  traffic to the requesting client around a `scores` request (the traffic
+  should be the `scores` message only after the first refresh) and compare a
+  tab press before/after a match move (exactly the moved slot re-pushed).

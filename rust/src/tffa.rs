@@ -557,7 +557,7 @@ fn reliable_pressure(client_num: c_int) -> bool {
 /// gets the correction deferred (`pending_view_refresh`) instead: pushing it
 /// now is what overflowed the buffer, dropped clients and made real clients
 /// print `CL_GetServerCommand: a reliable command was cycled out` (D-006.12).
-fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
+fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
     // Never add to the `map_restart` reconnect burst: the engine queues a
     // reliable command per reconnecting client for every client, and a
     // populated server is already close to the 128-slot limit before the proxy
@@ -566,7 +566,7 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
         if (0..MAX_CLIENTS as c_int).contains(&client_num) {
             state::with_state(|s| s.tffa.pending_view_refresh[client_num as usize] = true);
         }
-        return;
+        return false;
     }
     let mut safe = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -578,10 +578,102 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
     }
     let msg = format!("cs {index} \"{safe}\"\n");
     let Ok(cmsg) = std::ffi::CString::new(msg) else {
-        return;
+        return false;
     };
     // SAFETY: engine syscall registered; cmsg NUL-terminated.
     unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
+    true
+}
+
+/// Queue a `cs CS_PLAYERS + slot` value for one viewer unless that viewer is
+/// already known to hold exactly this value. Returns whether anything was
+/// queued.
+///
+/// This is the per-viewer dedup the scoreboard refresh needs: the demotions are
+/// re-pushed before every `scores` message (a lost override would put another
+/// match's player on the viewer's side), but the payloads are the full player
+/// info strings and a populated multi-match server has dozens of them per
+/// viewer — re-queueing identical ones every time the tab is pressed is what
+/// made that client's reliable stream burst. A value that was **not** queued
+/// (reliable-window pressure / restart burst) leaves the record untouched, so
+/// the deferred refresh (`pending_view_refresh`) still sends it later.
+fn push_cs_players(client_num: c_int, slot: usize, value: &str) -> bool {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) || slot >= MAX_CLIENTS {
+        return false;
+    }
+    let viewer = client_num as usize;
+    let index = CS_PLAYERS + slot as i32;
+    if state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] == value) {
+        return false;
+    }
+    if !send_cs_to_client(client_num, index, value) {
+        return false;
+    }
+    state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] = value.to_owned());
+    true
+}
+
+/// Record a `CS_PLAYERS + slot` value this viewer is known to hold without
+/// queueing anything (the engine broadcast it, or it came in a gamestate).
+fn record_cs_players_sent(client_num: c_int, slot: usize, value: &str) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) || slot >= MAX_CLIENTS {
+        return;
+    }
+    state::with_state(|s| s.tffa.cs_players_sent[client_num as usize][slot] = value.to_owned());
+}
+
+/// Record that the engine itself just broadcast `value` for `slot` to every
+/// connected client (`G_SET_CONFIGSTRING` forwarding), so the next per-viewer
+/// refresh does not re-send the base string to same-match viewers.
+fn record_cs_players_broadcast(slot: usize, value: &str) {
+    if slot >= MAX_CLIENTS {
+        return;
+    }
+    state::with_state(|s| {
+        for viewer in 0..MAX_CLIENTS {
+            if s.clients[viewer].is_connected {
+                s.tffa.cs_players_sent[viewer][slot] = value.to_owned();
+            }
+        }
+    });
+}
+
+/// Drop one viewer's per-slot record because the engine sent it a fresh
+/// gamestate, whose configstrings are the server's base strings again: every
+/// per-viewer override the proxy believed it held is gone. A connected client
+/// is marked for the next frame's full refresh (`pending_view_refresh`); a
+/// connecting one gets it from `GAME_CLIENT_BEGIN` anyway.
+pub fn forget_view_overrides(client_num: c_int) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    state::with_state(|s| {
+        let viewer = client_num as usize;
+        for slot in s.tffa.cs_players_sent[viewer].iter_mut() {
+            slot.clear();
+        }
+        if s.clients[viewer].is_connected {
+            s.tffa.pending_view_refresh[viewer] = true;
+        }
+    });
+}
+
+/// Drop **every** viewer's per-slot record and re-arm the full refresh for the
+/// connected ones. Used when the master switch is turned back on: while the
+/// proxy was disabled the game's own `CS_PLAYERS` broadcasts kept overwriting
+/// the per-viewer overrides, so what each client holds no longer matches the
+/// record.
+pub fn forget_all_view_overrides() {
+    state::with_state(|s| {
+        for viewer in 0..MAX_CLIENTS {
+            for slot in s.tffa.cs_players_sent[viewer].iter_mut() {
+                slot.clear();
+            }
+            if s.clients[viewer].is_connected {
+                s.tffa.pending_view_refresh[viewer] = true;
+            }
+        }
+    });
 }
 
 /// Record a `CS_PLAYERS + n` base string the game just set, then push the
@@ -598,6 +690,10 @@ pub fn on_set_cs_players(slot: i32, value: &str) {
     state::with_state(|s| {
         s.tffa.cs_players_base[slot as usize] = value.to_owned();
     });
+    // The engine broadcast this value to every client before the handler ran
+    // (the trap was forwarded first), so every connected viewer holds it now —
+    // record that instead of re-sending it to same-match viewers below.
+    record_cs_players_broadcast(slot as usize, value);
     // Follow-aware viewer matches (spectating adopts the target's instance).
     // State snapshot first (no nesting: effective_match locks per viewer).
     let (table, base): (u8, String) = state::with_state(|s| {
@@ -614,14 +710,13 @@ pub fn on_set_cs_players(slot: i32, value: &str) {
             .filter(|v| s.clients[*v as usize].is_connected)
             .collect()
     });
-    let index = CS_PLAYERS + slot;
     for viewer in viewers {
         let viewer_match = effective_match(viewer);
         // Same-match / spectator viewers already received this base via the
         // engine broadcast we just forwarded — resending it doubles traffic
         // for zero effect (and overflows the reliable buffer on team swaps).
         if let Some(modified) = rewrite_cs_players_for_viewer(&base, table, viewer_match) {
-            send_cs_to_client(viewer, index, &modified);
+            push_cs_players(viewer, slot as usize, &modified);
         }
     }
 }
@@ -658,14 +753,11 @@ pub fn broadcast_cs_players_slot(slot: i32) {
             .filter(|v| s.clients[*v as usize].is_connected)
             .collect()
     });
-    let index = CS_PLAYERS + slot;
     for viewer in viewers {
         let viewer_match = effective_match(viewer);
-        if let Some(modified) = rewrite_cs_players_for_viewer(&base, table, viewer_match) {
-            send_cs_to_client(viewer, index, &modified);
-        } else {
-            send_cs_to_client(viewer, index, &base);
-        }
+        let value = rewrite_cs_players_for_viewer(&base, table, viewer_match)
+            .unwrap_or_else(|| base.clone());
+        push_cs_players(viewer, slot as usize, &value);
     }
 }
 
@@ -831,6 +923,16 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
     });
     send_cs_to_client(client_num, CS_SCORES1, &red.to_string());
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
+    // A fresh gamestate carries the server's **base** `CS_PLAYERS` strings, not
+    // our per-viewer overrides: drop this viewer's record, then record what the
+    // gamestate just delivered so the demotions below are the only sends.
+    state::with_state(|s| {
+        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
+            for slot in s.tffa.cs_players_sent[client_num as usize].iter_mut() {
+                slot.clear();
+            }
+        }
+    });
     let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
     // Same-match and real-spectator slots already hold the base string (a
@@ -849,8 +951,13 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
             }
         }
     }
+    for (slot, base) in bases.iter().enumerate() {
+        if !base.is_empty() {
+            record_cs_players_sent(client_num, slot, base);
+        }
+    }
     for (slot, value) in demotions_for_viewer(viewer_match, &table, &bases) {
-        send_cs_to_client(client_num, CS_PLAYERS + slot, &value);
+        push_cs_players(client_num, slot as usize, &value);
     }
 }
 
@@ -878,16 +985,9 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
                 continue;
             }
         }
-        let index = CS_PLAYERS + slot;
-        if let Some(modified) =
-            rewrite_cs_players_for_viewer(&base, table[slot as usize], viewer_match)
-        {
-            send_cs_to_client(client_num, index, &modified);
-        } else {
-            // Own match / spectator: restore the base string (it may carry a
-            // stale prefix from a previous viewer_match).
-            send_cs_to_client(client_num, index, &base);
-        }
+        let value = rewrite_cs_players_for_viewer(&base, table[slot as usize], viewer_match)
+            .unwrap_or(base);
+        push_cs_players(client_num, slot as usize, &value);
     }
     let (red, blue) = state::with_state(|s| {
         let m = &s.tffa.matches[viewer_match as usize];
@@ -904,7 +1004,7 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
 }
 
-/// Re-push the `CS_PLAYERS` demotions (prefix + spectator team) for `viewer`
+/// Re-push the `CS_PLAYERS` overrides (prefix + spectator team) for `viewer`
 /// right before a `scores ...` message is forwarded.
 ///
 /// The tab scoreboard groups entries by each client's `cgs.clientinfo[].team`,
@@ -912,11 +1012,15 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
 /// lost (reliable-buffer pressure during connect/team churn, a gamestate
 /// resync, or a base the viewer processed after it). When that happens an
 /// outsider is grouped on the viewer's RED/BLUE side even though the proxy had
-/// classified them as another match's player. Re-sending the demotions first
+/// classified them as another match's player. Re-sending the overrides first
 /// (reliable commands are ordered) makes the team data correct at the moment
-/// the scoreboard is parsed, and it stays correct afterwards. Only playing
-/// outsiders need a push — same-match players and real spectators already have
-/// the base string — so the burst is bounded by the other matches' rosters.
+/// the scoreboard is parsed, and it stays correct afterwards.
+///
+/// Only values the viewer does not already hold are queued
+/// (`push_cs_players`): the payloads are full player info strings and a
+/// populated multi-match server has dozens of playing outsiders per viewer, so
+/// re-sending all of them on every scoreboard request queued kilobytes of
+/// reliable commands to the one client that opened the board.
 pub fn refresh_cs_players_for_scores(viewer: c_int) {
     if !enabled() {
         return;
@@ -941,9 +1045,36 @@ pub fn refresh_cs_players_for_scores(viewer: c_int) {
             }
         }
     }
-    for (slot, value) in demotions_for_viewer(viewer_match, &table, &bases) {
-        send_cs_to_client(viewer, CS_PLAYERS + slot, &value);
+    for (slot, value) in desired_cs_players(viewer_match, &table, &bases) {
+        push_cs_players(viewer, slot as usize, &value);
     }
+}
+
+/// The `CS_PLAYERS + slot` value `viewer` must hold for every slot with a known
+/// base string: the per-viewer demotion for another match's playing player, the
+/// base string for everyone else (own match, real spectators). Pure (built from
+/// the match table and the stored bases), so the delivery loops stay plain send
+/// loops and the rule is unit-tested without an engine.
+///
+/// The scoreboard refresh pushes every entry (not only the demotions): a slot
+/// that moved into the viewer's match must get its base string back, and the
+/// per-viewer dedup (`push_cs_players`) turns every unchanged entry into a
+/// no-op, so a steady roster queues nothing at all.
+fn desired_cs_players(
+    viewer_match: u8,
+    table: &[u8; MAX_CLIENTS],
+    bases: &[String; MAX_CLIENTS],
+) -> Vec<(i32, String)> {
+    let mut out = Vec::new();
+    for (slot, base) in bases.iter().enumerate() {
+        if base.is_empty() {
+            continue;
+        }
+        let value = rewrite_cs_players_for_viewer(base, table[slot], viewer_match)
+            .unwrap_or_else(|| base.clone());
+        out.push((slot as i32, value));
+    }
+    out
 }
 
 /// The `CS_PLAYERS` demotions one viewer's scoreboard needs, as
@@ -1498,6 +1629,13 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
     // falls back to the live configstring meanwhile), so the old round's copies
     // must not be pushed as if they were current.
     t.cs_players_base = core::array::from_fn(|_| String::new());
+    // The record of what each viewer holds is about the old gamestates: every
+    // client reconnects into a fresh one after the restart.
+    for viewer in t.cs_players_sent.iter_mut() {
+        for slot in viewer.iter_mut() {
+            slot.clear();
+        }
+    }
     // Re-arm the score dedup so round-start 0-0 is pushed.
     t.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
     // New round: fraglimit handling runs again.
@@ -1611,6 +1749,9 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
         s.tffa.cs_players_base[client_num as usize].clear();
+        for slot in s.tffa.cs_players_sent[client_num as usize].iter_mut() {
+            slot.clear();
+        }
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
@@ -1629,6 +1770,9 @@ pub fn on_client_disconnect(client_num: c_int) {
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
         s.tffa.cs_players_base[client_num as usize].clear();
+        for slot in s.tffa.cs_players_sent[client_num as usize].iter_mut() {
+            slot.clear();
+        }
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
@@ -1645,7 +1789,7 @@ pub fn on_client_disconnect(client_num: c_int) {
                 .collect()
         });
         for viewer in viewers {
-            send_cs_to_client(viewer, CS_PLAYERS + client_num, "");
+            push_cs_players(viewer, client_num as usize, "");
         }
     }
 }
@@ -1862,6 +2006,11 @@ fn disable_parallel_tffa() {
         // later re-enable falls back to the live server strings and starts with
         // a clean dedup.
         s.tffa.cs_players_base = core::array::from_fn(|_| String::new());
+        for viewer in s.tffa.cs_players_sent.iter_mut() {
+            for slot in viewer.iter_mut() {
+                slot.clear();
+            }
+        }
         s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
         s.tffa.viewer_match_cache = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
@@ -6232,6 +6381,88 @@ mod tests {
             Some("(TFFA 1) Alora")
         );
         assert_eq!(info_value(&out[0].1, "t").as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn the_scoreboard_refresh_covers_both_own_and_outsider_slots() {
+        // The refresh must carry every known slot, not only the demotions: a
+        // slot that moved into the viewer's match needs its base string back.
+        // (The per-viewer dedup turns the unchanged entries into no-ops.)
+        let own = "n\\Bob\\t\\1\\model\\kyle";
+        let outsider = "n\\Alora\\t\\2\\model\\alora";
+        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases[0] = own.to_owned();
+        bases[1] = outsider.to_owned();
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[1] = 1;
+
+        let out = desired_cs_players(MAIN_MATCH, &table, &bases);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], (0, own.to_owned()));
+        assert_eq!(out[1].0, 1);
+        assert_eq!(
+            info_value(&out[1].1, "n").as_deref(),
+            Some("(TFFA 1) Alora")
+        );
+        assert_eq!(info_value(&out[1].1, "t").as_deref(), Some("3"));
+
+        // Instance-1's viewer: its own slot keeps the base, main's is demoted.
+        let out = desired_cs_players(1, &table, &bases);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(info_value(&out[0].1, "n").as_deref(), Some("(TFFA 0) Bob"));
+        assert_eq!(out[1], (1, outsider.to_owned()));
+
+        // Unknown (empty) bases are skipped, never pushed as empty strings.
+        let mut empty: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        empty[3] = "n\\Spec\\t\\3".to_owned();
+        let out = desired_cs_players(MAIN_MATCH, &table, &empty);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 3);
+    }
+
+    #[test]
+    fn a_steady_roster_needs_no_second_player_override_push() {
+        // Mirror of the delivery loop: `push_cs_players` records what it queued
+        // per viewer and slot, so a second refresh of the same roster queues
+        // nothing (this is the traffic the "spike when watching scores" came
+        // from), while a slot moving into the viewer's match flips back to its
+        // base string.
+        let own = "n\\Bob\\t\\1\\model\\kyle";
+        let outsider = "n\\Alora\\t\\2\\model\\alora";
+        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases[0] = own.to_owned();
+        bases[1] = outsider.to_owned();
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[1] = 1;
+
+        // The record the production code keeps (`cs_players_sent[viewer]`).
+        let mut sent: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        let queued = |table: &[u8; MAX_CLIENTS],
+                      bases: &[String; MAX_CLIENTS],
+                      sent: &mut [String; MAX_CLIENTS]| {
+            let mut n = 0;
+            for (slot, value) in desired_cs_players(MAIN_MATCH, table, bases) {
+                let slot = slot as usize;
+                if sent[slot] != value {
+                    sent[slot] = value;
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        // First refresh queues both slots (the viewer holds neither override
+        // nor base yet in this simulation).
+        assert_eq!(queued(&table, &bases, &mut sent), 2);
+        // Steady roster: nothing changes, nothing is queued.
+        assert_eq!(queued(&table, &bases, &mut sent), 0);
+        // The outsider joins the viewer's match: its demotion is replaced by
+        // the base string, and only that slot is queued.
+        table[1] = MAIN_MATCH;
+        assert_eq!(queued(&table, &bases, &mut sent), 1);
+        assert_eq!(sent[1], outsider);
+        // And it stays quiet again.
+        assert_eq!(queued(&table, &bases, &mut sent), 0);
     }
 
     #[test]

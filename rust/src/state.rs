@@ -365,6 +365,19 @@ pub struct TffaState {
     /// temp entity currently being constructed (`SOURCE_WORLD` when none).
     pub pending_sound_source: u8,
     pub cs_players_base: [String; MAX_CLIENTS],
+    /// Last `cs CS_PLAYERS + slot` value queued **to each viewer**
+    /// (`[viewer][slot]`, empty = nothing sent yet): the per-viewer demotions
+    /// are pushed again before every `scores` message so a lost override cannot
+    /// group an outsider on the viewer's side, but a populated multi-match
+    /// server has one demotion per playing outsider for every viewer — re-sending
+    /// all of them (each a full `CS_PLAYERS` info string, ~150-250 bytes) on
+    /// every scoreboard request queued several kilobytes of reliable commands to
+    /// the one client that opened the board. The record is what the viewer is
+    /// known to already hold, so the refresh only sends what changed. The
+    /// engine's own `CS_PLAYERS` broadcasts and the proxy's sends keep it in
+    /// step; a client that gets a fresh gamestate (connect, resend, restart)
+    /// has its row dropped (`tffa::forget_view_overrides`).
+    pub cs_players_sent: [[String; MAX_CLIENTS]; MAX_CLIENTS],
     /// Last per-viewer `CS_SCORES1/2` sent, to skip redundant corrections
     /// (the 128-slot reliable buffer overflows otherwise: every frag would
     /// re-push unchanged scores to every client).
@@ -513,6 +526,7 @@ impl Default for TffaState {
             sound_source: [crate::tffa::SOURCE_WORLD; MAX_GENTITIES],
             pending_sound_source: crate::tffa::SOURCE_WORLD,
             cs_players_base: core::array::from_fn(|_| String::new()),
+            cs_players_sent: core::array::from_fn(|_| core::array::from_fn(|_| String::new())),
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission_boards: [0; MAX_CLIENTS],

@@ -393,6 +393,11 @@ pub unsafe fn set_enabled(enabled: bool) {
         if !engine_sv::attached() {
             // SAFETY: memory layer initialised; original module loaded.
             unsafe { attach_all() };
+            // A runtime re-enable follows a disable during which the game's own
+            // `CS_PLAYERS` broadcasts overwrote the per-viewer overrides the
+            // proxy had queued: what each client holds no longer matches the
+            // proxy's record, so refresh every viewer from scratch.
+            crate::tffa::forget_all_view_overrides();
         }
     } else {
         if engine_sv::attached() {

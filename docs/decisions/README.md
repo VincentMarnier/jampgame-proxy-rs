@@ -22,7 +22,8 @@
   per-viewer `scores`/`cs` rewrites, physics isolation via trace
   interception, per-match team chat, per-instance world entities, per-match
   spawn-point occupancy and per-event snapshot attribution (sounds, shields,
-  obituaries, effects).
+  obituaries, effects); the `map_restart` reliable-burst guard (D-006.12) and
+  the per-viewer `CS_PLAYERS` refresh dedup (D-006.13).
 - `0007-map-change-module-pinning.md` — map-change crash: rcon commands run
   inside our `SVC_RemoteCommand` wrapper, the engine `dlclose`s the proxy
   mid-call, and the stale return faults. Fix: pin the module for the process

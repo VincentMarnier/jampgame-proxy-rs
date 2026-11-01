@@ -1072,6 +1072,77 @@ auto-join path still needs a live client (`tffa_create` is a client command
 bots never issue); it rests on the unit-tested deferral plus the
 already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
 
+### D-006.13 — The scoreboard refresh only re-pushes player overrides it changed
+
+*Status: landed (live bug report, 2026-11-01).*
+
+Reported: "Some say they have lag spikes on death and sometimes when watching
+scores", on a parallel-TFFA server running several matches; only the player
+concerned feels it.
+
+**Observed in the code.** Every `scores ...` command the game sends to a viewer
+runs `refresh_cs_players_for_scores(viewer)` first
+(`jampgame_syscall_forward`, `G_SEND_SERVER_COMMAND`), so the tab scoreboard
+parses with current team data. The old delivery loop re-sent **one full
+`CS_PLAYERS` info string per playing outsider** on every request
+(`demotions_for_viewer`), unconditionally. A `CS_PLAYERS` string is the
+player's whole info block (`n`, `model`, `c1/c2`, `hc`, `w/l`, `skill`, `st`,
+`st2`, `forcepowers`, ...), ~150-250 bytes on a real server (the shape pinned by
+`scoreboard_demotions_cover_exactly_the_playing_outsiders`), so a viewer with
+~25 playing outsiders in other matches received ~5 KB of reliable commands plus
+the ~1 KB `scores` message in one game frame, every time they opened the board.
+Reliable commands are queued ahead of snapshots on the client's connection, so
+that burst is exactly the shape of a self-inflicted lag spike on the requesting
+client. The same overrides were also re-sent on match moves
+(`refresh_cs_players_for_viewer`) and on the disconnect restore.
+
+**Fix.** `TffaState::cs_players_sent[viewer][slot]` records the value the viewer
+is known to hold, and `push_cs_players` queues a `cs` only when the desired value
+differs:
+
+- the engine's own `G_SET_CONFIGSTRING` broadcast of a `CS_PLAYERS` slot reaches
+  every connected client, so `on_set_cs_players` records the base before pushing
+  the per-viewer rewrites (`record_cs_players_broadcast`);
+- `send_all_overrides_to_client` starts from the base strings its fresh
+  gamestate carried, records them, and then pushes only the demotions;
+- `refresh_cs_players_for_scores` now walks **every** known slot instead of only
+  the demotions, so a slot that moved into the viewer's match gets its base
+  string back; unchanged slots cost no command;
+- a send that was deferred by the reliable-window guard (`send_cs_to_client`
+  returns `false`) does not update the record, so `pending_view_refresh` still
+  sends it later;
+- the record is dropped for a client at connect/disconnect, on a new round
+  (`map_restart` reconnects every client into a fresh gamestate), when the
+  engine (re)sends a gamestate (`SV_SendClientGameState` wrapper →
+  `forget_view_overrides`), and for every viewer when the master switch is
+  turned back on (the game's broadcasts overwrote the overrides meanwhile).
+
+**What this does and does not explain.** The scoreboard path is the only
+place where one viewer could receive kilobytes of proxy traffic at once, and
+the fix removes the repeated part of it. The **death** half of the report has
+no such proxy burst: dying runs `CalculateRanks`, which rewrites only
+`CS_SCORES1/2` (two small per-viewer corrections, unchanged by this decision),
+and the client does not request `scores` on death (`CG_ScoresDown_f` is bound to
+`+scores` only). What a dead client does do is draw the scoreboard, which calls
+`CG_ActualLoadDeferredPlayers` (`cg_players.c:1947-1978`,
+`cg_view.c:2452-2456`) and loads **every deferred player model in one frame** —
+stock cgame behaviour, not proxy traffic. It is a client-side frame hitch, and
+the proxy cannot remove it while the unified roster keeps outsiders as valid
+`clientinfo` entries (which the scoreboard design wants). A client-side test
+(`cg_deferPlayers 0` or `cg_forceModel 1`) would separate the two; the death
+report is not claimed fixed here.
+
+**Verification.** `cargo test` 193/193 (2 new: `desired_cs_players` covers own
+and outsider slots; a steady roster queues nothing on a second refresh while a
+match move re-pushes exactly the moved slot), `clippy` clean, `fmt --check`,
+i686 release build, and the real-engine smoke test
+(`rust/scripts/engine-test.sh`: proxy loaded, `GAME_INIT` forwarded, protocol-26
+query answered) still passes with the reworked state. Not yet exercised on a
+live multi-match server: the traffic reduction is pinned by the pure
+delivery-loop test, and the record's maintenance paths (broadcast, gamestate,
+connect/disconnect, re-enable) are state transitions reviewed against the
+existing D-006.12 deferral machinery.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
