@@ -3514,6 +3514,101 @@ pub fn sound_visible(viewer_match: u8, source_match: u8) -> bool {
     source_match == SOURCE_WORLD || entity_visible(viewer_match, source_match)
 }
 
+/// How a (non-sound) temp event names the match it belongs to in its
+/// `entityState_t`, and therefore which fields the snapshot filter may read.
+///
+/// The game builds temp entities with `G_TempEntity`, which zeroes only what
+/// the caller sets: `G_InitGentity` resets `r.ownerNum` but not `s.*`
+/// (`g_utils.c:694-700`, and the freed slot was memset, `g_utils.c:1100`), so
+/// every field the event does not use keeps the bare `0` default. That `0`
+/// coincides with client 0, so a blanket "read both `s.otherEntityNum*`" rule
+/// dropped every such effect from every match that was not client 0's
+/// (D-006, "World-entity visibility fix" residual). This classification is
+/// source-derived from every `G_TempEntity` call site in `codemp/game`; see
+/// the per-event notes below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOwners {
+    /// The event carries no player reference at all: a map/world effect
+    /// (impact sparks, glass shards, screen shakes, broadcasts). Kept for
+    /// every viewer; the engine's PVS still culls it by position.
+    World,
+    /// `s.otherEntityNum` always names the affected player; a `0` there is
+    /// client 0.
+    Victim,
+    /// `s.otherEntityNum` names the affected player only on some hits; a `0`
+    /// there is the untouched default ("no target"), not client 0.
+    OptionalVictim,
+    /// `s.otherEntityNum2` names the other player only in some clash paths; a
+    /// `0` there is the untouched default, not client 0.
+    OptionalAttacker,
+    /// `s.otherEntityNum` (victim) and `s.otherEntityNum2` (attacker/killer),
+    /// both always set.
+    VictimAndAttacker,
+    /// `s.owner` always names the affected player; a `0` there is client 0.
+    SOwner,
+}
+
+/// Classification of a temp event (`event = eType - ET_EVENTS`) from its
+/// creators in `codemp/game`. Only events that must stay match-scoped are
+/// listed; everything else is a world effect.
+pub fn event_owners(event: c_int) -> EventOwners {
+    use crate::sdk::{
+        EV_CONC_ALT_IMPACT, EV_DEBRIS, EV_DISRUPTOR_SNIPER_SHOT, EV_FORCE_DRAINED, EV_GHOUL2_MARK,
+        EV_GLOBAL_DUEL, EV_LOCALTIMER, EV_OBITUARY, EV_SABER_BLOCK, EV_SABER_HIT, EV_SCOREPLUM,
+        EV_SHIELD_HIT, EV_SIEGESPEC, EV_VEH_FIRE,
+    };
+    match event {
+        // `g_combat.c:5624-5628` and `g_missile.c:914-917`: the entity the
+        // projectile mark is placed on.
+        EV_GHOUL2_MARK => EventOwners::Victim,
+        // `g_main.c:3101-3105,3205-3209`: the two duelists.
+        EV_GLOBAL_DUEL => EventOwners::VictimAndAttacker,
+        // `g_weapon.c:3811-3815`: the firing vehicle (`ent->s.number`).
+        EV_VEH_FIRE => EventOwners::SOwner,
+        // `w_saber.c:3508-3512,5571-5573,5652-5655` (victim + saber owner,
+        // the latter `ENTITYNUM_NONE` for thrown-saber damage) and
+        // `g_combat.c:3246-3248` (victim + `ENTITYNUM_NONE`).
+        EV_SABER_HIT => EventOwners::VictimAndAttacker,
+        // `WP_SaberDoClash` (`w_saber.c:3569-3573`) sets only
+        // `s.otherEntityNum2`, but the projectile-deflect paths
+        // (`g_missile.c:338,507,582`, `g_weapon.c:559`, `w_saber.c:5516,8317`)
+        // set neither field: there the untouched `0` is not client 0.
+        EV_SABER_BLOCK => EventOwners::OptionalAttacker,
+        // `g_weapon.c:757` (no target) and `:776-786` (target only when the
+        // shot hits a client): the beam itself is a world effect.
+        EV_DISRUPTOR_SNIPER_SHOT => EventOwners::OptionalVictim,
+        // `g_items.c:1405-1408`: `s.owner = ps.clientNum` (thrown-item timer).
+        EV_LOCALTIMER => EventOwners::SOwner,
+        // `g_mover.c:2370-2374`: `s.owner` is the exploding entity, a client
+        // only when the breakable belongs to one.
+        EV_DEBRIS => EventOwners::SOwner,
+        // `g_weapon.c:3165-3168`: `s.owner = ent->s.number` (the shooter).
+        EV_CONC_ALT_IMPACT => EventOwners::SOwner,
+        // `g_combat.c:2468-2472`: `s.otherEntityNum` = victim,
+        // `s.otherEntityNum2` = killer.
+        EV_OBITUARY => EventOwners::VictimAndAttacker,
+        // `w_force.c:2179-2181`: `s.owner = traceEnt->s.number` (the victim).
+        EV_FORCE_DRAINED => EventOwners::SOwner,
+        // `g_combat.c:419-424`: `s.otherEntityNum = ent->s.number` (the player
+        // the score plum belongs to); the bot-waypoint preview
+        // (`ai_wpnav.c:258,339`) sets none, but is a development broadcast.
+        EV_SCOREPLUM => EventOwners::Victim,
+        // `g_combat.c:5257-5259`: `s.otherEntityNum = targ->s.number` (the
+        // shielded victim); `s.otherEntityNum2` is never set.
+        EV_SHIELD_HIT => EventOwners::Victim,
+        // `g_client.c:1117-1119`: `s.owner = ent->s.number` (the player).
+        EV_SIEGESPEC => EventOwners::SOwner,
+        // Everything else: `EV_CLIENTJOIN`, `EV_GIVE_NEW_RANK`,
+        // `EV_SET_FREE_SABER`/`EV_SET_FORCE_DISABLE`, `EV_TEAM_POWER`,
+        // `EV_SCREENSHAKE`, `EV_PLAY_EFFECT*`, `EV_GLASS_SHATTER`,
+        // `EV_MISC_MODEL_EXP`, the weapon-impact events
+        // (`EV_MISSILE_MISS`, `EV_DISRUPTOR_*_MISS/_HIT`, ...), the
+        // `EV_SABER_CLASHFLARE` hit point, and the deliberate broadcasts
+        // already handled by `sound_attribution` are owner-less world events.
+        _ => EventOwners::World,
+    }
+}
+
 /// gentity slot of `ent` (`ent - g_entities` in `SIZEOF_GENTITY` steps), or
 /// `None` when the pointer is not a slot of the `g_entities` array.
 fn ent_num_of(g_entities: usize, ent: usize) -> Option<c_int> {
@@ -5042,6 +5137,40 @@ mod tests {
         assert!(!sound_visible(1, 2));
         assert!(!sound_visible(MAIN_MATCH, 1));
         assert!(sound_visible(MAIN_MATCH, MAIN_MATCH));
+    }
+
+    #[test]
+    fn event_owners_classifies_temp_events() {
+        use EventOwners::*;
+        // Reported bug: the shield shell names only `s.otherEntityNum`.
+        assert_eq!(event_owners(crate::sdk::EV_SHIELD_HIT), Victim);
+        // Both fields set by the creator.
+        assert_eq!(event_owners(crate::sdk::EV_OBITUARY), VictimAndAttacker);
+        assert_eq!(event_owners(crate::sdk::EV_SABER_HIT), VictimAndAttacker);
+        assert_eq!(event_owners(crate::sdk::EV_GLOBAL_DUEL), VictimAndAttacker);
+        // `s.owner`-tagged events.
+        assert_eq!(event_owners(crate::sdk::EV_FORCE_DRAINED), SOwner);
+        assert_eq!(event_owners(crate::sdk::EV_LOCALTIMER), SOwner);
+        assert_eq!(event_owners(crate::sdk::EV_DEBRIS), SOwner);
+        assert_eq!(event_owners(crate::sdk::EV_CONC_ALT_IMPACT), SOwner);
+        assert_eq!(event_owners(crate::sdk::EV_VEH_FIRE), SOwner);
+        assert_eq!(event_owners(crate::sdk::EV_SIEGESPEC), SOwner);
+        // Set only on some creator paths: a zero is "no owner".
+        assert_eq!(
+            event_owners(crate::sdk::EV_DISRUPTOR_SNIPER_SHOT),
+            OptionalVictim
+        );
+        assert_eq!(event_owners(crate::sdk::EV_SABER_BLOCK), OptionalAttacker);
+        // Owner-less effects and broadcasts.
+        for event in [
+            crate::sdk::EV_SABER_CLASHFLARE,
+            crate::sdk::EV_GLASS_SHATTER,
+            crate::sdk::EV_MISSILE_MISS,
+            crate::sdk::EV_DISRUPTOR_HIT,
+            0,
+        ] {
+            assert_eq!(event_owners(event), World, "event {event}");
+        }
     }
 
     #[test]

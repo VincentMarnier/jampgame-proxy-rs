@@ -875,17 +875,16 @@ fn snapshot_keep(
     // SAFETY: ent is inside the g_entities array; eType/owner fields are ints.
     let etype = unsafe { read_i32(ent + OFFSET_GENTITY_S_ETYPE) };
     // Temp event entities (`G_TempEntity`: `eType = ET_EVENTS + event`) carry
-    // no `r.ownerNum`/`s.owner` attribution (`G_InitGentity` sets
-    // `r.ownerNum = NONE`, `s.owner` stays 0 from the freelist `memset` — a
-    // bare 0 that coincides with client 0 and used to hide every same-match
-    // saber effect whenever client 0 was elsewhere). Sound and predicted
-    // player events are attributed first (their own sources, below); the rest
-    // only via `s.otherEntityNum*`, event-specifically:
-    // - `EV_SABER_BLOCK` (saber-vs-saber clash): only `otherEntityNum2`
-    //   (attacker) is set, `otherEntityNum` is the untouched 0 default.
-    // - `EV_SABER_CLASHFLARE`: neither is set (both default 0) — broadcast,
-    //   it marks the shared hit point and carries no victim/attacker.
-    // - everything else (hits, obituaries, missile marks): both fields.
+    // no `r.ownerNum` (`G_InitGentity` sets it to `NONE`), and only the
+    // `s.*` fields their creator assigns: the rest keep the freed slot's
+    // memset zero (`g_utils.c:1100`), a bare `0` that coincides with client 0.
+    // Which fields are meaningful is therefore event-specific
+    // (`tffa::event_owners`, source-derived from every `G_TempEntity` call
+    // site). Reading a field the event never sets as "client 0" dropped every
+    // such effect outside client 0's match — the reported "shield is not
+    // displayed when receiving damage, when not on main TFFA"
+    // (`EV_SHIELD_HIT` sets `s.otherEntityNum` only) and the same class for
+    // impact sparks, glass shards and projectile-deflect flashes.
     if etype >= crate::sdk::ET_EVENTS {
         let event = etype - crate::sdk::ET_EVENTS;
         // Predicted player events (`SendPendingPredictableEvents`,
@@ -921,21 +920,39 @@ fn snapshot_keep(
             }
             crate::tffa::SoundAttribution::None => {}
         }
-        if event == crate::sdk::EV_SABER_CLASHFLARE {
-            return true;
-        }
-        // SAFETY: ent is inside the g_entities array; owner fields are ints.
-        if event == crate::sdk::EV_SABER_BLOCK {
-            let o2 = unsafe { read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2) };
-            return owners_in_viewer_match(viewer_match, table, g_entities, &[o2]);
-        }
-        let owned = unsafe {
-            [
-                read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM),
-                read_i32(ent + OFFSET_GENTITY_S_OTHER_ENTITY_NUM2),
-            ]
+        // SAFETY: ent is inside the g_entities array; `s.*` fields are ints.
+        let field = |off: usize| unsafe { read_i32(ent + off) };
+        return match crate::tffa::event_owners(event) {
+            crate::tffa::EventOwners::World => true,
+            crate::tffa::EventOwners::Victim => {
+                let owned = [field(OFFSET_GENTITY_S_OTHER_ENTITY_NUM)];
+                owners_in_viewer_match(viewer_match, table, g_entities, &owned)
+            }
+            crate::tffa::EventOwners::OptionalVictim => {
+                let victim = field(OFFSET_GENTITY_S_OTHER_ENTITY_NUM);
+                // The creator leaves the field at 0 when it names no player
+                // (`EV_DISRUPTOR_SNIPER_SHOT` on a wall): a world effect.
+                victim == 0 || owners_in_viewer_match(viewer_match, table, g_entities, &[victim])
+            }
+            crate::tffa::EventOwners::OptionalAttacker => {
+                let attacker = field(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2);
+                // Projectile-deflect `EV_SABER_BLOCK`s set no attacker; the
+                // untouched 0 is not client 0.
+                attacker == 0
+                    || owners_in_viewer_match(viewer_match, table, g_entities, &[attacker])
+            }
+            crate::tffa::EventOwners::VictimAndAttacker => {
+                let owned = [
+                    field(OFFSET_GENTITY_S_OTHER_ENTITY_NUM),
+                    field(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2),
+                ];
+                owners_in_viewer_match(viewer_match, table, g_entities, &owned)
+            }
+            crate::tffa::EventOwners::SOwner => {
+                let owned = [field(OFFSET_GENTITY_S_OWNER)];
+                owners_in_viewer_match(viewer_match, table, g_entities, &owned)
+            }
         };
-        return owners_in_viewer_match(viewer_match, table, g_entities, &owned);
     }
     // Per-instance world entity (D-006 extension): a tagged door/trigger/button
     // clone is visible only inside its own instance; untagged (`ENTITY_SHARED`)
@@ -1308,6 +1325,204 @@ mod tests {
                 game.base(),
                 48
             ));
+        }
+    }
+
+    /// `EV_SHIELD_HIT` (`g_combat.c:5257-5259`) names its victim in
+    /// `s.otherEntityNum` only; `s.otherEntityNum2` keeps the untouched `0`
+    /// default. Reading that default as client 0 hid the shield shell from
+    /// every instance but main — the reported "shield is not displayed when
+    /// receiving damage, when not on main TFFA".
+    #[test]
+    fn shield_hit_follows_its_victim_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        game.with_entity(48, crate::sdk::ET_EVENTS + crate::sdk::EV_SHIELD_HIT);
+        // Victim in instance 1; the untouched oEN2 stays 0.
+        game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 5);
+        assert!(
+            snapshot_keep(1, &table, &sound_table(), &shared_table(), game.base(), 48),
+            "the shield shell must show in the victim's instance"
+        );
+        assert!(
+            !snapshot_keep(0, &table, &sound_table(), &shared_table(), game.base(), 48),
+            "the shield shell must stay hidden from main"
+        );
+        // Victim is client 0: 0 in the used field really is client 0.
+        game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 0);
+        assert!(snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+        assert!(!snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+    }
+
+    /// Owner-attributed events (`EV_OBITUARY`, `EV_SABER_HIT`) name both the
+    /// victim and the attacker/killer; the other instance must not see them.
+    #[test]
+    fn two_owner_temp_event_follows_both_matches() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        for event in [crate::sdk::EV_OBITUARY, crate::sdk::EV_SABER_HIT] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 5);
+            game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 5);
+            assert!(snapshot_keep(
+                1,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            assert!(!snapshot_keep(
+                0,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            // An attacker from main (mixed assignments are not expected, but
+            // the hide direction must be symmetric).
+            game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 5);
+            game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 0);
+            assert!(!snapshot_keep(
+                1,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+        }
+    }
+
+    /// `s.owner`-tagged temp events (`EV_FORCE_DRAINED`, `EV_LOCALTIMER`, ...)
+    /// follow the player in that field.
+    #[test]
+    fn s_owner_temp_event_follows_its_player_match() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        for event in [
+            crate::sdk::EV_FORCE_DRAINED,
+            crate::sdk::EV_LOCALTIMER,
+            crate::sdk::EV_CONC_ALT_IMPACT,
+        ] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            game.put_i32(48, OFFSET_GENTITY_S_OWNER, 5);
+            assert!(snapshot_keep(
+                1,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            assert!(!snapshot_keep(
+                0,
+                &table,
+                &sound_table(),
+                &shared_table(),
+                game.base(),
+                48
+            ));
+        }
+    }
+
+    /// Events whose owner field is set only on some paths must not read the
+    /// untouched `0` as client 0: a projectile-deflect `EV_SABER_BLOCK`
+    /// (`g_missile.c:338,507,582` — no attacker) and a sniper beam that hit a
+    /// wall (`g_weapon.c:776-786` — no victim) are world effects.
+    #[test]
+    fn optional_owner_temp_event_is_world_when_unset() {
+        let (game, table) = main_player_and_viewer();
+        let mut game = game;
+        for event in [
+            crate::sdk::EV_SABER_BLOCK,
+            crate::sdk::EV_DISRUPTOR_SNIPER_SHOT,
+        ] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            for viewer_match in [0, 1, 2] {
+                assert!(
+                    snapshot_keep(
+                        viewer_match,
+                        &table,
+                        &sound_table(),
+                        &shared_table(),
+                        game.base(),
+                        48
+                    ),
+                    "event {event} with no owner must stay visible everywhere"
+                );
+            }
+        }
+        // When the optional field does name a player, it is attributed again.
+        let mut table = table;
+        game.with_player(5);
+        table[5] = 1;
+        game.with_entity(48, crate::sdk::ET_EVENTS + crate::sdk::EV_SABER_BLOCK);
+        game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 5);
+        assert!(snapshot_keep(
+            1,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+        assert!(!snapshot_keep(
+            0,
+            &table,
+            &sound_table(),
+            &shared_table(),
+            game.base(),
+            48
+        ));
+    }
+
+    /// Owner-less positional effects stay in every instance. Before the
+    /// event-specific classification the filter read both `s.otherEntityNum*`
+    /// for them, and their bare `0` defaults dropped them outside client 0's
+    /// match (weapon impact sparks, glass shards, the saber clash flare).
+    #[test]
+    fn ownerless_temp_effect_stays_visible_in_every_instance() {
+        let (game, table) = main_player_and_viewer();
+        let mut game = game;
+        for event in [
+            crate::sdk::EV_SABER_CLASHFLARE,
+            crate::sdk::EV_GLASS_SHATTER,
+            crate::sdk::EV_MISSILE_MISS,
+            crate::sdk::EV_DISRUPTOR_HIT,
+        ] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            for viewer_match in [0, 1, 2] {
+                assert!(
+                    snapshot_keep(
+                        viewer_match,
+                        &table,
+                        &sound_table(),
+                        &shared_table(),
+                        game.base(),
+                        48
+                    ),
+                    "event {event} carries no owner and must stay visible"
+                );
+            }
         }
     }
 

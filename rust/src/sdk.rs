@@ -394,10 +394,24 @@ pub const CONTENTS_TRIGGER: i32 = 0x0000_0400;
 pub const CONTENTS_SOLID: i32 = 0x0000_0001;
 
 /// Event numbers (`bg_public.h` `entity_event_t`, oracle-counted 2026-09-15;
-/// the sound set re-counted 2026-10-18 and cross-checked against these pins).
+/// the sound set re-counted 2026-10-18 and the owner-attributed set re-counted
+/// 2026-11-01, all cross-checked against these pins).
+pub const EV_GHOUL2_MARK: i32 = 13;
+pub const EV_GLOBAL_DUEL: i32 = 14;
+pub const EV_VEH_FIRE: i32 = 24;
 pub const EV_SABER_HIT: i32 = 30;
 pub const EV_SABER_BLOCK: i32 = 31;
 pub const EV_SABER_CLASHFLARE: i32 = 32;
+/// `EV_DISRUPTOR_SNIPER_SHOT` (`g_weapon.c:757,776`): the sniper beam trail.
+/// Its `s.otherEntityNum` is the victim only when the shot hits a client
+/// (`g_weapon.c:786`), so a zero there means "no target", not client 0.
+pub const EV_DISRUPTOR_SNIPER_SHOT: i32 = 36;
+/// `EV_DISRUPTOR_HIT` (`g_weapon.c:602,812,862`): a beam impact spark with no
+/// owner field.
+pub const EV_DISRUPTOR_HIT: i32 = 38;
+/// `EV_LOCALTIMER` (`g_items.c:1405-1408`): the thrown-item timer HUD, tagged
+/// with `s.owner = ps.clientNum`.
+pub const EV_LOCALTIMER: i32 = 43;
 /// `G_PreDefSound`'s event (`w_force.c:40-49`: force jump, protect and absorb
 /// sounds). Built by `G_TempEntity`, so it carries no owner of its own; the
 /// proxy stamps it with the acting scope's instance (see `tffa`).
@@ -417,7 +431,33 @@ pub const EV_GENERAL_SOUND: i32 = 76;
 pub const EV_GLOBAL_SOUND: i32 = 77;
 pub const EV_GLOBAL_TEAM_SOUND: i32 = 78;
 pub const EV_ENTITY_SOUND: i32 = 79;
+/// `EV_GLASS_SHATTER` (`g_mover.c:2883,2904`): breakable glass shards, no
+/// owner field (the broken mover rides `s.genericenemyindex`, not an owner).
+pub const EV_GLASS_SHATTER: i32 = 81;
+/// `EV_DEBRIS` (`g_mover.c:2370-2374`): breakable/missile chunks,
+/// `s.owner = owner` (the exploding entity's number).
+pub const EV_DEBRIS: i32 = 82;
+/// `EV_CONC_ALT_IMPACT` (`g_weapon.c:3165-3168`): concussion-rifle impact,
+/// `s.owner = ent->s.number` (the shooter).
+pub const EV_CONC_ALT_IMPACT: i32 = 84;
+/// `EV_MISSILE_MISS` (`g_weapon.c:789,2693`: impact mark, no owner field on
+/// the temp entity — the detpack path tags `r.ownerNum`, which is not a
+/// player slot).
+pub const EV_MISSILE_MISS: i32 = 86;
 pub const EV_OBITUARY: i32 = 93;
+/// `EV_FORCE_DRAINED` (`w_force.c:2179-2181`): drain hit feedback,
+/// `s.owner = traceEnt->s.number` (the victim).
+pub const EV_FORCE_DRAINED: i32 = 96;
+/// `EV_SCOREPLUM` (`g_combat.c:419-424`): the score plum,
+/// `s.otherEntityNum = ent->s.number` (the player it belongs to).
+pub const EV_SCOREPLUM: i32 = 98;
+/// `EV_SHIELD_HIT` (`g_combat.c:5257-5259`): the shield shell flash when a
+/// shielded player absorbs damage, `s.otherEntityNum = targ->s.number` (the
+/// victim). `s.otherEntityNum2` is never set by the creator.
+pub const EV_SHIELD_HIT: i32 = 110;
+/// `EV_SIEGESPEC` (`g_client.c:1117-1119`): siege spectator HUD,
+/// `s.owner = ent->s.number` (the player).
+pub const EV_SIEGESPEC: i32 = 191;
 
 /// `EF_PLAYER_EVENT` (`bg_public.h:570`, `1<<5`): the temp entity carries a
 /// predicted player event (`SendPendingPredictableEvents`, `g_active.c:1058`),
@@ -919,11 +959,17 @@ mod tests {
         // numbers were re-counted 2026-10-18 and cross-checked against the
         // oracle-counted 2026-09-15 pins below.
         assert_eq!(ET_EVENTS, 18);
+        assert_eq!(EV_GHOUL2_MARK, 13);
+        assert_eq!(EV_GLOBAL_DUEL, 14);
+        assert_eq!(EV_VEH_FIRE, 24);
         assert_eq!(EV_SABER_HIT, 30);
         assert_eq!(EV_SABER_BLOCK, 31);
         assert_eq!(EV_SABER_CLASHFLARE, 32);
+        assert_eq!(EV_DISRUPTOR_SNIPER_SHOT, 36);
+        assert_eq!(EV_DISRUPTOR_HIT, 38);
         // `G_PreDefSound` (`w_force.c:44`): the force-jump/protect/absorb event.
         assert_eq!(EV_PREDEFSOUND, 40);
+        assert_eq!(EV_LOCALTIMER, 43);
         // Respawning/teleporting players (`sound/player/telein.wav`).
         assert_eq!(EV_PLAYER_TELEPORT_IN, 64);
         assert_eq!(EV_PLAYER_TELEPORT_OUT, 65);
@@ -932,7 +978,15 @@ mod tests {
         assert_eq!(EV_GLOBAL_SOUND, 77);
         assert_eq!(EV_GLOBAL_TEAM_SOUND, 78);
         assert_eq!(EV_ENTITY_SOUND, 79);
+        assert_eq!(EV_GLASS_SHATTER, 81);
+        assert_eq!(EV_DEBRIS, 82);
+        assert_eq!(EV_CONC_ALT_IMPACT, 84);
+        assert_eq!(EV_MISSILE_MISS, 86);
         assert_eq!(EV_OBITUARY, 93);
+        assert_eq!(EV_FORCE_DRAINED, 96);
+        assert_eq!(EV_SCOREPLUM, 98);
+        assert_eq!(EV_SHIELD_HIT, 110);
+        assert_eq!(EV_SIEGESPEC, 191);
         assert_eq!(EF_PLAYER_EVENT, 0x20);
     }
 }

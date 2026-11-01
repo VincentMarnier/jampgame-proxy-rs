@@ -20,8 +20,9 @@
   agrees.
 - `0006-parallel-tffa.md` — parallel TFFA matches: per-match score copies,
   per-viewer `scores`/`cs` rewrites, physics isolation via trace
-  interception, per-match team chat, per-instance world entities and
-  per-match spawn-point occupancy.
+  interception, per-match team chat, per-instance world entities, per-match
+  spawn-point occupancy and per-event snapshot attribution (sounds, shields,
+  obituaries, effects).
 - `0007-map-change-module-pinning.md` — map-change crash: rcon commands run
   inside our `SVC_RemoteCommand` wrapper, the engine `dlclose`s the proxy
   mid-call, and the stale return faults. Fix: pin the module for the process

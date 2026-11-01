@@ -1331,7 +1331,8 @@ already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
   the `EF_PLAYER_EVENT` set legitimately carry `0` for client 0, so a
   follow-up needs the event-specific classification the sound round used
   (the `EF_PLAYER_EVENT` / saber special cases above are exactly that).
-  `EV_PLAYER_TELEPORT_IN` was fixed that way in the next round (below).
+  `EV_PLAYER_TELEPORT_IN` was fixed that way in the next round (below), and
+  the rest of the temp branch in the 2026-11-01 round further below.
 - **Respawn/teleport sound isolation (2026-10-27, live report: "we can hear
   other TFFA instances' respawns"):** the respawn sound is
   `EV_PLAYER_TELEPORT_IN`, a `G_TempEntity` built by `respawn()`
@@ -1363,6 +1364,48 @@ already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
   `EV_GLOBAL_SOUND`, or `EV_GENERAL_SOUND` when the item sets `speed`, both
   built by plain `G_TempEntity` at the item's origin and therefore stamped
   world/broadcast) still plays in every instance.
+- **Temp-event owner classification (2026-11-01, live report: "the shield is
+  not displayed when receiving damage, when not on main TFFA — might be the
+  case of other graphics/particles"):** `EV_SHIELD_HIT` is the shield shell
+  flash the client draws around the shielded player (`cg_event.c:3481-3483` →
+  `CG_PlayerShieldHit`/`CG_DrawPlayerShield`, `cg_players.c:5033-5125`). Its
+  creator (`g_combat.c:5257-5259`) sets only `s.otherEntityNum = targ->s.number`;
+  `s.otherEntityNum2` keeps the freed slot's memset zero. The temp-event
+  fallback read both fields, so the `0` resolved to client 0, and every
+  viewer whose match was not client 0's (i.e. every non-main instance) dropped
+  the event: the shield showed in main only. The same field coincidence hid
+  the whole owner-less temp-event class outside main — weapon impact sparks
+  (`EV_MISSILE_MISS`, `EV_DISRUPTOR_*`), glass shards (`EV_GLASS_SHATTER`),
+  model debris (`EV_MISC_MODEL_EXP`), the saber clash flare, the sniper beam
+  on a wall, and projectile-deflect `EV_SABER_BLOCK`s (`g_missile.c:338,507,582`
+  set no `s.otherEntityNum2`) — the "other graphics/particles" of the report.
+  `tffa::event_owners` now classifies the events the game actually builds as
+  temp entities from their `G_TempEntity` call sites (`bg_public.h`
+  `entity_event_t` values pinned in `sdk`): `Victim` (`s.otherEntityNum`
+  always set, `EV_SHIELD_HIT`, `EV_GHOUL2_MARK`, `EV_SCOREPLUM`),
+  `VictimAndAttacker` (`EV_OBITUARY`, `EV_SABER_HIT`, `EV_GLOBAL_DUEL`),
+  `SOwner` (`EV_LOCALTIMER`, `EV_FORCE_DRAINED`, `EV_DEBRIS`,
+  `EV_CONC_ALT_IMPACT`, `EV_VEH_FIRE`, `EV_SIEGESPEC`), `OptionalVictim`
+  (`EV_DISRUPTOR_SNIPER_SHOT`: the field is set only when the shot hits a
+  client) and `OptionalAttacker` (`EV_SABER_BLOCK`: only some clash paths set
+  it); every other event is `World` and stays visible to every viewer (PVS
+  still culls it by position). Optional fields treat a bare `0` as "unset, no
+  owner" instead of client 0. Cost accepted, in line with the earlier
+  world-entity round: an optional field that genuinely names client 0 (a
+  client-0 sniper beam target, or the client-0 side of a clash) is broadcast
+  rather than match-scoped.
+  Verification: `cargo test` 191/191 (6 new: `event_owners` classification and
+  five `snapshot_keep` fixtures over a fabricated `g_entities` buffer);
+  `clippy -D warnings` clean; `fmt --check` clean; i686 release build. Four of
+  the five snapshot fixtures (shield, owner-less, optional-owner, `s.owner`)
+  fail on the pre-fix predicate when it is restored, and pass with the
+  classification; the fifth (two-owner obituary/saber hit) pins the unchanged
+  behaviour. Engine smoke (proxy overlay, `proxy_tffa_enable 1`,
+  `bot_minplayers 4`, `mp/duel1`, ~50 s): all 37 detours attached, bots
+  connect/enter/fight/die, server keeps answering, no crash or error line.
+  A live two-instance visual check (shield shell flashing for an instance
+  player) is still pending: bots never create split instances, and the proxy
+  has no debug command to force one.
 - Known limitations (documented, not fixed here): force
   grip/push and force-heal target selection are not trace-based and may
   still cross matches (the S9 box gate now keeps foreign players out of the
