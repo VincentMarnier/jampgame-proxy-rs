@@ -41,6 +41,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
+| `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -82,6 +83,31 @@ so mixed rosters work: updated clients see K/D, older ones keep a correct
 scoreboard instead of having the whole roster collapse onto one team. The
 `taystJKinfo 128` server info key stays advertised because that is what tells a
 capable cgame to parse the 15-int layout; cgames without support ignore it.
+
+### Spectator team overlay
+
+With `proxy_sv_spectatorTeamOverlay 1` (the default), a spectator who is
+following a player receives the same team information the players themselves
+get: name, health, armor, weapon and powerups for the followed player's team,
+refreshed once per second. That is what makes
+[TaystJK](https://github.com/taysta/TaystJK)'s `cg_drawTeamOverlay` (including
+the bar styles 5/6) show live HP while spectating; the stock game module only
+sends this data to teammates, so a spectator's overlay stays empty or keeps
+stale values.
+
+It is the stock `tinfo` message in its usual format, so it works with the
+latest TaystJK cgame as shipped and with unmodified clients — nothing has to be
+installed client-side. Two limits are worth knowing:
+
+- the overlay is drawn while the spectator **follows a player** (the point of
+  view the cgame uses comes from that player); in free-fly spectating the
+  client hides it, which cannot be changed from the server;
+- when the spectator switches to a player on the other team, that team's
+  roster arrives immediately; otherwise it refreshes once per second, exactly
+  like a teammate's overlay.
+
+`proxy_sv_spectatorTeamOverlay 0` stops the feed; only the master switch
+`proxy_sv_enable` and team gametypes are needed on top of it.
 
 ### Net status
 

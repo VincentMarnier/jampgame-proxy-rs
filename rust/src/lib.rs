@@ -43,6 +43,7 @@ mod shared_api;
 mod state;
 mod syscall;
 mod teamlock;
+mod teamoverlay;
 mod tffa;
 mod utils;
 
@@ -136,6 +137,9 @@ pub unsafe extern "C" fn vmMain(
             let response = forward(GAME_RUN_FRAME, &args);
             if state::proxy_enabled() {
                 tffa::on_run_frame_post();
+                // The pristine game only sends the team overlay's `tinfo`
+                // roster to teammates; give it to following spectators too.
+                teamoverlay::on_run_frame_post();
             }
             response
         }
@@ -156,6 +160,7 @@ pub unsafe extern "C" fn vmMain(
             // unknown client — the TAB `score` request and `netStatus`
             // included, silently (empty scoreboard, no netStatus output).
             shared_api::client_disconnect(a0);
+            teamoverlay::on_client_disconnect(a0);
             if state::proxy_enabled() {
                 tffa::on_client_disconnect(a0);
             }

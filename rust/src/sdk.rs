@@ -64,6 +64,12 @@ pub const TEAM_BLUE: i32 = 2;
 pub const TEAM_SPECTATOR: i32 = 3;
 pub const TEAM_NUM_TEAMS: i32 = 4;
 
+/// `TEAM_MAXOVERLAY` (`bg_public.h:1031`): the stock `tinfo` parser's array
+/// size in every cgame (`sortedTeamPlayers[TEAM_MAXOVERLAY]`). A `tinfo` count
+/// above this overflows a stock cgame's array (its parser has no bounds check)
+/// and makes a TaystJK cgame drop the client (`trap_Error`).
+pub const TEAM_MAXOVERLAY: usize = 32;
+
 // gametype_t (bg_public.h:183-198): the team modes the proxy features apply to.
 pub const GT_TEAM: i32 = 6;
 pub const GT_CTF: i32 = 8;
@@ -583,6 +589,9 @@ pub const OFFSET_SHARED_ENTITY_S: usize = 0;
 pub const OFFSET_ENTITY_NUMBER: usize = 0;
 /// `offsetof(entityState_t, clientNum)`.
 pub const OFFSET_ENTITY_CLIENT_NUM: usize = 232;
+/// `offsetof(entityState_t, powerups)` — the `tinfo` powerup bitmask the game
+/// sends as `player->s.powerups` (`g_team.c:TeamplayInfoMessage`).
+pub const OFFSET_ENTITY_POWERUPS: usize = 292;
 
 /// `offsetof(playerState_t, stats)` — `int[MAX_STATS]` (STAT_HEALTH/STAT_ARMOR).
 pub const OFFSET_PS_STATS: usize = 244;
@@ -590,6 +599,9 @@ pub const OFFSET_PS_STATS: usize = 244;
 pub const OFFSET_PS_PERSISTANT: usize = 308;
 /// `offsetof(playerState_t, clientNum)`.
 pub const OFFSET_PS_CLIENT_NUM: usize = 172;
+/// `offsetof(playerState_t, weapon)` — the `tinfo` weapon field the game sends
+/// as `player->client->ps.weapon` (`g_team.c:TeamplayInfoMessage`).
+pub const OFFSET_PS_WEAPON: usize = 176;
 
 /// `offsetof(gclient_t, ps)` — playerState_t.
 pub const OFFSET_GCLIENT_PS: usize = 0;
@@ -601,6 +613,13 @@ pub const OFFSET_PERS_CMD: usize = 4;
 /// `offsetof(clientPersistant_t, connected)` — `clientConnected_t` (first
 /// field, `g_local.h:441`); `TeamCount` skips `CON_DISCONNECTED` clients.
 pub const OFFSET_PERS_CONNECTED: usize = 0;
+/// `offsetof(clientPersistant_t, teamState.location)` — the `CS_LOCATIONS`
+/// index the team overlay shows (`g_local.h:playerTeamState_t`).
+pub const OFFSET_PERS_TEAM_STATE_LOCATION: usize = 100;
+/// `offsetof(clientPersistant_t, teamInfo)` — `qboolean`, "send team overlay
+/// updates?" (`g_local.h:454`), set from the `teamoverlay` userinfo key by
+/// `ClientUserinfoChanged` (forced on in team gametypes, `g_client.c:2160`).
+pub const OFFSET_PERS_TEAM_INFO: usize = 152;
 
 /// `offsetof(clientSession_t, sessionTeam)` — team_t.
 pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
@@ -638,6 +657,12 @@ pub const OFFSET_LEVEL_TEAM_SCORES: usize = 44;
 pub const OFFSET_LEVEL_TEAM_SCORES_RED: usize = 48;
 /// `offsetof(level_locals_t, teamScores[TEAM_BLUE])`.
 pub const OFFSET_LEVEL_TEAM_SCORES_BLUE: usize = 52;
+/// `offsetof(level_locals_t, follow1)` / `follow2` — the two auto-follow
+/// spectator targets (`g_main.c:CalculateRanks`). A spectator whose
+/// `sess.spectatorClient` is `-1`/`-2` follows these instead
+/// (`g_active.c:SpectatorClientEndFrame`).
+pub const OFFSET_LEVEL_FOLLOW1: usize = 212;
+pub const OFFSET_LEVEL_FOLLOW2: usize = 216;
 
 /// `offsetof(msg_t, data)` — the message bytes (`SV_ExecuteClientMessage` peek).
 pub const OFFSET_MSG_DATA: usize = 12;
@@ -837,6 +862,11 @@ mod tests {
         assert_eq!(OFFSET_GCLIENT_SESS, 1708);
         assert_eq!(OFFSET_PERS_CMD, 4);
         assert_eq!(OFFSET_PERS_NETNAME, 48);
+        assert_eq!(OFFSET_PERS_TEAM_STATE_LOCATION, 100);
+        assert_eq!(OFFSET_PERS_TEAM_INFO, 152);
+        assert_eq!(OFFSET_PS_WEAPON, 176);
+        assert_eq!(OFFSET_ENTITY_POWERUPS, 292);
+        assert_eq!(TEAM_MAXOVERLAY, 32);
         assert_eq!(OFFSET_SESS_SESSION_TEAM, 0);
         assert_eq!(OFFSET_LEVEL_TIME, 32);
         assert_eq!(OFFSET_LEVEL_FRAMENUM, 28);
@@ -845,6 +875,8 @@ mod tests {
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES, 44);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_RED, 48);
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_BLUE, 52);
+        assert_eq!(OFFSET_LEVEL_FOLLOW1, 212);
+        assert_eq!(OFFSET_LEVEL_FOLLOW2, 216);
         assert_eq!(OFFSET_GENTITY_S_ETYPE, 4);
         assert_eq!(OFFSET_GENTITY_S_EFLAGS, 8);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);

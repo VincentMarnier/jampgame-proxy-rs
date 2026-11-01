@@ -49,3 +49,9 @@
   prefix, colour codes ignored), per-slot flag cleared on disconnect and carried
   across `map_restart`, enforced by dropping `say`/`say_team`/`tell`/`voice_cmd`
   in `GAME_CLIENT_COMMAND`.
+- `0012-spectator-team-overlay.md` — spectator team overlay feed: the pristine
+  game only sends `tinfo` (the roster `cg_drawTeamOverlay`/`CG_TEAMINFO` draw
+  from) to teammates, so the proxy sends the stock six-int roster for the
+  followed player's team to a following spectator once per second
+  (`proxy_sv_spectatorTeamOverlay`, default on); team-scoped and
+  parallel-TFFA-instance-scoped, stock-cgame compatible by construction.

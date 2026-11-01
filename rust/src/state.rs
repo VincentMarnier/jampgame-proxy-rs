@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 13] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 14] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -33,6 +33,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 13] = [
     (c"proxy_tffa_enable", c"0"),
     (c"proxy_tffa_maxMatches", c"8"),
     (c"proxy_tffa_maxGroupSize", c"12"),
+    (c"proxy_sv_spectatorTeamOverlay", c"1"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -56,6 +57,10 @@ pub const CVAR_TFFA_ENABLE: usize = 10;
 pub const CVAR_TFFA_MAX_MATCHES: usize = 11;
 /// Maximum players per match (both teams combined).
 pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 12;
+/// Spectator team overlay (`crate::teamoverlay`): while on, a spectator
+/// following a player receives the stock `tinfo` roster (HP/armor/powerups) for
+/// the followed player's team, which the pristine game only sends to teammates.
+pub const CVAR_SPECTATOR_TEAM_OVERLAY: usize = 13;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -622,6 +627,13 @@ pub struct ProxyState {
     /// The `timelimit`/`fraglimit`/`capturelimit` captured before the proxy
     /// first overrode them, restored when the roster falls below every rule.
     pub base_limits: Option<crate::rules::BaseLimits>,
+    /// `level.time` of the last periodic spectator team-overlay send
+    /// (`crate::teamoverlay`).
+    pub spec_overlay_last_time: i32,
+    /// Per viewer, the `(team, match)` scope last announced to its cgame
+    /// (`0` = none): a follow change resends the roster immediately instead of
+    /// waiting for the next periodic tick.
+    pub spec_overlay_scope: [i32; MAX_CLIENTS],
     pub tffa: TffaState,
 }
 
@@ -750,6 +762,8 @@ impl ProxyState {
             team_lock: TeamLock::default(),
             last_team_rule: None,
             base_limits: None,
+            spec_overlay_last_time: 0,
+            spec_overlay_scope: [0; MAX_CLIENTS],
             tffa: TffaState::default(),
         }
     }
@@ -818,6 +832,7 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_TFFA_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_MATCHES].1.to_bytes(), b"8");
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_GROUP_SIZE].1.to_bytes(), b"12");
+        assert_eq!(PROXY_CVARS[CVAR_SPECTATOR_TEAM_OVERLAY].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
