@@ -190,14 +190,19 @@ pub unsafe extern "C" fn vmMain(
             response
         }
         GAME_CLIENT_COMMAND => {
+            let mut shadow_mute = None;
             if state::proxy_enabled() {
                 if tffa::handle_client_command(a0) {
                     return 0;
                 }
-                // A muted player's chat/voice never reaches the game's own
-                // `ClientCommand`; everything else they send still does.
-                if mute::handle_client_command(a0) {
-                    return 0;
+                // A muted player's chat/voice is either kept from the game's
+                // own `ClientCommand` (stock mute) or, in silent mode, the text
+                // commands are forwarded in a shadow scope so only the speaker
+                // sees their line. Everything else they send is unaffected.
+                match mute::handle_client_command(a0) {
+                    mute::ClientCommandOutcome::Drop => return 0,
+                    mute::ClientCommandOutcome::Shadow => shadow_mute = Some(a0),
+                    mute::ClientCommandOutcome::Forward => {}
                 }
                 if !shared_api::client_command(a0) {
                     return 0;
@@ -212,7 +217,11 @@ pub unsafe extern "C" fn vmMain(
             } else {
                 None
             };
+            let previous_shadow = shadow_mute.map(mute::begin_shadow_scope);
             let response = forward(command, &args);
+            if let Some(previous) = previous_shadow {
+                mute::end_shadow_scope(previous);
+            }
             if let Some(previous) = scope {
                 tffa::close_acting_scope(previous);
             }

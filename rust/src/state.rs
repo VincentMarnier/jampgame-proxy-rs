@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 14] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 15] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -34,6 +34,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 14] = [
     (c"proxy_tffa_maxMatches", c"8"),
     (c"proxy_tffa_maxGroupSize", c"12"),
     (c"proxy_sv_spectatorTeamOverlay", c"1"),
+    (c"proxy_sv_muteMode", c"1"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -61,6 +62,10 @@ pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 12;
 /// following a player receives the stock `tinfo` roster (HP/armor/powerups) for
 /// the followed player's team, which the pristine game only sends to teammates.
 pub const CVAR_SPECTATOR_TEAM_OVERLAY: usize = 13;
+/// `mute`/`unmute` behaviour (D-011, `crate::mute`): `0` off, `1` the stock
+/// mute (chat dropped and the player told), `2` silent (the player's own chat
+/// line is echoed back to them, nobody else receives it, no notice is sent).
+pub const CVAR_MUTE_MODE: usize = 14;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -564,10 +569,10 @@ pub struct ClientEntry {
     pub is_connected: bool,
     pub clean_name: [u8; MAX_NETNAME],
     /// Admin mute (D-011): the client's `say`/`say_team`/`tell`/`voice_cmd`
-    /// commands are dropped instead of being forwarded to the game. Set and
-    /// cleared by the `mute`/`unmute` console commands, and dropped with the
-    /// rest of the entry when the client disconnects (the slot belongs to the
-    /// next player after that).
+    /// commands are dropped (or, with `proxy_sv_muteMode 2`, shadowed) instead
+    /// of reaching the other players. Set and cleared by the `mute`/`unmute`
+    /// console commands, and dropped with the rest of the entry when the client
+    /// disconnects (the slot belongs to the next player after that).
     pub muted: bool,
     /// netStatus estimator state (D-007): per-packet window, fps/pps ring
     /// semantics and the reset rules.
@@ -833,6 +838,7 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_MATCHES].1.to_bytes(), b"8");
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_GROUP_SIZE].1.to_bytes(), b"12");
         assert_eq!(PROXY_CVARS[CVAR_SPECTATOR_TEAM_OVERLAY].1.to_bytes(), b"1");
+        assert_eq!(PROXY_CVARS[CVAR_MUTE_MODE].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

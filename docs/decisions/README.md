@@ -48,7 +48,8 @@
   at `GAME_CONSOLE_COMMAND`, target by client number or name (exact, then unique
   prefix, colour codes ignored), per-slot flag cleared on disconnect and carried
   across `map_restart`, enforced by dropping `say`/`say_team`/`tell`/`voice_cmd`
-  in `GAME_CLIENT_COMMAND`.
+  in `GAME_CLIENT_COMMAND`; `proxy_sv_muteMode` selects off / stock (drop + tell)
+  / silent (the speaker sees their own line, nobody else receives it, no notice).
 - `0012-spectator-team-overlay.md` — spectator team overlay feed: the pristine
   game only sends `tinfo` (the roster `cg_drawTeamOverlay`/`CG_TEAMINFO` draw
   from) to teammates, so the proxy sends the stock six-int roster for the

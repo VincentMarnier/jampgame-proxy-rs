@@ -1,6 +1,6 @@
-# 0011 — Admin `mute` / `unmute` console commands
+# 0011 — Admin `mute` / `unmute` console commands and `proxy_sv_muteMode`
 
-Date: 2026-10-27
+Date: 2026-10-27 (mode cvar added 2026-11-02)
 
 ## Context
 
@@ -11,6 +11,11 @@ mute has to drop those commands before the game sees them. The admin command mus
 be usable both over `rcon` and from the dedicated server's own console, and must
 accept the player number the scoreboard/`status` shows as well as the player's
 name.
+
+Some servers also want a *silent* mute: the player keeps chatting and sees
+their own lines normally, so they cannot tell they are muted, while nobody else
+receives them. The same command therefore has three modes, selected by
+`proxy_sv_muteMode` (D-011).
 
 ## Evidence
 
@@ -44,6 +49,18 @@ Paths are relative to the source trees named by `AGENTS.md`.
   (3113) (`original/jedi-academy-sdk/codemp/game/g_cmds.c:3080-3120`). The engine
   delivers them to the module as `GAME_CLIENT_COMMAND` (`sv_client.cpp`,
   `SV_ClientCommand`).
+- `G_Say` sends a `say`/`say_team` line to every appropriate client, **the
+  speaker included** (`g_cmds.c:1573-1595`); that echo is what makes the line
+  appear in the speaker's own chat. `G_SayTo` delivers it as `chat`/`lchat`
+  (global) or `tchat`/`ltchat` (team) through `trap_SendServerCommand`
+  (`g_cmds.c:1511-1522`). A `tell` goes to its target and then a second
+  `G_Say(ent, ent, …)` echoes it to the sender.
+- The proxy already intercepts `G_SEND_SERVER_COMMAND` (`rust/src/syscall.rs`,
+  the same arm that isolates parallel-TFFA team chat), so it can drop a chat
+  line per recipient while leaving the speaker's own echo alone. `voice_cmd`
+  instead spawns a broadcast `EV_VOICECMD_SOUND` temp entity
+  (`g_cmds.c:1688-1719`), not a server command: there is no line to show its
+  author, so a silent mute still drops the command.
 - A game module answers the admin with `trap_Print` (`G_PRINT`,
   `g_public.h:105`); the engine routes it to `Com_Printf`
   (`sv_game.cpp:515-517`), which an open rcon redirect captures and returns to
@@ -106,11 +123,44 @@ Paths are relative to the source trees named by `AGENTS.md`.
 7. The feature follows the master switch: while `proxy_sv_enable` is `0` the
    command is not claimed (the pristine dedicated server answers `server: mute …`)
    and chat is not filtered.
+8. `proxy_sv_muteMode` (default `1`) selects the behaviour:
+   - `0` — off: `mute`/`unmute` are still claimed so the pristine module does
+     not broadcast `server: mute …`, but they only answer
+     `proxy: mute is disabled (proxy_sv_muteMode 0).`; no chat is filtered and
+     no notice is sent. Flags already set are left dormant and take effect
+     again when the mode returns to `1`/`2`.
+   - `1` — the stock mute described in item 6.
+   - `2` — silent: the three text commands (`say`, `say_team`, `tell`) are
+     forwarded to the game under a *shadow scope* (the speaking client number,
+     held in `mute::SHADOW_CLIENT` for the duration of that synchronous
+     `GAME_CLIENT_COMMAND` forward). The game builds and sends its normal chat
+     line, and the `G_SEND_SERVER_COMMAND` trap drops every `chat`/`tchat`/
+     `lchat`/`ltchat` recipient except the speaker — the speaker sees their own
+     line, nobody else does. No mute, unmute or per-message notice is sent, so
+     the mute is invisible. `voice_cmd` is dropped without a word (it has no
+     chat line to echo). Values outside `0..=2` behave like `1`.
 
 ## Consequences and limits
 
-- Replies appear in the rcon reply buffer (and on the dedicated console). Other
-  players are not told about a mute; only the muted player is.
+- Replies appear in the rcon reply buffer (and on the dedicated console). In
+  mode `1` other players are not told about a mute; only the muted player is.
+  In mode `2` nobody — the muted player included — is told.
+- In silent mode the game's own `G_Say` still logs `say:`/`sayteam:`/`tell:` to
+  the server log and the dedicated console echoes the global line
+  (`g_dedicated`), so the admin keeps a moderation trail; the line is only kept
+  from the other *clients*.
+- Silent mode goes through the game, so anything the game derives from the
+  message before delivery — location prefixes, team colouring, the game log —
+  is preserved for the speaker's own echo, unlike mode `1` which never lets the
+  command reach the game.
+- A `voice_cmd` in silent mode is dropped before the game, so the speaking
+  player hears/sees nothing from it — the same as being ignored, and the absence
+  of the expected voice line could still hint at a mute. Text chat has no such
+  tell.
+- While a shadow scope is open only that client's chat delivery is narrowed.
+  `G_Say` addresses each recipient individually, so a broadcast chat (`-1`) is
+  dropped as well; the stock code never broadcasts chat, and a mod that did
+  would lose its author's echo rather than leak to everyone.
 - Client numbers are slots, so they change as players come and go — the `mute`
   list always shows the current number and name.
 - A player whose name is a plain number cannot be targeted by name (the word is
@@ -139,13 +189,19 @@ Paths are relative to the source trees named by `AGENTS.md`.
 
 ## Verification
 
-- `cargo test` — 14 new tests in `mute` plus one in `state`: chat-command
-  recognition (exact names, case, prefixes rejected), numeric/name/colour-code/
-  prefix/substring/ambiguity/empty-name resolution, the exact→prefix→substring
-  precedence, the ambiguity reply cap, disconnected slots not being players, the
-  mute flag write (including a bot-style slot the mirror never saw), the reply
-  lines (`plan`/`decide`), `mute_direction`, the usage/muted-list text, and the
-  `state` restart carry / map-change reset.
+- `cargo test` — the `mute` tests cover: chat-command recognition (exact names,
+  case, prefixes rejected), numeric/name/colour-code/prefix/substring/
+  ambiguity/empty-name resolution, the exact→prefix→substring precedence, the
+  ambiguity reply cap, disconnected slots not being players, the mute flag write
+  (including a bot-style slot the mirror never saw), the reply lines
+  (`plan`/`decide`), `mute_direction`, the usage/muted-list text, the mode
+  mapping (`0`/`1`/`2`, unknown values → `1`), the per-mode command decision
+  (stock drop-with-notice, silent text shadow / silent voice drop, off
+  forwards everything), notice suppression in silent/off mode, the shadow-chat
+  predicate (speaker kept, every other recipient and broadcast dropped,
+  `chat`/`tchat`/`lchat`/`ltchat` recognised on raw bytes, non-chat untouched,
+  no scope or another mode untouched), and the `state` restart carry /
+  map-change reset.
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` — clean.
 - `rust/dev.sh ./scripts/build.sh` — i386 cdylib builds and stages as a 32-bit
   ELF shared object.
@@ -179,10 +235,12 @@ Paths are relative to the source trees named by `AGENTS.md`.
   - No `server: mute …` line reached the clients while the proxy was enabled
     (checked in the server log), so the command was consumed by the proxy rather
     than echoed by the pristine `ConsoleCommand`.
-- **Not yet exercised end to end**: a real client sending `say` while muted. The
-  enforcement path (`GAME_CLIENT_COMMAND` → drop + notice) is unit-tested for the
-  command-name decision and reviewed against `g_cmds.c:3093-3120`; a live
-  two-client check remains open, and the live server above ran with bots only.
+- **Not yet exercised end to end**: a real client sending `say` while muted, in
+  either mode. The enforcement path (`GAME_CLIENT_COMMAND` → drop or shadow,
+  then the `G_SEND_SERVER_COMMAND` recipient filter) is unit-tested for the
+  command-name and mode decisions and reviewed against `g_cmds.c:1471-1597`; a
+  live two-client check remains open, and the live server above ran with bots
+  only. Also not yet checked live: `proxy_sv_muteMode 0` on a running server.
 
 ## Alternatives considered
 
@@ -196,6 +254,12 @@ Paths are relative to the source trees named by `AGENTS.md`.
 - **Broadcasting the mute/unmute to all players** — noisy, and it tells the muted
   player's target nothing useful; the admin and the player are the only parties
   acted on.
+- **Synthesising the muted speaker's chat echo in the proxy** (drop the command,
+  `trap_SendServerCommand` a `chat` line back) — the wording, colour codes, `EC`
+  markers and team/location variants would have to be duplicated, and would
+  drift from the game's `G_Say`. Forwarding the real command under a shadow
+  scope lets the game produce the exact line its client expects and only
+  narrows who receives it.
 - **Persisting mutes by name/GUID across sessions or maps** — out of scope: this
   is a session-level admin action, and a persistent store would need a policy for
   name changes and reconnects.

@@ -208,6 +208,13 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             {
                 // SAFETY: the game passes a NUL-terminated command string.
                 let text = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
+                // Silent mute (`proxy_sv_muteMode 2`): the muted client's text
+                // chat was forwarded so the game would echo it back to them,
+                // but only the speaker may receive it. Screened on bytes for
+                // the same reason as the team-chat gate below.
+                if crate::mute::shadow_chat_dropped(text.to_bytes(), a0) {
+                    return 0;
+                }
                 // One feature read per command: the same gate covers the
                 // kill-limit prune, the team-chat prune and the score rewrite
                 // below.

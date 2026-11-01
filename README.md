@@ -29,6 +29,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | cvar                                  | default | description                                                                                   |
 |---------------------------------------|---------|-----------------------------------------------------------------------------------------------|
 | `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module (RCON keeps working, with the engine's pristine 500 ms gate) |
+| `proxy_sv_muteMode`                   | 1       | `mute`/`unmute` behaviour: `0` disabled, `1` drop the player's chat and tell them, `2` silent (their own line is echoed back to them, nobody else receives it, no notice); see [Player mute](#player-mute) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
@@ -58,11 +59,26 @@ a fragment shared by several players is answered with the candidates and their
 numbers, and a bare `rcon mute` prints the usage and who is currently muted.
 
 A muted player keeps playing normally: only `say`, `say_team`, `tell` and the
-voice menu's `voice_cmd` are dropped, and they are told they are muted. Mutes
-are per client slot, cleared when the player leaves, and kept across a
-`map_restart`; a full map change starts with nobody muted. Like every proxy
-feature they need `proxy_sv_enable 1`, and the same commands work in the
-dedicated server's own console.
+voice menu's `voice_cmd` are covered. Mutes are per client slot, cleared when
+the player leaves, and kept across a `map_restart`; a full map change starts
+with nobody muted. Like every proxy feature they need `proxy_sv_enable 1`, and
+the same commands work in the dedicated server's own console.
+
+`proxy_sv_muteMode` selects what a mute does:
+
+- `1` (default) — the stock mute: the four commands are dropped before the game
+  sees them and the player is told they are muted each time they try to chat;
+- `2` — silent mute: the player's `say`/`say_team`/`tell` are still processed by
+  the game, so their own chat line appears in their client as usual, but it is
+  delivered to nobody else; no mute or per-message notice is sent, so they have
+  no way to tell. `voice_cmd` is dropped silently (it has no chat line to echo);
+- `0` — the feature is off: `mute`/`unmute` only answer that it is disabled,
+  and no chat is filtered (a slot that still carries a flag is left untouched
+  until the feature is turned back on).
+
+In silent mode the server console/log still records the player's line
+(`G_Say`'s own `say:` log), which keeps moderation auditable.
+
 
 ### TaystJK scoreboard deaths
 
