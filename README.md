@@ -240,7 +240,10 @@ an asteroid field's rocks, a dropped weapon, a script's spawn — are attributed
 the match whose code created them, and the questions a match's world entities ask
 about the world (collision, touch, `targetname` chains, blast radius and box
 queries) see only their own match's copies plus everything shared: spawn points,
-lights, static models and a player's own projectiles stay as they were. A map
+lights, static models and a player's own projectiles stay as they were. Spawn
+points are shared, but a match picks among them without counting another match's
+players: its spawn-in never runs out of spots because other matches are full, so
+it never drops its players on top of each other. A map
 whose interactive entities cannot be duplicated (an NPC or vehicle actor among
 them) takes no parallel matches at all, and `tffa_create` is refused with a
 message when the map's remaining entity slots cannot hold another whole set —

@@ -333,17 +333,22 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             }
         }
         // World-query family (`trap_EntitiesInBox` / `trap_EntityContact` /
-        // `trap_EntityContactCapsule`, D-006 extension S9): game code that asks
-        // the world what is around it only sees its own instance's tagged
-        // entities plus everything shared. The engine still does the whole query
-        // — the box test, the brush-model contact test — and the filter is the
-        // same rule the `G_Find` link gate applies (a foreign tag is hidden), so
-        // a mover, an explosion or a script running in one instance no longer
-        // reaches another instance's doors, triggers or items.
+        // `trap_EntityContactCapsule`, D-006 extension S9 + S11): game code that
+        // asks the world what is around it only sees its own instance's tagged
+        // entities plus everything shared, and not the players of another
+        // instance. The engine still does the whole query — the box test, the
+        // brush-model contact test — and the filter is the tag rule the `G_Find`
+        // link gate applies (a foreign tag is hidden) plus the player rule the
+        // visibility, collision and damage gates apply (`client_match`), so a
+        // mover, an explosion or a script running in one instance no longer
+        // reaches another instance's doors, triggers or items, and
+        // `SpotWouldTelefrag` (`g_client.c:529-552`) does not count another
+        // match's players as standing on a shared spawn point.
         //
         // The scope comes from the acting entity (`G_RunThink`, `G_RunMissile`,
-        // `G_UseTargets2`, `player_die`); with no scope open the query is
-        // pristine, exactly as before this gate.
+        // `G_UseTargets2`, `player_die`, and `ClientSpawn` so spawn-point
+        // selection runs in the spawning player's instance); with no scope open
+        // the query is pristine, exactly as before this gate.
         crate::sdk::G_ENTITIES_IN_BOX => {
             if crate::state::proxy_enabled() && crate::tffa::enabled() {
                 let scope = crate::tffa::acting_scope();
@@ -375,10 +380,11 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     // fall through to the pristine call below
                 } else {
                     // `a2` is the `const gentity_t *` the contact is tested
-                    // against. A foreign instance's entity does not exist for
-                    // this query, and the engine test is a pure geometric
-                    // predicate, so answering `false` needs no engine call.
-                    if a2 != 0 && crate::tffa::link_hides(a2 as usize, scope) {
+                    // against. A foreign instance's entity — or player — does
+                    // not exist for this query, and the engine test is a pure
+                    // geometric predicate, so answering `false` needs no engine
+                    // call.
+                    if a2 != 0 && crate::tffa::query_hides(a2 as usize, scope) {
                         return 0;
                     }
                     // SAFETY: engine syscall registered; words forwarded.

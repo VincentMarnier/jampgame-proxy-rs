@@ -770,8 +770,10 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
 /// the world's; `TeamCount` so the game's auto team pick and its team-balance
 /// check census the joining client's own instance; `ScoreIsTied` so the
 /// pristine `CheckExitRules` defers the shared timelimit to the proxy's
-/// per-match sudden-death rule).
-pub static GAME_HOOKS: [Hook; 21] = [
+/// per-match sudden-death rule; `ClientSpawn` so spawn-point selection runs in
+/// the spawning player's instance and `SpotWouldTelefrag` only counts that
+/// instance's players).
+pub static GAME_HOOKS: [Hook; 22] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -813,6 +815,7 @@ pub static GAME_HOOKS: [Hook; 21] = [
         crate::jampgame::FN_WP_FORCE_POWERS_UPDATE,
         true,
     ),
+    Hook::new("ClientSpawn", crate::jampgame::FN_CLIENT_SPAWN, true),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1217,6 +1220,11 @@ mod tests {
             name: "WP_ForcePowersUpdate",
             bytes: b"\x55\x8b\xec\x83\xec\x48\x89\x5d\xf8\x89\x7d\xf0\x89\x75\xf4",
             want: 6,
+        },
+        Site {
+            name: "ClientSpawn",
+            bytes: b"\x55\x8b\xec\x81\xec\x38\x19\x00\x00",
+            want: 9,
         },
     ];
 

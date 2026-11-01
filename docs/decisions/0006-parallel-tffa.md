@@ -109,7 +109,9 @@ count.
 - in a team chain (`teamchain`/`teammaster` non-null).
 
 Everything else — spawn points without keys, `misc_model_static`, lights —
-stays shared and inert.
+stays shared and inert. (Spawn points are shared coordinates; which of them a
+match considers occupied is judged per match — S11, see the spawn-separation
+round at the end.)
 
 **Capacity (decided):** clones are created with the instance (lazily), one set
 costing `interactive_count` entity slots; when the free ordinary range cannot
@@ -125,9 +127,9 @@ entities, created with the game's own `G_Spawn` and driven by the pristine
 (`trace_flips`), the touch gate (`G_TouchTriggers` + `touch_flips`) and the
 **acting scope** — the instance whose game code is running, opened around the
 calls that run it (`G_RunThink`, `G_UseTargets2`, `G_RunMissile`,
-`ClientThink_real`, the vmMain client command/disconnect paths) and resolved
-from the acting entity or, when it carries no instance, its owner — read by the
-`G_Find` link gate, the `G_Spawn` runtime-spawn gate and the
+`ClientThink_real`, `ClientSpawn`, the vmMain client command/disconnect paths)
+and resolved from the acting entity or, when it carries no instance, its owner —
+read by the `G_Find` link gate, the `G_Spawn` runtime-spawn gate and the
 `G_EntitiesInBox`/`G_EntityContact` world-query gates — then resolve everything
 against the tag, so no game code is reimplemented.
 
@@ -395,12 +397,13 @@ The acting scope itself grew to cover the code that matters (the same
   entity's scope.
 
 The two world-query traps then filter their results by that scope, reusing the
-exact `G_Find` hide rule (`link_hides_tag`): a foreign-tagged entity is dropped
-from a box list (compacted in place — the engine still performs the whole box
-test) and answers `false` to a contact test, which needs no engine call at all.
-A query made with no scope open is pristine, exactly as before this gate, so the
-verified touch/trace behaviour of S5–S7 (which runs in client paths) is
-unchanged.
+`G_Find` hide rule (`link_hides_tag`): a foreign-tagged entity is dropped from a
+box list (compacted in place — the engine still performs the whole box test)
+and answers `false` to a contact test, which needs no engine call at all. (S11,
+2026-11-01, widened that rule with the players of another instance — see the
+spawn-separation round at the end of this document.) A query made with no scope
+open is pristine, exactly as before this gate, so the verified touch/trace
+behaviour of S5–S7 (which runs in client paths) is unchanged.
 
 **Evidence (S9):** `G_RunMissile` `0x14d274` (`nm -D`
 `G_RunMissile__FP9gentity_s`; prologue `55 8b ec 81 ec d8 00 00 00`, 9
@@ -1362,13 +1365,16 @@ already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
   world/broadcast) still plays in every instance.
 - Known limitations (documented, not fixed here): force
   grip/push and force-heal target selection are not trace-based and may
-  still cross matches; cross-match telefrag-induced kills still die
-  (hidden feed, score lands in the attacker's match — spawn separation is
-  future work); the flip path needs mixed-match assignments to observe at
-  runtime (bots never issue `tffa_*`); `EV_ENTITY_SOUND` is attributed at
-  snapshot time from `s.clientNum`, so a non-player emitter freed within the
-  same frame would fall back to the client-0 owner hop (the emitters in
-  practice are players and NPCs, which outlive their sounds).
+  still cross matches (the S9 box gate now keeps foreign players out of the
+  radius lists, see the 2026-11-01 round); cross-match telefrag-induced kills
+  (hidden feed, score landing in the attacker's match) were possible while
+  `G_KillBox`'s box query still saw every match's players — the 2026-11-01
+  spawn-separation round makes that query per instance, so a teleporter only
+  telefraggs its own match; the flip path needs mixed-match assignments to
+  observe at runtime (bots never issue `tffa_*`); `EV_ENTITY_SOUND` is
+  attributed at snapshot time from `s.clientNum`, so a non-player emitter freed
+  within the same frame would fall back to the client-0 owner hop (the emitters
+  in practice are players and NPCs, which outlive their sounds).
 - Verification: 7 new unit tests (gates, scores filter, fraglimit);
   `cargo test` 56/56; `clippy` clean; i686 release builds; engine smoke
   (proxy overlay boots, queries answer) plus a 70 s TFFA+bot soak on
@@ -1991,3 +1997,92 @@ already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
   chain (2026-10-20 round) and needs a live two-instance finish to confirm
   end to end. The standard engine smoke (`rust/scripts/engine-test.sh`,
   `mp/duel1`, feature off) passes on the same build.
+
+- **Spawn separation (2026-11-01, live report: "TFFA instances affect each
+  other for spawn points. So on maps with few spawn points, it is common that
+  people spawn kill each-others at the start of the game (by spawning on
+  another player)").**
+
+  Spawn points stay shared and inert (`info_player_deathmatch`,
+  `info_player_start_red/blue` — the interactive predicate above never clones
+  them), so every match selects from the same pool. What was *not* shared was
+  the occupancy answer: `SelectRandomFurthestSpawnPoint` /
+  `SelectRandomTeamSpawnPoint` skip a candidate when `SpotWouldTelefrag`
+  (`g_client.c:529-552`) finds a player in its box, and that box query is
+  `trap_EntitiesInBox` — an S9 world query, whose hide rule deliberately kept
+  players reachable from every instance. So a match counted every *other*
+  match's bodies as occupying "its" spawn points. With the map's pool smaller
+  than the server's player count (4 DM spawns on `mp/duel3`, 6 players across
+  2 matches), the pristine fallback then took over: `!numSpots` →
+  `G_Find(NULL, …, "info_player_deathmatch")`, i.e. the map's *first* spawn
+  point, regardless of who stands there (`g_client.c:739-747`;
+  `SelectRandomTeamSpawnPoint` does the same at `g_team.c:1000-1002`). A match
+  whose own spots were free therefore still exhausted its pool and dropped
+  its players onto one another — spawn kills at spawn-in.
+
+  Root cause, in the S9 gate's own terms: a player is only in their own
+  instance's world — the snapshot filter does not send them anywhere else and
+  `trace_flips` makes them non-solid there — so they must not answer another
+  instance's box query either. Fix (S11, spawn separation):
+
+  - the world-query rule (`query_hides` / `query_hides_num`) extends the tag
+    rule with the players of another instance, read from `client_match` (the
+    table the visibility, collision and damage gates already use). The box
+    filter (`filter_box_list`) and the `G_EntityContact`/`…Capsule` arm use
+    it; the `G_Find` link gate keeps the tag-only rule, because a
+    `targetname` chain resolves *named* entities and never a player by slot;
+  - a new `ClientSpawn` detour (`GAME_HOOKS` 21 → 22) opens the spawning
+    player's acting scope around the pristine body. The spawn paths reached
+    the selector with no scope of their own (the first `ClientBegin` and the
+    `SetTeam` join path are entered from vmMain, outside every other acting
+    scope), so without this hook the box gate stayed pristine and the fix
+    never applied. `ClientSpawn` is the single choke point: `ClientBegin` →
+    `ClientSpawn` (`g_client.c:2443` → `:2567`), `respawn` → `:1178`/`:1222`
+    and `SetTeam` → `:2567`.
+
+  Evidence. `fn ClientSpawn` `nm -D` `ClientSpawn__FP9gentity_s` at file
+  offset `0x127904`, prologue `55 8b ec 81 ec 38 19 00 00` (9 detour-safe
+  bytes, `objdump` — `push %ebp; mov %esp,%ebp; sub $0x1938,%esp`). The
+  occupancy answer is `SpotWouldTelefrag`'s `trap_EntitiesInBox` of the spot
+  box (`g_client.c:538-540`), and the pristine skip/fallback are
+  `g_client.c:711-747` (`info_player_deathmatch`) and
+  `g_client.c:679-706`/`g_team.c:985-1002` (team starts). Unit tests:
+  `box_list_drops_foreign_entities_and_players` (own/shared kept, foreign tag
+  and foreign player dropped, main's own player kept) and
+  `world_query_hides_foreign_players_but_keeps_own_and_shared` (player/tag/
+  non-slot classification, main's scope included), plus the existing link-gate
+  tests unchanged (`link_hides` still keeps players for `G_Find`).
+  `cargo test` 185/185, `clippy -D warnings`, `fmt --check` and the i686
+  release build green. Engine smoke: `attached ClientSpawn @
+  <base>+0x127904 (trampoline …, steal 9)`, 22 game detours, server answers.
+
+  Matched pair (temporary instrumentation, removed after the run). Two
+  proxy builds differing only in the player half of the world-query rule,
+  `mp/duel3` (4 `info_player_deathmatch`, no team starts), `g_gametype 6`,
+  `proxy_tffa_enable 1`, `bot_minplayers 6`, `sv_maxclients 8`, clients split
+  across matches 0/1 by slot parity in the `ClientSpawn` wrapper (bots never
+  issue `tffa_create`), and `map_restart` at t≈40 s to reproduce the
+  simultaneous spawn-in burst. A probe in `filter_box_list` printed the spawn
+  path's queries as `scope in kept own_players foreign_players`:
+
+  - pre-fix, every spawn-path query reported `kept == in` while
+    `foreign_players > 0` (e.g. `scope=1 in=2 kept=2 own_players=1
+    foreign_players=1`): another match's player was counted as occupying the
+    candidate. The 6-bot burst then showed same-match spawn collisions (two
+    players of match 0 at the same `info_player_deathmatch`, two of match 1 at
+    the same one);
+  - post-fix, the same shape reports `kept = in - foreign_players` (e.g.
+    `scope=1 in=2 kept=1 own_players=0 foreign_players=1`, and `scope=0 in=4
+    kept=3 own_players=1 foreign_players=1`): the foreign body no longer
+    occupies the spot, a same-match body still does (`own_players=1`, the spot
+    is skipped). In the same burst, match 0's three spawn-in positions were
+    three different spawn points.
+
+  Residual, deliberate: spawn points remain shared *coordinates*, so two
+  matches may legitimately spawn players at the same point — they are
+  invisible and non-solid to each other, so that is not a spawn kill. The
+  intermission point (`FindIntermissionPoint` writes the global
+  `level.intermission_origin`) is still map-global, so a match's spectators
+  share it with every other match's; not addressed here. A live-client
+  session (real players creating matches) was not run: the split above is an
+  instrumented stand-in for `tffa_create`/`tffa_join`.

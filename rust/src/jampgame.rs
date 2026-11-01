@@ -35,6 +35,16 @@ pub const FN_PLAYER_DIE: usize = 0x0013_3b44;
 pub const FN_BEGIN_INTERMISSION: usize = 0x0008_7d14;
 pub const FN_G_ADD_EVENT: usize = 0x0016_e564;
 pub const FN_CLIENT_THINK_REAL: usize = 0x0011_c4c4;
+/// `void ClientSpawn(gentity_t *ent)` (nm `ClientSpawn__FP9gentity_s`, file
+/// offset `0x127904`; prologue `55 8b ec 81 ec 38 19 00 00`, 9 detour-safe
+/// bytes). Called every time a client is placed fresh in the world — after the
+/// first `ClientBegin` (`g_client.c:2443` → `:2567`), after each respawn
+/// (`respawn` → `:1178`/`:1222`) and on a team join (`SetTeam` → `:2567`).
+/// Hooked by the parallel-TFFA feature so the whole spawn — `SelectSpawnPoint`,
+/// and the `SpotWouldTelefrag` box query inside it (`g_client.c:529-552`) —
+/// runs in the spawning player's acting scope: spawn-point occupancy is then
+/// judged against that instance's players only (S11).
+pub const FN_CLIENT_SPAWN: usize = 0x0012_7904;
 /// `void SetTeam(gentity_t*, char*)` (nm-verified `SetTeam__FP9gentity_sPc`),
 /// the single choke point every team change funnels through. Hooked by
 /// `proxy_sv_lockTeamsAfterXSecs` to enforce the round-start caps and notice

@@ -3908,12 +3908,12 @@ pub fn close_acting_scope(previous: u8) {
     state::with_state(|s| s.tffa.acting_scope = previous);
 }
 
-/// Whether the open acting scope hides an entity a *world query* named: yes for
-/// an entity tagged to another instance, no for everything else. Players and
+/// Whether the open acting scope hides an entity a `G_Find` search named: yes
+/// for an entity tagged to another instance, no for everything else. Players and
 /// untagged entities (shared props, `info_player_*`, lights) stay reachable from
-/// every instance, exactly as the visibility, collision and touch gates treat
-/// them. Both the `G_Find` link gate (S7) and the box/contact gates
-/// (`G_EntitiesInBox`/`G_EntityContact`, S9) ask this question.
+/// every instance. This is the `G_Find` link gate's question (S7); the
+/// box/contact gates ask the wider world-query rule (`query_hides`), which also
+/// drops the players of another instance.
 pub fn link_hides(found: usize, window: u8) -> bool {
     state::with_state(|s| {
         link_hides_tag(
@@ -3926,13 +3926,18 @@ pub fn link_hides(found: usize, window: u8) -> bool {
 }
 
 /// Compact a box-query result in place, dropping the entries a foreign instance
-/// owns; returns the number of entries kept. Pure over the caller's slice, so
-/// the rule is unit-tested directly.
-fn retain_visible_slots(tags: &[u8; MAX_GENTITIES], list: &mut [c_int], scope: u8) -> usize {
+/// owns or plays; returns the number of entries kept. Pure over the caller's
+/// slice, so the rule is unit-tested directly.
+fn retain_visible_slots(
+    tags: &[u8; MAX_GENTITIES],
+    client_match: &[u8; MAX_CLIENTS],
+    list: &mut [c_int],
+    scope: u8,
+) -> usize {
     let mut kept = 0usize;
     for i in 0..list.len() {
         let num = list[i];
-        if scope_hides_num(tags, num, scope) {
+        if query_hides_num(tags, client_match, num, scope) {
             continue;
         }
         list[kept] = num;
@@ -3943,10 +3948,21 @@ fn retain_visible_slots(tags: &[u8; MAX_GENTITIES], list: &mut [c_int], scope: u
 
 /// Keep only the entities the open acting scope may see in a box-query result,
 /// compacting `list` in place and returning the new count. The engine already
-/// did the box test (`G_EntitiesInBox`); only the entries tagged to another
-/// instance are dropped — the same rule `link_hides` applies to `G_Find`
-/// results, so a mover, an explosion or a script running in one instance no
-/// longer sees another instance's doors, triggers or items in its box.
+/// did the box test (`G_EntitiesInBox`); the entries tagged to another instance
+/// and the players of another instance are dropped, so a mover, an explosion or
+/// a script running in one instance no longer sees another instance's doors,
+/// triggers, items — or players — in its box.
+///
+/// Dropping the foreign players is what keeps a match's spawn points its own
+/// (S11, spawn separation): `SpotWouldTelefrag` asks the engine "is a player
+/// standing on this spawn point?" (`g_client.c:529-552`) and the answer used to
+/// include every other match's players, so on maps with few spawn points every
+/// match saw the others' bodies as occupied spots, exhausted its own pool and
+/// fell back to the map's first spawn point — piling its players onto the same
+/// spot. A player is only in their own instance's world: the snapshot filter
+/// does not send them anywhere else and the trace gate makes them non-solid
+/// there (`trace_flips`), so they must not answer another instance's box query
+/// either.
 ///
 /// # Safety
 ///
@@ -3965,21 +3981,59 @@ pub unsafe fn filter_box_list(list: *mut c_int, count: c_int, scope: u8) -> c_in
         // SAFETY: the caller guarantees `count` writable `c_int`s at `list`
         // (the game's own array, as the engine just filled it).
         let slice = unsafe { core::slice::from_raw_parts_mut(list, count as usize) };
-        retain_visible_slots(&s.tffa.entity_instance, slice, scope) as c_int
+        retain_visible_slots(&s.tffa.entity_instance, &s.tffa.client_match, slice, scope) as c_int
+    })
+}
+
+/// Whether the open acting scope hides a *specific* entity in a world query
+/// (`G_EntityContact`/`G_EntityContactCapsule`) — the pointer form of the box
+/// filter's rule: an entity tagged to another instance, or a player of another
+/// instance, is not there for this query.
+pub fn query_hides(found: usize, window: u8) -> bool {
+    state::with_state(|s| {
+        let g_entities = s.located_game_data.g_entities;
+        if g_entities == 0 || found < g_entities {
+            return false;
+        }
+        let num = ((found - g_entities) / SIZEOF_GENTITY) as i32;
+        query_hides_num(&s.tffa.entity_instance, &s.tffa.client_match, num, window)
     })
 }
 
 /// The hide rule proper, in the form every user needs — a *slot number* is
-/// hidden when it is tagged to another instance than `scope`. Players, the world
-/// slots and untagged (shared) entities are never hidden, the rule the
-/// visibility, collision and touch gates also follow. No state access, so it can
-/// be unit-tested with a fabricated tag table.
+/// hidden when it is tagged to another instance than `scope`. The world slots
+/// and untagged (shared) entities are never hidden, the rule the visibility,
+/// collision and touch gates also follow. No state access, so it can be
+/// unit-tested with a fabricated tag table.
 fn scope_hides_num(tags: &[u8; MAX_GENTITIES], num: i32, scope: u8) -> bool {
     if !(MAX_CLIENTS as i32..ENTITYNUM_MAX_NORMAL).contains(&num) {
         return false;
     }
     let tag = tags[num as usize];
     tag != ENTITY_SHARED && tag != scope
+}
+
+/// The world-query hide rule: the tag rule plus the players of another
+/// instance. A player carries no instance tag (players are never cloned and the
+/// tag table covers the ordinary `MAX_CLIENTS..ENTITYNUM_MAX_NORMAL` range), so
+/// their instance is read from the proxy's `client_match` table — the one the
+/// visibility, collision and damage gates use. Only the box/contact gates ask
+/// this question; the `G_Find` link gate keeps the tag-only rule
+/// (`scope_hides_num`), because a `targetname` chain resolves *named* entities
+/// and never a player by slot.
+fn query_hides_num(
+    tags: &[u8; MAX_GENTITIES],
+    client_match: &[u8; MAX_CLIENTS],
+    num: i32,
+    scope: u8,
+) -> bool {
+    if (0..MAX_CLIENTS as i32).contains(&num) {
+        // `SCOPE_NONE` means "no instance filter" and never reaches the gates
+        // (they forward the pristine call instead); keep that answer intact
+        // rather than hiding every player if one ever did.
+        return scope != SCOPE_NONE && client_match[num as usize] != scope;
+    }
+    scope_hides_num(tags, num, scope)
 }
 
 /// The hide decision for a `G_Find` result pointer — the pointer form of
@@ -5697,32 +5751,79 @@ mod tests {
         assert_eq!(acting_instance(&t, base, ent(61)), Some(1));
     }
 
-    /// A box query made inside an acting scope keeps the scope's own and every
-    /// shared/untagged slot (players included) and drops the entries tagged to
-    /// another instance — the same rule the link gate applies to `G_Find`.
+    /// A box query made inside an acting scope keeps the scope's own entities and
+    /// every shared/untagged slot, and drops the entries tagged to another
+    /// instance *plus the players of another instance* (S11 spawn separation):
+    /// a foreign match's player is not in this match's world, exactly as the
+    /// visibility and trace gates treat them.
     #[test]
-    fn box_list_drops_only_foreign_tagged_entries() {
+    fn box_list_drops_foreign_entities_and_players() {
         let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
         tags[48] = 1; // instance 1's door
         tags[49] = 2; // instance 2's own
         tags[51] = MAIN_MATCH; // main's original
-        // 50 stays shared, 3 is a player, 1023/`-1` are not slots at all.
-        let mut list = [48, 49, 51, 50, 3, ENTITYNUM_NONE as c_int, -1];
-        assert_eq!(retain_visible_slots(&tags, &mut list, 2), 5);
-        assert_eq!(list[0], 49, "own instance kept, foreign dropped");
+        // 50 stays shared; player 3 is instance 2's, player 4 is main's,
+        // player 5 is instance 1's; 1023/`-1` are not slots at all.
+        let mut client_match = [MAIN_MATCH; MAX_CLIENTS];
+        client_match[3] = 2;
+        client_match[4] = MAIN_MATCH;
+        client_match[5] = 1;
+        let mut list = [48, 49, 51, 50, 3, 4, 5, ENTITYNUM_NONE as c_int, -1];
+        assert_eq!(retain_visible_slots(&tags, &client_match, &mut list, 2), 5);
         assert_eq!(
             &list[..5],
             &[49, 50, 3, ENTITYNUM_NONE as c_int, -1],
-            "shared prop, player and non-slots are never dropped"
+            "own instance and shared entries kept; foreign entities and players dropped"
         );
-        // Main's scope hides both instances' copies but not its own original.
-        let mut list = [48, 49, 51, 50];
-        assert_eq!(retain_visible_slots(&tags, &mut list, MAIN_MATCH), 2);
-        assert_eq!(&list[..2], &[51, 50]);
-        // A scope that owns nothing keeps only the shared/player entries.
+        // Main's scope hides both instances' copies and both players but not its
+        // own original or its own player.
+        let mut list = [48, 49, 51, 50, 4, 5];
+        assert_eq!(
+            retain_visible_slots(&tags, &client_match, &mut list, MAIN_MATCH),
+            3
+        );
+        assert_eq!(&list[..3], &[51, 50, 4]);
+        // A scope that owns nothing keeps only the shared entry.
         let mut list = [48, 49, 51, 50, 3];
-        assert_eq!(retain_visible_slots(&tags, &mut list, 5), 2);
-        assert_eq!(&list[..2], &[50, 3]);
+        assert_eq!(retain_visible_slots(&tags, &client_match, &mut list, 5), 1);
+        assert_eq!(&list[..1], &[50]);
+    }
+
+    /// The world-query rule hides foreign tagged entities and foreign players,
+    /// keeps own/shared slots, and leaves the non-slot numbers (the world,
+    /// `NONE`, negative) alone — the rule the contact gate applies to a single
+    /// entity and the box filter to a list.
+    #[test]
+    fn world_query_hides_foreign_players_but_keeps_own_and_shared() {
+        let mut tags = [ENTITY_SHARED; MAX_GENTITIES];
+        tags[48] = 1;
+        tags[49] = 2;
+        let mut client_match = [MAIN_MATCH; MAX_CLIENTS];
+        client_match[0] = 2;
+        client_match[1] = 1;
+        client_match[2] = MAIN_MATCH;
+
+        assert!(!query_hides_num(&tags, &client_match, 0, 2), "own player");
+        assert!(
+            query_hides_num(&tags, &client_match, 1, 2),
+            "instance 1's player"
+        );
+        assert!(query_hides_num(&tags, &client_match, 2, 2), "main's player");
+        assert!(query_hides_num(&tags, &client_match, 48, 2), "foreign tag");
+        assert!(!query_hides_num(&tags, &client_match, 49, 2), "own tag");
+        tags[50] = ENTITY_SHARED;
+        assert!(!query_hides_num(&tags, &client_match, 50, 2), "shared");
+        assert!(
+            !query_hides_num(&tags, &client_match, ENTITYNUM_NONE as c_int, 2),
+            "NONE is not a slot"
+        );
+        assert!(!query_hides_num(&tags, &client_match, -1, 2));
+        // Main's scope keeps its own player and hides both instances' players.
+        assert!(!query_hides_num(&tags, &client_match, 2, MAIN_MATCH));
+        assert!(query_hides_num(&tags, &client_match, 0, MAIN_MATCH));
+        assert!(query_hides_num(&tags, &client_match, 1, MAIN_MATCH));
+        // No scope never hides a player (the gates forward pristine instead).
+        assert!(!query_hides_num(&tags, &client_match, 0, SCOPE_NONE));
     }
 
     /// The acting scope hides exactly the entities tagged to another instance:

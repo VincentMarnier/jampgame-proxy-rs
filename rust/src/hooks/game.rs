@@ -3,7 +3,8 @@
 //! (`crate::patch::GAME_HOOKS`): stats accounting (`G_Damage`, `player_die`,
 //! `BeginIntermission`), anti-HP teller (`G_AddEvent`) and minimum jump time
 //! (`ClientThink_real`), plus the Rust-only parallel-TFFA hooks (`AddScore`
-/// accounting; `G_Damage`/`player_die` cross-match gating).
+//! accounting; `G_Damage`/`player_die` cross-match gating; the per-instance
+//! world-entity gates; `ClientSpawn` for per-instance spawn points).
 use core::ffi::{CStr, c_char, c_int};
 
 use crate::hooks::engine_sv::read_i32;
@@ -495,6 +496,42 @@ pub unsafe extern "C" fn wp_force_powers_update(self_: usize, ucmd: usize) {
     // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
     let original = original_call(crate::hooks::game_hook_original_wp_force_powers_update);
     unsafe { original(self_, ucmd) };
+    if let Some(previous) = scope {
+        crate::tffa::close_acting_scope(previous);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientSpawn — per-instance spawn point selection (S11)
+// ---------------------------------------------------------------------------
+
+/// `ClientSpawn(gentity_t *ent)` wrapper (D-006 extension, S11 spawn
+/// separation): a client placed fresh in the world picks its spawn point with
+/// `SelectSpawnPoint` → `SelectRandomFurthestSpawnPoint`/`SelectRandomTeamSpawnPoint`,
+/// which ask `SpotWouldTelefrag` about every candidate (`g_client.c:529-552`).
+/// That question is a `trap_EntitiesInBox` query, so it can only answer for the
+/// acting instance — and the spawn paths reach here with no scope of their own
+/// (the first `ClientBegin` and the `SetTeam` join path are entered from
+/// vmMain, outside every other acting scope). Opening the spawning player's
+/// scope around the pristine body makes the world-query gate (S9 + S11) drop
+/// the players of the other matches: spawn-point occupancy is then judged
+/// against the player's own instance only, so a match never counts another
+/// match's bodies as occupying a shared spawn point and never exhausts its own
+/// pool into the game's first-spawn-point fallback (which drops its players on
+/// top of each other — the spawn-kill report).
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `ClientSpawn` argument.
+pub unsafe extern "C" fn client_spawn(ent: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_client_spawn);
+    let scope = if ent != 0 && crate::tffa::enabled() {
+        Some(crate::tffa::open_acting_scope(ent))
+    } else {
+        None
+    };
+    unsafe { original(ent) };
     if let Some(previous) = scope {
         crate::tffa::close_acting_scope(previous);
     }

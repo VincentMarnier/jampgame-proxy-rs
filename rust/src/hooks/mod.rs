@@ -220,6 +220,11 @@ game_trampoline!(
     20,
     unsafe extern "C" fn(usize, usize)
 );
+game_trampoline!(
+    game_hook_original_client_spawn,
+    21,
+    unsafe extern "C" fn(usize)
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -338,6 +343,7 @@ pub unsafe fn attach_all() {
         game::team_count as usize,
         game::score_is_tied as usize,
         game::wp_force_powers_update as usize,
+        game::client_spawn as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the
@@ -435,6 +441,7 @@ mod tests {
             "TeamCount",
             "ScoreIsTied",
             "WP_ForcePowersUpdate",
+            "ClientSpawn",
         ];
         assert_eq!(patch::GAME_HOOKS.len(), by_index.len());
         for (index, name) in by_index.into_iter().enumerate() {
