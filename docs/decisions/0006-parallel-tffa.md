@@ -977,6 +977,98 @@ test are green. The auto-join itself still needs a live client and a
 `map_restart`, which the automated suite cannot drive; it is the same
 `SetTeam`-after-`ClientBegin` path D-006.10 already uses for created matches.
 
+### D-006.12 — The `map_restart` reconnect burst must not carry proxy commands
+
+*Status: landed (live bug report, 2026-11-01).*
+
+Reported: "After some games, on a `map_restart`, server crashed and displayed to
+clients: `CL_GetServerCommand: a reliable command was cycled out`."
+
+**Mechanism (reproduced, not a Rust panic).** `SV_MapRestart_f`
+(`sv_ccmds.cpp:244-349`) reconnects every retained client in one engine frame:
+for each client it queues `map_restart`, runs `GAME_CLIENT_CONNECT` (whose
+`ClientUserinfoChanged`/`CalculateRanks` broadcasts go to *every* client), sets
+it active, and runs `GAME_CLIENT_BEGIN`. Nothing is
+acknowledged until the next engine frame, so the whole burst is measured
+against the engine's per-client `MAX_RELIABLE_COMMANDS` window. The shipped
+binary uses **128** (the 1.011 source says 64, but `SV_AddServerCommand`'s
+overflow compare at `0x805614d` is `cmp $0x81`, i.e. 128 + 1; `and $0x7f`
+indexes the ring). At the 129th pending command the engine drops the client
+with `Server command overflow` (`sv_main.cpp:130-149`, shipped string), and a
+client whose cgame falls that far behind prints the reported
+`CL_GetServerCommand: a reliable command was cycled out`
+(`cl_cgame.cpp:468`).
+
+The proxy added to that burst in three places:
+
+1. **Every `GAME_CLIENT_BEGIN` re-sent every player's `CS_PLAYERS`** to the
+   client (`send_all_overrides_to_client`), including the same-match/spectator
+   slots whose base string the client already had — one redundant reliable
+   command per occupied slot per client. On a populated server this alone was
+   the largest single contributor.
+2. **The auto-join** (`restore_pending_join` → pristine `SetTeam` →
+   `ClientUserinfoChanged`/`ClientBegin`) queued ~3-4 more broadcasts to *every*
+   client per reconnected member, inside the same burst. This is the
+   "after some games" half: only finished matches with remembered rosters
+   (D-006.10/D-006.11) auto-join.
+3. **Under parallel TFFA, `CalculateRanks`' `CS_SCORES1/2` churn.** The proxy
+   keeps `level.teamScores` neutralised, so every reconnect and every restart
+   telefrag made the game rewrite `CS_SCORES1/2` (1→0→1…), each rewrite one
+   reliable command to every client.
+
+**Reproduction.** Real 2003 engine, `mp/duel1`, `g_gametype 6`,
+`proxy_tffa_enable 1`, 32-slot server filled with `addbot`, then
+`map_restart 0` via rcon. Pre-fix, the first overflow appeared at **19 bots**
+(the pending dump showed the proxy's `cs 1131..1149` blocks between the game's
+per-client `cp`/`cs`/`print` groups). A pristine module (`jampgamei386.so`
+without the proxy) at 30 bots restarted with **no overflow**, so the burst was
+within the window before the proxy added its commands.
+
+**Fix.**
+
+- `send_all_overrides_to_client` now sends only the slots that actually need a
+  per-viewer rewrite (`demotions_for_viewer`, the same rule `on_set_cs_players`
+  already used). Same-match and real-spectator slots are left alone.
+- A `map_restart` sets `TffaState::restart_burst` **before** the pristine
+  `GAME_INIT` body runs (`state::tffa_after_reset`). While it is set, every
+  proxy `cs` send (`send_cs_to_client`) is deferred and every
+  `GAME_CLIENT_BEGIN` push is deferred (`deferred_begin`). The flag is cleared
+  by a small state machine on the `GAME_RUN_FRAME` after
+  `SV_MapRestart_f`'s trailing one (three settle frames → reconnect loop →
+  one trailing frame; `RESTART_BURST_MAX_FRAMES` bounds the fallback for a
+  modified engine).
+- `G_SET_CONFIGSTRING` for `CS_SCORES1/2` is dropped during the burst under
+  parallel TFFA, so the neutralisation-induced rewrites cannot flood the
+  window. The game writes them again on the next rank calculation, and the
+  deferred per-viewer push carries the correct HUD.
+- After the burst, `drain_deferred_client_work` re-runs the deferred
+  `restore_pending_join` + `send_all_overrides_to_client`, **4 clients per
+  frame** (`DEFERRED_BEGINS_PER_FRAME`), so the auto-join's game-side
+  broadcasts are spread instead of recreating the burst one frame later.
+- A secondary guard (`reliable_backlog` / `RELIABLE_SEND_LIMIT` = 16, reading
+  `cl->reliableSequence - cl->reliableAcknowledge` at the SDK offsets
+  `132104`/`132108`, pinned by the shipped `SV_AddServerCommand`
+  disassembly) defers any proxy send while a client's window is nearly full,
+  covering non-restart bursts too.
+- Per-client deferred flags are cleared on fresh connect, disconnect, a new
+  round and a `proxy_tffa_enable` disable.
+
+**Behaviour change to note.** A remembered match's auto-join (D-006.10) now
+happens a few frames after `GAME_CLIENT_BEGIN` instead of inside it, when the
+reconnect burst is under pressure. The client is already active (the pristine
+`ClientBegin` ran) and is spectating meanwhile, so the move is the same one
+`/team red|blue` makes; it is not observable as a gameplay change.
+
+**Verification.** `cargo test` 184/184 (2 new: the burst state machine's
+settle/trailing/bounded sequence, and the same-match omission in
+`demotions_for_viewer`), `clippy -D warnings`, `fmt --check`, i686 release
+build. Runtime: the same 32-slot `mp/duel1` server, **32 bots**, six
+consecutive `map_restart 0` commands → **0 `Server command overflow`, all 32
+clients retained** (pre-fix: first overflow at 19 bots). The created-match
+auto-join path still needs a live client (`tffa_create` is a client command
+bots never issue); it rests on the unit-tested deferral plus the
+already-runtime-verified `SetTeam`-after-`ClientBegin` path (D-006.10).
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`

@@ -387,6 +387,36 @@ pub struct TffaState {
     /// that disconnects or reconnects fresh, so a reused slot never inherits
     /// the previous occupant's team.
     pub pending_join: [u8; MAX_CLIENTS],
+    /// Clients whose `GAME_CLIENT_BEGIN` handling was deferred because their
+    /// reliable-command window was still full of the `map_restart` burst
+    /// (`tffa::reliable_pressure`). The next frame under the limit runs
+    /// `restore_pending_join` + `send_all_overrides_to_client` for them, so
+    /// the auto-join and its game-side broadcasts do not add to the burst
+    /// (D-006.12).
+    pub deferred_begin: [bool; MAX_CLIENTS],
+    /// Clients whose per-viewer `cs` correction had to be dropped because
+    /// their reliable window was full; a later frame re-pushes their overrides
+    /// once the client acknowledged the burst (D-006.12).
+    pub pending_view_refresh: [bool; MAX_CLIENTS],
+    /// A `map_restart` reconnect burst is in progress (D-006.12). Set before
+    /// the pristine `GAME_INIT` body runs, so even the configstrings it sets
+    /// cannot make the proxy queue commands into the burst. Every proxy `cs`
+    /// send and every `GAME_CLIENT_BEGIN` push is deferred until the
+    /// `GAME_RUN_FRAME` after `SV_MapRestart_f`'s trailing one; the per-client
+    /// reliable-window check then waits for the acknowledgements that the
+    /// engine reads at the start of the next engine frame.
+    pub restart_burst: bool,
+    /// A `GAME_CLIENT_BEGIN` was seen while `restart_burst` was set: the
+    /// reconnect loop ran, so the next `GAME_RUN_FRAME` is the engine's
+    /// trailing settle frame (`SV_MapRestart_f`, `sv_ccmds.cpp:346-349`).
+    pub restart_burst_connects: bool,
+    /// That trailing frame has been observed; the following `GAME_RUN_FRAME`
+    /// is the first real frame and the deferred work may run.
+    pub restart_burst_trailing: bool,
+    /// `GAME_RUN_FRAME` calls seen since the burst started. Bounded fallback
+    /// so a modified engine that skips the trailing frame cannot freeze the
+    /// proxy's per-viewer corrections forever.
+    pub restart_burst_frames: u8,
     /// Set when any intermission begins (pristine timelimit exit or the
     /// proxy-triggered solo-main finish); cleared on `GAME_INIT`. While set,
     /// fraglimit handling stays off — the map is ending.
@@ -487,6 +517,12 @@ impl Default for TffaState {
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission_boards: [0; MAX_CLIENTS],
             pending_join: [crate::tffa::REMEMBERED_NONE; MAX_CLIENTS],
+            deferred_begin: [false; MAX_CLIENTS],
+            pending_view_refresh: [false; MAX_CLIENTS],
+            restart_burst: false,
+            restart_burst_connects: false,
+            restart_burst_trailing: false,
+            restart_burst_frames: 0,
             intermission: false,
             entity_instance: [crate::tffa::ENTITY_SHARED; MAX_GENTITIES],
             world_clone_cost: 0,
@@ -651,7 +687,14 @@ fn mutes_after_reset(previous: Option<&ProxyState>, restart: bool) -> [bool; MAX
 ///
 /// Kept separate from the lock so the carry is unit-tested directly.
 fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
-    let mut fresh = TffaState::default();
+    // A `map_restart` reconnects every retained client in one engine frame
+    // (`SV_MapRestart_f`); the proxy must not queue its own reliable commands
+    // into that burst (D-006.12). Set before the pristine `GAME_INIT` body
+    // runs, so even its `CS_PLAYERS` sets are handled as burst traffic.
+    let mut fresh = TffaState {
+        restart_burst: restart,
+        ..TffaState::default()
+    };
     let Some(previous) = previous.filter(|_| restart) else {
         return fresh;
     };

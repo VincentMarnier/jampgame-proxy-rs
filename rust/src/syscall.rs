@@ -400,6 +400,23 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // own mini-HUD scores and its own team-overlay client names. The
         // corrections arrive after the broadcast and win per client.
         G_SET_CONFIGSTRING => {
+            // Parallel TFFA keeps `level.teamScores` neutralised, so the game's
+            // own `CalculateRanks` rewrites `CS_SCORES1/2` on every reconnect
+            // (and every restart telefrag) of the `map_restart` burst. Each
+            // rewrite is one reliable command per client, and with a populated
+            // server they are what pushes the burst past the engine's 128-slot
+            // window (dropped clients / `CL_GetServerCommand: a reliable
+            // command was cycled out`). The per-viewer HUD is re-pushed after
+            // the burst instead (D-006.12); the game sets these again on the
+            // next rank calculation, so `sv.configstrings` is not left stale
+            // for a later gamestate.
+            if (a0 == CS_SCORES1 || a0 == CS_SCORES2)
+                && crate::state::proxy_enabled()
+                && crate::tffa::enabled()
+                && crate::state::with_state(|s| s.tffa.restart_burst)
+            {
+                return 0;
+            }
             if crate::state::proxy_enabled()
                 && (a0 == CS_SCORES1
                     || a0 == CS_SCORES2

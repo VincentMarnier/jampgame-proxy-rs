@@ -496,12 +496,78 @@ pub fn is_kill_limit_print(text: &str) -> bool {
     text.starts_with("print \"") && text.contains("HIT_THE_KILL_LIMIT")
 }
 
+/// Reliable commands the engine still owes `client_num`: `reliableSequence -
+/// reliableAcknowledge`, the number queued but not yet acknowledged.
+///
+/// The shipped engine buffers `MAX_RELIABLE_COMMANDS` (128) per client and
+/// drops a client when it would overwrite an unacknowledged command
+/// (`SV_AddServerCommand`, `sv_main.cpp:130-149`); a client whose cgame falls
+/// more than that behind prints `CL_GetServerCommand: a reliable command was
+/// cycled out` and drops. `None` when the engine client table is not
+/// reachable (unit tests, feature off, before `GAME_INIT`).
+fn reliable_backlog(client_num: c_int) -> Option<i32> {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) || crate::original::base() == 0 {
+        return None;
+    }
+    // SAFETY: engine memory layer initialised (this path only runs from the
+    // game module after GAME_INIT); `clients_base` is `svs.clients` and the
+    // client index is in range.
+    let base = unsafe { crate::hooks::engine_sv::clients_base() };
+    if base == 0 {
+        return None;
+    }
+    let cl = base + client_num as usize * crate::sdk::SIZEOF_CLIENT_T;
+    // SAFETY: cl is a valid client_t; both fields are plain ints.
+    unsafe {
+        Some(
+            read_i32(cl + crate::sdk::OFFSET_CLIENT_RELIABLE_SEQUENCE)
+                - read_i32(cl + crate::sdk::OFFSET_CLIENT_RELIABLE_ACKNOWLEDGE),
+        )
+    }
+}
+
+/// Backlog at which the proxy stops adding reliable commands to a client,
+/// leaving the rest of the 128-slot window to the pristine game's own
+/// `map_restart` broadcasts (about four `cs`/`cp`/`print` commands per
+/// reconnecting client, so a 24-slot server's burst alone is already ~96).
+/// Above it a correction is deferred to a later frame instead of being queued
+/// into the burst (D-006.12).
+const RELIABLE_SEND_LIMIT: i32 = 16;
+
+/// Whether `client_num` has too many unacknowledged reliable commands for the
+/// proxy to add another one now. Pure half of [`reliable_pressure`] so the
+/// threshold is unit-tested without an engine.
+fn backlog_is_pressured(backlog: Option<i32>) -> bool {
+    backlog.is_some_and(|n| n >= RELIABLE_SEND_LIMIT)
+}
+
+/// Whether a proxy `cs` correction must wait for a later frame. Reads the
+/// engine's per-client window (see [`reliable_backlog`]).
+fn reliable_pressure(client_num: c_int) -> bool {
+    backlog_is_pressured(reliable_backlog(client_num))
+}
+
 /// Send `cs <index> "<value>"` to one client (the same wire format the
 /// engine's own `SV_SetConfigstring` broadcast uses, so the client's
 /// `gameState` updates identically). `"` becomes `'` and CR/LF become spaces
 /// so a hostile player name cannot break the quoting/framing (names allow
 /// `0x22` through `ClientCleanName`).
+///
+/// A client whose reliable window is already full of the `map_restart` burst
+/// gets the correction deferred (`pending_view_refresh`) instead: pushing it
+/// now is what overflowed the buffer, dropped clients and made real clients
+/// print `CL_GetServerCommand: a reliable command was cycled out` (D-006.12).
 fn send_cs_to_client(client_num: c_int, index: i32, value: &str) {
+    // Never add to the `map_restart` reconnect burst: the engine queues a
+    // reliable command per reconnecting client for every client, and a
+    // populated server is already close to the 128-slot limit before the proxy
+    // adds anything (D-006.12). The client is re-pushed after the burst.
+    if reliable_pressure(client_num) || state::with_state(|s| s.tffa.restart_burst) {
+        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
+            state::with_state(|s| s.tffa.pending_view_refresh[client_num as usize] = true);
+        }
+        return;
+    }
     let mut safe = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -765,27 +831,26 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
     });
     send_cs_to_client(client_num, CS_SCORES1, &red.to_string());
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
-    let (table, bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
+    let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
-    for slot in 0..MAX_CLIENTS as i32 {
-        let mut base = bases[slot as usize].clone();
+    // Same-match and real-spectator slots already hold the base string (a
+    // fresh connect got it in the gamestate, a `map_restart` reconnect gets it
+    // from the game's own `CS_PLAYERS` broadcast): re-sending it only queued
+    // one redundant reliable command per slot per client, which is what filled
+    // the 128-slot buffer during the reconnect burst (D-006.12). Only the
+    // playing outsiders of another match need a rewrite.
+    for (slot, base) in bases.iter_mut().enumerate() {
         if base.is_empty() {
-            if let Some(live) = get_live_cs_players(slot) {
-                base = live.clone();
+            if let Some(live) = get_live_cs_players(slot as i32) {
+                *base = live.clone();
                 state::with_state(|s| {
-                    s.tffa.cs_players_base[slot as usize] = live;
+                    s.tffa.cs_players_base[slot] = live;
                 });
-            } else {
-                continue;
             }
         }
-        if let Some(modified) =
-            rewrite_cs_players_for_viewer(&base, table[slot as usize], viewer_match)
-        {
-            send_cs_to_client(client_num, CS_PLAYERS + slot, &modified);
-        } else {
-            send_cs_to_client(client_num, CS_PLAYERS + slot, &base);
-        }
+    }
+    for (slot, value) in demotions_for_viewer(viewer_match, &table, &bases) {
+        send_cs_to_client(client_num, CS_PLAYERS + slot, &value);
     }
 }
 
@@ -1348,8 +1413,11 @@ pub fn reset_round(restart: bool) {
 /// consumes its roster the same way. Returns whether any created match
 /// survived, i.e. whether the post-restart grace window is needed.
 fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
-    // Auto-joins are scheduled for the round being initialised only.
+    // Auto-joins are scheduled for the round being initialised only, and no
+    // deferred begin/refresh may survive the round that queued it (D-006.12).
     t.pending_join = [REMEMBERED_NONE; MAX_CLIENTS];
+    t.deferred_begin = [false; MAX_CLIENTS];
+    t.pending_view_refresh = [false; MAX_CLIENTS];
     // Main hosts its own id again: the promoted game goes back to its slot.
     t.main_origin = MAIN_MATCH;
     if keep {
@@ -1546,6 +1614,8 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
+        s.tffa.deferred_begin[client_num as usize] = false;
+        s.tffa.pending_view_refresh[client_num as usize] = false;
     });
 }
 
@@ -1562,6 +1632,8 @@ pub fn on_client_disconnect(client_num: c_int) {
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
+        s.tffa.deferred_begin[client_num as usize] = false;
+        s.tffa.pending_view_refresh[client_num as usize] = false;
     });
     // The slot is free: other viewers' stale prefixed views of it will be
     // refreshed when the game clears `CS_PLAYERS + n` (empty base). Push an
@@ -1590,14 +1662,136 @@ pub fn on_client_begin(client_num: c_int) {
     if !enabled() {
         return;
     }
+    // The `map_restart` reconnect burst queues the game's own per-client
+    // broadcasts for every retained client before anyone acknowledges them
+    // (`SV_MapRestart_f`, `sv_ccmds.cpp:306-349`). Running the auto-join (a
+    // pristine `SetTeam` → `ClientUserinfoChanged`/`ClientBegin`, three more
+    // broadcasts to *every* client) and the override push here on top of that
+    // burst is what overflowed the 128-slot reliable window with a populated
+    // server, dropped clients and made real clients print
+    // `CL_GetServerCommand: a reliable command was cycled out` (D-006.12).
+    // Defer both to the first frame after the burst; the client is already
+    // active (the pristine `ClientBegin` ran), so a frame's delay is invisible.
+    let (burst, pressured) = (
+        state::with_state(|s| s.tffa.restart_burst),
+        reliable_pressure(client_num),
+    );
+    if burst || pressured {
+        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
+            state::with_state(|s| {
+                s.tffa.deferred_begin[client_num as usize] = true;
+                if s.tffa.restart_burst {
+                    s.tffa.restart_burst_connects = true;
+                }
+            });
+        }
+        return;
+    }
     restore_pending_join(client_num);
     send_all_overrides_to_client(client_num);
+}
+
+/// `GAME_RUN_FRAME` calls the engine runs after `GAME_INIT` before the first
+/// real frame of a `map_restart`: three settle frames, then the client
+/// reconnect loop, then one trailing settle frame (`SV_MapRestart_f`,
+/// `sv_ccmds.cpp:306-349`). Used as the bounded fallback that ends the burst
+/// even if the trailing frame never arrives (a modified engine).
+const RESTART_BURST_MAX_FRAMES: u8 = 8;
+
+/// Advance the `map_restart` burst state machine once per `GAME_RUN_FRAME`
+/// (called from [`on_frame_start`], before the frame is forwarded).
+///
+/// `SV_MapRestart_f` reconnects every retained client in one engine frame and
+/// then runs one trailing `GAME_RUN_FRAME` in the *same* engine frame, before
+/// any client acknowledgement is read. The deferred work may therefore only
+/// start on the `GAME_RUN_FRAME` after that trailing one. The sequence the
+/// proxy observes is: settle frames (no `GAME_CLIENT_BEGIN`), the reconnect
+/// loop (begins, no frame), the trailing frame (the first frame after a begin),
+/// then the first real frame.
+fn advance_restart_burst() {
+    state::with_state(|s| advance_restart_burst_state(&mut s.tffa));
+}
+
+/// The state-machine half of [`advance_restart_burst`], split out so the
+/// sequence is unit-tested without an engine.
+fn advance_restart_burst_state(t: &mut state::TffaState) {
+    if !t.restart_burst {
+        return;
+    }
+    t.restart_burst_frames = t.restart_burst_frames.saturating_add(1);
+    if t.restart_burst_connects && !t.restart_burst_trailing {
+        // The engine's trailing settle frame: clients are reconnected but
+        // nobody has acknowledged the burst yet.
+        t.restart_burst_trailing = true;
+        return;
+    }
+    let trailing_seen = t.restart_burst_trailing;
+    let bounded = t.restart_burst_frames >= RESTART_BURST_MAX_FRAMES;
+    if trailing_seen || bounded {
+        // The burst is over. The per-client reliable-window check still keeps
+        // the deferred work off until each client's acknowledgement of the
+        // burst has been read (`Com_EventLoop` runs before the next frame's
+        // `GAME_RUN_FRAME`), so the first real frame may safely start draining.
+        t.restart_burst = false;
+        t.restart_burst_connects = false;
+        t.restart_burst_trailing = false;
+        t.restart_burst_frames = 0;
+    }
+}
+
+/// Frames' worth of deferred `GAME_CLIENT_BEGIN` work: how many clients may be
+/// auto-joined and refreshed per frame once the burst has been acknowledged.
+/// Each auto-join makes the pristine game broadcast to every client, so a
+/// whole-server burst would recreate the same overflow one frame later; a
+/// small batch keeps each frame's addition bounded while every client is
+/// served within a few frames (D-006.12).
+const DEFERRED_BEGINS_PER_FRAME: usize = 4;
+
+/// Run the `GAME_CLIENT_BEGIN` work a full reliable window deferred, plus any
+/// `cs` correction dropped by [`send_cs_to_client`], for the clients whose
+/// window now has room. Called once per game frame before the early returns in
+/// [`on_run_frame_post`], so a pending auto-join/refresh is never starved by
+/// the intermission or settle-window gates.
+fn drain_deferred_client_work() {
+    if state::with_state(|s| s.tffa.restart_burst) {
+        return;
+    }
+    let candidates: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| {
+                let i = *v as usize;
+                s.clients[i].is_connected
+                    && (s.tffa.deferred_begin[i] || s.tffa.pending_view_refresh[i])
+            })
+            .collect()
+    });
+    let mut budget = DEFERRED_BEGINS_PER_FRAME;
+    for viewer in candidates {
+        if budget == 0 || reliable_pressure(viewer) {
+            continue;
+        }
+        let begin = state::with_state(|s| {
+            core::mem::replace(&mut s.tffa.deferred_begin[viewer as usize], false)
+        });
+        // The refresh flag is cleared before the push so a correction that
+        // trips the limit again re-arms it from `send_cs_to_client`.
+        state::with_state(|s| s.tffa.pending_view_refresh[viewer as usize] = false);
+        if begin {
+            restore_pending_join(viewer);
+        }
+        send_all_overrides_to_client(viewer);
+        budget -= 1;
+    }
 }
 
 /// Bump the frame stamp so the owned-entity cache is rebuilt once per game
 /// frame (called from `GAME_RUN_FRAME` before the frame is forwarded).
 pub fn on_frame_start() {
     state::with_state(|s| s.tffa.frame_stamp = s.tffa.frame_stamp.wrapping_add(1));
+    // Track the `map_restart` reconnect burst so the deferred per-viewer work
+    // only starts on the first frame whose acknowledgements have been read
+    // (D-006.12).
+    advance_restart_burst();
     // `proxy_tffa_enable` turned off since the last frame (the cvar mirror was
     // just refreshed): dissolve every created match before the game runs, so
     // no frame plays with the isolation gates off while players are still
@@ -1681,6 +1875,8 @@ fn disable_parallel_tffa() {
         s.tffa.home = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.main_origin = MAIN_MATCH;
         s.tffa.pending_join = [REMEMBERED_NONE; MAX_CLIENTS];
+        s.tffa.deferred_begin = [false; MAX_CLIENTS];
+        s.tffa.pending_view_refresh = [false; MAX_CLIENTS];
         // Main keeps playing: a pending end-of-match delay from before the
         // disable must not void its damage after a later re-enable.
         s.tffa.matches[MAIN_MATCH as usize].end_queued_at = 0;
@@ -2253,6 +2449,11 @@ pub fn on_run_frame_post() {
     if !enabled() {
         return;
     }
+    // Finish the `GAME_CLIENT_BEGIN` work the `map_restart` burst deferred, and
+    // any `cs` correction it dropped, now that the clients have acknowledged
+    // it (D-006.12). Before the intermission/settle early returns below, which
+    // must not starve it.
+    drain_deferred_client_work();
     // Game-follow changes adopt a new instance with no proxy command: when a
     // viewer's effective match moves (follow start/stop/switch, or a travel
     // that missed its explicit refresh), re-push prefixed names + scores so
@@ -2286,6 +2487,19 @@ pub fn on_run_frame_post() {
         left
     });
     if grace != 0 {
+        return;
+    }
+    // A finished match's auto-join is deferred past the restart burst
+    // (D-006.12): its remembered members are still spectators, so the match
+    // looks empty until the deferred `restore_pending_join` runs. Keep the
+    // sweep (and limit handling) off until every scheduled auto-join has been
+    // applied — the same protection the settle window gives the open matches.
+    if state::with_state(|s| {
+        s.tffa
+            .pending_join
+            .iter()
+            .any(|team| *team != REMEMBERED_NONE)
+    }) {
         return;
     }
     // A created match whose last player went spectator or disconnected has
@@ -5713,6 +5927,42 @@ mod tests {
     }
 
     #[test]
+    fn the_proxy_defers_sends_once_the_reliable_window_is_nearly_full() {
+        // No engine client (unit tests / feature off): never pressured.
+        assert!(!backlog_is_pressured(None));
+        // An acknowledged client (or one command in flight) has room.
+        assert!(!backlog_is_pressured(Some(0)));
+        assert!(!backlog_is_pressured(Some(1)));
+        // Just under the limit still sends.
+        assert!(!backlog_is_pressured(Some(RELIABLE_SEND_LIMIT - 1)));
+        // At the limit the proxy stops and defers to a later frame.
+        assert!(backlog_is_pressured(Some(RELIABLE_SEND_LIMIT)));
+        // The shipped engine's own overflow point (128 pending + the one it
+        // is about to add) is far past the proxy's threshold.
+        assert!(backlog_is_pressured(Some(129)));
+        // The threshold leaves the pristine game real headroom in the 128-slot
+        // window for its own per-client `map_restart` broadcasts.
+        const { assert!(RELIABLE_SEND_LIMIT > 0 && RELIABLE_SEND_LIMIT < 128) };
+    }
+
+    #[test]
+    fn a_single_match_needs_no_per_viewer_player_override() {
+        // Fix A: same-match slots are not re-sent at connect (they already hold
+        // the base string from the gamestate / the game's own broadcast), so a
+        // main-only server queues no `cs` per slot during the reconnect burst.
+        let base = "n\\Bob\\t\\2\\model\\kyle";
+        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases[0] = base.to_owned();
+        bases[1] = base.to_owned();
+        let table = [MAIN_MATCH; MAX_CLIENTS];
+        assert!(demotions_for_viewer(MAIN_MATCH, &table, &bases).is_empty());
+        // A real spectator watching main is own too.
+        let mut bases2: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases2[0] = "n\\Spec\\t\\3\\model\\kyle".to_owned();
+        assert!(demotions_for_viewer(MAIN_MATCH, &table, &bases2).is_empty());
+    }
+
+    #[test]
     fn scoreboard_demotions_cover_exactly_the_playing_outsiders() {
         // Real CS_PLAYERS shape captured from a running GT_TEAM server.
         let blue_main = "n\\TIE Pilot\\t\\2\\model\\stormpilot\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_2\\st2\\none\\dt\\0\\sdt\\0";
@@ -6444,6 +6694,48 @@ mod tests {
                 .is_empty()
         );
         assert!(matches[MAIN_MATCH as usize].active);
+    }
+
+    /// D-006.12: the proxy stays silent through `SV_MapRestart_f`'s settle
+    /// frames, the reconnect loop and its trailing frame, and only re-arms on
+    /// the frame after that (where the clients' acknowledgements have been
+    /// read). The bounded fallback ends the burst if the trailing frame never
+    /// arrives.
+    #[test]
+    fn the_restart_burst_defers_proxy_sends_until_after_the_trailing_frame() {
+        let mut t = state::TffaState {
+            restart_burst: true,
+            ..state::TffaState::default()
+        };
+
+        // Three settle frames run before the reconnect loop: still bursting.
+        for _ in 0..3 {
+            advance_restart_burst_state(&mut t);
+            assert!(t.restart_burst);
+            assert!(!t.restart_burst_trailing);
+        }
+        // The reconnect loop begins clients: the next frame is the trailing one.
+        t.restart_burst_connects = true;
+        advance_restart_burst_state(&mut t);
+        assert!(
+            t.restart_burst,
+            "the trailing frame is still inside the burst"
+        );
+        assert!(t.restart_burst_trailing);
+        // The first frame after it ends the burst.
+        advance_restart_burst_state(&mut t);
+        assert!(!t.restart_burst);
+        assert!(!t.restart_burst_connects);
+        assert!(!t.restart_burst_trailing);
+        assert_eq!(t.restart_burst_frames, 0);
+
+        // A restart nobody reconnected for (empty server) ends after the
+        // bounded wait, so a modified engine can never freeze the proxy.
+        t.restart_burst = true;
+        for _ in 0..RESTART_BURST_MAX_FRAMES {
+            advance_restart_burst_state(&mut t);
+        }
+        assert!(!t.restart_burst);
     }
 
     /// A `map_restart` keeps the matches that were open and each client's
