@@ -56,3 +56,7 @@
   followed player's team to a following spectator once per second
   (`proxy_sv_spectatorTeamOverlay`, default on); team-scoped and
   parallel-TFFA-instance-scoped, stock-cgame compatible by construction.
+- `0013-crash-diagnostics.md` — opt-in `proxy_sv_debugLog` trace: blocked
+  commands, client commands/userinfo, rcon/download/query attempts and client
+  lifecycle, flushed to `proxy_debug.log` before dispatch for crash
+  attribution; the new `SV_ExecuteClientCommand` entry-wrapper detour.

@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 15] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 16] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -35,6 +35,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 15] = [
     (c"proxy_tffa_maxGroupSize", c"12"),
     (c"proxy_sv_spectatorTeamOverlay", c"1"),
     (c"proxy_sv_muteMode", c"1"),
+    (c"proxy_sv_debugLog", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -66,6 +67,9 @@ pub const CVAR_SPECTATOR_TEAM_OVERLAY: usize = 13;
 /// mute (chat dropped and the player told), `2` silent (the player's own chat
 /// line is echoed back to them, nobody else receives it, no notice is sent).
 pub const CVAR_MUTE_MODE: usize = 14;
+/// Crash-diagnostics trace (`crate::diagnostics`): `0` off, `1` suspicious
+/// events only, `2` every client command/userinfo/lifecycle event.
+pub const CVAR_DEBUG_LOG: usize = 15;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -782,6 +786,11 @@ pub fn is_initialised() -> bool {
 
 /// `GAME_RUN_FRAME` bookkeeping (`Proxy_Main.cpp:169`).
 pub fn set_svs_time(time: i32) {
+    // Keep the diagnostics timestamp lock-free: log call sites run from engine
+    // hooks and must never take the proxy state lock (some are already nested
+    // inside engine/game calls, and logging must stay usable if state is ever
+    // held).
+    crate::diagnostics::set_svs_time(time);
     with_state(|s| s.svs_time = time);
 }
 
@@ -839,6 +848,7 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_TFFA_MAX_GROUP_SIZE].1.to_bytes(), b"12");
         assert_eq!(PROXY_CVARS[CVAR_SPECTATOR_TEAM_OVERLAY].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_MUTE_MODE].1.to_bytes(), b"1");
+        assert_eq!(PROXY_CVARS[CVAR_DEBUG_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

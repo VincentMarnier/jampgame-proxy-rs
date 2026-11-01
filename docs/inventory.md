@@ -52,6 +52,16 @@ rcon for ~49 days — `proxy_sv_enable 1` included. While the proxy is off, rcon
 otherwise behaves like the pristine engine, whose own 500 ms flood gate is
 then active. `rust/scripts/enable-toggle-test.sh` pins this handback.
 
+## Crash diagnostics (Rust addition)
+
+`proxy_sv_debugLog` (default `0`, D-013) is a Rust-only, opt-in trace used to
+attribute live-server crashes: level `1` logs blocked commands and other
+security-relevant events, level `2` adds every client command, userinfo update
+and client lifecycle event. It adds one entry wrapper,
+`SV_ExecuteClientCommand` (`0x804e3d4`, six stealable bytes), so the log sees
+server-level client commands (`userinfo`, downloads) as well as the ones
+forwarded to the game; lines are flushed to `proxy_debug.log` before dispatch.
+
 ## Wanted
 
 ### Security fixes — explicitly named

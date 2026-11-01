@@ -19,10 +19,10 @@ use crate::sdk::{
     OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_CLIENT_NUM, OFFSET_ENTITY_NUMBER, OFFSET_GENTITY_CLIENT,
     OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS, OFFSET_GENTITY_S_ETYPE,
     OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
-    OFFSET_MSG_BIT, OFFSET_MSG_READCOUNT, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
-    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
-    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY,
-    SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
+    OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_READCOUNT, OFFSET_NETCHAN_REMOTE_ADDRESS,
+    OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST,
+    OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE,
+    OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
 };
 use crate::state::{self, CVAR_ENABLE_RCON_CMD_COOLDOWN, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
@@ -185,6 +185,105 @@ pub fn cstr_len(p: *const c_char) -> usize {
     }
 }
 
+/// The engine's client slot index for a `client_t*`, or `None` when the
+/// pointer is not one of `svs->clients` (never prints: this runs from hot
+/// diagnostic paths).
+pub fn client_number(cl: usize) -> Option<usize> {
+    // SAFETY: engine memory layer initialised (hooks only run after GAME_INIT).
+    let base = unsafe { clients_base() };
+    if base == 0 {
+        return None;
+    }
+    let num = cl.wrapping_sub(base) / SIZEOF_CLIENT_T;
+    (num < crate::sdk::MAX_CLIENTS).then_some(num)
+}
+
+/// `NET_AdrToString`-compatible rendering of a `netadr_t`, without the
+/// engine's shared static buffer.
+pub fn netadr_string(adr: &Netadr) -> String {
+    match adr.kind {
+        0 => "bot".to_owned(),       // NA_BOT
+        1 => "BAD".to_owned(),       // NA_BAD
+        2 => "loopback".to_owned(),  // NA_LOOPBACK
+        3 => "broadcast".to_owned(), // NA_BROADCAST
+        4 => format!(
+            "{}.{}.{}.{}:{}",
+            adr.ip[0],
+            adr.ip[1],
+            adr.ip[2],
+            adr.ip[3],
+            u16::from_be(adr.port)
+        ),
+        other => format!(
+            "type{}:{:02x}{:02x}{:02x}{:02x}.{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}:{}",
+            other,
+            adr.ipx[0],
+            adr.ipx[1],
+            adr.ipx[2],
+            adr.ipx[3],
+            adr.ipx[4],
+            adr.ipx[5],
+            adr.ipx[6],
+            adr.ipx[7],
+            adr.ipx[8],
+            adr.ipx[9],
+            u16::from_be(adr.port)
+        ),
+    }
+}
+
+/// One-line client identity for diagnostic logs: slot, engine name and remote
+/// address. Reads engine memory only (safe from any hook), never proxy state.
+///
+/// # Safety
+///
+/// `cl` must be a valid `client_t*` while the engine is running.
+pub unsafe fn client_label(cl: usize) -> String {
+    let number = client_number(cl)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    // SAFETY: cl is a valid client_t; name/userinfo are NUL-terminated.
+    let name = cstr_bytes((cl + OFFSET_CLIENT_NAME) as *const c_char);
+    // SAFETY: cl is a valid client_t; remoteAddress is a plain netadr_t.
+    let adr =
+        unsafe { core::ptr::read_unaligned((cl + OFFSET_NETCHAN_REMOTE_ADDRESS) as *const Netadr) };
+    format!(
+        "client={number} name=\"{}\" adr=\"{}\"",
+        crate::diagnostics::escape_bytes(name, 128),
+        netadr_string(&adr)
+    )
+}
+
+/// [`client_label`] for a client slot index (used by the game-module vmMain
+/// event handlers, which only receive the number).
+pub fn client_label_for_num(client_num: c_int) -> String {
+    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+        return format!("client={client_num} (out of range)");
+    }
+    // SAFETY: engine memory layer initialised; the slot index is in range.
+    let base = unsafe { clients_base() };
+    if base == 0 {
+        return format!("client={client_num}");
+    }
+    // SAFETY: base points at svs->clients, slot index in range.
+    unsafe { client_label(base + client_num as usize * SIZEOF_CLIENT_T) }
+}
+
+/// Join `Cmd_Argv(start..argc)` for a log line, escaping each token.
+pub fn join_cmd_args(start: c_int) -> String {
+    let argc = unsafe { engine::cmd_argc() }.clamp(0, 64);
+    let mut out = String::new();
+    for i in start..argc {
+        // SAFETY: Cmd_Argv is valid in the command context; NUL-terminated.
+        let arg = unsafe { engine::cmd_argv(i) };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&crate::diagnostics::escape_bytes(cstr_bytes(arg), 256));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // SVC_RemoteCommand (rcon) — entry wrapper (D-002 "rcon" row)
 // ---------------------------------------------------------------------------
@@ -203,9 +302,36 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
     // wrapping_add: svs.time wraps past u32::MAX after ~49 days; a plain `+`
     // would panic (= abort) in debug builds at the wrap.
     if cooldown_enabled && now.wrapping_sub(RCON_COOLDOWN.load(Ordering::Relaxed)) < 500 {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "rcon.cooldown",
+                format!(
+                    "from=\"{}\" command=\"{}\"",
+                    netadr_string(&from),
+                    join_cmd_args(2)
+                ),
+            );
+        }
         return;
     }
     RCON_COOLDOWN.store(now, Ordering::Relaxed);
+
+    // Log every rcon attempt with the password redacted. `Cmd_Argv(1)` is the
+    // supplied password; only its match result is recorded.
+    if crate::diagnostics::suspicious_enabled() {
+        // SAFETY: Cmd_Argv is valid in the connectionless context and
+        // NUL-terminated; the cvar slot is a live `cvar_t*`.
+        let valid = unsafe { rcon_password_matches(engine::cmd_argv(1)) };
+        crate::diagnostics::suspicious(
+            "rcon",
+            format!(
+                "from=\"{}\" valid={} command=\"{}\"",
+                netadr_string(&from),
+                valid,
+                join_cmd_args(2)
+            ),
+        );
+    }
 
     // Only allow writeconfig on cfg files.
     // SAFETY: engine Cmd_Argv is valid in the connectionless context.
@@ -219,6 +345,16 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
             && unsafe { *arg3.add(arg3_len - 4) } == b'.' as i8
             && unsafe { jampgame::q_stricmpn(arg3.add(arg3_len - 4), c".cfg".as_ptr(), 4) } != 0
         {
+            if crate::diagnostics::suspicious_enabled() {
+                crate::diagnostics::suspicious(
+                    "rcon.writeconfig",
+                    format!(
+                        "from=\"{}\" rejected=\"{}\"",
+                        netadr_string(&from),
+                        crate::diagnostics::escape_bytes(cstr_bytes(arg3), 256)
+                    ),
+                );
+            }
             return;
         }
     }
@@ -226,6 +362,29 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
     // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
     let original = original_call(crate::hooks::engine_hook_original_svc_remote_command);
     unsafe { original(from, msg) };
+}
+
+/// Whether `supplied` matches the engine's current `sv_rconpassword`.
+///
+/// # Safety
+///
+/// Called in the connectionless command context with engine memory
+/// initialised; `supplied` is NUL-terminated.
+unsafe fn rcon_password_matches(supplied: *const c_char) -> bool {
+    // SAFETY: validated cvar-pointer slot (R-018), dereferenced by the memory
+    // layer at GAME_INIT.
+    let cvar_ptr = unsafe { *(engine::cvar_slots::SV_RCONPASSWORD as *const usize) };
+    if cvar_ptr == 0 {
+        return false;
+    }
+    // SAFETY: cvar_ptr is a live cvar_t*; string is a NUL-terminated char*.
+    let expected = unsafe { engine::cvar_string_ptr(cvar_ptr) };
+    if expected.is_null() {
+        return false;
+    }
+    // SAFETY: engine cvar strings are NUL-terminated for the cvar's lifetime.
+    let expected = unsafe { core::ffi::CStr::from_ptr(expected as *const c_char) }.to_bytes();
+    !expected.is_empty() && expected == cstr_bytes(supplied)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +398,22 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
 ///
 /// Entered from `SV_ConnectionlessPacket` with a `netadr_t`.
 pub unsafe extern "C" fn svc_status(from: Netadr) {
-    if cmd_argv_len(1) > 128 {
+    let len = cmd_argv_len(1);
+    if len > 128 {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "query.oversize",
+                format!(
+                    "kind=getstatus from=\"{}\" len={len} arg=\"{}\"",
+                    netadr_string(&from),
+                    // SAFETY: Cmd_Argv is NUL-terminated in this context.
+                    crate::diagnostics::escape_bytes(
+                        cstr_bytes(unsafe { engine::cmd_argv(1) }),
+                        256
+                    )
+                ),
+            );
+        }
         return;
     }
     // SAFETY: trampoline attached at GAME_INIT.
@@ -253,7 +427,22 @@ pub unsafe extern "C" fn svc_status(from: Netadr) {
 ///
 /// Entered from `SV_ConnectionlessPacket` with a `netadr_t`.
 pub unsafe extern "C" fn svc_info(from: Netadr) {
-    if cmd_argv_len(1) > 128 {
+    let len = cmd_argv_len(1);
+    if len > 128 {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "query.oversize",
+                format!(
+                    "kind=getinfo from=\"{}\" len={len} arg=\"{}\"",
+                    netadr_string(&from),
+                    // SAFETY: Cmd_Argv is NUL-terminated in this context.
+                    crate::diagnostics::escape_bytes(
+                        cstr_bytes(unsafe { engine::cmd_argv(1) }),
+                        256
+                    )
+                ),
+            );
+        }
         return;
     }
     // SAFETY: trampoline attached at GAME_INIT.
@@ -281,6 +470,20 @@ fn cmd_argv_len(n: c_int) -> usize {
 /// Entered from the engine with a valid `client_t*`.
 pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
     let userinfo = cl + OFFSET_CLIENT_USERINFO;
+    if crate::diagnostics::verbose_enabled() {
+        // SAFETY: cl is a valid client_t; userinfo is NUL-terminated.
+        let info = cstr_bytes(userinfo as *const c_char);
+        crate::diagnostics::verbose(
+            "userinfo",
+            format!(
+                "{} len={} userinfo=\"{}\"",
+                // SAFETY: cl is a valid client_t.
+                unsafe { client_label(cl) },
+                info.len(),
+                crate::diagnostics::escape_bytes(info, 512)
+            ),
+        );
+    }
     // SAFETY: cl is a valid client_t; userinfo is NUL-terminated.
     let model =
         unsafe { jampgame::info_value_for_key(userinfo as *const c_char, c"model".as_ptr()) };
@@ -292,6 +495,18 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
         let max_len =
             state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer.max(1)) as usize;
         if !utils::is_valid_ascii_str(model_bytes) || model_len >= max_len {
+            if crate::diagnostics::suspicious_enabled() {
+                crate::diagnostics::suspicious(
+                    "userinfo.model",
+                    format!(
+                        "{} len={} model=\"{}\" forced=\"kyle\"",
+                        // SAFETY: cl is a valid client_t.
+                        unsafe { client_label(cl) },
+                        model_len,
+                        crate::diagnostics::escape_bytes(model_bytes, 256)
+                    ),
+                );
+            }
             // SAFETY: userinfo buffer writable; literals NUL-terminated.
             unsafe {
                 jampgame::info_set_value_for_key(
@@ -320,6 +535,21 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
 /// Entered from the engine's command execution path with a valid `client_t*`.
 pub unsafe extern "C" fn sv_begin_download_f(cl: usize) {
     if unsafe { client_state(cl) } == CS_ACTIVE {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "download.block",
+                format!(
+                    "{} reason=\"player active\" file=\"{}\"",
+                    // SAFETY: cl is a valid client_t.
+                    unsafe { client_label(cl) },
+                    // SAFETY: Cmd_Argv valid in the command context.
+                    crate::diagnostics::escape_bytes(
+                        cstr_bytes(unsafe { engine::cmd_argv(1) }),
+                        256
+                    )
+                ),
+            );
+        }
         return;
     }
     // SAFETY: Cmd_Argv valid in the command context.
@@ -330,6 +560,25 @@ pub unsafe extern "C" fn sv_begin_download_f(cl: usize) {
         || compat::check_dir_traversal(file_bytes)
         || unsafe { jampgame::q_stricmpn(file_name.add(len - 4), c".pk3".as_ptr(), 4) } != 0
     {
+        if crate::diagnostics::suspicious_enabled() {
+            let reason = if compat::check_dir_traversal(file_bytes) {
+                "directory traversal"
+            } else if len < 5 {
+                "short name"
+            } else {
+                "not .pk3"
+            };
+            crate::diagnostics::suspicious(
+                "download.block",
+                format!(
+                    "{} reason=\"{}\" file=\"{}\"",
+                    // SAFETY: cl is a valid client_t.
+                    unsafe { client_label(cl) },
+                    reason,
+                    crate::diagnostics::escape_bytes(file_bytes, 256)
+                ),
+            );
+        }
         return;
     }
     // SAFETY: trampoline attached at GAME_INIT.
@@ -345,6 +594,15 @@ pub unsafe extern "C" fn sv_begin_download_f(cl: usize) {
 /// Entered from the engine's command execution path with a valid `client_t*`.
 pub unsafe extern "C" fn sv_next_download_f(cl: usize) {
     if unsafe { client_state(cl) } == CS_ACTIVE {
+        if crate::diagnostics::suspicious_enabled() {
+            // SAFETY: cl is a valid client_t.
+            crate::diagnostics::suspicious(
+                "download.block",
+                format!("{} reason=\"player active\" command=nextdl", unsafe {
+                    client_label(cl)
+                }),
+            );
+        }
         return;
     }
     let original = original_call(crate::hooks::engine_hook_original_sv_next_download_f);
@@ -358,6 +616,15 @@ pub unsafe extern "C" fn sv_next_download_f(cl: usize) {
 /// Entered from the engine's command execution path with a valid `client_t*`.
 pub unsafe extern "C" fn sv_stop_download_f(cl: usize) {
     if unsafe { client_state(cl) } == CS_ACTIVE {
+        if crate::diagnostics::suspicious_enabled() {
+            // SAFETY: cl is a valid client_t.
+            crate::diagnostics::suspicious(
+                "download.block",
+                format!("{} reason=\"player active\" command=stopdl", unsafe {
+                    client_label(cl)
+                }),
+            );
+        }
         return;
     }
     let original = original_call(crate::hooks::engine_hook_original_sv_stop_download_f);
@@ -371,6 +638,15 @@ pub unsafe extern "C" fn sv_stop_download_f(cl: usize) {
 /// Entered from the engine's command execution path with a valid `client_t*`.
 pub unsafe extern "C" fn sv_done_download_f(cl: usize) {
     if unsafe { client_state(cl) } == CS_ACTIVE {
+        if crate::diagnostics::suspicious_enabled() {
+            // SAFETY: cl is a valid client_t.
+            crate::diagnostics::suspicious(
+                "download.block",
+                format!("{} reason=\"player active\" command=donedl", unsafe {
+                    client_label(cl)
+                }),
+            );
+        }
         return;
     }
     let original = original_call(crate::hooks::engine_hook_original_sv_done_download_f);
@@ -387,7 +663,27 @@ pub unsafe extern "C" fn sv_update_userinfo_f(cl: usize) {
     // SAFETY: Cmd_Argv valid in the command context.
     let arg = unsafe { engine::cmd_argv(1) };
     if arg.is_null() || unsafe { *arg } == 0 {
+        if crate::diagnostics::suspicious_enabled() {
+            // SAFETY: cl is a valid client_t.
+            crate::diagnostics::suspicious(
+                "userinfo.empty",
+                format!("{} command=userinfo", unsafe { client_label(cl) }),
+            );
+        }
         return;
+    }
+    if crate::diagnostics::verbose_enabled() {
+        let bytes = cstr_bytes(arg);
+        crate::diagnostics::verbose(
+            "userinfo.command",
+            format!(
+                "{} len={} userinfo=\"{}\"",
+                // SAFETY: cl is a valid client_t.
+                unsafe { client_label(cl) },
+                bytes.len(),
+                crate::diagnostics::escape_bytes(bytes, 512)
+            ),
+        );
     }
     let original = original_call(crate::hooks::engine_hook_original_sv_update_userinfo_f);
     unsafe { original(cl) };
@@ -453,6 +749,17 @@ pub unsafe extern "C" fn sv_write_download_to_client(cl: usize, msg: usize) {
         unsafe { *((cl + OFFSET_CLIENT_DOWNLOAD) as *mut c_int) = 0 };
 
         if unreferenced {
+            if crate::diagnostics::suspicious_enabled() {
+                crate::diagnostics::suspicious(
+                    "download.block",
+                    format!(
+                        "{} reason=\"not in pure set\" file=\"{}\"",
+                        // SAFETY: cl is a valid client_t.
+                        unsafe { client_label(cl) },
+                        crate::diagnostics::escape_bytes(cstr_bytes(dlname as *const c_char), 256)
+                    ),
+                );
+            }
             let client_num = client_num_from_addr(cl) as c_int;
             let dlname_cstr = dlname as *const c_char;
             // SAFETY: engine Com_Printf is valid; downloadName NUL-terminated.
@@ -529,6 +836,12 @@ pub unsafe extern "C" fn sv_sventity_for_gentity(g_ent: usize) -> usize {
         bad = number < 0 || number as usize >= MAX_GENTITIES;
     }
     if bad {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "sventity.bad",
+                format!("gentity={g_ent:#x} reason=\"bad entity number\""),
+            );
+        }
         // SAFETY: game Com_Error is valid; literal format string.
         unsafe {
             com_error(ERR_DROP, c"SV_SvEntityForGentity: bad gEnt\n".as_ptr());
@@ -542,6 +855,14 @@ pub unsafe extern "C" fn sv_sventity_for_gentity(g_ent: usize) -> usize {
     // outside the array (or a zero/negative size) must not yield an OOB
     // svEntity pointer for the engine to write through.
     if gentity_size == 0 || g_ent < gentities || (g_ent - gentities) % gentity_size != 0 {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "sventity.bad",
+                format!(
+                    "gentity={g_ent:#x} base={gentities:#x} size={gentity_size} reason=\"array math\""
+                ),
+            );
+        }
         // SAFETY: game Com_Error is valid; literal format string.
         unsafe {
             com_error(ERR_DROP, c"SV_SvEntityForGentity: bad gEnt\n".as_ptr());
@@ -550,6 +871,14 @@ pub unsafe extern "C" fn sv_sventity_for_gentity(g_ent: usize) -> usize {
     }
     let num = (g_ent - gentities) / gentity_size;
     if num >= MAX_GENTITIES {
+        if crate::diagnostics::suspicious_enabled() {
+            crate::diagnostics::suspicious(
+                "sventity.bad",
+                format!(
+                    "gentity={g_ent:#x} index={num} max={MAX_GENTITIES} reason=\"index out of range\""
+                ),
+            );
+        }
         // SAFETY: game Com_Error is valid; literal format string.
         unsafe {
             com_error(ERR_DROP, c"SV_SvEntityForGentity: bad gEnt\n".as_ptr());
@@ -652,6 +981,48 @@ pub unsafe extern "C" fn sv_send_client_game_state(cl: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// SV_ExecuteClientCommand — diagnostic trace of every client command
+// ---------------------------------------------------------------------------
+
+/// `SV_ExecuteClientCommand(client_t*, const char*, qboolean)` — logs the raw
+/// command before the engine dispatches it to its own `ucmds` table or to the
+/// game module's `ClientCommand`.
+///
+/// This is the single point every client command passes through, including the
+/// server-level ones (`userinfo`, `download`, `nextdl`) that never reach the
+/// game's `GAME_CLIENT_COMMAND` vmMain event. Logging before the original body
+/// means a command that crashes the engine/game still has its last trace
+/// flushed to `proxy_debug.log`.
+///
+/// # Safety
+///
+/// Entered from the engine with a valid `client_t*` and a NUL-terminated
+/// command string.
+pub unsafe extern "C" fn sv_execute_client_command(
+    cl: usize,
+    command: *const c_char,
+    client_ok: c_int,
+) {
+    if crate::diagnostics::verbose_enabled() {
+        let bytes = cstr_bytes(command);
+        crate::diagnostics::verbose(
+            "clientcmd",
+            format!(
+                "{} client_ok={} len={} cmd=\"{}\"",
+                // SAFETY: cl is a valid client_t.
+                unsafe { client_label(cl) },
+                client_ok,
+                bytes.len(),
+                crate::diagnostics::escape_bytes(bytes, 512)
+            ),
+        );
+    }
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_sv_execute_client_command);
+    unsafe { original(cl, command, client_ok) };
+}
+
+// ---------------------------------------------------------------------------
 // SV_ExecuteClientMessage — upstream gate + packet-start marking (entry wrapper)
 // ---------------------------------------------------------------------------
 
@@ -719,6 +1090,20 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
             tolerated_nextdl = lcc.windows(6).any(|w| w == b"nextdl");
         }
         if !tolerated_nextdl {
+            if crate::diagnostics::verbose_enabled() {
+                let cursize = unsafe { read_i32(msg + OFFSET_MSG_CURSIZE) };
+                crate::diagnostics::verbose(
+                    "clientmsg.gate",
+                    format!(
+                        "{} server_id={} expected={} restarted={} bytes={cursize} reason=\"stale serverId\"",
+                        // SAFETY: cl is a valid client_t.
+                        unsafe { client_label(cl) },
+                        server_id,
+                        sv_server_id,
+                        restarted_server_id
+                    ),
+                );
+            }
             if server_id >= restarted_server_id && server_id < sv_server_id {
                 // SAFETY: cl->name is a NUL-terminated string.
                 unsafe {
@@ -744,6 +1129,20 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
 
     // 2. Peek the command byte; mark the packet start for usercmd messages.
     let c = unsafe { engine::msg_read_byte(msg) };
+    if !(0..=5).contains(&c) && crate::diagnostics::suspicious_enabled() {
+        // clc_bad..clc_EOF; the pristine body only dispatches 2/3 and treats
+        // the rest as end-of-message. An out-of-range byte is a malformed
+        // client and can be the fingerprint of a crashing exploit.
+        let cursize = unsafe { read_i32(msg + OFFSET_MSG_CURSIZE) };
+        crate::diagnostics::suspicious(
+            "clientmsg.badcmd",
+            format!(
+                "{} command_byte={c} bytes={cursize}",
+                // SAFETY: cl is a valid client_t.
+                unsafe { client_label(cl) }
+            ),
+        );
+    }
     // SAFETY: restore exactly the state the body expects.
     unsafe {
         *((msg + OFFSET_MSG_READCOUNT) as *mut c_int) = saved_readcount;

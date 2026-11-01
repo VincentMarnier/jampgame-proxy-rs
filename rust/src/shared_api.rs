@@ -12,6 +12,7 @@ use core::ffi::{CStr, c_char, c_int};
 
 use std::ffi::CString;
 
+use crate::diagnostics;
 use crate::jampgame;
 use crate::original;
 use crate::sdk::{
@@ -132,6 +133,7 @@ pub fn client_command(client_num: c_int) -> bool {
     }
     let is_connected = state::with_state(|s| s.clients[client_num as usize].is_connected);
     if !is_connected {
+        log_blocked(client_num, "not connected", b"", b"");
         return false;
     }
 
@@ -147,6 +149,7 @@ pub fn client_command(client_num: c_int) -> bool {
 
     // Anti-cheat: kick jkaDST_ tool commands.
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"jkaDST_".as_ptr(), 7) } == 0 {
+        log_blocked(client_num, "anti-cheat jkaDST_ command", cmd, &[]);
         let netname = client_netname(client_num);
         let chat =
             format!("chat \"^3(Anti-Cheat system) ^7{netname}^3 got kicked cause of cheating^7\"");
@@ -173,6 +176,7 @@ pub fn client_command(client_num: c_int) -> bool {
     {
         say_cmd = true;
         if args_concat.len() > 256 {
+            log_blocked(client_num, "chat longer than 256 bytes", cmd, args_concat);
             return false;
         }
     }
@@ -190,6 +194,12 @@ pub fn client_command(client_num: c_int) -> bool {
         // SAFETY: engine syscall registered.
         let sv_maxclients = unsafe { syscall::cvar_variable_integer_value(c"sv_maxclients") };
         if utils::atoi(cmd_arg1) >= sv_maxclients {
+            log_blocked(
+                client_num,
+                "gc clientNum >= sv_maxclients",
+                cmd,
+                args_concat,
+            );
             return false;
         }
     }
@@ -200,6 +210,7 @@ pub fn client_command(client_num: c_int) -> bool {
         && (unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg2), c"ragnos".as_ptr(), 6) } == 0
             || unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg2), c"saber_droid".as_ptr(), 6) } == 0)
     {
+        log_blocked(client_num, "npc spawn crash guard", cmd, args_concat);
         return false;
     }
 
@@ -208,11 +219,13 @@ pub fn client_command(client_num: c_int) -> bool {
         && (unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg1), c"follow1".as_ptr(), 7) } == 0
             || unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg1), c"follow2".as_ptr(), 7) } == 0)
     {
+        log_blocked(client_num, "team follow crash guard", cmd, args_concat);
         return false;
     }
 
     // Disable callteamvote (useless in basejka, can bug the custom-client UI).
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"callteamvote".as_ptr(), 12) } == 0 {
+        log_blocked(client_num, "callteamvote disabled", cmd, args_concat);
         return false;
     }
 
@@ -224,6 +237,7 @@ pub fn client_command(client_num: c_int) -> bool {
 
         // Fix: callvote long string length crash.
         if cmd_arg2.len() >= MAX_CVAR_VALUE_STRING {
+            log_blocked(client_num, "callvote value too long", cmd, args_concat);
             return false;
         }
 
@@ -254,14 +268,17 @@ pub fn client_command(client_num: c_int) -> bool {
         }
 
         if check_needed && (cmd_arg2_number_value < min_arg2 || cmd_arg2_number_value > max_arg2) {
+            log_blocked(client_num, "callvote value out of range", cmd, args_concat);
             return false;
         }
     }
 
     if utils::strchrs(args_concat, b"\r\n").is_some() {
+        log_blocked(client_num, "CR/LF command injection", cmd, args_concat);
         return false;
     }
     if !say_cmd && utils::strchrs(args_concat, b";").is_some() {
+        log_blocked(client_num, "semicolon command injection", cmd, args_concat);
         return false;
     }
 
@@ -340,6 +357,16 @@ pub fn client_userinfo_changed(client_num: c_int) {
 
         // Anti-cheat: darksidetools model.
         if is_darkside_tools {
+            if diagnostics::suspicious_enabled() {
+                diagnostics::suspicious(
+                    "userinfo.kick",
+                    format!(
+                        "{} reason=\"darksidetools model\" userinfo=\"{}\"",
+                        crate::hooks::engine_sv::client_label_for_num(client_num),
+                        diagnostics::escape_bytes(&userinfo_buf, 512)
+                    ),
+                );
+            }
             let name = String::from_utf8_lossy(&clean_name[..utils::c_strlen(&clean_name)]);
             let chat =
                 format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
@@ -369,6 +396,17 @@ pub fn client_userinfo_changed(client_num: c_int) {
             || model.len() >= max_model_len;
 
         if bad_model {
+            if diagnostics::suspicious_enabled() {
+                diagnostics::suspicious(
+                    "userinfo.model",
+                    format!(
+                        "{} len={} model=\"{}\" forced=\"kyle\"",
+                        crate::hooks::engine_sv::client_label_for_num(client_num),
+                        model.len(),
+                        diagnostics::escape_bytes(model, 256)
+                    ),
+                );
+            }
             // SAFETY: userinfo buffer writable; literals NUL-terminated.
             unsafe {
                 jampgame::info_set_value_for_key(
@@ -415,6 +453,17 @@ pub fn client_userinfo_changed(client_num: c_int) {
     }
 
     if bad_force {
+        if diagnostics::suspicious_enabled() {
+            diagnostics::suspicious(
+                "userinfo.forcepowers",
+                format!(
+                    "{} len={} forcepowers=\"{}\" forced=\"7-1-030000000000003332\"",
+                    crate::hooks::engine_sv::client_label_for_num(client_num),
+                    fp_len,
+                    diagnostics::escape_bytes(&force_powers[..fp_len], 64)
+                ),
+            );
+        }
         utils::strncpyz(&mut force_powers, b"7-1-030000000000003332");
     }
 
@@ -441,6 +490,24 @@ pub fn client_userinfo_changed(client_num: c_int) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Log a command the proxy refused to forward (or a client that tried to send
+/// one before it was fully in the game).
+fn log_blocked(client_num: c_int, reason: &str, cmd: &[u8], args: &[u8]) {
+    if !diagnostics::suspicious_enabled() {
+        return;
+    }
+    diagnostics::suspicious(
+        "clientcmd.block",
+        format!(
+            "{} reason=\"{}\" cmd=\"{}\" args=\"{}\"",
+            crate::hooks::engine_sv::client_label_for_num(client_num),
+            reason,
+            diagnostics::escape_bytes(cmd, 128),
+            diagnostics::escape_bytes(args, 512)
+        ),
+    );
+}
 
 /// Bytes before the NUL terminator of `buf`.
 fn nul_terminated(buf: &[u8]) -> &[u8] {

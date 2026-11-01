@@ -686,7 +686,7 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `SV_AddEntitiesVisibleFromPoint` is re-added as a Rust-only parallel-TFFA
 /// post-filter (invisibility); it runs the pristine body then drops
 /// cross-match entities from the snapshot list.
-pub static ENGINE_HOOKS: [Hook; 15] = [
+pub static ENGINE_HOOKS: [Hook; 16] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -752,6 +752,11 @@ pub static ENGINE_HOOKS: [Hook; 15] = [
     Hook::new(
         "SV_AddEntitiesVisibleFromPoint",
         crate::engine::functions::SV_ADD_ENTITIES_VISIBLE_FROM_POINT,
+        false,
+    ),
+    Hook::new(
+        "SV_ExecuteClientCommand",
+        crate::engine::functions::SV_EXECUTE_CLIENT_COMMAND,
         false,
     ),
 ];
@@ -1106,6 +1111,11 @@ mod tests {
         Site {
             name: "SV_AddEntitiesVisibleFromPoint",
             bytes: b"\x55\x8b\xec\x83\xec\x58\x89\x7d\xf4\x89\x75\xf0\x89\x5d\xec\x8b",
+            want: 6,
+        },
+        Site {
+            name: "SV_ExecuteClientCommand",
+            bytes: b"\x55\x8b\xec\x83\xec\x20\x89\x7d\xf4\x89\x75\xf8",
             want: 6,
         },
         Site {

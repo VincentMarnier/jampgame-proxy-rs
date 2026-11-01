@@ -29,6 +29,7 @@
 //! both mirroring the original proxy's forwarders. See `src/syscall.rs`,
 //! `src/original.rs`, `src/sdk.rs`.
 
+mod diagnostics;
 mod engine;
 mod hooks;
 mod jampgame;
@@ -149,6 +150,17 @@ pub unsafe extern "C" fn vmMain(
                 tffa::on_client_connect(a0, a1 != 0);
                 teamlock::on_client_connect(a1 != 0);
             }
+            if diagnostics::verbose_enabled() {
+                diagnostics::verbose(
+                    "client.connect",
+                    format!(
+                        "first_time={} bot={} {}",
+                        a1 != 0,
+                        a2 != 0,
+                        hooks::engine_sv::client_label_for_num(a0)
+                    ),
+                );
+            }
             forward(command, &args)
         }
         GAME_CLIENT_DISCONNECT => {
@@ -172,6 +184,12 @@ pub unsafe extern "C" fn vmMain(
             } else {
                 None
             };
+            if diagnostics::verbose_enabled() {
+                diagnostics::verbose(
+                    "client.disconnect",
+                    hooks::engine_sv::client_label_for_num(a0),
+                );
+            }
             let response = forward(command, &args);
             if let Some(previous) = scope {
                 tffa::close_acting_scope(previous);
@@ -183,6 +201,16 @@ pub unsafe extern "C" fn vmMain(
             // master switch so a runtime enable finds the clients that began
             // while it was off.
             shared_api::client_begin(a0, a1 != 0);
+            if diagnostics::verbose_enabled() {
+                diagnostics::verbose(
+                    "client.begin",
+                    format!(
+                        "allow_team_reset={} {}",
+                        a1 != 0,
+                        hooks::engine_sv::client_label_for_num(a0)
+                    ),
+                );
+            }
             let response = forward(command, &args);
             if state::proxy_enabled() {
                 tffa::on_client_begin(a0);
@@ -430,6 +458,9 @@ fn update_proxy_cvars() {
             // SAFETY: cvar is stable within the state.
             unsafe { syscall::cvar_update(cvar) };
         }
+        // The diagnostics level is mirrored into a lock-free atomic so engine
+        // hook call sites can gate their formatting without re-entering state.
+        diagnostics::set_level(s.cvars[state::CVAR_DEBUG_LOG].integer);
         s.cvars[state::CVAR_ENABLE].integer != 0
     });
     state::set_proxy_enabled(enabled);

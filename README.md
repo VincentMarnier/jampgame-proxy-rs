@@ -30,6 +30,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 |---------------------------------------|---------|-----------------------------------------------------------------------------------------------|
 | `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module (RCON keeps working, with the engine's pristine 500 ms gate) |
 | `proxy_sv_muteMode`                   | 1       | `mute`/`unmute` behaviour: `0` disabled, `1` drop the player's chat and tell them, `2` silent (their own line is echoed back to them, nobody else receives it, no notice); see [Player mute](#player-mute) |
+| `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
@@ -78,6 +79,38 @@ the same commands work in the dedicated server's own console.
 
 In silent mode the server console/log still records the player's line
 (`G_Say`'s own `say:` log), which keeps moderation auditable.
+
+
+### Crash diagnostics
+
+`proxy_sv_debugLog` turns on a trace meant to identify a player who crashes the
+dedicated server. Set it at runtime with `rcon proxy_sv_debugLog 2` (or
+permanently with `+set proxy_sv_debugLog 1` in the server command line) and
+reproduce the crash:
+
+- `0` (default) — off. Nothing is collected or formatted.
+- `1` — suspicious events only: commands the proxy blocked (anti-cheat,
+  crash guards, chat/command injection, oversized callvote), userinfo fields
+  forced back to safe values, rcon attempts (password redacted), rejected
+  downloads, oversized `getstatus`/`getinfo` queries and malformed client
+  messages.
+- `2` — everything in `1`, plus every client command with its full text and
+  length, every `userinfo` update, and client connect/begin/disconnect events.
+
+Each line records the server time (`t=`, the engine's `svs.time`), the wall
+clock (`unix_ms=`), the client slot, its name and remote address where
+available. Client bytes are escaped (`\n`, `\r`, non-printables as `\xNN`) so a
+malicious command cannot forge log lines. Lines are written and flushed to
+`proxy_debug.log` in the server's working directory *before* the command is
+handed to the engine/game, so the last line survives a segmentation fault; they
+are also printed to the server console (and therefore `qconsole.log` when
+`logfile` is on). The rcon password is never written.
+
+Use it only while investigating: level `2` is intentionally verbose, and a
+busy server will produce a lot of lines. A typical report is the last few
+`clientcmd`/`userinfo` lines before the server died, plus the client name and
+IP. If the file cannot be created, the proxy says so once on the console and
+keeps logging to the console only.
 
 
 ### TaystJK scoreboard deaths

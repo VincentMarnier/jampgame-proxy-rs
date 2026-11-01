@@ -148,6 +148,7 @@ csrc/syscall_shim.c     C variadic trap shim (stable Rust can't define one)
 src/lib.rs              exported dllEntry / vmMain + GAME_INIT/SHUTDOWN/RUN_FRAME
 src/sdk.rs              SDK ABI: repr(C) types, trap ordinals, layout pins
 src/state.rs            proxy state (locatedGameData, client data, cvar mirror)
+src/diagnostics.rs      opt-in crash trace (proxy_sv_debugLog -> proxy_debug.log)
 src/original.rs         dlopen/dlsym/dladdr of the original module
 src/jampgame.rs         game-module helper function bindings (base+offset)
 src/engine.rs           engine address tables + memory-layer init + Com_EndRedirect
