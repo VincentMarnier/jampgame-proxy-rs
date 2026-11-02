@@ -243,6 +243,8 @@ h3.sub .count {
   border-radius: 99px;
   padding: 0.1rem 0.6rem;
   letter-spacing: 0.1em;
+  flex: none;
+  white-space: nowrap;
 }
 
 .prose { max-width: var(--prose); }
