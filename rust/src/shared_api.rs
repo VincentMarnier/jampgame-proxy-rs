@@ -646,22 +646,25 @@ pub fn client_userinfo_changed(client_num: c_int) -> bool {
 }
 
 /// Whether a `forcepowers` value passes the proxy's shape check
-/// (`Proxy_SharedAPI.cpp:270-324`, as ported).
+/// (`Proxy_SharedAPI.cpp:270-324`, as ported, plus 11-01 F4).
 ///
-/// The rule, verbatim from the inline loop it replaces: 22 to 24 characters,
-/// only digits and `-`, exactly two `-` at positions 1 to 5, never adjacent.
-/// It is a pure function so the audit vectors of
-/// `docs/ybeproxy-2026-delta.md` (F4) can be pinned by unit tests; the caller
-/// still writes the default string on failure.
+/// 22 to 24 characters, only digits and `-`, exactly two `-` at positions 1
+/// to 5 and never adjacent, **at least 18 power digits after the second `-`**,
+/// and every power digit in `0..=3`. The rank and side digits are not limited:
+/// the game replaces the rank and checks the side itself.
 ///
-/// Known gap (F4, 2026-11-01 audit): the rule does not require the 18 power
-/// digits that `BG_LegalizedForcePowers` reads after the second `-`, and it
-/// accepts a power digit above 3. See the tests below.
+/// `BG_LegalizedForcePowers` reads exactly `NUM_FORCE_POWERS` (18) digits after
+/// the second `-`; with fewer, the missing `final_Powers[]` entries keep stack
+/// garbage and are used as indices. A level above 3 is used as a
+/// `bgForcePowerCost` column before being clamped.
+///
+/// The caller still writes the default string on failure.
 fn forcepowers_is_valid(powers: &[u8]) -> bool {
     if !(22..=24).contains(&powers.len()) {
         return false;
     }
     let mut seps = 0u32;
+    let mut second_sep = 0usize;
     for (i, &b) in powers.iter().enumerate() {
         if b != b'-' && !b.is_ascii_digit() {
             return false;
@@ -674,9 +677,29 @@ fn forcepowers_is_valid(powers: &[u8]) -> bool {
         }
         if b == b'-' {
             seps += 1;
+            if seps == 2 {
+                second_sep = i;
+            }
         }
     }
-    seps == 2
+    if seps != 2 {
+        return false;
+    }
+
+    // F4 (10-25): `BG_LegalizedForcePowers` reads NUM_FORCE_POWERS (18)
+    // digits after the second `-`. With fewer, the missing `final_Powers[]`
+    // entries keep stack garbage and are used as loop counters and as a
+    // `bgForcePowerCost` column.
+    if powers.len() - second_sep - 1 < 18 {
+        return false;
+    }
+
+    // A level above 3 is used as a `bgForcePowerCost` column before being
+    // clamped; refuse it, as OpenJK. The rank and side digits (before the
+    // second `-`) are not limited: the game replaces/checks them itself.
+    powers[second_sep + 1..]
+        .iter()
+        .all(|&b| (b'0'..=b'3').contains(&b))
 }
 
 // ---------------------------------------------------------------------------
@@ -946,19 +969,13 @@ mod tests {
         assert!(!forcepowers_is_valid(b"7-1-a00000000000003332"));
     }
 
-    /// F4 known gap (2026-11-01 audit): our accepted window is exactly the 18
-    /// shapes the audit enumerated, and 8 of them carry fewer than the 18
-    /// digits `BG_LegalizedForcePowers` reads after the second `-`. The
-    /// missing entries stay uninitialised on the stack and are used as indices
-    /// (`bgForcePowerCost[i][countDown]` in the retail game), which can crash
-    /// the server.
-    ///
-    /// When F4 is fixed, this test must be inverted: `short` must be 0 and
-    /// every short shape must be refused.
+    /// F4 (10-25): `BG_LegalizedForcePowers` reads 18 power digits after the
+    /// second `-`; the 18 shapes of the old window include 8 with only 16 or
+    /// 17. After the fix only the 10 long shapes pass, and every accepted
+    /// shape has at least 18 powers.
     #[test]
-    fn f4_known_gap_accepts_shapes_with_16_or_17_powers() {
+    fn f4_requires_18_power_digits() {
         let mut accepted = 0;
-        let mut short = 0;
 
         for len in 22..=24 {
             for first in 1..=5 {
@@ -969,29 +986,31 @@ mod tests {
 
                     if forcepowers_is_valid(&value) {
                         accepted += 1;
-                        // The game reads a digit for every index from the byte
-                        // after the second `-` to the end of the string.
-                        if len - second - 1 < 18 {
-                            short += 1;
-                        }
+                        assert!(
+                            len - second > 18,
+                            "accepted a shape with fewer than 18 powers: {len}/{first}/{second}"
+                        );
                     }
                 }
             }
         }
 
-        assert_eq!(accepted, 18, "the accepted window has 18 shapes");
-        assert_eq!(
-            short, 8,
-            "8 of them give BG_LegalizedForcePowers 16 or 17 digits"
-        );
+        assert_eq!(accepted, 10, "only the 10 long shapes of the window pass");
     }
 
-    /// F4 known gap, second half: `BG_LegalizedForcePowers` uses the digit as
-    /// a column of `bgForcePowerCost` before clamping it to 3, so 4..=9 read
-    /// past the table. The 2026 fix refuses anything outside 0..=3, as OpenJK.
+    /// F4: a level above 3 is used as a `bgForcePowerCost` column before being
+    /// clamped to 3. The 2026 fix refuses anything outside 0..=3, as OpenJK.
     #[test]
-    fn f4_known_gap_accepts_power_digits_above_three() {
-        assert!(forcepowers_is_valid(b"7-1-333333333333333399"));
+    fn f4_rejects_power_digits_above_three() {
+        assert!(!forcepowers_is_valid(b"7-1-333333333333333399"));
+        assert!(forcepowers_is_valid(b"7-1-030000000000003332"));
+    }
+
+    /// F4: the rank and side digits (before the second `-`) are not limited;
+    /// the game replaces the rank and checks the side itself.
+    #[test]
+    fn f4_leaves_rank_and_side_digits_unrestricted() {
+        assert!(forcepowers_is_valid(b"9-9-333333333333333333"));
     }
 
     // -----------------------------------------------------------------------

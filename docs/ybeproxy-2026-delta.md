@@ -53,7 +53,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | 11-01 F1 | command line length → `G_LogPrintf` stack overflow | Critical | **FIXED** 2026-11-02 |
 | 11-01 F2 | `callvote clientkick <n>` out of client slots | High | **FIXED** 2026-11-02 |
 | 11-01 F3 | `gc <player> 7` reads past `gc_orders` | High (Linux) | **FIXED** 2026-11-02 |
-| 11-01 F4 | `forcepowers` with 16/17 digits or digits 4–9 | Medium | **LIVE** (tested) |
+| 11-01 F4 | `forcepowers` with 16/17 digits or digits 4–9 | Medium | **FIXED** 2026-11-02 |
 | 11-01 F5 | `color1`/`color2` fill the gamestate | Medium | **LIVE** |
 | 11-01 F6 | `vote` parsing / `callvote kick <name>` lookup | Low, not security | **LIVE** |
 | 11-01 F7 | `modelFullPath` overflow with `d_perPlayerGhoul2` | Low | **ACCEPTED** (unreachable on retail) |
@@ -132,7 +132,7 @@ is the command filter, as upstream chose.
 A direct port of `d9daa68`:
 
 - `MAX_COMMAND_LENGTH = 512` (`shared_api.rs:32`) and the pure predicate
-  `command_line_too_long(cmd, args)` (`shared_api.rs:690-692`), which is
+  `command_line_too_long(cmd, args)` (`shared_api.rs:713-715`), which is
   literally `cmd.len() + 1 + args.len() > 512` — the separating space is
   counted even with no arguments, as upstream.
 - The check runs in `client_command` right after `args_concat` is computed
@@ -176,11 +176,11 @@ A direct port of `94c89b0`, using the range table the other votes already go
 through:
 
 - `clientkick_max_slot(sv_maxclients) = sv_maxclients - 1`
-  (`shared_api.rs:712-714`).
+  (`shared_api.rs:735-737`).
 - The `clientkick` entry in the `callvote` table (`shared_api.rs:296-305`)
   sets `min = 0`, `max = clientkick_max_slot(sv_maxclients)`, so the existing
   final test `vote_value_out_of_range(value, min, max)`
-  (`shared_api.rs:719-721`, also extracted) drops both directions:
+  (`shared_api.rs:742-744`, also extracted) drops both directions:
   `value < 0` and `value >= sv_maxclients`. Upstream's applied code uses the
   same `min = 0`, so a negative number is refused by the proxy as well, even
   though the game would also refuse it.
@@ -226,7 +226,7 @@ A direct port of `85403cd`, with the same choices:
 
 - `GC_ORDERS_COUNT = 7` (`shared_api.rs:34-36`), from `g_cmds.c:1721-1729`.
 - The pure predicate `gc_command_denied(player, order, sv_maxclients)`
-  (`shared_api.rs:704-706`, Helpers) is
+  (`shared_api.rs:727-729`, Helpers) is
   `atoi(player) >= sv_maxclients || atoi(order) >= GC_ORDERS_COUNT`. The
   `client_command` guard (`shared_api.rs:240-257`) calls it and drops the
   command with a debug-log line.
@@ -249,7 +249,7 @@ the same player on a 32-slot server, `atoi` treating text as 0, and the
 negative cases the game owns. The runtime reproduction on Linux is in
 [Section 6](#6-tests-and-test-plan).
 
-### S4. `forcepowers` with 16 or 17 power levels, or levels above 3 — Medium
+### S4. `forcepowers` with 16 or 17 power levels, or levels above 3 — Medium — **FIXED 2026-11-02**
 
 Upstream: 11-01 F4, commit `2b96214` (*"fix: require 18 force power levels from
 0 to 3 in forcepowers"*).
@@ -268,27 +268,39 @@ The old proxy rule accepted 18 shapes of 22–24 characters; **8 of them carry
 only 16 or 17 powers**. The 2026 fix requires at least 18 digits after the
 second `-` and rejects digits outside `0..=3`.
 
-**Our code (SOURCE (ours), TESTED).** `shared_api.rs:529-553` calls
-`forcepowers_is_valid` (`shared_api.rs:660-680`). The rule is the old one:
-22–24 characters, digits only, exactly two `-` at positions 1–5, never
-adjacent. It does **not** require 18 digits and accepts `4`–`9`.
+**Our code before the fix (SOURCE (ours)).** `forcepowers_is_valid` kept the
+old shape rule: 22–24 characters, digits only, exactly two `-` at positions
+1–5, never adjacent. It did **not** require 18 digits and accepted `4`–`9`.
 
-**Tests (`rust/src/shared_api.rs`, `mod tests`).** These pass today and pin the
-gap:
+**Impact.** A bad `forcepowers` string could leave 16/17 `final_Powers[]`
+entries uninitialised, or use a `4`–`9` column, on every connect and every
+`userinfo` command.
 
-- `f4_known_gap_accepts_shapes_with_16_or_17_powers` — enumerates the rule's
-  accepted window and asserts **18 accepted shapes, 8 of them short**, matching
-  the upstream count;
-- `f4_known_gap_accepts_power_digits_above_three`;
-- `retail_forcepowers_value_is_accepted` and
-  `length_and_separator_shape_is_enforced` guard the rest of the rule.
+#### Applied (2026-11-02)
 
-When F4 is fixed, the two `f4_known_gap_*` tests must be inverted (short = 0,
-digits > 3 rejected). This is stated in their doc comments.
+A direct port of `2b96214` in `forcepowers_is_valid`
+(`shared_api.rs:662-703`):
 
-**Connect path.** S10 now runs the same sanitizer at `GAME_CLIENT_CONNECT`, so
-the connect userinfo reaches the same rule. F4 is still exploitable there (and
-on a `userinfo` command) until the rule itself is tightened.
+- after the second `-`, require at least `NUM_FORCE_POWERS` (18) digits — the
+  number `BG_LegalizedForcePowers` reads;
+- require every power digit to be in `0..=3`;
+- the rank and side digits (before the second `-`) stay unrestricted: the game
+  replaces the rank and checks the side itself;
+- the rest of the shape (22–24 characters, exactly two `-` at positions 1–5,
+  never adjacent, digits only) is unchanged.
+
+The invalid string still gets the default
+`7-1-030000000000003332` written in its place.
+
+**Tests (TESTED).**
+`f4_requires_18_power_digits` enumerates the old 18-shape window and asserts
+only the **10 long shapes** pass, each with at least 18 powers;
+`f4_rejects_power_digits_above_three` covers a `9` in the power list;
+`f4_leaves_rank_and_side_digits_unrestricted` covers `9-9-…`;
+`retail_forcepowers_value_is_accepted` and
+`length_and_separator_shape_is_enforced` guard the rest. The runtime check
+(connect with `123-1-` + 16 digits, and with a `9`) is in
+[Section 6](#6-tests-and-test-plan).
 
 ### S5. `color1` and `color2` are copied whole into `CS_PLAYERS` — Medium
 
@@ -912,19 +924,19 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 `rust/src/shared_api.rs`:
 
 - the forcepowers shape check was moved **verbatim** out of the userinfo
-  sanitiser into the pure `forcepowers_is_valid` (`shared_api.rs:660-680`).
-- `command_line_too_long` (`shared_api.rs:690-692`) is the S1 predicate.
-- `gc_command_denied` (`shared_api.rs:704-706`) is the S3 predicate; the
+  sanitiser into the pure `forcepowers_is_valid` (`shared_api.rs:662-703`).
+- `command_line_too_long` (`shared_api.rs:713-715`) is the S1 predicate.
+- `gc_command_denied` (`shared_api.rs:727-729`) is the S3 predicate; the
   `client_command` guard only reads the cvar and calls it.
-- `clientkick_max_slot` (`shared_api.rs:712-714`) and
-  `vote_value_out_of_range` (`shared_api.rs:719-721`) are the S2 seam.
+- `clientkick_max_slot` (`shared_api.rs:735-737`) and
+  `vote_value_out_of_range` (`shared_api.rs:742-744`) are the S2 seam.
 - `connect_userinfo_sanitized` (`shared_api.rs:363-365`) is the S10 bot
   exemption.
 - `sanitize_userinfo_bytes` (`shared_api.rs:441-556`) is the S6 pure core. The
   whole userinfo path is tested without an engine: name/model/forcepowers
   rewrites, duplicate-key refusal, the O8 write that cannot fit, the
   `darksidetools` refusal, and the bot path.
-- 21 new tests in this module: `connect_sanitiser_skips_bots_only`,
+- 22 new tests in this module: `connect_sanitiser_skips_bots_only`,
   `command_line_is_capped_at_512_bytes`,
   `gc_accepts_a_real_slot_and_a_listed_order`,
   `gc_drops_the_order_past_the_end`,
@@ -935,8 +947,9 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
   `clientkick_drops_a_negative_slot`,
   `retail_forcepowers_value_is_accepted`,
   `length_and_separator_shape_is_enforced`,
-  `f4_known_gap_accepts_shapes_with_16_or_17_powers`,
-  `f4_known_gap_accepts_power_digits_above_three`,
+  `f4_requires_18_power_digits`,
+  `f4_rejects_power_digits_above_three`,
+  `f4_leaves_rank_and_side_digits_unrestricted`,
   `get_usercmd_sanitises_forcesel_and_roll`,
   `o10_known_gap_get_usercmd_leaves_minus_128`,
   `sanitizer_rewrites_a_bad_name_model_and_forcepowers`,
@@ -967,7 +980,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 301 unit tests pass; the i686 release cdylib builds. No server was
+Result: 302 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1017,8 +1030,9 @@ None of these has been run yet; they are the runtime half of the fixes.
 - S2: `callvote clientkick 31` with `sv_maxclients 8`.
 - S3: `gc 1 7` on Linux (upstream reproduced the crash).
 - S4/S10: connect with `forcepowers` = `123-1-` + 16 digits and with a 9 in the
-  power list; with and without a following `userinfo` command. Confirm the
-  game's `WP_InitForcePowers` sees the sanitised string on the first spawn.
+  power list; with and without a following `userinfo` command. The game's
+  `WP_InitForcePowers` must see the default
+  `7-1-030000000000003332` on the first spawn and after the command.
 - S10: connect with a `darksidetools` model; the engine must print the
   anti-cheat reason and refuse the client, and no `CS_PLAYERS` configstring may
   remain for the slot. Also send a `userinfo` command with that model to a
@@ -1060,8 +1074,7 @@ dependencies. It is the order the fixes are being applied in.
    *Fixed 2026-11-02.*
 8. ✅ **S9** — re-derive the `ip` userinfo key (High; IP-ban bypass, only
    observable when bans are used). *Fixed 2026-11-02.*
-9. **S4** — forcepowers 18 digits / 0..3 (Medium; the `*_known_gap_*` tests are
-   ready to invert once S10 lands).
+9. ✅ **S4** — forcepowers 18 digits / 0..3 (Medium). *Fixed 2026-11-02.*
 10. **S5** — cut `color1`/`color2` at 15 (Medium, multi-client DoS).
 11. **S19** — null Ghoul2 instance (Medium crash, trigger not reproduced).
 12. **S7** — `Info_Print` / `dumpuser` (Medium; depends on S6 for the full fix,
@@ -1104,9 +1117,9 @@ Rust rewrite (this repository):
 `:162-357` (`client_command`), `:363-365` (`connect_userinfo_sanitized`),
 `:441-556` (`sanitize_userinfo_bytes`, pure core), `:566-612`
 (`sanitize_userinfo`, FFI wrapper), `:621-646` (`client_userinfo_changed`),
-`:660-680` (`forcepowers_is_valid`), `:690-692` (`command_line_too_long`),
-`:704-706` (`gc_command_denied`), `:712-714` (`clientkick_max_slot`),
-`:719-721` (`vote_value_out_of_range`), and its `mod tests`;
+`:662-703` (`forcepowers_is_valid`), `:713-715` (`command_line_too_long`),
+`:727-729` (`gc_command_denied`), `:735-737` (`clientkick_max_slot`),
+`:742-744` (`vote_value_out_of_range`), and its `mod tests`;
 `rust/src/userinfo.rs:145-338` (`value_for_key`, `set_value_for_key*`,
 `validate_userinfo`) and its `mod tests`;
 `rust/src/lib.rs:153-195` and `:301-308`;
