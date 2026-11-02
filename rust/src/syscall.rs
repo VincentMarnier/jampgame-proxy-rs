@@ -25,9 +25,19 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sdk::{
     CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
     G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
-    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_MILLISECONDS,
-    G_NAV_FREE, G_NAV_LOAD, G_PRINT, G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO,
-    MAX_CLIENTS, VmCvar,
+    G_G2_ABSURDSMOOTHING, G_G2_ADDBOLT, G_G2_ANGLEOVERRIDE, G_G2_ANIMATEG2MODELS,
+    G_G2_ATTACHINSTANCETOENTNUM, G_G2_COLLISIONDETECT, G_G2_COLLISIONDETECTCACHE,
+    G_G2_COPYGHOUL2INSTANCE, G_G2_COPYSPECIFICGHOUL2MODEL, G_G2_DOESBONEEXIST,
+    G_G2_DUPLICATEGHOUL2INSTANCE, G_G2_GETBOLT, G_G2_GETBOLT_NOREC, G_G2_GETBOLT_NOREC_NOROT,
+    G_G2_GETBONEANIM, G_G2_GETGLANAME, G_G2_GETRAGBONEPOS, G_G2_GETSURFACENAME,
+    G_G2_GETSURFACERENDERSTATUS, G_G2_HASGHOUL2MODELONINDEX, G_G2_HAVEWEGHOULMODELS, G_G2_IKMOVE,
+    G_G2_OVERRIDESERVER, G_G2_PLAYANIM, G_G2_RAGEFFECTORGOAL, G_G2_RAGEFFECTORKICK,
+    G_G2_RAGFORCESOLVE, G_G2_RAGPCJCONSTRAINT, G_G2_RAGPCJGRADIENTSPEED, G_G2_REMOVEBONE,
+    G_G2_REMOVEGHOUL2MODEL, G_G2_REMOVEGHOUL2MODELS, G_G2_SETBOLTINFO, G_G2_SETBONEIKSTATE,
+    G_G2_SETMODELS, G_G2_SETNEWORIGIN, G_G2_SETRAGDOLL, G_G2_SETROOTSURFACE, G_G2_SETSKIN,
+    G_G2_SETSURFACEONOFF, G_G2_SIZE, G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO,
+    G_LOCATE_GAME_DATA, G_MILLISECONDS, G_NAV_FREE, G_NAV_LOAD, G_PRINT, G_SEND_SERVER_COMMAND,
+    G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -122,6 +132,75 @@ fn team_chat_dropped(command: &CStr, tffa_on: bool, recipient: c_int) -> bool {
 /// out per-viewer `cs` corrections (own-match mini HUD and own-side client
 /// names; another match's players are kept out of the viewer's team overlay).
 /// All are then forwarded normally.
+///
+/// S19 (11-01 commit `99f5599`): a Ghoul2 trap with a null instance is
+/// answered here. The engine dereferences the instance without a test, and the
+/// game passes a null one when a model failed to load. The values are what the
+/// engine returns for an empty instance (0, or -1 for the two calls that
+/// report failure), as OpenJK.
+fn g2_null_result(command: c_int, p0: usize, p1: usize, p2: usize) -> Option<c_int> {
+    match command {
+        // Instance is the first argument; return 0.
+        G_G2_HAVEWEGHOULMODELS
+        | G_G2_SETMODELS
+        | G_G2_GETBOLT
+        | G_G2_GETBOLT_NOREC
+        | G_G2_GETBOLT_NOREC_NOROT
+        | G_G2_SETSKIN
+        | G_G2_SIZE
+        | G_G2_SETBOLTINFO
+        | G_G2_ANGLEOVERRIDE
+        | G_G2_PLAYANIM
+        | G_G2_GETBONEANIM
+        | G_G2_GETGLANAME
+        | G_G2_SETROOTSURFACE
+        | G_G2_SETSURFACEONOFF
+        | G_G2_SETNEWORIGIN
+        | G_G2_DOESBONEEXIST
+        | G_G2_ABSURDSMOOTHING
+        | G_G2_SETRAGDOLL
+        | G_G2_ANIMATEG2MODELS
+        | G_G2_RAGPCJCONSTRAINT
+        | G_G2_RAGPCJGRADIENTSPEED
+        | G_G2_RAGEFFECTORGOAL
+        | G_G2_GETRAGBONEPOS
+        | G_G2_RAGEFFECTORKICK
+        | G_G2_RAGFORCESOLVE
+        | G_G2_SETBONEIKSTATE
+        | G_G2_IKMOVE
+        | G_G2_REMOVEBONE
+        | G_G2_ATTACHINSTANCETOENTNUM
+        | G_G2_OVERRIDESERVER
+        | G_G2_GETSURFACENAME => (p0 == 0).then_some(0),
+
+        // Instance is the first argument; these report failure with -1.
+        G_G2_ADDBOLT | G_G2_GETSURFACERENDERSTATUS => (p0 == 0).then_some(-1),
+
+        // (void* from, void* to, ...)
+        G_G2_COPYGHOUL2INSTANCE | G_G2_DUPLICATEGHOUL2INSTANCE => (p0 == 0 || p1 == 0).then_some(0),
+
+        // (void* from, int modelFrom, void* to, int modelTo)
+        G_G2_COPYSPECIFICGHOUL2MODEL => (p0 == 0 || p2 == 0).then_some(0),
+
+        // (CollisionRecord_t*, void* instance, ...)
+        G_G2_COLLISIONDETECT | G_G2_COLLISIONDETECTCACHE => (p1 == 0).then_some(0),
+
+        // (void** instancePtr, ...): the engine uses *instancePtr.
+        G_G2_HASGHOUL2MODELONINDEX | G_G2_REMOVEGHOUL2MODEL | G_G2_REMOVEGHOUL2MODELS => {
+            if p0 == 0 {
+                Some(0)
+            } else {
+                // SAFETY: the game passes a pointer to its Ghoul2 instance
+                // pointer as the first argument.
+                let instance = unsafe { *(p0 as *const usize) };
+                (instance == 0).then_some(0)
+            }
+        }
+
+        _ => None,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jampgame_syscall_forward(
     command: c_int,
@@ -142,6 +221,14 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
     a14: c_int,
     a15: c_int,
 ) -> c_int {
+    // S19: a null Ghoul2 instance must not reach the engine, which
+    // dereferences it without a test.
+    if crate::state::proxy_enabled() {
+        if let Some(response) = g2_null_result(command, a0 as usize, a1 as usize, a2 as usize) {
+            return response;
+        }
+    }
+
     match command {
         // `G_LOCATE_GAME_DATA(sharedEntity_t*, int, int, playerState_t*, int)`:
         // record where the game put its data (later hooks read it), then pass
@@ -869,5 +956,103 @@ mod tests {
             s.tffa.client_match[0] = crate::tffa::MAIN_MATCH;
             s.tffa.client_match[1] = crate::tffa::MAIN_MATCH;
         });
+    }
+
+    /// S19: each Ghoul2 trap with a null instance gets the engine's
+    /// empty-instance answer; a non-null instance is forwarded unchanged.
+    #[test]
+    fn null_ghoul2_instances_are_answered() {
+        // First-argument instance group: 0.
+        for command in [
+            G_G2_HAVEWEGHOULMODELS,
+            G_G2_SETMODELS,
+            G_G2_GETBOLT,
+            G_G2_GETBOLT_NOREC,
+            G_G2_GETBOLT_NOREC_NOROT,
+            G_G2_SETSKIN,
+            G_G2_SIZE,
+            G_G2_SETBOLTINFO,
+            G_G2_ANGLEOVERRIDE,
+            G_G2_PLAYANIM,
+            G_G2_GETBONEANIM,
+            G_G2_GETGLANAME,
+            G_G2_SETROOTSURFACE,
+            G_G2_SETSURFACEONOFF,
+            G_G2_SETNEWORIGIN,
+            G_G2_DOESBONEEXIST,
+            G_G2_ABSURDSMOOTHING,
+            G_G2_SETRAGDOLL,
+            G_G2_ANIMATEG2MODELS,
+            G_G2_RAGPCJCONSTRAINT,
+            G_G2_RAGPCJGRADIENTSPEED,
+            G_G2_RAGEFFECTORGOAL,
+            G_G2_GETRAGBONEPOS,
+            G_G2_RAGEFFECTORKICK,
+            G_G2_RAGFORCESOLVE,
+            G_G2_SETBONEIKSTATE,
+            G_G2_IKMOVE,
+            G_G2_REMOVEBONE,
+            G_G2_ATTACHINSTANCETOENTNUM,
+            G_G2_OVERRIDESERVER,
+            G_G2_GETSURFACENAME,
+        ] {
+            assert_eq!(g2_null_result(command, 0, 123, 0), Some(0), "{command}");
+            assert_eq!(g2_null_result(command, 7, 0, 0), None, "{command}");
+        }
+
+        // -1 group.
+        for command in [G_G2_ADDBOLT, G_G2_GETSURFACERENDERSTATUS] {
+            assert_eq!(g2_null_result(command, 0, 0, 0), Some(-1), "{command}");
+            assert_eq!(g2_null_result(command, 7, 0, 0), None, "{command}");
+        }
+
+        // (from, to) and (from, modelFrom, to, modelTo).
+        for command in [G_G2_COPYGHOUL2INSTANCE, G_G2_DUPLICATEGHOUL2INSTANCE] {
+            assert_eq!(g2_null_result(command, 0, 1, 0), Some(0), "{command}");
+            assert_eq!(g2_null_result(command, 1, 0, 0), Some(0), "{command}");
+            assert_eq!(g2_null_result(command, 1, 1, 0), None, "{command}");
+        }
+        assert_eq!(
+            g2_null_result(G_G2_COPYSPECIFICGHOUL2MODEL, 0, 1, 1),
+            Some(0)
+        );
+        assert_eq!(
+            g2_null_result(G_G2_COPYSPECIFICGHOUL2MODEL, 1, 1, 0),
+            Some(0)
+        );
+        assert_eq!(g2_null_result(G_G2_COPYSPECIFICGHOUL2MODEL, 1, 1, 1), None);
+
+        // (CollisionRecord_t*, instance, ...).
+        for command in [G_G2_COLLISIONDETECT, G_G2_COLLISIONDETECTCACHE] {
+            assert_eq!(g2_null_result(command, 1, 0, 0), Some(0), "{command}");
+            assert_eq!(g2_null_result(command, 1, 1, 0), None, "{command}");
+        }
+
+        // (void** instancePtr, ...): the pointer and its target are both tested.
+        let mut instance = 0usize;
+        let non_null = &mut instance as *mut usize as usize;
+        for command in [
+            G_G2_HASGHOUL2MODELONINDEX,
+            G_G2_REMOVEGHOUL2MODEL,
+            G_G2_REMOVEGHOUL2MODELS,
+        ] {
+            assert_eq!(g2_null_result(command, 0, 0, 0), Some(0), "{command}");
+            assert_eq!(
+                g2_null_result(command, non_null, 0, 0),
+                Some(0),
+                "{command}"
+            );
+            instance = 1;
+            assert_eq!(instance, 1);
+            assert_eq!(g2_null_result(command, non_null, 0, 0), None, "{command}");
+            instance = 0;
+            assert_eq!(instance, 0);
+        }
+
+        // Traps outside the list are left alone (`INITGHOUL2MODEL` creates the
+        // instance; `CLEANMODELS` and the attachment cleanups take no instance).
+        assert_eq!(g2_null_result(590, 0, 0, 0), None); // G_G2_INITGHOUL2MODEL
+        assert_eq!(g2_null_result(605, 0, 0, 0), None); // G_G2_CLEANMODELS
+        assert_eq!(g2_null_result(G_GET_USERINFO, 0, 0, 0), None);
     }
 }

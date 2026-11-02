@@ -707,7 +707,7 @@ kicked. The 2026 fix snapshots each slot's client address on
 when the slot changed hands.
 
 **Our code (SOURCE (ours)).** The syscall forwarder intercepts
-`G_SET_CONFIGSTRING` for `CS_SCORES1/2`/`CS_PLAYERS` only (`syscall.rs:417-430`)
+`G_SET_CONFIGSTRING` for `CS_SCORES1/2`/`CS_PLAYERS` only (`syscall.rs:510`)
 and does not intercept `G_SEND_CONSOLE_COMMAND`/`EXEC_APPEND`; there is no vote
 tracking anywhere. So the retail behaviour remains.
 
@@ -835,7 +835,7 @@ address+port binding, the base-address comparison, and the `sdk.rs` layout
 pins. The engine write into `svs.challenges` and the `challengeResponse` on the
 wire need the runtime check in [Section 6](#6-tests-and-test-plan).
 
-### S19. Ghoul2 calls with a null instance
+### S19. Ghoul2 calls with a null instance — **FIXED 2026-11-02**
 
 Upstream: commit `99f5599`.
 
@@ -843,13 +843,40 @@ Upstream: commit `99f5599`.
 passes one when a model failed to load. The proxy returns the engine's
 empty-instance value for the `G_G2_*` traps when the pointer is null.
 
-**Our code (SOURCE (ours)).** The syscall forwarder does not intercept any
-`G_G2_*` trap (`syscall.rs`; only `G_LOCATE_GAME_DATA`, `G_GET_USERCMD`,
-`G_NAV_LOAD`, `G_SEND_SERVER_COMMAND`, `G_SET_CONFIGSTRING`). A null instance
-from a failed model load reaches the engine unchanged.
+**Our code before the fix (SOURCE (ours)).** The syscall forwarder did not
+intercept any `G_G2_*` trap; a null instance from a failed model load reached
+the engine unchanged.
 
 **Impact.** Possible remote/indirect server crash when a model load fails. Not
 reproduced. Medium.
+
+#### Applied (2026-11-02)
+
+A port of `99f5599` in the syscall forwarder:
+
+- `g2_null_result` (`syscall.rs:141-203`) runs at the entry of
+  `jampgame_syscall_forward` (`:205-579`) when the master switch is on. It
+  answers the exact groups of the upstream commit:
+  - instance in `args[0]` → `0` (31 traps, `G_G2_HAVEWEGHOULMODELS` …
+    `G_G2_GETSURFACENAME`);
+  - instance in `args[0]` → `-1` (`G_G2_ADDBOLT`, `G_G2_GETSURFACERENDERSTATUS`);
+  - `args[0]`/`args[1]` null → `0` (`COPYGHOUL2INSTANCE`,
+    `DUPLICATEGHOUL2INSTANCE`);
+  - `args[0]`/`args[2]` null → `0` (`COPYSPECIFICGHOUL2MODEL`);
+  - `args[1]` null → `0` (`COLLISIONDETECT`, `COLLISIONDETECTCACHE`);
+  - `args[0]` or `*args[0]` null → `0` (`HASGHOUL2MODELONINDEX`,
+    `REMOVEGHOUL2MODEL`, `REMOVEGHOUL2MODELS`).
+  `G_G2_INITGHOUL2MODEL` (creates the instance), `G_G2_CLEANMODELS` and the
+  attachment cleanups are left alone, as upstream. The bolt matrix of
+  `G_G2_GETBOLT` is left untouched.
+- The ordinals (585–629, after `BOTLIB_PC_SOURCE_FILE_AND_LINE` = 581) are in
+  `sdk.rs:171-221`, with the null-return rule documented per group.
+
+**Tests (TESTED, 1 new).** `null_ghoul2_instances_are_answered` covers every
+group, the `void**` dereference (both the pointer and its target), and the traps
+deliberately left alone. **Not reproduced at runtime**: triggering it needs a
+model that fails to load, so it stays in the runtime list as a `dG2` scenario
+without a reproduction.
 
 ### S20. Sub-BSP buffers leak on every map load
 
@@ -986,6 +1013,9 @@ SipHash-2-4 reference vector, a challenge valid at its timestamp and the next
 one but not later, the address+port binding, the base-address comparison, and
 the `challenge_t`/`serverStatic_t` offsets.
 
+`rust/src/syscall.rs` (1 new test): `null_ghoul2_instances_are_answered` covers
+every null-instance group and the `void**` dereference.
+
 Run:
 
 ```sh
@@ -995,7 +1025,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 303 unit tests pass; the i686 release cdylib builds. No server was
+Result: 304 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1011,10 +1041,10 @@ Most of the rules above are not reachable in a host-architecture `cargo test`:
 - `sanitize_userinfo` itself is now split: the policy core
   (`sanitize_userinfo_bytes`) is pure and tested, and only the FFI wrapper
   needs the engine.
-- The remaining engine-side findings (S7, S8, S13, S19, S20, S21, S22) are
-  byte patches or entry wrappers over `linuxjampded`; they need the container
-  runtime under `tools/runtime`. S11 and S18 have pure tests for their policy
-  (buckets, SipHash, timestamps), but their live paths do too.
+- The remaining engine-side findings (S7, S8, S13, S20, S21, S22) are byte
+  patches or entry wrappers over `linuxjampded`; they need the container
+  runtime under `tools/runtime`. S11, S18 and S19 have pure tests for their
+  policy (buckets, SipHash, null groups), but their live paths do too.
 
 To make the missing rules testable without duplicating them, the later work
 should split the decision logic from the I/O the way `forcepowers_is_valid`
@@ -1096,7 +1126,8 @@ dependencies. It is the order the fixes are being applied in.
 9. ✅ **S4** — forcepowers 18 digits / 0..3 (Medium). *Fixed 2026-11-02.*
 10. ✅ **S5** — cut `color1`/`color2` at 15 (Medium, multi-client DoS).
     *Fixed 2026-11-02.*
-11. **S19** — null Ghoul2 instance (Medium crash, trigger not reproduced).
+11. ✅ **S19** — null Ghoul2 instance (Medium crash, trigger not reproduced).
+    *Fixed 2026-11-02.*
 12. **S7** — `Info_Print` / `dumpuser` (Medium; depends on S6 for the full fix,
     but the `Info_Print` rewrite stands alone).
 13. **S8** — `Info_SetValueForKey` one-byte overflow (Medium, connect path).
@@ -1152,6 +1183,8 @@ its `mod tests`;
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its
 tests; `rust/src/sdk.rs:582-593` (challenge layout constants);
-`rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:145-430`
-(intercepted traps), `rust/src/pps.rs` (sequenced-packet limiter);
+`rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:141-203`
+(`g2_null_result`), `:205-579` (intercepted traps), `rust/src/pps.rs`
+(sequenced-packet limiter);
+`rust/src/sdk.rs:171-221` (Ghoul2 ordinals);
 `rust/src/hooks/compat.rs:74-103` (tokenizer).

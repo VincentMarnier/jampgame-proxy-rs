@@ -161,6 +161,65 @@ pub const G_ENTITY_CONTACT: i32 = 37;
 /// `G_TRACECAPSULE` 49): the capsule variant of `G_ENTITY_CONTACT`.
 pub const G_ENTITY_CONTACTCAPSULE: i32 = 50;
 
+// Ghoul2 traps (`g_public.h:507-569`, enum-counted from
+// `BOTLIB_PC_SOURCE_FILE_AND_LINE` = 581; `G_R_REGISTERSKIN` = 582). S19
+// answers a null instance without entering the engine, which dereferences it
+// without a test.
+//
+// The first block takes the instance as the first argument and returns 0 when
+// it is null.
+pub const G_G2_HAVEWEGHOULMODELS: i32 = 585;
+pub const G_G2_SETMODELS: i32 = 586;
+pub const G_G2_GETBOLT: i32 = 587;
+pub const G_G2_GETBOLT_NOREC: i32 = 588;
+pub const G_G2_GETBOLT_NOREC_NOROT: i32 = 589;
+pub const G_G2_SETSKIN: i32 = 591;
+pub const G_G2_SIZE: i32 = 592;
+pub const G_G2_SETBOLTINFO: i32 = 594;
+pub const G_G2_ANGLEOVERRIDE: i32 = 595;
+pub const G_G2_PLAYANIM: i32 = 596;
+pub const G_G2_GETBONEANIM: i32 = 597;
+pub const G_G2_GETGLANAME: i32 = 598;
+pub const G_G2_SETROOTSURFACE: i32 = 608;
+pub const G_G2_SETSURFACEONOFF: i32 = 609;
+pub const G_G2_SETNEWORIGIN: i32 = 610;
+pub const G_G2_DOESBONEEXIST: i32 = 611;
+pub const G_G2_ABSURDSMOOTHING: i32 = 613;
+pub const G_G2_SETRAGDOLL: i32 = 614;
+pub const G_G2_ANIMATEG2MODELS: i32 = 615;
+pub const G_G2_RAGPCJCONSTRAINT: i32 = 616;
+pub const G_G2_RAGPCJGRADIENTSPEED: i32 = 617;
+pub const G_G2_RAGEFFECTORGOAL: i32 = 618;
+pub const G_G2_GETRAGBONEPOS: i32 = 619;
+pub const G_G2_RAGEFFECTORKICK: i32 = 620;
+pub const G_G2_RAGFORCESOLVE: i32 = 621;
+pub const G_G2_SETBONEIKSTATE: i32 = 622;
+pub const G_G2_IKMOVE: i32 = 623;
+pub const G_G2_REMOVEBONE: i32 = 624;
+pub const G_G2_ATTACHINSTANCETOENTNUM: i32 = 625;
+pub const G_G2_OVERRIDESERVER: i32 = 628;
+pub const G_G2_GETSURFACENAME: i32 = 629;
+
+/// These return -1 for a null instance.
+pub const G_G2_ADDBOLT: i32 = 593;
+pub const G_G2_GETSURFACERENDERSTATUS: i32 = 612;
+
+/// `(void* from, void* to)`; either null returns 0.
+pub const G_G2_COPYGHOUL2INSTANCE: i32 = 599;
+pub const G_G2_DUPLICATEGHOUL2INSTANCE: i32 = 601;
+/// `(void* from, int modelFrom, void* to, int modelTo)`; `from` or `to` null
+/// returns 0.
+pub const G_G2_COPYSPECIFICGHOUL2MODEL: i32 = 600;
+
+/// `(CollisionRecord_t*, void* instance, …)`; a null instance returns 0.
+pub const G_G2_COLLISIONDETECT: i32 = 606;
+pub const G_G2_COLLISIONDETECTCACHE: i32 = 607;
+
+/// `(void** instancePtr, …)`; a null pointer, or a null `*pointer`, returns 0.
+pub const G_G2_HASGHOUL2MODELONINDEX: i32 = 602;
+pub const G_G2_REMOVEGHOUL2MODEL: i32 = 603;
+pub const G_G2_REMOVEGHOUL2MODELS: i32 = 604;
+
 /// `trap_Milliseconds` ordinal (`g_public.h:110`).
 pub const G_MILLISECONDS: i32 = 2;
 
@@ -812,6 +871,11 @@ mod tests {
         assert_eq!(G_TRACE, 27);
         assert_eq!(G_G2TRACE, 28);
         assert_eq!(G_TRACECAPSULE, 49);
+        // Ghoul2 block (`g_public.h:507-569`, enum-counted after
+        // BOTLIB_PC_SOURCE_FILE_AND_LINE = 581).
+        assert_eq!(G_G2_HAVEWEGHOULMODELS, 585);
+        assert_eq!(G_G2_REMOVEGHOUL2MODELS, 604);
+        assert_eq!(G_G2_GETSURFACENAME, 629);
         // World-query ordinals (S9): `G_ENTITIES_IN_BOX`/`G_ENTITY_CONTACT` sit
         // between the pinned `G_UNLINKENTITY` 35 and `G_GET_USERCMD` 40, and
         // `G_ENTITY_CONTACTCAPSULE` follows the pinned `G_TRACECAPSULE` 49.
