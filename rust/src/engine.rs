@@ -36,6 +36,9 @@ pub const ENGINE_RW_HI: usize = 0x0839_6bb4; // end of RW LOAD (incl. BSS)
 /// the `cfg(test)` tests.
 pub mod functions {
     pub const COM_PRINTF: usize = 0x0807_2ca4;
+    /// `Info_Print` (`0x8073504`): retail `char key[512]` / `char value[512]`
+    /// stack buffers; rewritten with growable buffers (S7/10-25 F11).
+    pub const INFO_PRINT: usize = 0x0807_3504;
     pub const SV_CALCPINGS: usize = 0x0805_7204;
     pub const SV_SEND_MESSAGE_TO_CLIENT: usize = 0x0805_8c84;
     pub const SV_SEND_CLIENT_GAME_STATE: usize = 0x0804_cee4;

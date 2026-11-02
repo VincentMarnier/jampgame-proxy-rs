@@ -69,7 +69,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | 10-25 F8 | unbounded index in `SV_SvEntityForGentity` | Low | **COVERED** (stricter) |
 | 10-25 F9 | `netStatus` modifies engine state | Medium | **N/A** (different design) |
 | 10-25 F10 | low-priority bugs | Low | **N/A / one cosmetic gap** |
-| 10-25 F11 | `dumpuser` crash on a long userinfo value | Medium | **LIVE** |
+| 10-25 F11 | `dumpuser` crash on a long userinfo value | Medium | **FIXED** 2026-11-02 |
 | O1 | `ip` userinfo key not maintained | High | **FIXED** 2026-11-02 |
 | O2 | out-of-band rate limiting | High | **FIXED** 2026-11-02 (= F6) |
 | O3 | userinfo sanitised before the game sees it | High | **LIVE** (= F2) |
@@ -398,7 +398,7 @@ A port of `3b3b252` with two parts:
      a `darksidetools` model keeps the chat.
    - The engine-side `SV_UserinfoChanged` wrapper uses the checked writer for
      its `model` → `kyle` rewrite and calls `SV_DropClient` when it does not
-     fit (`hooks/engine_sv.rs:609-613`), as JK2MV and upstream do.
+     fit (`hooks/engine_sv.rs:703-707`), as JK2MV and upstream do.
    - The unused game `Info_SetValueForKey` binding was removed from
      `jampgame.rs`; nothing calls the unchecked game writer anymore.
 
@@ -413,7 +413,7 @@ writing; bots skip validation.
 
 The runtime reproduction is in [Section 6](#6-tests-and-test-plan).
 
-### S7. `dumpuser` crashes on a long userinfo value — Medium
+### S7. `dumpuser` crashes on a long userinfo value — Medium — **FIXED 2026-11-02**
 
 Upstream: 10-25 F11, applied as an `Info_Print` rewrite (option 2).
 
@@ -423,15 +423,32 @@ userinfo command accepts up to `MAX_INFO_STRING` = 1024); the next routine
 `rcon dumpuser` on that client overflows the stack and kills the server. OpenJK
 uses `BIG_INFO_VALUE` (8192).
 
-**Our code (SOURCE (ours)).** There is no `Info_Print` hook in the Rust hook
-table (`rust/src/patch.rs:692-797` lists the engine detours; `Info_Print` is
-not among them) and no userinfo value-length validation (see S6). The engine's
-pristine 512-byte buffers remain.
+**Our code before the fix (SOURCE (ours)).** There was no `Info_Print` hook;
+the engine's pristine 512-byte key/value buffers remained.
 
 **Impact.** Remote-triggered admin crash: the client plants the value, the
 server dies on the next `dumpuser` (a normal admin command).
 
-**Test.** None without a running engine; add once `Info_Print` is ported.
+#### Applied (2026-11-02)
+
+The 2026 option 2, as a full rewrite (the original is never called):
+
+- `info_print_lines` (`hooks/engine_sv.rs:498-531`) reproduces the retail
+  parsing and layout: a key shorter than 20 characters is padded with spaces
+  to 20; a value is everything up to the next `\`; a key without a value is
+  `MISSING VALUE`. The buffers are growable `Vec`s, so no 512-byte limit.
+- `info_print` (`hooks/engine_sv.rs:557-582`) prints each line through the
+  engine's `Com_Printf` with the retail formats (`"%s"` for the padded key,
+  the value plus newline, or `MISSING VALUE\n`).
+- A new `Info_Print` hook (`patch.rs`, `0x8073504`, prologue
+  `55 8b ec 81 ec 20 04 00 00`), with no trampoline use.
+- The ordinals/helpers: `engine::functions::INFO_PRINT`.
+
+**Tests (TESTED, 3 new).** `info_print_pads_short_keys_and_keeps_long_values`
+(a 600-character value is kept, the retail 512 buffer would overflow),
+`info_print_reports_a_missing_value`, and
+`info_print_leaves_a_long_key_unpadded`. The live `rcon dumpuser` check is in
+[Section 6](#6-tests-and-test-plan).
 
 ### S8. `Info_SetValueForKey` writes one byte past the buffer — Medium
 
@@ -481,7 +498,7 @@ undermined any future IP-based feature (O5).
 
 Both halves of `e54cb88`:
 
-- `hooks/engine_sv::refresh_ip` (`hooks/engine_sv.rs:509-546`), called at the
+- `hooks/engine_sv::refresh_ip` (`hooks/engine_sv.rs:603-640`), called at the
   start of `sv_userinfo_changed` (`:556-619`) before the model fix and the
   original:
   - `ip = "localhost"` for `NA_LOOPBACK`, otherwise the engine's own
@@ -902,7 +919,7 @@ non-active clients, as Quake3e.
 
 **Our code (SOURCE (ours)).** We do not patch `SV_MapRestart_f`'s client-state
 store. We **do** port the `SV_ExecuteClientMessage` upstream gate (see
-`hooks/engine_sv.rs:1147-1173`), which is the other half of this interaction.
+`hooks/engine_sv.rs:1241-1266`), which is the other half of this interaction.
 A client that is connecting during a `map_restart` may still be stuck. Low
 functional impact.
 
@@ -942,7 +959,7 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 | 10-25 F3 (anti-cheat) | The 2026 corrected rule is largely what we have: `darksidetools` is a fixed-length prefix (kicks every suffixed model), `rancor`/`wampa` are prefixes (skins caught). S10 also implemented the "after the drop, return the reason; do not call `SetUserinfo` and do not forward" part, so the game no longer rewrites `CS_PLAYERS` for a dropped slot. Two minor differences remain: (a) we still only catch `jedi_/red` and `jedi_/blue`, not `jedi_` alone or other skins; (b) an empty model is left empty instead of forced to `kyle` (upstream says the retail game handles it, and we did not reproduce a problem). Neither is a bypass of the *kick*; they are cosmetic/robustness. |
 | 10-25 F4 (OpenJK API) | The Rust module exports only `dllEntry` and `vmMain` (`lib.rs:87-120`), i.e. upstream's chosen option A. No `GetModuleAPI`. |
 | 10-25 F5 (wrong cvars) | The Rust proxy does not register `sv_gametype`/`sv_fps` at all (`state.rs:22-43`); it reads what it needs through the engine. The bogus cvar cannot be created. |
-| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:938-998` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
+| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:1032-1092` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
 | 10-25 F9 (`netStatus` engine state) | Our netStatus only **reads** `cl->snapshotMsec` (`hooks/netstatus.rs:276`) and derives fps/packets itself; it does not write `snapshotMsec`. The bug (a display command changing a player's snapshot rate) does not exist. |
 | 10-25 F10 | F10.1/F10.5/F10.8 are refuted or engine-specific and not present. F10.2 (`1000 / sv_fps`): our netstatus/pps arithmetic is hardened (D-010). F10.4: we still compare command names/arguments by prefix (`shared_api.rs`), so we over-block (`teamvote`, `saber_*` NPCs, `gc…`) exactly like the 2019 proxy; the game compares whole names, so this is not a bypass. Cosmetic, Low. F10.6/F10.7 are about C++ code we do not have. |
 | O6 (server commands > 1022) | **Do not port**, upstream's own conclusion: the retail `scores` command legitimately exceeds 1022 and retail clients handle the truncation. |
@@ -1016,6 +1033,10 @@ the `challenge_t`/`serverStatic_t` offsets.
 `rust/src/syscall.rs` (1 new test): `null_ghoul2_instances_are_answered` covers
 every null-instance group and the `void**` dereference.
 
+`rust/src/hooks/engine_sv.rs` (3 new tests): the `Info_Print` formatter —
+20-character key padding, a 600-character value kept intact (the retail 512
+buffer would overflow), a long key left unpadded, and `MISSING VALUE`.
+
 Run:
 
 ```sh
@@ -1025,7 +1046,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 304 unit tests pass; the i686 release cdylib builds. No server was
+Result: 307 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1128,8 +1149,7 @@ dependencies. It is the order the fixes are being applied in.
     *Fixed 2026-11-02.*
 11. ✅ **S19** — null Ghoul2 instance (Medium crash, trigger not reproduced).
     *Fixed 2026-11-02.*
-12. **S7** — `Info_Print` / `dumpuser` (Medium; depends on S6 for the full fix,
-    but the `Info_Print` rewrite stands alone).
+12. ✅ **S7** — `Info_Print` / `dumpuser` (Medium). *Fixed 2026-11-02.*
 13. **S8** — `Info_SetValueForKey` one-byte overflow (Medium, connect path).
 14. **S12** — `Com_WriteConfig_f` (Medium, rcon admin only; mind the A1
     relocation note).
@@ -1176,9 +1196,11 @@ its `mod tests`;
 `validate_userinfo`) and its `mod tests`;
 `rust/src/lib.rs:153-195` and `:301-308`;
 `rust/src/hooks/engine_sv.rs:301-358` (rcon), `:393-453` (status/info),
-`:459-488` (challenge/connect), `:509-546` (`refresh_ip`), `:556-619`
-(`SV_UserinfoChanged`), `:938-998` (`SV_SvEntityForGentity`);
-`rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-797`
+`:459-488` (challenge/connect), `:498-531` (`info_print_lines`),
+`:557-582` (`info_print`), `:603-640` (`refresh_ip`), `:650-713`
+(`SV_UserinfoChanged`),
+`:1032-1092` (`SV_SvEntityForGentity`);
+`rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-799`
 (engine hook table) and `:452-489` (trampoline copy);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its

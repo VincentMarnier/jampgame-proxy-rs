@@ -487,6 +487,100 @@ pub unsafe extern "C" fn sv_direct_connect(from: Netadr) {
     unsafe { original(from) };
 }
 
+// ---------------------------------------------------------------------------
+// Info_Print (dumpuser / serverinfo / systeminfo) — full rewrite (S7/F11)
+// ---------------------------------------------------------------------------
+
+/// Format an info string the way the retail `Info_Print` does: one key per
+/// entry, padded with spaces to 20 characters when shorter (no newline), then
+/// the value (or `None` for a missing value). Growable buffers instead of the
+/// retail `char key[512]` / `char value[512]` (S7/10-25 F11).
+fn info_print_lines(bytes: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    if bytes.first() == Some(&b'\\') {
+        i += 1;
+    }
+    while i < bytes.len() {
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'\\' {
+            i += 1;
+        }
+        let mut key = bytes[key_start..i].to_vec();
+        if key.len() < 20 {
+            key.resize(20, b' ');
+        }
+
+        if i >= bytes.len() {
+            out.push((key, None));
+            break;
+        }
+
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != b'\\' {
+            i += 1;
+        }
+        out.push((key, Some(bytes[value_start..i].to_vec())));
+
+        if i < bytes.len() {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `void Com_Printf(const char *fmt, ...)` with one `%s` argument.
+///
+/// # Safety
+///
+/// Engine memory layer initialised; both strings NUL-terminated.
+unsafe fn com_printf(format: *const c_char, text: *const c_char) {
+    // SAFETY: fixed engine address; a cdecl call with `(const char*, const
+    // char*)` is a valid use of the variadic function for a `%s` format.
+    let f: unsafe extern "C" fn(*const c_char, *const c_char) =
+        unsafe { core::mem::transmute(engine::functions::COM_PRINTF) };
+    unsafe { f(format, text) };
+}
+
+/// `Info_Print` (S7/10-25 F11): the retail function copies each key and value
+/// into a 512-byte stack buffer, so a userinfo value of 512 or more characters
+/// overflows it — a client plants the value and `rcon dumpuser` kills the
+/// server. This rewrite uses growable buffers; the original body is never
+/// called. The output format is the retail one (`"%s"` for the padded key,
+/// then the value and a newline, or `MISSING VALUE`).
+///
+/// # Safety
+///
+/// Entered from the engine's `serverinfo`, `systeminfo` and `dumpuser`
+/// commands with a NUL-terminated info string.
+pub unsafe extern "C" fn info_print(s: *const c_char) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: the engine passes a NUL-terminated info string.
+    let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
+
+    for (mut key, value) in info_print_lines(bytes) {
+        key.push(0);
+        // SAFETY: `key` is NUL-terminated; engine printf valid.
+        unsafe { com_printf(c"%s".as_ptr(), key.as_ptr() as *const c_char) };
+
+        match value {
+            None => {
+                // SAFETY: static NUL-terminated string.
+                unsafe { com_printf(c"%s".as_ptr(), c"MISSING VALUE\n".as_ptr()) };
+            }
+            Some(mut value) => {
+                value.push(b'\n');
+                value.push(0);
+                // SAFETY: `value` is NUL-terminated; engine printf valid.
+                unsafe { com_printf(c"%s".as_ptr(), value.as_ptr() as *const c_char) };
+            }
+        }
+    }
+}
+
 /// `strlen(Cmd_Argv(n))`, with a null-safe 0.
 fn cmd_argv_len(n: c_int) -> usize {
     // SAFETY: engine Cmd_Argv is valid in the connectionless context.
@@ -2123,5 +2217,47 @@ mod tests {
                 48
             ));
         }
+    }
+
+    #[test]
+    fn info_print_pads_short_keys_and_keeps_long_values() {
+        let long_value = vec![b'x'; 600];
+        let mut info = b"\\a\\1\\b\\".to_vec();
+        info.extend_from_slice(&long_value);
+
+        let lines = info_print_lines(&info);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0.len(), 20, "short key padded to 20");
+        assert_eq!(&lines[0].0[..5], b"a    ");
+        assert_eq!(lines[0].1.as_deref(), Some(&b"1"[..]));
+        assert_eq!(lines[1].0.len(), 20);
+        assert_eq!(
+            lines[1].1.as_ref().map(Vec::len),
+            Some(600),
+            "the retail 512-byte buffer would have overflowed"
+        );
+    }
+
+    #[test]
+    fn info_print_reports_a_missing_value() {
+        let lines = info_print_lines(b"\\key\\value\\last");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(&lines[0].0[..3], b"key");
+        assert_eq!(lines[0].1.as_deref(), Some(&b"value"[..]));
+        assert_eq!(&lines[1].0[..4], b"last");
+        assert!(lines[1].1.is_none());
+    }
+
+    #[test]
+    fn info_print_leaves_a_long_key_unpadded() {
+        let key = vec![b'k'; 600];
+        let mut info = b"\\".to_vec();
+        info.extend_from_slice(&key);
+        info.extend_from_slice(b"\\v");
+
+        let lines = info_print_lines(&info);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, key);
+        assert_eq!(lines[0].1.as_deref(), Some(&b"v"[..]));
     }
 }
