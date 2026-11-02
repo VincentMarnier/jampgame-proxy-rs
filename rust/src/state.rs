@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 16] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 19] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -36,6 +36,9 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 16] = [
     (c"proxy_sv_spectatorTeamOverlay", c"1"),
     (c"proxy_sv_muteMode", c"1"),
     (c"proxy_sv_debugLog", c"0"),
+    (c"proxy_sv_enableClientPpsLimit", c"0"),
+    (c"proxy_sv_globalMaxPps", c"100"),
+    (c"proxy_sv_clientPpsLog", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -70,6 +73,16 @@ pub const CVAR_MUTE_MODE: usize = 14;
 /// Crash-diagnostics trace (`crate::diagnostics`): `0` off, `1` suspicious
 /// events only, `2` every client command/userinfo/lifecycle event.
 pub const CVAR_DEBUG_LOG: usize = 15;
+/// Per-client incoming packet-rate limiter (`crate::pps`): `0` off, non-zero
+/// on. When on, each client's limit is an integer downscale of its measured
+/// FPS, capped by [`CVAR_GLOBAL_MAX_PPS`].
+pub const CVAR_ENABLE_CLIENT_PPS_LIMIT: usize = 16;
+/// Global hard ceiling on accepted packets/second per client (default `100`,
+/// `0` = no ceiling). The per-client FPS-derived limit is capped to it.
+pub const CVAR_GLOBAL_MAX_PPS: usize = 17;
+/// `proxy_sv_clientPpsLog`: print one line for a client whose window is above
+/// its limit (clients inside their limit stay silent).
+pub const CVAR_CLIENT_PPS_LOG: usize = 18;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -581,6 +594,8 @@ pub struct ClientEntry {
     /// netStatus estimator state (D-007): per-packet window, fps/pps ring
     /// semantics and the reset rules.
     pub netstatus: NetstatusState,
+    /// Incoming packet-rate accounting / smoothing (`crate::pps`).
+    pub pps: crate::pps::PpsState,
     pub last_time_net_status: i32,
     /// Monotonic packet-identity counter for the cmdStats feed: bumped once
     /// per usercmd client message by the `SV_ExecuteClientMessage` entry
@@ -601,6 +616,7 @@ impl Default for ClientEntry {
             clean_name: [0; MAX_NETNAME],
             muted: false,
             netstatus: NetstatusState::default(),
+            pps: crate::pps::PpsState::default(),
             last_time_net_status: 0,
             packet_counter: 0,
             game_stats: [GameStats::default(); MAX_CLIENTS],
@@ -814,6 +830,12 @@ pub fn proxy_enabled() -> bool {
     PROXY_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Serializes the tests that mutate the process-global [`STATE`] (the
+/// `cargo test` harness runs tests in parallel; two tests initialising/clearing
+/// the same global race).
+#[cfg(test)]
+pub(crate) static TEST_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +871,9 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_SPECTATOR_TEAM_OVERLAY].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_MUTE_MODE].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_DEBUG_LOG].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_CLIENT_PPS_LIMIT].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_GLOBAL_MAX_PPS].1.to_bytes(), b"100");
+        assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
@@ -870,6 +895,9 @@ mod tests {
 
     #[test]
     fn state_initialises_once() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // A test that ran before this one may have left the global initialised.
+        *lock() = None;
         assert!(!is_initialised());
         with_state(|s| s.svs_time = 42);
         assert!(is_initialised());

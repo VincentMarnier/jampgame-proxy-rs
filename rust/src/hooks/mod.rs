@@ -235,6 +235,11 @@ engine_trampoline!(
     15,
     unsafe extern "C" fn(usize, *const core::ffi::c_char, core::ffi::c_int)
 );
+engine_trampoline!(
+    engine_hook_original_sv_netchan_process,
+    16,
+    unsafe extern "C" fn(usize, usize) -> core::ffi::c_int
+);
 
 /// Thin alias kept for call-site readability (`original_call(f) == f()`).
 #[inline]
@@ -319,6 +324,7 @@ pub unsafe fn attach_all() {
         engine_sv::sv_execute_client_message as usize,
         engine_sv::sv_add_entities_visible_from_point as usize,
         engine_sv::sv_execute_client_command as usize,
+        engine_sv::sv_netchan_process as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine
@@ -404,6 +410,9 @@ pub unsafe fn set_enabled(enabled: bool) {
             // proxy had queued: what each client holds no longer matches the
             // proxy's record, so refresh every viewer from scratch.
             crate::tffa::forget_all_view_overrides();
+            // Packet-rate windows did not advance while detached; never
+            // enforce a pre-disable rate on the traffic that follows.
+            crate::pps::reset_all();
         }
     } else {
         if engine_sv::attached() {

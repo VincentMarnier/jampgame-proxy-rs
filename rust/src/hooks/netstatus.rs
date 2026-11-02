@@ -37,10 +37,12 @@
 //! plan-literal variant) because the unit tests validate them; the printed
 //! table is the only surface.
 //!
-//! With `proxy_sv_enableNetStatus 0` the feature is **completely inert**
-//! (user directive, 2026-10-26): the per-cmd feed, the per-packet record
-//! work, the table and every estimator computation are gated on the cvar, so
-//! the only cost left is one cvar mirror read per usercmd message.
+//! With `proxy_sv_enableNetStatus 0` the table and every estimator computation
+//! are **completely inert** (user directive, 2026-10-26). The raw per-cmd
+//! record feed is also what the per-client packet-rate limiter uses to derive
+//! each client's FPS (`crate::pps`), so it stays active when
+//! `proxy_sv_enableClientPpsLimit` is on; with both cvars off it does nothing
+//! beyond one cvar mirror read per usercmd message.
 
 use core::ffi::{c_char, c_int};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -55,8 +57,17 @@ use crate::sdk::{
     OFFSET_CLIENT_RATE, OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT, OFFSET_CLIENT_SNAPSHOT_MSEC,
     OFFSET_CLIENT_STATE, PACKET_MASK, SIZEOF_CLIENT_SNAPSHOT_T, SIZEOF_CLIENT_T, Usercmd,
 };
-use crate::state::{self, CVAR_ENABLE_NET_STATUS};
+use crate::state::{self, CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS};
 use crate::syscall;
+
+/// Whether the shared per-usercmd record feed must run: the netStatus table
+/// needs it, and the packet-rate limiter derives each client's FPS from it.
+fn feed_enabled() -> bool {
+    state::with_state(|s| {
+        s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0
+            || s.cvars[CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
+    })
+}
 
 /// `server.cvars.sv_maxclients->integer` (cvar slot 0x8273ea4). Returns 0 when
 /// the memory layer is not initialised yet (null slot) instead of faulting.
@@ -207,10 +218,10 @@ unsafe fn frames_msg_interval(cl: usize, now: i32) -> f32 {
 /// message's ack at this point (`SV_ExecuteClientMessage` writes it before
 /// calling `SV_UserMove`), so the pairing must use the parsed one.
 ///
-/// With `proxy_sv_enableNetStatus 0` the whole feature is inert: this returns
-/// before touching the engine or the window (the per-cmd feed and the table
-/// are gated too), and the off→on edge resets every window through
-/// [`NETSTATUS_WAS_OFF`].
+/// With both `proxy_sv_enableNetStatus` and
+/// `proxy_sv_enableClientPpsLimit` at `0` the feed is inert: this returns
+/// before touching the engine or the window, and the off→on edge resets every
+/// window through [`FEED_WAS_OFF`].
 ///
 /// # Safety
 ///
@@ -220,8 +231,8 @@ pub unsafe fn mark_packet_start(cl: usize, message_acknowledge: i32) {
     if client_num >= crate::sdk::MAX_CLIENTS {
         return;
     }
-    if !state::with_state(|s| s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0) {
-        NETSTATUS_WAS_OFF.store(true, Ordering::Relaxed);
+    if !feed_enabled() {
+        FEED_WAS_OFF.store(true, Ordering::Relaxed);
         return;
     }
     // SAFETY: engine memory layer initialised.
@@ -262,9 +273,9 @@ pub fn reset_client(client_num: usize) {
     });
 }
 
-/// Drop every estimator window (`proxy_sv_enableNetStatus` off -> on). The
-/// reset is deferred to each client's next usercmd packet (`reset_pending`) so
-/// the hot path never clears the 512-record ring mid-packet.
+/// Drop every estimator window (the shared feed off -> on). The reset is
+/// deferred to each client's next usercmd packet (`reset_pending`) so the hot
+/// path never clears the 512-record ring mid-packet.
 pub fn reset_all() {
     state::with_state(|s| {
         for client in s.clients.iter_mut() {
@@ -273,9 +284,9 @@ pub fn reset_all() {
     });
 }
 
-/// Set when `proxy_sv_enableNetStatus` was seen off, so the next enabled feed
+/// Set when the shared feed was seen off, so the next enabled feed
 /// invalidates every window (D-007 step 4).
-static NETSTATUS_WAS_OFF: AtomicBool = AtomicBool::new(false);
+static FEED_WAS_OFF: AtomicBool = AtomicBool::new(false);
 
 /// `sv_client_think_stub` — the retarget of `call SV_ClientThink` inside the
 /// pristine `SV_UserMove` (0x804e891). Runs the pristine `SV_ClientThink`,
@@ -288,12 +299,11 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     // SAFETY: engine function at the fixed table; args from the engine loop.
     unsafe { engine::sv_client_think(cl, cmd as usize) };
 
-    let net_status_enabled = state::with_state(|s| s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0);
-    if !net_status_enabled {
-        NETSTATUS_WAS_OFF.store(true, Ordering::Relaxed);
+    if !feed_enabled() {
+        FEED_WAS_OFF.store(true, Ordering::Relaxed);
         return;
     }
-    if NETSTATUS_WAS_OFF.swap(false, Ordering::Relaxed) {
+    if FEED_WAS_OFF.swap(false, Ordering::Relaxed) {
         reset_all();
     }
     // SAFETY: cmd is the engine's usercmd buffer.

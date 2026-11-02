@@ -44,6 +44,9 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
+| `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± 2, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
+| `proxy_sv_globalMaxPps`               | 100     | global hard ceiling on accepted packets per second per client (`0` = no ceiling); the per-client FPS-derived limit is capped to it |
+| `proxy_sv_clientPpsLog`               | 0       | log one line only for a client whose measured rate is above its limit |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -193,6 +196,68 @@ ping    rtt   jit  fps  pps     timeNudge snaps   rate name
 * **rate** — the player's bandwidth setting (bytes per second the game is
   allowed to use).
 * **name** — the player.
+
+### Client packet rate
+
+`proxy_sv_enableClientPpsLimit 1` activates the per-client incoming packet-rate
+limiter. The maximum allowed pps is computed per client from their **estimated
+FPS** and the global ceiling:
+
+```text
+limit = max over f in FPS-2 ..= FPS+2 of
+            min(f / ceil(f / proxy_sv_globalMaxPps), proxy_sv_globalMaxPps)
+```
+
+The FPS estimate is uncertain by ±2, so the formula is evaluated for all five
+values and the **highest** result is used; the uncertainty can only raise the
+limit, never lower it. This makes the accepted rate an exact `1/K` fraction of
+the client's rate (`K = ceil(f / globalMaxPps)`), so the eviction pattern is a
+clean "drop one out of every K packets":
+
+| FPS | global max | samples | limit |
+|---|---|---|---|
+| 60 | 100 | 58..62 → 58..62 | 62 |
+| 100 | 100 | 98..102 → 98,99,100,50,51 | 100 |
+| 144 | 100 | 142..146 → 71,71,72,72,73 | 73 |
+| 250 | 100 | 248..252 → 82,83,83,83,84 | 84 |
+
+The FPS is computed by the same function as the netStatus table
+(`netstatus_est::fps_pps`), so both agree. `proxy_sv_globalMaxPps 0` removes
+the ceiling and the highest sample (`FPS + 2`) is used; if the FPS is not yet
+trustworthy, only the global ceiling is enforced (and `0` there means fail
+open).
+
+A stock client sends at most one packet per generated usercmd (one per rendered
+frame; `cl_maxpackets` can only make it send fewer), so a client sending more
+packets than its frame rate can explain — duplicated/empty packets — is the
+shape this catches. Genuinely new usercmds raise the measured FPS and therefore
+the limit; limiting the command rate itself is a separate concern.
+
+- The rate is measured over one-second windows and the limit follows the
+  client's FPS refreshed once a second. Until the client's command stream
+  covers a full window (`< 0.9 s`, e.g. just connected), the FPS is not
+  trusted; only the global ceiling applies, and with no ceiling the limiter
+  fails open.
+- A client inside its limit is never touched. Above it, the excess is dropped
+  **evenly through the next second**: with a limit of 63 and a client sending
+  100, the proxy accepts 63 and drops 37 interleaved (about two accepted, one
+  dropped), never "the last 37".
+- The first second after a connect (and after a 2 s silence) is measurement
+  only, so handshake/reconnect bursts are not filtered.
+- Being dropped is exactly a lost UDP packet to the engine, so the netchan and
+  the client's `cl_packetdup` redundancy handle it like any other loss.
+- The feature does not require `proxy_sv_enableNetStatus`; it uses the same
+  per-usercmd feed internally for the FPS estimate.
+
+With `proxy_sv_clientPpsLog 1`, the server prints one line **only when a
+client's completed window is above its limit**:
+
+```text
+----- proxy-rs: pps over limit: observed=100 accepted=63 dropped=37 rate=100 limit=62 fps=60 window_ms=1000 client=2 name="..." adr="..."
+```
+
+Nothing is printed for a client inside its limit. `proxy_sv_enable 0` detaches
+the hook, so the whole feature is off with the master switch.
 
 ### Team lock
 

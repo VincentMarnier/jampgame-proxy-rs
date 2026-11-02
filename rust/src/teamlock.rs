@@ -693,6 +693,9 @@ mod tests {
 
     #[test]
     fn caps_follow_a_promotion_and_are_cleared_with_their_instance() {
+        let _guard = state::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         state::with_state(|s| {
             s.team_lock = TeamLock::default();
             s.team_lock.caps[1] = TeamCaps { red: 2, blue: 2 };

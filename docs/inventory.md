@@ -62,6 +62,27 @@ and client lifecycle event. It adds one entry wrapper,
 server-level client commands (`userinfo`, downloads) as well as the ones
 forwarded to the game; lines are flushed to `proxy_debug.log` before dispatch.
 
+## Client packet-rate limit (Rust addition)
+
+`proxy_sv_enableClientPpsLimit` (default `0`, off) with
+`proxy_sv_globalMaxPps` (default `100`) and `proxy_sv_clientPpsLog` (default
+`0`) is a Rust-only, D-014 feature. The per-client limit is the highest
+`f / ceil(f / globalMaxPps)` over `FPS ± 2` (capped by `globalMaxPps`) using
+the same `netstatus_est::fps_pps` calculation as the netStatus table; the shared
+usercmd feed stays active while the limiter is on, even if the table is off,
+and logging only reports clients above their limit. It adds one entry wrapper,
+`SV_Netchan_Process` (`0x8057e14`, six stealable bytes), the engine's first
+sequenced-packet point that already holds the `client_t*` (address + qport
+matched, `sv_main.cpp:623`). The wrapper counts every incoming packet per
+client over one-second windows and returns `qfalse` for the excess, which is
+exactly the engine's own lost/out-of-order packet path: the pristine body is
+never entered, `lastPacketTime` is not refreshed and no client message runs.
+Drops are spread evenly through the window by a deterministic accumulator; a
+client at or below its FPS-derived limit passes untouched, the FPS estimate is
+refreshed once a second, and the first window after connect (or after a 2 s
+silence) is measurement-only. `clientPpsLog 1` prints a line only for clients
+whose completed window is above their limit.
+
 ## Wanted
 
 ### Security fixes — explicitly named

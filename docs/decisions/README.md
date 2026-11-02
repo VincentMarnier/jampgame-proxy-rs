@@ -60,3 +60,12 @@
   commands, client commands/userinfo, rcon/download/query attempts and client
   lifecycle, flushed to `proxy_debug.log` before dispatch for crash
   attribution; the new `SV_ExecuteClientCommand` entry-wrapper detour.
+- `0014-client-pps-limit.md` — per-client incoming packet-rate limiting
+  derived from the client's measured FPS:
+  `proxy_sv_enableClientPpsLimit` / `proxy_sv_globalMaxPps` (default 100,
+  hard ceiling; the enforced limit is the highest
+  `f / ceil(f / globalMaxPps)` over `FPS ± 2`) /
+  `proxy_sv_clientPpsLog`; `SV_Netchan_Process` entry wrapper, the shared
+  `fps_pps` calculation (same as the netStatus table), one-second measurement
+  windows, deterministic evenly-spread drops (never a tail drop), fail-open
+  guards for short/stale command streams, and over-limit-only logging.

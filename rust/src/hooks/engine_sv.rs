@@ -1161,6 +1161,39 @@ pub unsafe extern "C" fn sv_execute_client_message(cl: usize, msg: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// SV_Netchan_Process — incoming packet-rate limiter (entry wrapper)
+// ---------------------------------------------------------------------------
+
+/// `qboolean SV_Netchan_Process(client_t *client, msg_t *msg)` (0x8057e14):
+/// account the packet for `proxy_sv_enableClientPpsLimit` and, when the client
+/// is over its FPS-derived limit, return `qfalse` so the engine drops it
+/// exactly as it drops an out-of-order packet (`sv_main.cpp:623`).
+///
+/// This is the first sequenced-packet point that already knows the
+/// `client_t*` (address and qport matched), so the limiter is per player and
+/// connectionless/unknown-address traffic keeps its own engine handling. The
+/// pristine body (netchan sequencing/decoding) is still called for accepted
+/// packets; a dropped packet never reaches `SV_ExecuteClientMessage`, does not
+/// refresh `lastPacketTime` and is retransmitted by the client's reliable path
+/// or covered by its usercmd redundancy like any other lost UDP packet.
+///
+/// With `proxy_sv_enableClientPpsLimit 0` the wrapper is a plain passthrough
+/// (one atomic check).
+///
+/// # Safety
+///
+/// Entered from the engine with `(client_t*, msg_t*)`.
+pub unsafe extern "C" fn sv_netchan_process(cl: usize, msg: usize) -> c_int {
+    // SAFETY: cl is the client_t* the engine matched for this packet.
+    if !unsafe { crate::pps::on_incoming_packet(cl) } {
+        return 0;
+    }
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_sv_netchan_process);
+    unsafe { original(cl, msg) }
+}
+
+// ---------------------------------------------------------------------------
 // SV_AddEntitiesVisibleFromPoint — parallel-TFFA invisibility (entry wrapper)
 // ---------------------------------------------------------------------------
 

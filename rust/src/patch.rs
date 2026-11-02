@@ -686,7 +686,10 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `SV_AddEntitiesVisibleFromPoint` is re-added as a Rust-only parallel-TFFA
 /// post-filter (invisibility); it runs the pristine body then drops
 /// cross-match entities from the snapshot list.
-pub static ENGINE_HOOKS: [Hook; 16] = [
+/// `SV_Netchan_Process` is a Rust-only entry wrapper for the per-client packet
+/// rate limiter (`crate::pps`): it accounts one incoming packet and may return
+/// `qfalse` (drop) before the pristine body decodes it.
+pub static ENGINE_HOOKS: [Hook; 17] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -757,6 +760,11 @@ pub static ENGINE_HOOKS: [Hook; 16] = [
     Hook::new(
         "SV_ExecuteClientCommand",
         crate::engine::functions::SV_EXECUTE_CLIENT_COMMAND,
+        false,
+    ),
+    Hook::new(
+        "SV_Netchan_Process",
+        crate::engine::functions::SV_NETCHAN_PROCESS,
         false,
     ),
 ];
@@ -1116,6 +1124,11 @@ mod tests {
         Site {
             name: "SV_ExecuteClientCommand",
             bytes: b"\x55\x8b\xec\x83\xec\x20\x89\x7d\xf4\x89\x75\xf8",
+            want: 6,
+        },
+        Site {
+            name: "SV_Netchan_Process",
+            bytes: b"\x55\x8b\xec\x83\xec\x18\x89\x7d\xf4\x89\x75\xf8",
             want: 6,
         },
         Site {

@@ -822,6 +822,9 @@ mod tests {
     fn non_utf8_team_chat_stays_inside_the_senders_instance() {
         use std::ffi::CString;
 
+        let _guard = crate::state::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // The same shape `G_SayTo` builds (`g_cmds.c:1511-1522`), latin-1 text.
         let chat = CString::new(b"tchat \"\x19(alpha^7\x19)\x19: ^5CAF\xe9\"".to_vec()).unwrap();
         let text = chat.as_c_str();

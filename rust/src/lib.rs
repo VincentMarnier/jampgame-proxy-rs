@@ -37,6 +37,7 @@ mod mute;
 mod netstatus_est;
 mod original;
 mod patch;
+mod pps;
 mod rules;
 mod scoreboard;
 mod sdk;
@@ -461,6 +462,13 @@ fn update_proxy_cvars() {
         // The diagnostics level is mirrored into a lock-free atomic so engine
         // hook call sites can gate their formatting without re-entering state.
         diagnostics::set_level(s.cvars[state::CVAR_DEBUG_LOG].integer);
+        // The packet-rate limiter's three cvars are mirrored into lock-free
+        // atomics: the check runs once per incoming packet.
+        pps::set_config(
+            s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer,
+            s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
+            s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
+        );
         s.cvars[state::CVAR_ENABLE].integer != 0
     });
     state::set_proxy_enabled(enabled);
@@ -536,6 +544,9 @@ mod tests {
     /// (no output) included.
     #[test]
     fn client_mirror_survives_a_disabled_master_switch() {
+        let _guard = state::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         state::set_proxy_enabled(false);
         assert!(!state::proxy_enabled());
 
