@@ -64,14 +64,14 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | 10-25 F3 | anti-cheat false positive / bypass | Critical | **COVERED** (minor model gaps) |
 | 10-25 F4 | OpenJK API path | High | **N/A** |
 | 10-25 F5 | wrong cvars read | High | **N/A** (not ported) |
-| 10-25 F6 | rcon/getstatus/getinfo without rate limiting | High | **LIVE** |
+| 10-25 F6 | rcon/getstatus/getinfo without rate limiting | High | **FIXED** 2026-11-02 |
 | 10-25 F7 | `writeconfig` filter bypass | Medium | **LIVE** |
 | 10-25 F8 | unbounded index in `SV_SvEntityForGentity` | Low | **COVERED** (stricter) |
 | 10-25 F9 | `netStatus` modifies engine state | Medium | **N/A** (different design) |
 | 10-25 F10 | low-priority bugs | Low | **N/A / one cosmetic gap** |
 | 10-25 F11 | `dumpuser` crash on a long userinfo value | Medium | **LIVE** |
 | O1 | `ip` userinfo key not maintained | High | **LIVE** |
-| O2 | out-of-band rate limiting | High | **LIVE** (= F6) |
+| O2 | out-of-band rate limiting | High | **FIXED** 2026-11-02 (= F6) |
 | O3 | userinfo sanitised before the game sees it | High | **LIVE** (= F2) |
 | O4 | `writeconfig` | Medium | **LIVE** (= F7) |
 | O5 | connections per IP address | Medium, optional | **MISSING** (availability) |
@@ -307,7 +307,7 @@ must cooperate (about 10–15 by upstream's estimate). The 2026 fix cuts each at
 **Our code (SOURCE (ours)).** `sanitize_userinfo` touches `name`,
 `model` and `forcepowers` only (`shared_api.rs:441-549`); the engine-side
 `SV_UserinfoChanged` wrapper touches `model` only
-(`hooks/engine_sv.rs:471-528`). `color1`/`color2` are never read or rewritten.
+(`hooks/engine_sv.rs:505-562`). `color1`/`color2` are never read or rewritten.
 
 **Impact.** Multi-client denial of service (gamestate overflow) on the retail
 client. Not a server crash.
@@ -372,7 +372,7 @@ A port of `3b3b252` with two parts:
      a `darksidetools` model keeps the chat.
    - The engine-side `SV_UserinfoChanged` wrapper uses the checked writer for
      its `model` → `kyle` rewrite and calls `SV_DropClient` when it does not
-     fit (`hooks/engine_sv.rs:515-522`), as JK2MV and upstream do.
+     fit (`hooks/engine_sv.rs:552-556`), as JK2MV and upstream do.
    - The unused game `Info_SetValueForKey` binding was removed from
      `jampgame.rs`; nothing calls the unchecked game writer anymore.
 
@@ -398,7 +398,7 @@ userinfo command accepts up to `MAX_INFO_STRING` = 1024); the next routine
 uses `BIG_INFO_VALUE` (8192).
 
 **Our code (SOURCE (ours)).** There is no `Info_Print` hook in the Rust hook
-table (`rust/src/patch.rs:692-788` lists the engine detours; `Info_Print` is
+table (`rust/src/patch.rs:692-797` lists the engine detours; `Info_Print` is
 not among them) and no userinfo value-length validation (see S6). The engine's
 pristine 512-byte buffers remain.
 
@@ -444,7 +444,7 @@ for every client at each map change) does not apply to a player already on the
 server. The fix re-derives `ip` from `netchan.remoteAddress` in
 `SV_UserinfoChanged` and refuses a connect without room for it, as OpenJK.
 
-**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:471-528`
+**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:505-562`
 (`sv_userinfo_changed`) checks only the `model` key and then calls the
 original. No `ip` repair, no length refusal. `client_connect`
 (`shared_api.rs:88-119`) sends the banner only.
@@ -491,7 +491,7 @@ The upstream design, split into a sanitiser and its two callers:
   FFI wrapper `sanitize_userinfo` (`shared_api.rs:559-605`) reads the engine
   userinfo, calls the core, and writes the result with `SetUserinfo`, turning a
   rejection into `Option<SanitizeRejection>`.
-- `GAME_CLIENT_CONNECT` (`lib.rs:152-194`) runs it for every non-bot connect
+- `GAME_CLIENT_CONNECT` (`lib.rs:153-195`) runs it for every non-bot connect
   (first connection and the map-change reconnect) via
   `connect_userinfo_sanitized` (`shared_api.rs:363-365`), **before**
   `client_connect` and before forwarding. On a reason it returns the reason
@@ -501,7 +501,7 @@ The upstream design, split into a sanitiser and its two callers:
   call.
 - `client_userinfo_changed` (`shared_api.rs:614-639`) keeps the change-path
   behaviour: on the same reason it sends the anti-cheat chat and calls
-  `DropClient`, then returns `false`; `vmMain` (`lib.rs:300-307`) returns 0
+  `DropClient`, then returns `false`; `vmMain` (`lib.rs:301-308`) returns 0
   instead of forwarding `GAME_CLIENT_USERINFO_CHANGED`.
 - That last point also finishes the 10-25 F3 part "after the drop, return the
   reason; do not call `SetUserinfo` and do not forward": the game no longer
@@ -523,7 +523,7 @@ the policy core now has its own S6 tests. The engine read/write and the
 game sees the sanitised userinfo), in
 [Section 6](#6-tests-and-test-plan).
 
-### S11. No out-of-band rate limiting; rcon flood gate disabled — High
+### S11. No out-of-band rate limiting; rcon flood gate disabled — High — **FIXED 2026-11-02**
 
 Upstream: 10-25 F6 / O2.
 
@@ -536,24 +536,63 @@ valid rcon is never limited; bad passwords share one global `(10, 1000)`
 bucket; `getstatus`/`getinfo` get a per-address `(10, 1000)` bucket plus a
 global outbound `(10, 100)`; `getchallenge`/`connect` get a per-address limit.
 
-**Our code (SOURCE (ours)).**
+**Our code before the fix (SOURCE (ours)).**
 
-- The engine's 500 ms timer is NOP'd unconditionally at attach
-  (`hooks/mod.rs:284-288`).
-- `svc_remote_command` (`hooks/engine_sv.rs:297-365`) only applies
-  `proxy_sv_enableRconCmdCooldown`, whose default is `"0"`
-  (`state.rs:24`) and which is a **global** gate updated before the password
+- The engine's 500 ms timer was NOP'd unconditionally at attach.
+- `svc_remote_command` applied only `proxy_sv_enableRconCmdCooldown`, whose
+  default was `"0"` and which was a **global** gate updated before the password
   check.
-- `svc_status`/`svc_info` (`hooks/engine_sv.rs:400-440`) keep the q3infoboom
-  length guard but have no rate limit.
-- The Rust `pps` module (`rust/src/pps.rs`) limits *sequenced, known-client*
-  packets at `SV_Netchan_Process`; it does not touch connectionless traffic.
+- `svc_status`/`svc_info` kept the q3infoboom length guard but had no rate
+  limit.
+- The Rust `pps` module limits *sequenced, known-client* packets at
+  `SV_Netchan_Process`; it never touched connectionless traffic.
 
 **Impact.** Unlimited rcon password guessing (global gate off by default) and
-unlimited query amplification. No `getchallenge` limit either.
+unlimited query amplification. No `getchallenge`/`connect` limit either.
 
-**Test.** The leaky-bucket arithmetic is pure and can be unit tested once
-implemented (upstream's `SVC_RateLimit` is ~20 lines).
+#### Applied (2026-11-02)
+
+A port of the 2026 `Engine/RateLimit.cpp` into `rust/src/ratelimit.rs`, called
+from the connectionless entry wrappers:
+
+- `limit` (`ratelimit.rs:61-83`) is OpenJK's `SVC_RateLimit` with unsigned
+  time: a `Sys_Milliseconds` wrap looks like one period elapsed instead of
+  freezing the bucket. One bucket `(10, 1000)` per IPv4 address
+  (`address_allowed`, `ratelimit.rs:129-140`), shared by `getstatus`,
+  `getinfo`, `getchallenge` and `connect`; a global outbound `(10, 100)` for
+  `getstatus`/`getinfo` (`status_allowed`, `:142-161`); a global `(10, 1000)`
+  for a bad rcon password (`rcon_allowed`, `:163-186`). A valid rcon password
+  is never limited.
+- The address table is a `HashMap` capped at 65536 entries, garbage-collected
+  once per second; a new address beyond the cap is dropped. Only `NA_IP`
+  sources are limited (loopback, bots and bad addresses are not).
+- `svc_status`/`svc_info` (`hooks/engine_sv.rs:390-450`) apply
+  `status_allowed` after the q3infoboom length check.
+- `svc_remote_command` (`hooks/engine_sv.rs:298-388`) computes the password
+  match once, logs the attempt (redacted), calls `rcon_allowed(valid)`, and
+  only then applies the `writeconfig` `.cfg` filter (so a bad password still
+  gets the engine's `Bad rconpassword.` reply).
+- New entry wrappers `sv_get_challenge` / `sv_direct_connect`
+  (`hooks/engine_sv.rs:456-485`) apply `address_allowed`; two new hooks
+  (`SV_GetChallenge`, `SV_DirectConnect`) with pinned prologues. A dropped
+  packet gets no `challengeResponse`/`connectResponse`.
+- `proxy_sv_enableRconCmdCooldown` is **deleted** (`state.rs` cvar table now
+  21 entries, later indices shifted); the engine's 500 ms timer stays NOP'd.
+  This matches the 2026 decision; the old cvar was the broken global gate.
+- Drops are logged only with `proxy_sv_debugLog` (`diagnostics`), the local
+  equivalent of upstream's `com_developer`.
+- Difference from upstream: our buckets live in the pinned module (D-007), so
+  they survive a map change instead of resetting. That can only make the limit
+  stricter across a map change, never looser.
+
+**Tests (TESTED, 5 new).** `ratelimit.rs`: burst then one token per period,
+the `u32` wrap, per-address sharing/keying and the non-IP exemption, the
+65536-entry cap, and the per-second garbage collection. The engine wrappers
+themselves need the runtime.
+
+**Runtime check.** `rcon` guessing, a `getstatus` flood, and a `getchallenge`
+flood from one address (and from many spoofed addresses, for the challenge
+table behaviour) in [Section 6](#6-tests-and-test-plan).
 
 ### S12. `writeconfig` `.cfg` filter is bypassable — Medium
 
@@ -566,7 +605,7 @@ Cbuf), allows `x.so` (4 characters), and does not block `..`. The fix hooks
 `Com_WriteConfig_f` itself and accepts only `.cfg`, no `..`, not
 `mpdefault.cfg`/`default.cfg`, copying OpenJK.
 
-**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:292-360` is the old
+**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:298-388` is the old
 `SVC_RemoteCommand` filter:
 
 ```rust
@@ -683,7 +722,7 @@ writes past it. It is only reached when `d_perPlayerGhoul2` (a `CVAR_CHEAT`,
 default 0) is set or `G_PlayerHasCustomSkeleton` returns true — the latter is
 `xor eax, eax; ret` in the retail Linux module (AUDIT), i.e. always false.
 Nobody on a normal server can trigger it. Our model check uses
-`proxy_sv_modelPathLength` (default 64, `state.rs:27`), so a 39–63 character
+`proxy_sv_modelPathLength` (default 64, `state.rs:26`), so a 39–63 character
 base still passes; it is the same accepted risk. Keep upstream's decision
 unless a custom-skeleton build is used.
 
@@ -757,7 +796,7 @@ non-active clients, as Quake3e.
 
 **Our code (SOURCE (ours)).** We do not patch `SV_MapRestart_f`'s client-state
 store. We **do** port the `SV_ExecuteClientMessage` upstream gate (see
-`hooks/engine_sv.rs:1038-1061`), which is the other half of this interaction.
+`hooks/engine_sv.rs:1090-1116`), which is the other half of this interaction.
 A client that is connecting during a `map_restart` may still be stuck. Low
 functional impact.
 
@@ -795,9 +834,9 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 | 11-01 H1 (quote/control characters in chat) | **REFUTED upstream**: the tokenizer never keeps a `"` inside an argument, so `ConcatArgs` cannot contain one. Our `cmd_tokenize_string2` follows the same tokenizer. Nothing to do. |
 | 10-25 F1 (`rcon map` crash) | **COVERED by D-007**: the Rust module pins itself (`original::pin_own_module()` at `dllEntry`) so the engine's `dlclose` cannot unmap code with live frames. Upstream chose a packet filter stub instead and rejected pinning; both remove the crash. Our approach also removes the hot-reload-on-map-change property, documented in D-007. |
 | 10-25 F3 (anti-cheat) | The 2026 corrected rule is largely what we have: `darksidetools` is a fixed-length prefix (kicks every suffixed model), `rancor`/`wampa` are prefixes (skins caught). S10 also implemented the "after the drop, return the reason; do not call `SetUserinfo` and do not forward" part, so the game no longer rewrites `CS_PLAYERS` for a dropped slot. Two minor differences remain: (a) we still only catch `jedi_/red` and `jedi_/blue`, not `jedi_` alone or other skins; (b) an empty model is left empty instead of forced to `kyle` (upstream says the retail game handles it, and we did not reproduce a problem). Neither is a bypass of the *kick*; they are cosmetic/robustness. |
-| 10-25 F4 (OpenJK API) | The Rust module exports only `dllEntry` and `vmMain` (`lib.rs:84-117`), i.e. upstream's chosen option A. No `GetModuleAPI`. |
-| 10-25 F5 (wrong cvars) | The Rust proxy does not register `sv_gametype`/`sv_fps` at all (`state.rs:19-41`); it reads what it needs through the engine. The bogus cvar cannot be created. |
-| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:829-889` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
+| 10-25 F4 (OpenJK API) | The Rust module exports only `dllEntry` and `vmMain` (`lib.rs:87-120`), i.e. upstream's chosen option A. No `GetModuleAPI`. |
+| 10-25 F5 (wrong cvars) | The Rust proxy does not register `sv_gametype`/`sv_fps` at all (`state.rs:22-43`); it reads what it needs through the engine. The bogus cvar cannot be created. |
+| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:881-941` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
 | 10-25 F9 (`netStatus` engine state) | Our netStatus only **reads** `cl->snapshotMsec` (`hooks/netstatus.rs:276`) and derives fps/packets itself; it does not write `snapshotMsec`. The bug (a display command changing a player's snapshot rate) does not exist. |
 | 10-25 F10 | F10.1/F10.5/F10.8 are refuted or engine-specific and not present. F10.2 (`1000 / sv_fps`): our netstatus/pps arithmetic is hardened (D-010). F10.4: we still compare command names/arguments by prefix (`shared_api.rs`), so we over-block (`teamvote`, `saber_*` NPCs, `gc…`) exactly like the 2019 proxy; the game compares whole names, so this is not a bypass. Cosmetic, Low. F10.6/F10.7 are about C++ code we do not have. |
 | O6 (server commands > 1022) | **Do not port**, upstream's own conclusion: the retail `scores` command legitimately exceeds 1022 and retail clients handle the truncation. |
@@ -855,6 +894,11 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
   characterisation tests: they pin a live gap and say, in their doc comments,
   that they must be inverted when the finding is fixed.
 
+`rust/src/ratelimit.rs` (new, 5 tests): the burst/refill boundary, the `u32`
+time wrap, per-address buckets keyed by IP with the non-IP exemption, the
+65536-entry cap, and the per-second garbage collection. `address_allowed_at`
+takes the time as a parameter, so the table is tested without the engine.
+
 Run:
 
 ```sh
@@ -864,7 +908,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 290 unit tests pass; the i686 release cdylib builds. No server was
+Result: 295 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -942,8 +986,8 @@ dependencies. It is the order the fixes are being applied in.
 5. ✅ **S6** — userinfo validation and a checked `Info_SetValueForKey` (High;
    closes the long/capitalised-key bypass, and is the prerequisite for S7/S8
    and a reliable S4). *Fixed 2026-11-02.*
-6. **S11** — out-of-band rate limits and the rcon policy (High,
-   unauthenticated DoS).
+6. ✅ **S11** — out-of-band rate limits and the rcon policy (High,
+   unauthenticated DoS). *Fixed 2026-11-02.*
 7. **S18** — stateless/renewed challenges (availability companion of S11).
 8. **S9** — re-derive the `ip` userinfo key (High; IP-ban bypass, only
    observable when bans are used).
@@ -996,11 +1040,13 @@ Rust rewrite (this repository):
 `:712-714` (`vote_value_out_of_range`), and its `mod tests`;
 `rust/src/userinfo.rs:145-338` (`value_for_key`, `set_value_for_key*`,
 `validate_userinfo`) and its `mod tests`;
-`rust/src/lib.rs:152-194` and `:300-307`;
-`rust/src/hooks/engine_sv.rs:297-365` (rcon), `:400-440` (status/info),
-`:471-528` (`SV_UserinfoChanged`), `:829-889` (`SV_SvEntityForGentity`);
-`rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-788`
+`rust/src/lib.rs:153-195` and `:301-308`;
+`rust/src/hooks/engine_sv.rs:298-388` (rcon), `:390-450` (status/info),
+`:456-485` (challenge/connect), `:505-562` (`SV_UserinfoChanged`),
+`:881-941` (`SV_SvEntityForGentity`);
+`rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-797`
 (engine hook table) and `:452-489` (trampoline copy);
-`rust/src/state.rs:19-41` (proxy cvars), `rust/src/syscall.rs:145-430`
+`rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
+`rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:145-430`
 (intercepted traps), `rust/src/pps.rs` (sequenced-packet limiter);
 `rust/src/hooks/compat.rs:74-103` (tokenizer).

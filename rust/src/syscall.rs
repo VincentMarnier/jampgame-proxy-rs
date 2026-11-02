@@ -25,8 +25,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sdk::{
     CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
     G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
-    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_NAV_FREE, G_NAV_LOAD,
-    G_PRINT, G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
+    G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO, G_LOCATE_GAME_DATA, G_MILLISECONDS,
+    G_NAV_FREE, G_NAV_LOAD, G_PRINT, G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO,
+    MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -636,6 +637,15 @@ pub unsafe fn argv(n: c_int, buffer: &mut [u8]) {
             &[n, buffer.as_mut_ptr() as c_int, buffer.len() as c_int],
         );
     }
+}
+
+/// `trap_Milliseconds` (`G_MILLISECONDS`) — `Sys_Milliseconds`, which wraps
+/// after about 24.8 days. Kept as `u32`: the rate-limit arithmetic is written
+/// for the wrap.
+pub fn milliseconds() -> u32 {
+    // SAFETY: the engine syscall pointer is registered (dllEntry ran); the
+    // trap takes no argument.
+    unsafe { call_engine(G_MILLISECONDS, &[]) as u32 }
 }
 
 /// `trap_DropClient` — kick `client_num` with `reason`.

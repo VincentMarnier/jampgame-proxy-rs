@@ -105,6 +105,16 @@ engine_trampoline!(
     13,
     unsafe extern "C" fn(usize, usize)
 );
+engine_trampoline!(
+    engine_hook_original_sv_get_challenge,
+    17,
+    unsafe extern "C" fn(engine_sv::Netadr)
+);
+engine_trampoline!(
+    engine_hook_original_sv_direct_connect,
+    18,
+    unsafe extern "C" fn(engine_sv::Netadr)
+);
 
 game_trampoline!(
     game_hook_original_g_damage,
@@ -325,6 +335,8 @@ pub unsafe fn attach_all() {
         engine_sv::sv_add_entities_visible_from_point as usize,
         engine_sv::sv_execute_client_command as usize,
         engine_sv::sv_netchan_process as usize,
+        engine_sv::sv_get_challenge as usize,
+        engine_sv::sv_direct_connect as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine

@@ -100,7 +100,7 @@ follows in the default colour. Both surfaces use the same
 
 | feature | cvar | original implementation | address | technique |
 |---|---|---|---|---|
-| rcon cooldown | `proxy_sv_enableRconCmdCooldown` | `Proxy_SVC_RemoteCommand`, `Patches/server/Proxy_sv_main.cpp:125-145` | `0x8056b14` | entry wrapper |
+| rcon cooldown | `proxy_sv_enableRconCmdCooldown` | `Proxy_SVC_RemoteCommand`, `Patches/server/Proxy_sv_main.cpp:125-145` | `0x8056b14` | entry wrapper — **removed in the Rust port** with the 2026 rcon rate-limit policy (S11, `ratelimit.rs`) |
 | rcon: NOP the timer block ("fix rcon disabler") | — | inline patch, `Proxy_Engine_Patch.cpp:159` | NOP 25 B @ `0x8056b26` | intra |
 | rcon: `Com_BeginRedirect` buffer 49136 → 1008 | — | inline patch, `Proxy_Engine_Patch.cpp:162` | byte `0xbff0`→`0x03` @ `0x8056c7d` | intra |
 | rcon: `writeconfig` only on `.cfg` | — | `Proxy_SVC_RemoteCommand`, `Proxy_sv_main.cpp:134-142` | `0x8056b14` | entry wrapper |

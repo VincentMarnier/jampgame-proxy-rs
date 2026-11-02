@@ -18,10 +18,10 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The `proxy.cvars` mirror table (D-002 keep list): each entry is
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
-/// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 22] = [
+/// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
+/// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
+pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
     (c"proxy_sv_enable", c"1"),
-    (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
     (c"proxy_sv_modelPathLength", c"64"),
@@ -47,55 +47,54 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 22] = [
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
 /// `proxy.cvars.*`, `Proxy_Header.hpp:108-120`, D-002 keep order).
 pub const CVAR_ENABLE: usize = 0;
-pub const CVAR_ENABLE_RCON_CMD_COOLDOWN: usize = 1;
-pub const CVAR_ENABLE_NET_STATUS: usize = 2;
-pub const CVAR_MAX_CALLVOTE_MAPRESTART: usize = 3;
-pub const CVAR_MODEL_PATH_LENGTH: usize = 4;
-pub const CVAR_ANTI_HP_TELLER: usize = 5;
-pub const CVAR_MIN_JUMP_TIME: usize = 6;
-pub const CVAR_ENABLE_END_GAME_STATS: usize = 7;
+pub const CVAR_ENABLE_NET_STATUS: usize = 1;
+pub const CVAR_MAX_CALLVOTE_MAPRESTART: usize = 2;
+pub const CVAR_MODEL_PATH_LENGTH: usize = 3;
+pub const CVAR_ANTI_HP_TELLER: usize = 4;
+pub const CVAR_MIN_JUMP_TIME: usize = 5;
+pub const CVAR_ENABLE_END_GAME_STATS: usize = 6;
 /// Team-lock grace delay in seconds before a round's teams lock (`0` = off).
-pub const CVAR_LOCK_TEAMS_AFTER_SECS: usize = 8;
+pub const CVAR_LOCK_TEAMS_AFTER_SECS: usize = 7;
 /// Per-team-size `timelimit`/`fraglimit`/`capturelimit` rules (reconciled every
 /// frame with the roster, independent of `proxy_sv_lockTeamsAfterXSecs`).
-pub const CVAR_TEAM_SIZE_RULES: usize = 9;
+pub const CVAR_TEAM_SIZE_RULES: usize = 8;
 /// Parallel TFFA matches (`GT_TEAM` only): `0` off, non-zero on.
-pub const CVAR_TFFA_ENABLE: usize = 10;
+pub const CVAR_TFFA_ENABLE: usize = 9;
 /// Maximum number of parallel matches.
-pub const CVAR_TFFA_MAX_MATCHES: usize = 11;
+pub const CVAR_TFFA_MAX_MATCHES: usize = 10;
 /// Maximum players per match (both teams combined).
-pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 12;
+pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 11;
 /// Spectator team overlay (`crate::teamoverlay`): while on, a spectator
 /// following a player receives the stock `tinfo` roster (HP/armor/powerups) for
 /// the followed player's team, which the pristine game only sends to teammates.
-pub const CVAR_SPECTATOR_TEAM_OVERLAY: usize = 13;
+pub const CVAR_SPECTATOR_TEAM_OVERLAY: usize = 12;
 /// `mute`/`unmute` behaviour (D-011, `crate::mute`): `0` off, `1` the stock
 /// mute (chat dropped and the player told), `2` silent (the player's own chat
 /// line is echoed back to them, nobody else receives it, no notice is sent).
-pub const CVAR_MUTE_MODE: usize = 14;
+pub const CVAR_MUTE_MODE: usize = 13;
 /// Crash-diagnostics trace (`crate::diagnostics`): `0` off, `1` suspicious
 /// events only, `2` every client command/userinfo/lifecycle event.
-pub const CVAR_DEBUG_LOG: usize = 15;
+pub const CVAR_DEBUG_LOG: usize = 14;
 /// Per-client incoming packet-rate limiter (`crate::pps`): `0` off, non-zero
 /// on. When on, each client's limit is an integer downscale of its measured
 /// FPS, capped by [`CVAR_GLOBAL_MAX_PPS`].
-pub const CVAR_ENABLE_CLIENT_PPS_LIMIT: usize = 16;
+pub const CVAR_ENABLE_CLIENT_PPS_LIMIT: usize = 15;
 /// Global hard ceiling on accepted packets/second per client (default `100`,
 /// `0` = no ceiling). The per-client FPS-derived limit is capped to it.
-pub const CVAR_GLOBAL_MAX_PPS: usize = 17;
+pub const CVAR_GLOBAL_MAX_PPS: usize = 16;
 /// `proxy_sv_clientPpsLog`: print one line for a client whose window is above
 /// its limit (clients inside their limit stay silent).
-pub const CVAR_CLIENT_PPS_LOG: usize = 18;
+pub const CVAR_CLIENT_PPS_LOG: usize = 17;
 /// `proxy_sv_voidTimeNudge`: rewrite the usercmd `serverTime` of a client whose
 /// estimated `cl_timeNudge` range excludes 0 (D-015, `crate::timenudge`).
-pub const CVAR_VOID_TIME_NUDGE: usize = 19;
+pub const CVAR_VOID_TIME_NUDGE: usize = 18;
 /// `proxy_sv_voidTimeNudgeLog`: log the non-zero/back-to-zero transitions;
 /// works without `proxy_sv_voidTimeNudge` (the shift is reported, not applied).
-pub const CVAR_VOID_TIME_NUDGE_LOG: usize = 20;
+pub const CVAR_VOID_TIME_NUDGE_LOG: usize = 19;
 /// Player `/ignore` (D-016, `crate::ignore`): `0` off, non-zero on. When off,
 /// `ignore`/`unignore` only answer that the feature is disabled and no chat is
 /// filtered, even for a player still carrying a mask.
-pub const CVAR_ENABLE_IGNORE: usize = 21;
+pub const CVAR_ENABLE_IGNORE: usize = 20;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -903,10 +902,6 @@ mod tests {
         );
         assert_eq!(PROXY_CVARS[CVAR_MODEL_PATH_LENGTH].1.to_bytes(), b"64");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_NET_STATUS].1.to_bytes(), b"0");
-        assert_eq!(
-            PROXY_CVARS[CVAR_ENABLE_RCON_CMD_COOLDOWN].1.to_bytes(),
-            b"0"
-        );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_END_GAME_STATS].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_LOCK_TEAMS_AFTER_SECS].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_TEAM_SIZE_RULES].1.to_bytes(), b"");

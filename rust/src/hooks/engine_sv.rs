@@ -4,7 +4,7 @@
 //! `Com_Printf` intra injections (see `crate::hooks::attach_all`).
 
 use core::ffi::{CStr, c_char, c_int};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine;
 use crate::hooks::compat;
@@ -24,7 +24,7 @@ use crate::sdk::{
     OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE,
     OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
 };
-use crate::state::{self, CVAR_ENABLE_RCON_CMD_COOLDOWN, CVAR_MODEL_PATH_LENGTH};
+use crate::state::{self, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
 use crate::utils;
 
@@ -38,10 +38,6 @@ pub struct Netadr {
     pub ipx: [u8; 10],
     pub port: u16,
 }
-
-/// The rcon cooldown timestamp (the original's `static unsigned int
-/// commandCoolDown`, `Proxy_sv_main.cpp:126`). Single-threaded engine.
-static RCON_COOLDOWN: AtomicU32 = AtomicU32::new(0);
 
 /// True once `attach_all` installed the detours.
 static HOOKS_ATTACHED: AtomicBool = AtomicBool::new(false);
@@ -288,40 +284,25 @@ pub fn join_cmd_args(start: c_int) -> String {
 // SVC_RemoteCommand (rcon) — entry wrapper (D-002 "rcon" row)
 // ---------------------------------------------------------------------------
 
-/// `Proxy_SVC_RemoteCommand` (`Proxy_sv_main.cpp:124-145`): cooldown + the
-/// `writeconfig` `.cfg`-only check, then the original.
+/// `Proxy_SVC_RemoteCommand` (10-25 F6): the rcon policy and the `writeconfig`
+/// `.cfg`-only check, then the original.
+///
+/// A valid password is never limited, so an admin keeps rcon during a flood
+/// that spoofs their own address. A bad password shares one global bucket
+/// `(10, 1000)`, about one guess per second whatever the source addresses; a
+/// dropped request gets no reply.
 ///
 /// # Safety
 ///
 /// Entered from the engine's connectionless dispatcher with `(netadr_t, msg_t*)`.
 pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
-    let cooldown_enabled =
-        state::with_state(|s| s.cvars[CVAR_ENABLE_RCON_CMD_COOLDOWN].integer != 0);
-    // SAFETY: engine memory layer initialised.
-    let now = unsafe { svs_time() } as u32;
-    // wrapping_add: svs.time wraps past u32::MAX after ~49 days; a plain `+`
-    // would panic (= abort) in debug builds at the wrap.
-    if cooldown_enabled && now.wrapping_sub(RCON_COOLDOWN.load(Ordering::Relaxed)) < 500 {
-        if crate::diagnostics::suspicious_enabled() {
-            crate::diagnostics::suspicious(
-                "rcon.cooldown",
-                format!(
-                    "from=\"{}\" command=\"{}\"",
-                    netadr_string(&from),
-                    join_cmd_args(2)
-                ),
-            );
-        }
-        return;
-    }
-    RCON_COOLDOWN.store(now, Ordering::Relaxed);
+    // SAFETY: Cmd_Argv is valid in the connectionless command context and
+    // NUL-terminated; the cvar slot is a live `cvar_t*`.
+    let valid = unsafe { rcon_password_matches(engine::cmd_argv(1)) };
 
-    // Log every rcon attempt with the password redacted. `Cmd_Argv(1)` is the
-    // supplied password; only its match result is recorded.
+    // Log every rcon attempt with the password redacted: only the match
+    // result is recorded.
     if crate::diagnostics::suspicious_enabled() {
-        // SAFETY: Cmd_Argv is valid in the connectionless context and
-        // NUL-terminated; the cvar slot is a live `cvar_t*`.
-        let valid = unsafe { rcon_password_matches(engine::cmd_argv(1)) };
         crate::diagnostics::suspicious(
             "rcon",
             format!(
@@ -333,29 +314,38 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
         );
     }
 
-    // Only allow writeconfig on cfg files.
-    // SAFETY: engine Cmd_Argv is valid in the connectionless context.
-    let argv2 = unsafe { engine::cmd_argv(2) };
-    if !argv2.is_null() && unsafe { jampgame::q_stricmpn(argv2, c"writeconfig".as_ptr(), 11) } == 0
-    {
-        // SAFETY: Cmd_Argv returns NUL-terminated strings.
-        let arg3 = unsafe { engine::cmd_argv(3) };
-        let arg3_len = cstr_len(arg3);
-        if arg3_len >= 5
-            && unsafe { *arg3.add(arg3_len - 4) } == b'.' as i8
-            && unsafe { jampgame::q_stricmpn(arg3.add(arg3_len - 4), c".cfg".as_ptr(), 4) } != 0
+    if !crate::ratelimit::rcon_allowed(valid) {
+        return; // dropped silently
+    }
+
+    // Only a valid rcon runs the command: a bad password still gets the
+    // engine's own "Bad rconpassword." reply below.
+    if valid {
+        // Only allow writeconfig on cfg files.
+        // SAFETY: engine Cmd_Argv is valid in the connectionless context.
+        let argv2 = unsafe { engine::cmd_argv(2) };
+        if !argv2.is_null()
+            && unsafe { jampgame::q_stricmpn(argv2, c"writeconfig".as_ptr(), 11) } == 0
         {
-            if crate::diagnostics::suspicious_enabled() {
-                crate::diagnostics::suspicious(
-                    "rcon.writeconfig",
-                    format!(
-                        "from=\"{}\" rejected=\"{}\"",
-                        netadr_string(&from),
-                        crate::diagnostics::escape_bytes(cstr_bytes(arg3), 256)
-                    ),
-                );
+            // SAFETY: Cmd_Argv returns NUL-terminated strings.
+            let arg3 = unsafe { engine::cmd_argv(3) };
+            let arg3_len = cstr_len(arg3);
+            if arg3_len >= 5
+                && unsafe { *arg3.add(arg3_len - 4) } == b'.' as i8
+                && unsafe { jampgame::q_stricmpn(arg3.add(arg3_len - 4), c".cfg".as_ptr(), 4) } != 0
+            {
+                if crate::diagnostics::suspicious_enabled() {
+                    crate::diagnostics::suspicious(
+                        "rcon.writeconfig",
+                        format!(
+                            "from=\"{}\" rejected=\"{}\"",
+                            netadr_string(&from),
+                            crate::diagnostics::escape_bytes(cstr_bytes(arg3), 256)
+                        ),
+                    );
+                }
+                return;
             }
-            return;
         }
     }
 
@@ -416,6 +406,11 @@ pub unsafe extern "C" fn svc_status(from: Netadr) {
         }
         return;
     }
+    // Per address (10, 1000), then the global outbound (10, 100): a reflection
+    // attack is aimed at one victim address, and the total is capped.
+    if !crate::ratelimit::status_allowed(&from, "getstatus") {
+        return;
+    }
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::engine_hook_original_svc_status);
     unsafe { original(from) };
@@ -445,8 +440,47 @@ pub unsafe extern "C" fn svc_info(from: Netadr) {
         }
         return;
     }
+    // Same policy as getstatus.
+    if !crate::ratelimit::status_allowed(&from, "getinfo") {
+        return;
+    }
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::engine_hook_original_svc_info);
+    unsafe { original(from) };
+}
+
+// ---------------------------------------------------------------------------
+// SV_GetChallenge / SV_DirectConnect — per-address rate limit (10-25 F6/O2)
+// ---------------------------------------------------------------------------
+
+/// `SV_GetChallenge(netadr_t)`: per-address limit, as Quake3e. A dropped
+/// request gets no `challengeResponse`.
+///
+/// # Safety
+///
+/// Entered from `SV_ConnectionlessPacket` with a `netadr_t` by value.
+pub unsafe extern "C" fn sv_get_challenge(from: Netadr) {
+    if !crate::ratelimit::address_allowed(&from, "getchallenge") {
+        return;
+    }
+    // SAFETY: trampoline attached at GAME_INIT; the argument is unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_sv_get_challenge);
+    unsafe { original(from) };
+}
+
+/// `SV_DirectConnect(netadr_t)`: per-address limit, sharing the
+/// getstatus/getinfo bucket, as Quake3e. A dropped request gets no
+/// `connectResponse`.
+///
+/// # Safety
+///
+/// Entered from `SV_ConnectionlessPacket` with a `netadr_t` by value.
+pub unsafe extern "C" fn sv_direct_connect(from: Netadr) {
+    if !crate::ratelimit::address_allowed(&from, "connect") {
+        return;
+    }
+    // SAFETY: trampoline attached at GAME_INIT; the argument is unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_sv_direct_connect);
     unsafe { original(from) };
 }
 

@@ -40,6 +40,7 @@ mod original;
 mod patch;
 mod player_target;
 mod pps;
+mod ratelimit;
 mod rules;
 mod scoreboard;
 mod sdk;
