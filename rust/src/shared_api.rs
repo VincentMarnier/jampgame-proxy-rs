@@ -77,6 +77,18 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
         ucmd.forcesel = 0xFF;
     }
     ucmd.angles[ROLL] = 0;
+
+    // S15 (10-25 O10): ioq3/OpenJK clamp a movement axis of -128 to -127, so a
+    // negative move is never one step longer than a positive one (+127 max).
+    if ucmd.forwardmove == -128 {
+        ucmd.forwardmove = -127;
+    }
+    if ucmd.rightmove == -128 {
+        ucmd.rightmove = -127;
+    }
+    if ucmd.upmove == -128 {
+        ucmd.upmove = -127;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -949,13 +961,11 @@ mod tests {
         assert_eq!(cmd.angles[ROLL], 0);
     }
 
-    /// O10 known gap (2026-10-25 audit): ioq3/OpenJK clamp a movement axis of
-    /// -128 to -127 so a negative move is never one step longer than a
-    /// positive one. Our `get_usercmd` leaves -128 untouched.
-    ///
-    /// When O10 is fixed, this test must be inverted.
+    /// S15 (10-25 O10): ioq3/OpenJK clamp a movement axis of -128 to -127, so a
+    /// negative move is never one step longer than a positive one. Every other
+    /// value, including -127 and +127, is untouched.
     #[test]
-    fn o10_known_gap_get_usercmd_leaves_minus_128() {
+    fn get_usercmd_clamps_minus_128() {
         let mut cmd = Usercmd {
             forwardmove: -128,
             rightmove: -128,
@@ -966,8 +976,18 @@ mod tests {
         unsafe { get_usercmd(0, &mut cmd) };
         assert_eq!(
             (cmd.forwardmove, cmd.rightmove, cmd.upmove),
-            (-128, -128, -128)
+            (-127, -127, -127)
         );
+
+        let mut cmd = Usercmd {
+            forwardmove: -127,
+            rightmove: 0,
+            upmove: 127,
+            ..Default::default()
+        };
+        // SAFETY: see the test above.
+        unsafe { get_usercmd(0, &mut cmd) };
+        assert_eq!((cmd.forwardmove, cmd.rightmove, cmd.upmove), (-127, 0, 127));
     }
 
     /// The value the retail client sends at full rank with 18 power levels.
