@@ -31,6 +31,10 @@ const MAX_CVAR_VALUE_STRING: usize = 256;
 /// in a 1024-byte buffer; no command of the game needs more than this.
 const MAX_COMMAND_LENGTH: usize = 512;
 
+/// Number of entries of `gc_orders` in the game (`g_cmds.c:1721-1729`,
+/// upstream `85403cd`, 11-01 F3).
+const GC_ORDERS_COUNT: i32 = 7;
+
 // ---------------------------------------------------------------------------
 // Trap interception (import table — traps the game issues to the engine)
 // ---------------------------------------------------------------------------
@@ -218,14 +222,18 @@ pub fn client_command(client_num: c_int) -> bool {
     let cmd_arg1 = nul_terminated(&cmd_arg1);
     let cmd_arg2 = nul_terminated(&cmd_arg2);
 
-    // Fix: gc crash — refuse clientNums at/above sv_maxclients.
+    // Fix: gc crash. The player number must be a client slot (`client` is NULL
+    // from sv_maxclients up to MAX_CLIENTS - 1) and the order an index of the
+    // game's `gc_orders`: the game also accepts the array length, one past the
+    // end, and sends what it reads there as a text (crash on Linux). The game
+    // already refuses a negative player or order, so those are left to it.
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"gc".as_ptr(), 2) } == 0 {
         // SAFETY: engine syscall registered.
         let sv_maxclients = unsafe { syscall::cvar_variable_integer_value(c"sv_maxclients") };
-        if utils::atoi(cmd_arg1) >= sv_maxclients {
+        if gc_command_denied(cmd_arg1, cmd_arg2, sv_maxclients) {
             log_blocked(
                 client_num,
-                "gc clientNum >= sv_maxclients",
+                "gc player >= sv_maxclients or order past gc_orders",
                 cmd,
                 args_concat,
             );
@@ -535,6 +543,20 @@ fn command_line_too_long(cmd: &[u8], args: &[u8]) -> bool {
     cmd.len() + 1 + args.len() > MAX_COMMAND_LENGTH
 }
 
+/// Whether a `gc <player> <order>` command must be dropped by the proxy
+/// (upstream `85403cd`, 11-01 F3).
+///
+/// The retail game only refuses `player < 0 || player >= MAX_CLIENTS` and
+/// `order < 0 || order > sizeof(gc_orders)/sizeof(char *)`. The second test is
+/// off by one: `order == GC_ORDERS_COUNT` passes and `gc_orders[7]` is read
+/// past the array. It also never checks the player against `sv_maxclients`;
+/// from there to `MAX_CLIENTS - 1` the slot's `client` pointer is `NULL` and
+/// reading it crashes the server. Both out-of-range directions are left to the
+/// game on purpose: they already return there.
+fn gc_command_denied(player: &[u8], order: &[u8], sv_maxclients: i32) -> bool {
+    utils::atoi(player) >= sv_maxclients || utils::atoi(order) >= GC_ORDERS_COUNT
+}
+
 /// Log a command the proxy refused to forward (or a client that tried to send
 /// one before it was fully in the game).
 fn log_blocked(client_num: c_int, reason: &str, cmd: &[u8], args: &[u8]) {
@@ -600,7 +622,7 @@ fn client_netname(client_num: c_int) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line_too_long, forcepowers_is_valid, get_usercmd};
+    use super::{command_line_too_long, forcepowers_is_valid, gc_command_denied, get_usercmd};
     use crate::sdk::{FP_LEVITATION, ROLL, Usercmd};
 
     /// 11-01 F1: the whole command line (name, one separating space, then the
@@ -620,6 +642,46 @@ mod tests {
 
         // The attack shape: a full `ConcatArgs(0)` line of 1022 characters.
         assert!(command_line_too_long(b"x", &[b'a'; 1022]));
+    }
+
+    /// 11-01 F3: a player in a real client slot and an order in `gc_orders`
+    /// pass. `g_entities[player].client` is set below `sv_maxclients`;
+    /// `gc_orders` has 7 entries.
+    #[test]
+    fn gc_accepts_a_real_slot_and_a_listed_order() {
+        assert!(!gc_command_denied(b"0", b"0", 8));
+        assert!(!gc_command_denied(b"7", b"6", 8));
+        // `atoi` semantics: a non-numeric value is 0, a valid slot/order.
+        assert!(!gc_command_denied(b"abc", b"abc", 8));
+    }
+
+    /// The off-by-one upstream fix: order 7 is `gc_orders[7]`, one past the
+    /// array. On the Linux retail module that entry is the text `"prin"` and
+    /// the server crashes when `G_Say` reads it.
+    #[test]
+    fn gc_drops_the_order_past_the_end() {
+        assert!(gc_command_denied(b"0", b"7", 8));
+        assert!(gc_command_denied(b"0", b"8", 8));
+        assert!(gc_command_denied(b"0", b"999", 8));
+    }
+
+    /// A player at or above `sv_maxclients` has a `NULL` `client` pointer;
+    /// the game's own `MAX_CLIENTS` test does not catch it.
+    #[test]
+    fn gc_drops_a_player_outside_the_configured_slots() {
+        assert!(gc_command_denied(b"8", b"0", 8));
+        assert!(gc_command_denied(b"31", b"0", 8));
+        // The same player is valid on a full 32-slot server.
+        assert!(!gc_command_denied(b"31", b"0", 32));
+    }
+
+    /// Negative players and orders are already refused by the game
+    /// (`order < 0 || order > 7`, `player < 0`), so the proxy leaves them
+    /// alone; upstream made the same choice.
+    #[test]
+    fn gc_leaves_negative_player_and_order_to_the_game() {
+        assert!(!gc_command_denied(b"-1", b"0", 8));
+        assert!(!gc_command_denied(b"0", b"-1", 8));
     }
 
     /// `get_usercmd` still sanitises `forcesel` and `ROLL`. The engine writes

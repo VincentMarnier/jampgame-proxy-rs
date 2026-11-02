@@ -52,7 +52,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 |---|---|---|---|
 | 11-01 F1 | command line length → `G_LogPrintf` stack overflow | Critical | **FIXED** 2026-11-02 |
 | 11-01 F2 | `callvote clientkick <n>` out of client slots | High | **LIVE** |
-| 11-01 F3 | `gc <player> 7` reads past `gc_orders` | High (Linux) | **LIVE** |
+| 11-01 F3 | `gc <player> 7` reads past `gc_orders` | High (Linux) | **FIXED** 2026-11-02 |
 | 11-01 F4 | `forcepowers` with 16/17 digits or digits 4–9 | Medium | **LIVE** (tested) |
 | 11-01 F5 | `color1`/`color2` fill the gamestate | Medium | **LIVE** |
 | 11-01 F6 | `vote` parsing / `callvote kick <name>` lookup | Low, not security | **LIVE** |
@@ -109,7 +109,7 @@ This is confirmed in our own `original/jedi-academy-sdk/codemp/game` copy
 …)`) and `g_cmds.c:3216-3229` (the intermission fallback to `Cmd_Say_f`).
 
 **Our code before the fix (SOURCE (ours)).** `shared_api::client_command`
-(`rust/src/shared_api.rs:143-308`) is the same choke point as the C++
+(`rust/src/shared_api.rs:147-331`) is the same choke point as the C++
 `Allowed`. It read the command and `args_concat = concat_args(1)` and only
 bounded chat (256 characters). There was **no whole-command-line limit**, so
 every other command name could carry up to the engine's 1022-character
@@ -132,11 +132,11 @@ is the command filter, as upstream chose.
 A direct port of `d9daa68`:
 
 - `MAX_COMMAND_LENGTH = 512` (`shared_api.rs:32`) and the pure predicate
-  `command_line_too_long(cmd, args)` (`shared_api.rs:534-535`), which is
+  `command_line_too_long(cmd, args)` (`shared_api.rs:542-543`), which is
   literally `cmd.len() + 1 + args.len() > 512` — the separating space is
   counted even with no arguments, as upstream.
 - The check runs in `client_command` right after `args_concat` is computed
-  (`shared_api.rs:192`). That is after the `jkaDST_` anti-cheat check and after
+  (`shared_api.rs:196`). That is after the `jkaDST_` anti-cheat check and after
   the mute filter (which runs in `lib.rs` before this function), and before the
   chat and command checks, matching upstream's placement. A dropped line is
   logged as `command line longer than 512 bytes` when `proxy_sv_debugLog` is
@@ -164,7 +164,7 @@ sets `client` only for `i < level.maxclients`, so from `sv_maxclients` to 31
 `g_allowVote` is on (default) and `sv_maxclients < 32`.
 
 **Our code (SOURCE (ours)).** The `callvote` block of `client_command`
-(`shared_api.rs:240-282`) validates only `capturelimit`, `fraglimit`,
+(`shared_api.rs:269-311`) validates only `capturelimit`, `fraglimit`,
 `g_doWarmup`, `map_restart` and `timelimit`, plus a `MAX_CVAR_VALUE_STRING`
 length guard. `clientkick` is not in the table, so the value is passed to the
 game unchanged.
@@ -174,7 +174,7 @@ game unchanged.
 **Test.** Needs the filter with a fake engine/game; no unit seam today.
 Integration test proposal in Section 6.
 
-### S3. `gc <player> 7` reads past `gc_orders` — High on Linux (our target)
+### S3. `gc <player> 7` reads past `gc_orders` — High on Linux (our target) — **FIXED 2026-11-02**
 
 Upstream: 11-01 F3, commit `85403cd` (*"fix: drop gc orders past the end of the
 game's list"*).
@@ -188,21 +188,42 @@ unmapped address and the server crashes. Upstream reproduced the crash on
 Linux; on Windows the neighbouring array yields the harmless text `Free For
 All`.
 
-**Our code (SOURCE (ours)).** The `gc` guard (`shared_api.rs:201-213`) only
-bounds the *client number*:
-
-```rust
-let sv_maxclients = unsafe { syscall::cvar_variable_integer_value(c"sv_maxclients") };
-if utils::atoi(cmd_arg1) >= sv_maxclients { return false; }
-```
-
-`cmd_arg2` (the order) is never inspected. Any in-game client can send
-`gc <valid-player> 7`.
+**Our code before the fix (SOURCE (ours)).** The `gc` guard in
+`client_command` only bounded the *client number*:
+`utils::atoi(cmd_arg1) >= sv_maxclients`. `cmd_arg2` (the order) was never
+inspected, so any in-game client could send `gc <valid-player> 7`.
 
 **Impact.** Remote crash on the platform this rewrite targets. Upstream rates
 it High because it is Linux-only; here Linux is the only target.
 
-**Test.** Same seam as S2.
+#### Applied (2026-11-02)
+
+A direct port of `85403cd`, with the same choices:
+
+- `GC_ORDERS_COUNT = 7` (`shared_api.rs:34-36`), from `g_cmds.c:1721-1729`.
+- The pure predicate `gc_command_denied(player, order, sv_maxclients)`
+  (`shared_api.rs:556-558`, Helpers) is
+  `atoi(player) >= sv_maxclients || atoi(order) >= GC_ORDERS_COUNT`. The
+  `client_command` guard (`shared_api.rs:225-242`) calls it and drops the
+  command with a debug-log line.
+- **Negative player and order are left to the game**, as upstream does: the
+  game already returns on `player < 0` and `order < 0`. Only the two holes the
+  game does not cover are closed: `order == 7` (one past `gc_orders`) and
+  `player >= sv_maxclients` (where the slot's `client` pointer is `NULL`).
+- The command name is still compared by prefix (`q_stricmpn(cmd, "gc", 2)`),
+  as in the 2019 port; the game compares it whole. This over-blocks unknown
+  commands that start with `gc`, which the game ignores anyway. Switching the
+  whole command table to exact comparisons is the separate 10-25 F10.4 item.
+
+**Tests (TESTED).** Four vectors in `mod tests`:
+`gc_accepts_a_real_slot_and_a_listed_order`,
+`gc_drops_the_order_past_the_end`,
+`gc_drops_a_player_outside_the_configured_slots` and
+`gc_leaves_negative_player_and_order_to_the_game`. They cover the last valid
+order (6), order 7/8/999, a player at `sv_maxclients` and `MAX_CLIENTS - 1`,
+the same player on a 32-slot server, `atoi` treating text as 0, and the
+negative cases the game owns. The runtime reproduction on Linux is in
+[Section 6](#6-tests-and-test-plan).
 
 ### S4. `forcepowers` with 16 or 17 power levels, or levels above 3 — Medium
 
@@ -223,8 +244,8 @@ The old proxy rule accepted 18 shapes of 22–24 characters; **8 of them carry
 only 16 or 17 powers**. The 2026 fix requires at least 18 digits after the
 second `-` and rejects digits outside `0..=3`.
 
-**Our code (SOURCE (ours), TESTED).** `shared_api.rs:429-449` calls
-`forcepowers_is_valid` (`shared_api.rs:483-503`). The rule is the old one:
+**Our code (SOURCE (ours), TESTED).** `shared_api.rs:458-478` calls
+`forcepowers_is_valid` (`shared_api.rs:512-532`). The rule is the old one:
 22–24 characters, digits only, exactly two `-` at positions 1–5, never
 adjacent. It does **not** require 18 digits and accepts `4`–`9`.
 
@@ -261,7 +282,7 @@ must cooperate (about 10–15 by upstream's estimate). The 2026 fix cuts each at
 1 + 13 characters).
 
 **Our code (SOURCE (ours)).** `client_userinfo_changed` touches `name`,
-`model` and `forcepowers` only (`shared_api.rs:307-468`); the engine-side
+`model` and `forcepowers` only (`shared_api.rs:336-498`); the engine-side
 `SV_UserinfoChanged` wrapper touches `model` only
 (`hooks/engine_sv.rs:471-523`). `color1`/`color2` are never read or rewritten.
 
@@ -286,7 +307,7 @@ a result-returning `Info_SetValueForKey` close it.
 **Our code (SOURCE (ours)).** There is no userinfo validation at all: no
 `validate_userinfo`/`g_userinfoValidate` equivalent anywhere under `rust/src`.
 `client_userinfo_changed` calls the game's `info_set_value_for_key` and
-**ignores its result** (`shared_api.rs:339-344`, `:420-425`, `:456-461`). The
+**ignores its result** (`shared_api.rs:368-373`, `:449-454`, `:485-490`). The
 game's function returns `void`, so the Rust binding cannot see failure. The
 model wrapper does the same (`hooks/engine_sv.rs:512-517`).
 
@@ -358,7 +379,7 @@ server. The fix re-derives `ip` from `netchan.remoteAddress` in
 **Our code (SOURCE (ours)).** `hooks/engine_sv.rs:471-523`
 (`sv_userinfo_changed`) checks only the `model` key and then calls the
 original. No `ip` repair, no length refusal. `client_connect`
-(`shared_api.rs:73-97`) sends the banner only.
+(`shared_api.rs:82-106`) sends the banner only.
 
 **Impact.** IP-ban bypass on map change; misleading game logs. Note this also
 undermines any future IP-based feature (O5).
@@ -508,7 +529,7 @@ axis; because negative values then have one more magnitude step than positive
 ones (+127 max), a negative move is very slightly longer. ioq3/OpenJK clamp
 −128 to −127.
 
-**Our code (SOURCE (ours)).** `shared_api::get_usercmd` (`shared_api.rs:58-65`)
+**Our code (SOURCE (ours)).** `shared_api::get_usercmd` (`shared_api.rs:67-74`)
 resets `forcesel` and `ROLL` but does not clamp movement axes:
 
 ```rust
@@ -684,12 +705,17 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 
 - the forcepowers shape check was moved **verbatim** out of
   `client_userinfo_changed` into the pure `forcepowers_is_valid`
-  (`shared_api.rs:483-503`). This is a test seam only: same input, same
+  (`shared_api.rs:512-532`). This is a test seam only: same input, same
   decision, same default string.
-- `command_line_too_long` (`shared_api.rs:534-535`) is the new S1 predicate:
-  a normal function of two byte slices. No other behaviour changed when it was
-  introduced.
-- 7 new tests (`mod tests`): `command_line_is_capped_at_512_bytes`,
+- `command_line_too_long` (`shared_api.rs:542-543`) is the new S1 predicate:
+  a normal function of two byte slices.
+- `gc_command_denied` (`shared_api.rs:556-558`) is the S3 predicate; the
+  `client_command` guard only reads the cvar and calls it.
+- 11 new tests (`mod tests`): `command_line_is_capped_at_512_bytes`,
+  `gc_accepts_a_real_slot_and_a_listed_order`,
+  `gc_drops_the_order_past_the_end`,
+  `gc_drops_a_player_outside_the_configured_slots`,
+  `gc_leaves_negative_player_and_order_to_the_game`,
   `retail_forcepowers_value_is_accepted`,
   `length_and_separator_shape_is_enforced`,
   `f4_known_gap_accepts_shapes_with_16_or_17_powers`,
@@ -708,7 +734,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 272 unit tests pass; the i686 release cdylib builds. No server was
+Result: 276 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -768,8 +794,8 @@ dependencies. It is the order the fixes are being applied in.
 
 1. ✅ **S1** — 512-character command line (Critical, any client, every map
    end). *Fixed 2026-11-02.*
-2. **S3** — `gc` order bound (High, any client, crashes the Linux module, which
-   is our only target).
+2. ✅ **S3** — `gc` order bound (High, any client, crashes the Linux module,
+   which is our only target). *Fixed 2026-11-02.*
 3. **S2** — `callvote clientkick` range (High, any voter, any platform).
 4. **S10** — sanitise the userinfo at `GAME_CLIENT_CONNECT` (High; makes the
    existing forcepowers/model/name fixes effective on first spawn).
@@ -821,9 +847,10 @@ Game behaviour (our authoritative copy for the game module):
 `bg_misc.c:439-560`.
 
 Rust rewrite (this repository):
-`rust/src/shared_api.rs:58-65` (`get_usercmd`), `:73-97` (`client_connect`),
-`:138-303` (`client_command`), `:307-468` (`client_userinfo_changed`),
-`:483-503` (`forcepowers_is_valid`), and its `mod tests`;
+`rust/src/shared_api.rs:67-74` (`get_usercmd`), `:82-106` (`client_connect`),
+`:147-331` (`client_command`), `:336-498` (`client_userinfo_changed`),
+`:512-532` (`forcepowers_is_valid`), `:542-543` (`command_line_too_long`),
+`:556-558` (`gc_command_denied`), and its `mod tests`;
 `rust/src/lib.rs:151-169` and `:274-279`;
 `rust/src/hooks/engine_sv.rs:297-365` (rcon), `:400-440` (status/info),
 `:471-523` (`SV_UserinfoChanged`), `:829-889` (`SV_SvEntityForGentity`);
