@@ -30,6 +30,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 |---------------------------------------|---------|-----------------------------------------------------------------------------------------------|
 | `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module (RCON keeps working, with the engine's pristine 500 ms gate) |
 | `proxy_sv_muteMode`                   | 1       | `mute`/`unmute` behaviour: `0` disabled, `1` drop the player's chat and tell them, `2` silent (their own line is echoed back to them, nobody else receives it, no notice); see [Player mute](#player-mute) |
+| `proxy_sv_enableIgnore`               | 0       | let any player hide another player's chat from their own client with `/ignore`/`/unignore`; see [Player ignore](#player-ignore) |
 | `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
@@ -84,6 +85,34 @@ the same commands work in the dedicated server's own console.
 
 In silent mode the server console/log still records the player's line
 (`G_Say`'s own `say:` log), which keeps moderation auditable.
+
+
+### Player ignore
+
+Any player can hide another player's chat from their own client:
+`/ignore <player>` silences that player **for them only**, and
+`/unignore <player>` brings them back. `<player>` uses the same target shape
+as `rcon mute`: the client number `status` shows (`/ignore 3`) or any part of
+the name, case- and colour-code-insensitive, exact first, then a prefix, then
+the fragment wherever it sits in the name (`/ignore ade` finds `Darth Vader`).
+A fragment shared by several players is answered with the candidates and their
+numbers instead of guessing; `/ignore` on its own prints the usage and who you
+are currently ignoring.
+
+The ignored player is not affected: they keep playing and their lines still
+reach everyone else, and they are never told. Only client chat is covered
+(`say`, `say_team` and `tell`, including the localized variants); the voice
+menu's `voice_cmd` is a sound event, not a chat line, and stays with the admin
+mute. Ignores are per client slot and last for the session: they are cleared
+when either player leaves (so the next player in a reused slot is not silently
+ignored) and kept across a `map_restart`; a full map change starts with nobody
+ignored.
+
+The feature is off by default: set `proxy_sv_enableIgnore 1` in the server
+command line or at runtime with `rcon proxy_sv_enableIgnore 1`. While it is
+off, `/ignore` answers that the feature is disabled and no chat is filtered;
+lists already set stay dormant and work again when it is turned back on. Like
+every proxy feature it also needs `proxy_sv_enable 1`.
 
 
 ### Crash diagnostics

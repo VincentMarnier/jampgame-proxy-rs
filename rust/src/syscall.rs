@@ -215,6 +215,13 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 if crate::mute::shadow_chat_dropped(text.to_bytes(), a0) {
                     return 0;
                 }
+                // Player `/ignore` (D-016): the speaker is the client whose
+                // `GAME_CLIENT_COMMAND` forward is in flight, so a recipient
+                // that ignores them does not receive the chat line. Everyone
+                // else still does, and the speaker keeps their own echo.
+                if crate::ignore::chat_dropped(text.to_bytes(), a0) {
+                    return 0;
+                }
                 // One feature read per command: the same gate covers the
                 // kill-limit prune, the team-chat prune and the score rewrite
                 // below.

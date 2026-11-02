@@ -99,6 +99,11 @@ pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
 /// `Proxy_SharedAPI_ClientDisconnect` (`Proxy_SharedAPI.cpp:47-53`): reset the
 /// client's proxy-side bookkeeping.
 pub fn client_disconnect(client_num: c_int) {
+    // The leaving player's ignore list goes, and so does their slot from every
+    // other player's list: a new player inheriting the slot must not be
+    // silently ignored. Runs before the entry reset below (and outside its lock
+    // section).
+    crate::ignore::on_client_disconnect(client_num);
     state::with_state(|s| {
         if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
             return;

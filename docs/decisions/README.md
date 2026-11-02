@@ -81,3 +81,10 @@
   `proxy_sv_voidTimeNudgeLog` reports the non-zero / back-to-zero transitions
   without applying the shift; the engine's duplicate filtering keeps the raw
   stamps (`lastUsercmd.serverTime` restored after `SV_ClientThink`).
+- `0016-player-ignore.md` — player `/ignore`/`/unignore` client commands: the
+  same target shape as `rcon mute` (shared `player_target` resolver), a
+  per-client slot mask on `ClientEntry::ignored`, cleared on disconnect in both
+  directions and carried across `map_restart`; enforced in the
+  `G_SEND_SERVER_COMMAND` trap with the speaker taken from the synchronous
+  `GAME_CLIENT_COMMAND` acting scope, gated by `proxy_sv_enableIgnore` (default
+  off).

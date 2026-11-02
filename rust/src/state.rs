@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 22] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -41,6 +41,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
     (c"proxy_sv_clientPpsLog", c"0"),
     (c"proxy_sv_voidTimeNudge", c"0"),
     (c"proxy_sv_voidTimeNudgeLog", c"0"),
+    (c"proxy_sv_enableIgnore", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -91,6 +92,10 @@ pub const CVAR_VOID_TIME_NUDGE: usize = 19;
 /// `proxy_sv_voidTimeNudgeLog`: log the non-zero/back-to-zero transitions;
 /// works without `proxy_sv_voidTimeNudge` (the shift is reported, not applied).
 pub const CVAR_VOID_TIME_NUDGE_LOG: usize = 20;
+/// Player `/ignore` (D-016, `crate::ignore`): `0` off, non-zero on. When off,
+/// `ignore`/`unignore` only answer that the feature is disabled and no chat is
+/// filtered, even for a player still carrying a mask.
+pub const CVAR_ENABLE_IGNORE: usize = 21;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -599,6 +604,11 @@ pub struct ClientEntry {
     /// console commands, and dropped with the rest of the entry when the client
     /// disconnects (the slot belongs to the next player after that).
     pub muted: bool,
+    /// Per-player `/ignore` mask (D-016, `crate::ignore`): bit `n` set means
+    /// this client does not receive client `n`'s chat. Cleared when either
+    /// client disconnects (slots are reused) and carried across a `map_restart`
+    /// like the mute flag.
+    pub ignored: u32,
     /// netStatus estimator state (D-007): per-packet window, fps/pps ring
     /// semantics and the reset rules.
     pub netstatus: NetstatusState,
@@ -626,6 +636,7 @@ impl Default for ClientEntry {
             is_connected: false,
             clean_name: [0; MAX_NETNAME],
             muted: false,
+            ignored: 0,
             netstatus: NetstatusState::default(),
             pps: crate::pps::PpsState::default(),
             nudge_void: crate::timenudge::VoidState::default(),
@@ -708,20 +719,23 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
 /// per-instance worlds are per round / per map and are never carried.
 pub fn reset_session(restart: bool) {
     let mut guard = lock();
-    let (tffa, muted) = {
+    let (tffa, muted, ignored) = {
         let previous = guard.as_ref();
         (
             tffa_after_reset(previous.map(|s| &s.tffa), restart),
             mutes_after_reset(previous, restart),
+            ignores_after_reset(previous, restart),
         )
     };
     let mut next = ProxyState::default();
     next.tffa = tffa;
     // A `map_restart` keeps every player in their slot, so an admin mute stays
-    // on the player it was issued for. A full map change drops everyone (the
-    // slots are handed to new players) and starts unmuted.
-    for (entry, muted) in next.clients.iter_mut().zip(muted) {
+    // on the player it was issued for and a player's ignore list keeps pointing
+    // at the same neighbours. A full map change drops everyone (the slots are
+    // handed to new players) and starts with nobody muted or ignored.
+    for (entry, (muted, ignored)) in next.clients.iter_mut().zip(muted.into_iter().zip(ignored)) {
         entry.muted = muted;
+        entry.ignored = ignored;
     }
     *guard = Some(next);
 }
@@ -739,6 +753,20 @@ fn mutes_after_reset(previous: Option<&ProxyState>, restart: bool) -> [bool; MAX
         *carried = entry.muted;
     }
     muted
+}
+
+/// The per-slot `/ignore` masks a `GAME_INIT` starts from: carried for a
+/// `map_restart` (client slots survive it), dropped for a full map change. Same
+/// rule as the mute flags.
+fn ignores_after_reset(previous: Option<&ProxyState>, restart: bool) -> [u32; MAX_CLIENTS] {
+    let mut ignored = [0u32; MAX_CLIENTS];
+    let Some(previous) = previous.filter(|_| restart) else {
+        return ignored;
+    };
+    for (carried, entry) in ignored.iter_mut().zip(previous.clients.iter()) {
+        *carried = entry.ignored;
+    }
+    ignored
 }
 
 /// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
@@ -888,6 +916,7 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE_LOG].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_IGNORE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
@@ -1084,6 +1113,31 @@ mod tests {
         assert!(!fresh.iter().any(|&muted| muted));
         // The first `GAME_INIT` after a module load carries nothing either.
         assert!(!mutes_after_reset(None, true).iter().any(|&muted| muted));
+    }
+
+    #[test]
+    fn map_restart_keeps_ignore_masks_and_a_map_change_clears_them() {
+        let mut previous = ProxyState::default();
+        previous.clients[2].ignored = (1 << 5) | (1 << 7);
+        previous.clients[5].ignored = 1 << 2;
+
+        // A `map_restart` keeps every player in their slot, so each mask still
+        // names the same neighbours.
+        let carried = ignores_after_reset(Some(&previous), true);
+        assert_eq!(carried[2], (1 << 5) | (1 << 7));
+        assert_eq!(carried[5], 1 << 2);
+        assert_eq!(carried.iter().filter(|&&mask| mask != 0).count(), 2);
+
+        // A full map change drops everyone: the slots go to new players and
+        // must start with no ignores.
+        let fresh = ignores_after_reset(Some(&previous), false);
+        assert!(fresh.iter().all(|&mask| mask == 0));
+        // The first `GAME_INIT` after a module load carries nothing either.
+        assert!(
+            ignores_after_reset(None, true)
+                .iter()
+                .all(|&mask| mask == 0)
+        );
     }
 
     #[test]

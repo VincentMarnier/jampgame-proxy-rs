@@ -32,11 +32,13 @@
 mod diagnostics;
 mod engine;
 mod hooks;
+mod ignore;
 mod jampgame;
 mod mute;
 mod netstatus_est;
 mod original;
 mod patch;
+mod player_target;
 mod pps;
 mod rules;
 mod scoreboard;
@@ -225,6 +227,13 @@ pub unsafe extern "C" fn vmMain(
                 if tffa::handle_client_command(a0) {
                     return 0;
                 }
+                // `/ignore` and `/unignore` are the player's own command, not a
+                // chat line: claim them before the muted check (a muted player
+                // may still choose whom to ignore) and before the game's
+                // `ClientCommand`.
+                if ignore::handle_client_command(a0) {
+                    return 0;
+                }
                 // A muted player's chat/voice is either kept from the game's
                 // own `ClientCommand` (stock mute) or, in silent mode, the text
                 // commands are forwarded in a shadow scope so only the speaker
@@ -248,7 +257,12 @@ pub unsafe extern "C" fn vmMain(
                 None
             };
             let previous_shadow = shadow_mute.map(mute::begin_shadow_scope);
+            // The chat `G_Say` emits during this forward must be attributed to
+            // the player who issued the command, so the `G_SEND_SERVER_COMMAND`
+            // trap can drop it for the recipients that ignore them (D-016).
+            let previous_sender = ignore::begin_sender(a0);
             let response = forward(command, &args);
+            ignore::end_sender(previous_sender);
             if let Some(previous) = previous_shadow {
                 mute::end_shadow_scope(previous);
             }
