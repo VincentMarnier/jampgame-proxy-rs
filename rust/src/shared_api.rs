@@ -278,6 +278,16 @@ pub fn client_command(client_num: c_int) -> bool {
             return false;
         }
 
+        // Fix: callvote clientkick crash. The game only compares the number
+        // with MAX_CLIENTS, then reads g_entities[n].client, which is NULL from
+        // sv_maxclients up to MAX_CLIENTS - 1.
+        if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg1), c"clientkick".as_ptr(), 10) } == 0 {
+            // SAFETY: engine syscall registered.
+            let sv_maxclients = unsafe { syscall::cvar_variable_integer_value(c"sv_maxclients") };
+            min_arg2 = 0;
+            max_arg2 = clientkick_max_slot(sv_maxclients);
+            check_needed = true;
+        }
         if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd_arg1), c"capturelimit".as_ptr(), 12) } == 0 {
             min_arg2 = 0;
             max_arg2 = 0x7FFF_FFFF;
@@ -304,7 +314,7 @@ pub fn client_command(client_num: c_int) -> bool {
             check_needed = true;
         }
 
-        if check_needed && (cmd_arg2_number_value < min_arg2 || cmd_arg2_number_value > max_arg2) {
+        if check_needed && vote_value_out_of_range(cmd_arg2_number_value, min_arg2, max_arg2) {
             log_blocked(client_num, "callvote value out of range", cmd, args_concat);
             return false;
         }
@@ -557,6 +567,21 @@ fn gc_command_denied(player: &[u8], order: &[u8], sv_maxclients: i32) -> bool {
     utils::atoi(player) >= sv_maxclients || utils::atoi(order) >= GC_ORDERS_COUNT
 }
 
+/// Last client slot `callvote clientkick <n>` may target (upstream `94c89b0`,
+/// 11-01 F2). The game only tests `n < MAX_CLIENTS`, then reads
+/// `g_entities[n].client`, which is `NULL` from `sv_maxclients` up to
+/// `MAX_CLIENTS - 1`.
+fn clientkick_max_slot(sv_maxclients: i32) -> i32 {
+    sv_maxclients - 1
+}
+
+/// Whether a numeric `callvote` argument is outside `min..=max`. Used by the
+/// per-vote range table in `client_command`; `clientkick` fills the bounds
+/// with `0..=clientkick_max_slot(sv_maxclients)`.
+fn vote_value_out_of_range(value: i32, min: i32, max: i32) -> bool {
+    value < min || value > max
+}
+
 /// Log a command the proxy refused to forward (or a client that tried to send
 /// one before it was fully in the game).
 fn log_blocked(client_num: c_int, reason: &str, cmd: &[u8], args: &[u8]) {
@@ -622,7 +647,10 @@ fn client_netname(client_num: c_int) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line_too_long, forcepowers_is_valid, gc_command_denied, get_usercmd};
+    use super::{
+        clientkick_max_slot, command_line_too_long, forcepowers_is_valid, gc_command_denied,
+        get_usercmd, vote_value_out_of_range,
+    };
     use crate::sdk::{FP_LEVITATION, ROLL, Usercmd};
 
     /// 11-01 F1: the whole command line (name, one separating space, then the
@@ -682,6 +710,35 @@ mod tests {
     fn gc_leaves_negative_player_and_order_to_the_game() {
         assert!(!gc_command_denied(b"-1", b"0", 8));
         assert!(!gc_command_denied(b"0", b"-1", 8));
+    }
+
+    /// 11-01 F2: `callvote clientkick <n>` accepts every slot below
+    /// `sv_maxclients`, including the last one. The table sets
+    /// `min = 0`, `max = clientkick_max_slot(sv_maxclients)`.
+    #[test]
+    fn clientkick_accepts_slots_below_sv_maxclients() {
+        for sv_maxclients in [1, 8, 32] {
+            let max = clientkick_max_slot(sv_maxclients);
+            assert!(!vote_value_out_of_range(0, 0, max));
+            assert!(!vote_value_out_of_range(sv_maxclients - 1, 0, max));
+        }
+    }
+
+    /// The crash: from `sv_maxclients` to `MAX_CLIENTS - 1`,
+    /// `g_entities[n].client` is NULL. The game's own `MAX_CLIENTS` test does
+    /// not catch it.
+    #[test]
+    fn clientkick_drops_the_slot_at_or_above_sv_maxclients() {
+        assert!(vote_value_out_of_range(8, 0, clientkick_max_slot(8)));
+        assert!(vote_value_out_of_range(31, 0, clientkick_max_slot(8)));
+        assert!(vote_value_out_of_range(32, 0, clientkick_max_slot(32)));
+    }
+
+    /// A negative number is already refused by the game (`n < 0`), but the
+    /// table's `min = 0` rejects it too, as upstream.
+    #[test]
+    fn clientkick_drops_a_negative_slot() {
+        assert!(vote_value_out_of_range(-1, 0, clientkick_max_slot(8)));
     }
 
     /// `get_usercmd` still sanitises `forcesel` and `ROLL`. The engine writes
