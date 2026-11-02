@@ -50,6 +50,7 @@ mod teamlock;
 mod teamoverlay;
 mod tffa;
 mod timenudge;
+mod userinfo;
 mod utils;
 
 use core::ffi::c_int;
@@ -157,21 +158,21 @@ pub unsafe extern "C" fn vmMain(
             // map change. Bots are skipped: their userinfo comes from the bot
             // files and has no `forcepowers`.
             if state::proxy_enabled() && shared_api::connect_userinfo_sanitized(a2 != 0) {
-                if let Some(reason) = shared_api::sanitize_userinfo(a0) {
+                if let Some(rejection) = shared_api::sanitize_userinfo(a0, true) {
                     if diagnostics::verbose_enabled() {
                         diagnostics::verbose(
                             "client.connect.refused",
                             format!(
                                 "{} reason=\"{}\"",
                                 hooks::engine_sv::client_label_for_num(a0),
-                                reason.to_string_lossy()
+                                rejection.reason.to_string_lossy()
                             ),
                         );
                     }
                     // A non-null return is the engine's refusal path (the
                     // game's own "Banned."): it prints the reason to the
                     // client and never enters the game. Nothing is forwarded.
-                    return reason.as_ptr() as usize as c_int;
+                    return rejection.reason.as_ptr() as usize as c_int;
                 }
             }
             if state::proxy_enabled() {

@@ -507,19 +507,37 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
                     ),
                 );
             }
-            // SAFETY: userinfo buffer writable; literals NUL-terminated.
-            unsafe {
-                jampgame::info_set_value_for_key(
-                    userinfo as *mut c_char,
-                    c"model".as_ptr(),
-                    c"kyle".as_ptr(),
-                )
+            // `Info_SetValueForKey` adds nothing when the userinfo has no
+            // room left, so the long model would stay. The checked Rust copy
+            // reports the failure; drop the client, as JK2MV and the 2026
+            // proxy do (O8).
+            // SAFETY: cl->userinfo is a char[MAX_INFO_STRING] inside client_t.
+            let buffer = unsafe {
+                core::slice::from_raw_parts_mut(userinfo as *mut u8, crate::sdk::MAX_INFO_STRING)
             };
+            if !crate::userinfo::set_value_for_key(buffer, b"model", b"kyle") {
+                // SAFETY: cl is a valid client_t; literal reason.
+                unsafe { sv_drop_client(cl, c"userinfo string length exceeded") };
+                return;
+            }
         }
     }
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::engine_hook_original_sv_userinfo_changed);
     unsafe { original(cl) };
+}
+
+/// `SV_DropClient(client_t*, const char*)` (`sv_client.cpp:686`). The engine
+/// function is not hooked, so it is called by address.
+///
+/// # Safety
+///
+/// `cl` must be a valid `client_t*` and `reason` a NUL-terminated string.
+unsafe fn sv_drop_client(cl: usize, reason: &CStr) {
+    // SAFETY: fixed engine function address, cdecl `(client_t*, const char*)`.
+    let f: unsafe extern "C" fn(usize, *const c_char) =
+        unsafe { core::mem::transmute(crate::engine::functions::SV_DROP_CLIENT) };
+    unsafe { f(cl, reason.as_ptr()) };
 }
 
 // ---------------------------------------------------------------------------

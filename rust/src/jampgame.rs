@@ -23,7 +23,6 @@ pub const FN_Q_STRICMPN: usize = 0x001a_5184;
 pub const FN_Q_STRICMP: usize = 0x001a_5304;
 const FN_COM_SPRINTF: usize = 0x001a_5524;
 pub const FN_INFO_VALUE_FOR_KEY: usize = 0x001a_5604;
-pub const FN_INFO_SET_VALUE_FOR_KEY: usize = 0x001a_5b54;
 pub const FN_CONCAT_ARGS: usize = 0x0012_9c74;
 
 // ---------------------------------------------------------------------------
@@ -279,22 +278,6 @@ pub unsafe fn info_value_for_key(info: *const c_char, key: *const c_char) -> *co
     unsafe { f(info, key) }
 }
 
-/// `void Info_SetValueForKey(char*, const char*, const char*)` at game
-/// base+0x1a5b54.
-///
-/// # Safety
-///
-/// `info` must point to a writable info string buffer; `key`/`value` must be
-/// valid NUL-terminated strings.
-pub unsafe fn info_set_value_for_key(info: *mut c_char, key: *const c_char, value: *const c_char) {
-    // SAFETY: pointer from base+offset of a loaded module.
-    let f: unsafe extern "C" fn(*mut c_char, *const c_char, *const c_char) = game_fn!(
-        unsafe extern "C" fn(*mut c_char, *const c_char, *const c_char),
-        FN_INFO_SET_VALUE_FOR_KEY
-    );
-    unsafe { f(info, key, value) };
-}
-
 /// `char* ConcatArgs(int)` at game base+0x129c74. Returns a pointer to the
 /// concatenated remaining command args (game static buffer).
 ///
@@ -356,7 +339,6 @@ mod tests {
             FN_Q_STRICMP,
             FN_COM_SPRINTF,
             FN_INFO_VALUE_FOR_KEY,
-            FN_INFO_SET_VALUE_FOR_KEY,
             FN_CONCAT_ARGS,
             FN_G_DAMAGE,
             FN_PLAYER_DIE,

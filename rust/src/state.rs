@@ -597,6 +597,10 @@ impl Default for TffaState {
 #[derive(Debug, Clone, Copy)]
 pub struct ClientEntry {
     pub is_connected: bool,
+    /// `isBot` of the last `GAME_CLIENT_CONNECT` (true on the reconnect after
+    /// a map change too). The userinfo validation skips bots: their userinfo
+    /// comes from the bot files and has none of the required keys.
+    pub is_bot: bool,
     pub clean_name: [u8; MAX_NETNAME],
     /// Admin mute (D-011): the client's `say`/`say_team`/`tell`/`voice_cmd`
     /// commands are dropped (or, with `proxy_sv_muteMode 2`, shadowed) instead
@@ -634,6 +638,7 @@ impl Default for ClientEntry {
     fn default() -> Self {
         ClientEntry {
             is_connected: false,
+            is_bot: false,
             clean_name: [0; MAX_NETNAME],
             muted: false,
             ignored: 0,

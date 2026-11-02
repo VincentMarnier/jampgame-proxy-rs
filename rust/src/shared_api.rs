@@ -11,6 +11,7 @@
 use core::ffi::{CStr, c_char, c_int};
 
 use std::ffi::CString;
+use std::sync::Mutex;
 
 use crate::diagnostics;
 use crate::jampgame;
@@ -22,6 +23,7 @@ use crate::state::{
     self, CVAR_ENABLE_NET_STATUS, CVAR_MAX_CALLVOTE_MAPRESTART, CVAR_MODEL_PATH_LENGTH,
 };
 use crate::syscall;
+use crate::userinfo;
 use crate::utils;
 
 const MAX_CVAR_VALUE_STRING: usize = 256;
@@ -84,6 +86,13 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
 /// `Proxy_SharedAPI_ClientConnect` (`Proxy_SharedAPI.cpp:38-45`): announce the
 /// proxy to first-time non-bot connects.
 pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
+    state::with_state(|s| {
+        if (0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+            // Remembered for every connect, including the reconnect after a
+            // map change, so the userinfo validation can skip bots later.
+            s.clients[client_num as usize].is_bot = is_bot;
+        }
+    });
     if first_time {
         // D-007 reset rule: a connect starts from an empty estimator window.
         // The packet-rate limiter starts from a fresh measurement window too:
@@ -126,6 +135,8 @@ pub fn client_disconnect(client_num: c_int) {
         // when the connect mirror never saw the slot begin: bots are added by
         // the game module itself and do not raise `GAME_CLIENT_BEGIN`.
         entry.muted = false;
+        // A slot reused by a human must not keep the bot exemption.
+        entry.is_bot = false;
         if entry.is_connected {
             *entry = Default::default();
             // Drop any in-progress jump-hold so a new client reusing the slot
@@ -353,74 +364,112 @@ pub fn connect_userinfo_sanitized(is_bot: bool) -> bool {
     !is_bot
 }
 
-/// `Proxy_SharedAPI_SanitizeUserinfo` (10-25 F2): clean the name, model and
-/// `forcepowers` of a client's userinfo in place.
-///
-/// Returns `Some(reason)` when the client must be refused (the
-/// `darksidetools` anti-cheat); in that case nothing is written back. Returns
-/// `None` otherwise (including an out-of-range client or an empty userinfo).
-///
-/// The function never drops the client itself. On a connect the engine expects
-/// the reason as the `GAME_CLIENT_CONNECT` return value, and calling
-/// `DropClient` during that event is unsafe: the slot is still `CS_FREE`.
-pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
-    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
-        return None;
+/// Why a userinfo was refused, as returned to the FFI callers.
+pub struct SanitizeRejection {
+    /// Static C string: the engine reads it after `GAME_CLIENT_CONNECT`
+    /// returns.
+    pub reason: &'static CStr,
+    /// `true` for the `darksidetools` anti-cheat (public kick message);
+    /// `false` for a validation or length failure (silent drop).
+    pub anti_cheat: bool,
+    /// Cleaned name when the name was processed (the anti-cheat chat uses it);
+    /// zeroed otherwise.
+    pub clean_name: [u8; MAX_NETNAME],
+}
+
+/// Owned rejection used by the pure core, so tests never touch the static
+/// reason buffer.
+struct SanitizeError {
+    reason: String,
+    anti_cheat: bool,
+    clean_name: [u8; MAX_NETNAME],
+}
+
+/// A sanitised userinfo, ready for the caller to write back.
+struct SanitizedUserinfo {
+    info: Vec<u8>,
+    clean_name: [u8; MAX_NETNAME],
+}
+
+/// Static storage for the last rejection reason. The engine reads the pointer
+/// after `GAME_CLIENT_CONNECT` returns, so it cannot be a local (upstream uses
+/// `static char reason[96]`). The server is single-threaded and consumes a
+/// reason before the next sanitisation.
+static REJECTION_REASON: Mutex<[u8; 128]> = Mutex::new([0; 128]);
+
+/// Store `text` in [`REJECTION_REASON`] and return it as a C string.
+fn rejection_reason(text: &str) -> &'static CStr {
+    let mut buf = REJECTION_REASON
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    buf[n] = 0;
+    // SAFETY: the bytes live in the static array, are NUL-terminated just
+    // above, and are read by the engine before the next sanitisation.
+    unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+}
+
+fn rejection(text: &str) -> SanitizeError {
+    SanitizeError {
+        reason: text.to_string(),
+        anti_cheat: false,
+        clean_name: [0; MAX_NETNAME],
     }
-    let mut userinfo_buf = [0u8; MAX_INFO_STRING];
-    // SAFETY: engine syscall registered; buffer writable.
-    unsafe { syscall::get_userinfo(client_num, &mut userinfo_buf) };
-    let info_len = utils::c_strlen(&userinfo_buf);
-    if info_len == 0 {
-        return None;
+}
+
+fn to_rejection(error: SanitizeError) -> SanitizeRejection {
+    SanitizeRejection {
+        reason: rejection_reason(&error.reason),
+        anti_cheat: error.anti_cheat,
+        clean_name: error.clean_name,
     }
-    // userinfo_buf is a NUL-terminated info string the whole time (the engine
-    // writes it, Info_SetValueForKey keeps it terminated); hand out the base
-    // pointer for the game helpers and keep the buffer for the writes.
-    let info_ptr = userinfo_buf.as_ptr() as *const c_char;
+}
 
-    // SAFETY: game module loaded; userinfo is NUL-terminated.
-    let name_val = unsafe { jampgame::info_value_for_key(info_ptr, c"name".as_ptr()) };
-    let name_val = cstr_bytes_or_empty(name_val);
+/// Pure core of [`sanitize_userinfo`]: validate and clean the name, model and
+/// `forcepowers` of `info` (the bytes before the NUL), returning the new
+/// userinfo or the rejection.
+///
+/// `validate` is set for every non-bot client: OpenJK's
+/// `G_ValidateUserinfo` runs first, so a duplicate or missing key, a bad slash
+/// count or a control character refuses the client instead of reaching the
+/// sanitising writes. Every write then goes through
+/// [`crate::userinfo::set_value_for_key_vec`]; a write that does not fit (a
+/// bad value near `MAX_INFO_STRING`) refuses the client instead of leaving the
+/// old value in place.
+fn sanitize_userinfo_bytes(
+    client_num: c_int,
+    info: &[u8],
+    validate: bool,
+    max_model_len: usize,
+) -> Result<Option<SanitizedUserinfo>, SanitizeError> {
+    if validate {
+        if let Err(detail) = userinfo::validate_userinfo(info) {
+            return Err(rejection(&format!("Failed userinfo validation: {detail}")));
+        }
+    }
+    if info.is_empty() {
+        return Ok(None);
+    }
+    let mut info = info.to_vec();
 
-    // Sanitise the name into the client's persisted clean-name slot (mirrors
-    // `currentClientData->cleanName`), then write it back.
-    let clean_name = {
-        let mut name = [0u8; MAX_NETNAME];
-        utils::client_clean_name(name_val, &mut name);
-        state::with_state(|s| {
-            s.clients[client_num as usize].clean_name = name;
-        });
-        name
-    };
-    // SAFETY: all strings NUL-terminated; userinfo buffer writable.
-    unsafe {
-        jampgame::info_set_value_for_key(
-            userinfo_buf.as_mut_ptr() as *mut c_char,
-            c"name".as_ptr(),
-            clean_name.as_ptr() as *const c_char,
-        )
-    };
+    let name_val = userinfo::value_for_key(&info, b"name").to_vec();
+    let mut clean_name = [0u8; MAX_NETNAME];
+    utils::client_clean_name(&name_val, &mut clean_name);
+    if !userinfo::set_value_for_key_vec(&mut info, b"name", nul_terminated(&clean_name)) {
+        return Err(rejection("Userinfo string length exceeded."));
+    }
 
-    // SAFETY: game module loaded.
-    let model_ptr = unsafe { jampgame::info_value_for_key(info_ptr, c"model".as_ptr()) };
-    if !model_ptr.is_null() {
-        let model = cstr_bytes_or_empty(model_ptr);
-
-        // Fixed literal lengths, so the game helper never reads past the
-        // literal's NUL (prefix semantics: catches suffixed variants).
-        // "darksidetools" = 13, "jedi_/red" = 9, "jedi_/blue" = 10,
-        // "rancor" = 6, "wampa" = 5.
-        let is_darkside_tools = model.len() >= 13
-            && unsafe { jampgame::q_stricmpn(model_ptr, c"darksidetools".as_ptr(), 13) } == 0;
-        let is_jedi_red = model.len() >= 9
-            && unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/red".as_ptr(), 9) } == 0;
-        let is_jedi_blue = model.len() >= 10
-            && unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_/blue".as_ptr(), 10) } == 0;
-        let is_rancor = model.len() >= 6
-            && unsafe { jampgame::q_stricmpn(model_ptr, c"rancor".as_ptr(), 6) } == 0;
-        let is_wampa = model.len() >= 5
-            && unsafe { jampgame::q_stricmpn(model_ptr, c"wampa".as_ptr(), 5) } == 0;
+    // Copied out before the vector is written below. Missing and empty are the
+    // same here (as the game's `Info_ValueForKey`).
+    let model = userinfo::value_for_key(&info, b"model").to_vec();
+    if !model.is_empty() {
+        let is_darkside_tools = userinfo::starts_with_ignore_case(&model, b"darksidetools");
+        let is_jedi_red = userinfo::starts_with_ignore_case(&model, b"jedi_/red");
+        let is_jedi_blue = userinfo::starts_with_ignore_case(&model, b"jedi_/blue");
+        let is_rancor = userinfo::starts_with_ignore_case(&model, b"rancor");
+        let is_wampa = userinfo::starts_with_ignore_case(&model, b"wampa");
 
         // Anti-cheat: darksidetools model. The caller refuses the client: the
         // engine gets the reason on connect, and a userinfo change is dropped
@@ -432,24 +481,24 @@ pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
                     format!(
                         "{} reason=\"darksidetools model\" userinfo=\"{}\"",
                         crate::hooks::engine_sv::client_label_for_num(client_num),
-                        diagnostics::escape_bytes(&userinfo_buf, 512)
+                        diagnostics::escape_bytes(&info, 512)
                     ),
                 );
             }
-            return Some(ANTI_CHEAT_KICK_REASON);
+            return Err(SanitizeError {
+                reason: ANTI_CHEAT_KICK_REASON.to_string_lossy().into_owned(),
+                anti_cheat: true,
+                clean_name,
+            });
         }
 
         // Fix bugged / overlong models (also the model length crash fix; a
         // length check is duplicated in SV_UserinfoChanged).
-        // Admin-controlled cvar is clamped >= 1 so a negative value cannot
-        // disable the check via a huge `as usize` cast.
-        let max_model_len =
-            state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer.max(1)) as usize;
-        let bad_model = (unsafe { jampgame::q_stricmpn(model_ptr, c"jedi_".as_ptr(), 5) } == 0
+        let bad_model = (userinfo::starts_with_ignore_case(&model, b"jedi_")
             && (is_jedi_red || is_jedi_blue))
             || is_rancor
             || is_wampa
-            || !utils::is_valid_ascii_str(model)
+            || !utils::is_valid_ascii_str(&model)
             || model.len() >= max_model_len;
 
         if bad_model {
@@ -460,26 +509,20 @@ pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
                         "{} len={} model=\"{}\" forced=\"kyle\"",
                         crate::hooks::engine_sv::client_label_for_num(client_num),
                         model.len(),
-                        diagnostics::escape_bytes(model, 256)
+                        diagnostics::escape_bytes(&model, 256)
                     ),
                 );
             }
-            // SAFETY: userinfo buffer writable; literals NUL-terminated.
-            unsafe {
-                jampgame::info_set_value_for_key(
-                    userinfo_buf.as_mut_ptr() as *mut c_char,
-                    c"model".as_ptr(),
-                    c"kyle".as_ptr(),
-                )
-            };
+            if !userinfo::set_value_for_key_vec(&mut info, b"model", b"kyle") {
+                return Err(rejection("Userinfo string length exceeded."));
+            }
         }
     }
 
     // Fix forcepowers crash (`Proxy_SharedAPI.cpp:270-324`).
     let mut force_powers = [0u8; 30];
-    // SAFETY: game module loaded.
-    let fp_ptr = unsafe { jampgame::info_value_for_key(info_ptr, c"forcepowers".as_ptr()) };
-    utils::strncpyz(&mut force_powers, cstr_bytes_or_empty(fp_ptr));
+    let fp_val = userinfo::value_for_key(&info, b"forcepowers").to_vec();
+    utils::strncpyz(&mut force_powers, &fp_val);
     let fp_len = utils::c_strlen(&force_powers);
 
     if !forcepowers_is_valid(&force_powers[..fp_len]) {
@@ -496,27 +539,69 @@ pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
         }
         utils::strncpyz(&mut force_powers, b"7-1-030000000000003332");
     }
+    let fp_len = utils::c_strlen(&force_powers);
 
-    // SAFETY: strncpyz NUL-terminates force_powers; from_ptr stops at the
-    // first NUL (the buffer has trailing zeros, so the unchecked slice form
-    // would violate the single-NUL CStr contract).
-    let fp_cstr = unsafe { CStr::from_ptr(force_powers.as_ptr() as *const c_char) };
-    unsafe {
-        jampgame::info_set_value_for_key(
-            userinfo_buf.as_mut_ptr() as *mut c_char,
-            c"forcepowers".as_ptr(),
-            fp_cstr.as_ptr(),
-        )
-    };
+    if !userinfo::set_value_for_key_vec(&mut info, b"forcepowers", &force_powers[..fp_len]) {
+        return Err(rejection("Userinfo string length exceeded."));
+    }
 
-    // SAFETY: Info_SetValueForKey keeps userinfo_buf NUL-terminated; the
-    // engine wrote it and every mutation above preserves termination.
-    // from_ptr stops at the first NUL instead of claiming trailing zeros.
-    userinfo_buf[MAX_INFO_STRING - 1] = 0;
-    let userinfo_cstr = unsafe { CStr::from_ptr(userinfo_buf.as_ptr() as *const c_char) };
-    unsafe { syscall::set_userinfo(client_num, userinfo_cstr) };
+    Ok(Some(SanitizedUserinfo { info, clean_name }))
+}
 
-    None
+/// `Proxy_SharedAPI_SanitizeUserinfo` (10-25 F2, O8): validate and clean the
+/// name, model and `forcepowers` of a client's userinfo.
+///
+/// Returns `Some(reason)` when the client must be refused; nothing is written
+/// back in that case. The function never drops the client itself: on a connect
+/// the engine expects the reason as the `GAME_CLIENT_CONNECT` return value,
+/// and `DropClient` during that event is unsafe (the slot is still
+/// `CS_FREE`).
+pub fn sanitize_userinfo(client_num: c_int, validate: bool) -> Option<SanitizeRejection> {
+    if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
+        return None;
+    }
+    let mut userinfo_buf = [0u8; MAX_INFO_STRING];
+    // SAFETY: engine syscall registered; buffer writable.
+    unsafe { syscall::get_userinfo(client_num, &mut userinfo_buf) };
+    let info_len = utils::c_strlen(&userinfo_buf);
+    // Admin-controlled cvar is clamped >= 1 so a negative value cannot disable
+    // the check via a huge `as usize` cast.
+    let max_model_len =
+        state::with_state(|s| s.cvars[CVAR_MODEL_PATH_LENGTH].integer.max(1)) as usize;
+
+    match sanitize_userinfo_bytes(
+        client_num,
+        &userinfo_buf[..info_len],
+        validate,
+        max_model_len,
+    ) {
+        Err(error) => {
+            if error.anti_cheat {
+                // The anti-cheat chat needs the cleaned name; other refusals
+                // have none.
+                state::with_state(|s| {
+                    s.clients[client_num as usize].clean_name = error.clean_name;
+                });
+            }
+            Some(to_rejection(error))
+        }
+        Ok(None) => None,
+        Ok(Some(sanitized)) => {
+            state::with_state(|s| {
+                s.clients[client_num as usize].clean_name = sanitized.clean_name;
+            });
+            let len = sanitized.info.len();
+            if len >= MAX_INFO_STRING {
+                return Some(to_rejection(rejection("Userinfo string length exceeded.")));
+            }
+            userinfo_buf[..len].copy_from_slice(&sanitized.info);
+            userinfo_buf[len] = 0;
+            // SAFETY: the buffer is NUL-terminated just above.
+            let cstr = unsafe { CStr::from_ptr(userinfo_buf.as_ptr() as *const c_char) };
+            unsafe { syscall::set_userinfo(client_num, cstr) };
+            None
+        }
+    }
 }
 
 /// `Proxy_SharedAPI_ClientUserinfoChanged` (`Proxy_SharedAPI.cpp:222-329`):
@@ -527,19 +612,28 @@ pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
 /// `ClientUserinfoChanged` does not test that the client is connected and would
 /// rewrite `CS_PLAYERS` for a slot that is being cleared (10-25 F3).
 pub fn client_userinfo_changed(client_num: c_int) -> bool {
-    let Some(reason) = sanitize_userinfo(client_num) else {
+    // Bots keep the userinfo from their bot files (no required keys).
+    let validate = state::with_state(|s| {
+        (0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num)
+            && !s.clients[client_num as usize].is_bot
+    });
+    let Some(rejection) = sanitize_userinfo(client_num, validate) else {
         return true;
     };
 
-    // `sanitize_userinfo` stored the cleaned name before the anti-cheat check.
-    let name = state::with_state(|s| s.clients[client_num as usize].clean_name);
-    let name = String::from_utf8_lossy(&name[..utils::c_strlen(&name)]);
-    let chat = format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
-    // SAFETY: formatted text has no interior NUL.
-    let cchat = CString::new(chat).expect("chat text has no interior NUL");
-    unsafe { syscall::send_server_command(-1, &cchat) };
-    // SAFETY: literal reason string.
-    unsafe { syscall::drop_client(client_num, reason) };
+    if rejection.anti_cheat {
+        let name = String::from_utf8_lossy(
+            &rejection.clean_name[..utils::c_strlen(&rejection.clean_name)],
+        );
+        let chat =
+            format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
+        // SAFETY: formatted text has no interior NUL.
+        let cchat = CString::new(chat).expect("chat text has no interior NUL");
+        unsafe { syscall::send_server_command(-1, &cchat) };
+    }
+
+    // SAFETY: a static CStr (literal or the rejection buffer).
+    unsafe { syscall::drop_client(client_num, rejection.reason) };
 
     false
 }
@@ -891,5 +985,138 @@ mod tests {
     #[test]
     fn f4_known_gap_accepts_power_digits_above_three() {
         assert!(forcepowers_is_valid(b"7-1-333333333333333399"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full sanitiser core (S6 / O8)
+    // -----------------------------------------------------------------------
+
+    /// Outcome of a sanitisation, owned so parallel tests never share the
+    /// static FFI reason buffer.
+    struct Outcome {
+        anti_cheat: bool,
+        reason: Option<String>,
+        info: Option<Vec<u8>>,
+    }
+
+    fn sanitize_with(input: &[u8], validate: bool) -> Outcome {
+        match super::sanitize_userinfo_bytes(0, input, validate, 64) {
+            Ok(Some(s)) => Outcome {
+                anti_cheat: false,
+                reason: None,
+                info: Some(s.info),
+            },
+            Ok(None) => Outcome {
+                anti_cheat: false,
+                reason: None,
+                info: None,
+            },
+            Err(e) => Outcome {
+                anti_cheat: e.anti_cheat,
+                reason: Some(e.reason),
+                info: None,
+            },
+        }
+    }
+
+    fn valid_userinfo() -> Vec<u8> {
+        b"\\ip\\127.0.0.1:29070\\name\\Padawan\\rate\\25000\\snaps\\20\
+          \\model\\kyle/default\\forcepowers\\7-1-030000000000003332\
+          \\color1\\4\\color2\\4\\handicap\\100\\cg_predictItems\\1\
+          \\saber1\\single_1\\saber2\\none\\char_color_red\\255\
+          \\char_color_green\\255\\char_color_blue\\255"
+            .to_vec()
+    }
+
+    #[test]
+    fn sanitizer_rewrites_a_bad_name_model_and_forcepowers() {
+        let input = b"\\ip\\127.0.0.1:29070\\name\\***Bad\\rate\\25000\\snaps\\20\
+            \\model\\rancor/default\\forcepowers\\7-1-\\color1\\4\\color2\\4\
+            \\handicap\\100\\cg_predictItems\\1\\saber1\\single_1\\saber2\\none\
+            \\char_color_red\\255\\char_color_green\\255\\char_color_blue\\255";
+        let outcome = sanitize_with(input, true);
+        assert!(outcome.reason.is_none());
+        let out = outcome
+            .info
+            .expect("the sanitised userinfo must be written");
+        assert_eq!(crate::userinfo::value_for_key(&out, b"name"), b"Bad");
+        assert_eq!(crate::userinfo::value_for_key(&out, b"model"), b"kyle");
+        assert_eq!(
+            crate::userinfo::value_for_key(&out, b"forcepowers"),
+            b"7-1-030000000000003332"
+        );
+    }
+
+    #[test]
+    fn sanitizer_refuses_a_duplicate_key() {
+        let mut input = valid_userinfo();
+        input.extend_from_slice(b"\\Forcepowers\\7-1-");
+        let outcome = sanitize_with(&input, true);
+        assert!(!outcome.anti_cheat);
+        assert_eq!(
+            outcome.reason.unwrap(),
+            "Failed userinfo validation: Too many forcepowers fields (2/1)"
+        );
+        assert!(outcome.info.is_none(), "nothing is written on a refusal");
+    }
+
+    /// O8: a userinfo close to the limit with a capitalised `Forcepowers`
+    /// passes the validation (the key is counted without case) and the write
+    /// that would replace it cannot fit. Before S6 the old bad value stayed
+    /// and the game read it; now the client is refused.
+    #[test]
+    fn sanitizer_refuses_the_o8_write_that_cannot_fit() {
+        let mut input = b"\\ip\\127.0.0.1:29070\\name\\Padawan\\rate\\25000\\snaps\\20\
+            \\model\\kyle\\Forcepowers\\7-1-\\color1\\4\\color2\\4\\handicap\\100\
+            \\cg_predictItems\\1\\saber1\\single_1\\saber2\\none\
+            \\char_color_red\\255\\char_color_green\\255\\char_color_blue\\255"
+            .to_vec();
+        // 990 bytes: the sanitising `\forcepowers\<default>` (35 bytes)
+        // cannot fit, so the checked write reports the failure.
+        let pad = 990 - input.len() - 5;
+        input.extend_from_slice(b"\\pad\\");
+        input.extend(std::iter::repeat_n(b'x', pad));
+        assert_eq!(input.len(), 990);
+        assert!(
+            crate::userinfo::validate_userinfo(&input).is_ok(),
+            "the capitalised key passes the validation"
+        );
+        assert_eq!(
+            crate::userinfo::value_for_key(&input, b"forcepowers"),
+            b"7-1-",
+            "the game would read the bad value"
+        );
+
+        let outcome = sanitize_with(&input, true);
+        assert!(!outcome.anti_cheat);
+        assert_eq!(outcome.reason.unwrap(), "Userinfo string length exceeded.");
+        assert!(outcome.info.is_none(), "nothing is written on a refusal");
+    }
+
+    #[test]
+    fn sanitizer_refuses_darksidetools_without_writing() {
+        let input = String::from_utf8(valid_userinfo())
+            .unwrap()
+            .replace("model\\kyle/default", "model\\darksidetools/default")
+            .into_bytes();
+        let outcome = sanitize_with(&input, true);
+        assert!(outcome.anti_cheat);
+        assert_eq!(
+            outcome.reason.unwrap(),
+            "(Anti-Cheat system) you got kicked cause of cheating"
+        );
+        assert!(outcome.info.is_none(), "nothing is written on a refusal");
+    }
+
+    #[test]
+    fn sanitizer_skips_validation_for_bots() {
+        // A bot userinfo has none of the required keys.
+        let input = b"\\name\\Bot\\model\\kyle";
+        let outcome = sanitize_with(input, false);
+        assert!(outcome.reason.is_none());
+        assert!(
+            outcome.info.is_some(),
+            "the bot userinfo is still sanitised, just not validated"
+        );
     }
 }
