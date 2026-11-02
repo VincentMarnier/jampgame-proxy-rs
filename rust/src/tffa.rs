@@ -194,10 +194,29 @@ fn follow_target(viewer: c_int) -> Option<c_int> {
     if st != SPECTATOR_FOLLOW {
         return None;
     }
-    let target = unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SPECTATOR_CLIENT) };
-    if !(0..MAX_CLIENTS as c_int).contains(&target) {
-        return None;
-    }
+    let raw = unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SPECTATOR_CLIENT) };
+    // `team follow1`/`follow2` store `-1`/`-2` and follow whatever client is
+    // playing (`SpectatorClientEndFrame`, `g_active.c:3660-3668`); resolve
+    // them here too, or a spectator watching through those aliases keeps
+    // their own instance for `CS_PLAYERS`/scores while the snapshot (built
+    // from the followed player's `ps.clientNum`) shows the watched instance:
+    // the watched players then render with a `(TFFA N)` prefix, a spectator
+    // team and their own model/saber colour.
+    let target = if raw == -1 || raw == -2 {
+        let level = crate::original::level_address();
+        if level == 0 {
+            return None;
+        }
+        let offset = if raw == -1 {
+            crate::sdk::OFFSET_LEVEL_FOLLOW1
+        } else {
+            crate::sdk::OFFSET_LEVEL_FOLLOW2
+        };
+        // SAFETY: level is the game's level_locals_t; follow1/follow2 are ints.
+        resolve_follow_target(raw, unsafe { read_i32(level + offset) }, -1)?
+    } else {
+        resolve_follow_target(raw, -1, -1)?
+    };
     let tent = g_entities + target as usize * SIZEOF_GENTITY;
     // SAFETY: target slot is inside the g_entities array.
     let tclient = unsafe { read_usize(tent + OFFSET_GENTITY_CLIENT) };
@@ -205,6 +224,21 @@ fn follow_target(viewer: c_int) -> Option<c_int> {
         return None;
     }
     Some(target)
+}
+
+/// Pure half of [`follow_target`]'s alias resolution: `spectatorClient == -1`
+/// / `-2` means `level.follow1` / `level.follow2`, every other value is the
+/// client slot itself (pristine `SpectatorClientEndFrame`, `g_active.c:3660-3668`).
+/// `None` when the resolved target is not a client slot (nothing to follow).
+fn resolve_follow_target(raw: c_int, follow1: c_int, follow2: c_int) -> Option<c_int> {
+    let target = match raw {
+        -1 => follow1,
+        -2 => follow2,
+        other => other,
+    };
+    (0..MAX_CLIENTS as c_int)
+        .contains(&target)
+        .then_some(target)
 }
 
 /// Pure damage gate: blocked unless both ends share one match.
@@ -7579,5 +7613,25 @@ mod tests {
             None,
             "the live promoted id is reserved"
         );
+    }
+
+    #[test]
+    fn follow_sentinels_resolve_through_level_follow1_and_follow2() {
+        // `team follow1`/`follow2` store -1/-2 in `sess.spectatorClient`;
+        // pristine `SpectatorClientEndFrame` resolves them to `level.follow1`
+        // / `level.follow2` (`g_active.c:3660-3668`). The CS_PLAYERS/scores
+        // view must use the same target or a spectator watching through an
+        // alias keeps their own instance while the snapshot shows the
+        // followed one (the reported `(TFFA N)` names on live players).
+        assert_eq!(resolve_follow_target(-1, 7, 3), Some(7));
+        assert_eq!(resolve_follow_target(-2, 7, 3), Some(3));
+        // A direct clientNum is its own target.
+        assert_eq!(resolve_follow_target(5, 7, 3), Some(5));
+        // No playing client (CalculateRanks leaves them -1) / out of range:
+        // nothing to follow.
+        assert_eq!(resolve_follow_target(-1, -1, 3), None);
+        assert_eq!(resolve_follow_target(-2, 7, -1), None);
+        assert_eq!(resolve_follow_target(MAX_CLIENTS as c_int, 7, 3), None);
+        assert_eq!(resolve_follow_target(-3, 7, 3), None);
     }
 }

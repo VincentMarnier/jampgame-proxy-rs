@@ -2200,3 +2200,45 @@ existing D-006.12 deferral machinery.
   share it with every other match's; not addressed here. A live-client
   session (real players creating matches) was not run: the split above is an
   instrumented stand-in for `tffa_create`/`tffa_join`.
+
+- **Auto-follow (`team follow1`/`follow2`) adopted the wrong instance
+  (2026-11-03, live report: "scoreboard got fucked" and "some players were
+  displayed ingame as (TFFA 0) and their models & sabers color weren't
+  enforce to red/blue", during a spectating/following session).**
+
+  The two symptoms share one cause. Pristine `SpectatorClientEndFrame` stores
+  `sess.spectatorClient == -1`/`-2` for the `team follow1`/`team follow2`
+  aliases and resolves them through `level.follow1`/`level.follow2`
+  (`g_active.c:3660-3668`). The cgame's world comes from the followed player's
+  `playerState` (`SpectatorClientEndFrame` copies it, so snapshot filtering —
+  keyed on `frame.ps.clientNum` — shows the **followed** instance), but
+  `tffa::follow_target` only accepted a direct `0..MAX_CLIENTS` slot and
+  returned `None` for the aliases. `effective_match` then fell back to the
+  spectator's own `client_match`, so the per-viewer `CS_PLAYERS` overrides and
+  the `scores` header were built for the **spectator's** match while they were
+  watching another one:
+  - the watched players were classified as outsiders: `(TFFA N)` name prefix
+    and `t=3` (`rewrite_cs_players_for_viewer`), which is exactly the reported
+    label, and the cgame only forces the team skin/saber colour for
+    `TEAM_RED`/`TEAM_BLUE` (`cg_players.c:5974-5986`,
+    `BG_ValidateSkinForTeam` leaves a spectator's chosen skin untouched), so
+    the watched players kept their own model/saber colour;
+  - the scoreboard showed the spectator's own match header/tallies and grouped
+    the watched players as spectators — the "only some players wrong" board.
+
+  Fix: `follow_target` now resolves the aliases the same way the pristine body
+  does (`resolve_follow_target`, pure, with `level.follow1`/`follow2` read only
+  for `-1`/`-2`; the same rule `teamoverlay::followed_player` already used).
+  This covers every consumer of `effective_match`: snapshot (already correct
+  through the copied `ps.clientNum`, unchanged), per-viewer `CS_PLAYERS`,
+  `CS_SCORES1/2`, the scoreboard rewrite and the pre-intermission board
+  capture.
+
+  Tests: `follow_sentinels_resolve_through_level_follow1_and_follow2`
+  (`-1`/`-2` resolution, direct slot identity, unset `follow1`/`follow2` and
+  out-of-range values → no follow); `cargo test` 320/320, `clippy -D warnings`,
+  `fmt --check` and the i686 release build green. The live half — a real
+  spectator using `team follow1`/`follow2` across two instances — was not
+  run: bots never spectate, so it rests on the source-equivalent resolution
+  (the same one the runtime-verified `teamoverlay` feed uses) plus the unit
+  test.
