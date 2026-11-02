@@ -71,9 +71,30 @@
 //!
 //! ## Logging
 //!
-//! `proxy_sv_clientPpsLog 1` prints one line for a client whose completed
-//! window is **above its limit**; a client inside its limit produces no
-//! output.
+//! `proxy_sv_clientPpsLog 1` logs **transitions**, not every window: one line
+//! when a client is first seen above its limit, one line when a completed
+//! window brings it back under, and another line if it starts again. A client
+//! that stays on the same side of its limit is silent. It works on its own:
+//! the log cvar keeps the accounting and the FPS feed running without
+//! `proxy_sv_enableClientPpsLimit`, so it reports the verdict the limiter
+//! *would* apply. While the cvar is `0` no transition state is kept, so
+//! enabling it reports the next over-limit window instead of staying silent on
+//! a stale edge.
+//!
+//! ## One shared over-limit verdict
+//!
+//! The accounting runs whenever **either** `proxy_sv_enableClientPpsLimit`,
+//! `proxy_sv_enableNetStatus` or `proxy_sv_clientPpsLog` is on; enforcement
+//! (returning `qfalse`) only happens when the limiter cvar is on. This lets
+//! the netStatus table render
+//! the *real* incoming packet rate — the netStatus record ring only counts
+//! packets that carried new usercmds, so a client flooding empty/duplicate
+//! packets is invisible there. The completed window is kept as a
+//! [`PpsSample`], and [`PpsSample::over_limit`] is the single predicate behind
+//! both the `proxy_sv_clientPpsLog` line and the hand-coloured `pps` cell in
+//! the table: the two surfaces cannot disagree on whether a client used too
+//! many packets. The limit is reported even while enforcement is off, so the
+//! table flags an over-limit client without the limiter being active.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -108,19 +129,37 @@ const FPS_REFRESH_MS: i32 = 1000;
 // ---------------------------------------------------------------------------
 
 static ENABLED: AtomicI32 = AtomicI32::new(0);
+/// Accounting gate: on when the limiter **or** the netStatus table is on (the
+/// table renders this module's measured rate). Enforcement still follows
+/// [`ENABLED`].
+static MEASURE: AtomicI32 = AtomicI32::new(0);
 static GLOBAL_MAX_PPS: AtomicI32 = AtomicI32::new(100);
 static LOG: AtomicI32 = AtomicI32::new(0);
 
-/// Set when the feature was seen disabled, so the next enabled packet starts
-/// from fresh windows instead of enforcing a pre-disable rate.
-static PPS_WAS_OFF: AtomicBool = AtomicBool::new(true);
+/// Set when accounting was seen off, so the next measured packet starts from
+/// fresh windows instead of filtering on a pre-disable rate.
+static MEASURE_WAS_OFF: AtomicBool = AtomicBool::new(true);
 
-/// Mirror the three cvars into lock-free atomics so a disabled feature costs
-/// one packet-path check. Values are clamped here, not at the call site.
-pub fn set_config(enabled: i32, global_max_pps: i32, log: i32) {
+/// Set when enforcement was seen off while accounting ran: the off -> on edge
+/// starts a fresh measurement window, so the first second of enforcement is
+/// measurement-only (D-014).
+static ENFORCE_WAS_OFF: AtomicBool = AtomicBool::new(true);
+
+/// Mirror the cvars into lock-free atomics so a fully idle feature costs one
+/// packet-path check. `measure` is `enableClientPpsLimit ||
+/// enableNetStatus`. Values are clamped here, not at the call site.
+pub fn set_config(enabled: i32, measure: i32, global_max_pps: i32, log: i32) {
     ENABLED.store(i32::from(enabled != 0), Ordering::Relaxed);
+    MEASURE.store(i32::from(measure != 0), Ordering::Relaxed);
     GLOBAL_MAX_PPS.store(global_max_pps.clamp(0, 100_000), Ordering::Relaxed);
     LOG.store(i32::from(log != 0), Ordering::Relaxed);
+}
+
+/// Whether the limiter is currently dropping the excess
+/// (`proxy_sv_enableClientPpsLimit` on). The netStatus table uses this to
+/// decide between "just the current rate" and "rate/limit".
+pub fn enforcing() -> bool {
+    ENABLED.load(Ordering::Relaxed) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +239,8 @@ fn allowed_pps(fps: i32, global_max_pps: i32) -> i32 {
 // Per-client limiter state
 // ---------------------------------------------------------------------------
 
-/// One completed measurement window, for the `proxy_sv_clientPpsLog` line.
+/// One completed measurement window, for the `proxy_sv_clientPpsLog` line and
+/// the netStatus `pps` cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PpsSample {
     /// Rate seen in the window (packets per second, normalized by its length).
@@ -217,9 +257,19 @@ pub struct PpsSample {
     pub limit: i32,
 }
 
-/// Per-client state: the current counting window, the previous window's rate,
-/// the FPS-derived limit and the accumulator that spreads drops through the
-/// current window.
+impl PpsSample {
+    /// The single over-limit verdict shared by the log line and the netStatus
+    /// table: the client used more packets than the FPS-derived limit allows
+    /// (or the limiter had to drop some). A `0` limit means "fail open", so it
+    /// never flags.
+    pub fn over_limit(&self) -> bool {
+        self.limit > 0 && (self.rate > self.limit as u32 || self.dropped > 0)
+    }
+}
+
+/// Per-client state: the current counting window, the last completed window
+/// (kept for the shared over-limit verdict), the FPS-derived limit and the
+/// accumulator that spreads drops through the current window.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PpsState {
     started: bool,
@@ -240,6 +290,15 @@ pub struct PpsState {
     limit: i32,
     fps_valid: bool,
     fps_ms: i32,
+    /// Last completed window (rate/limit/drops), shared with the netStatus
+    /// table. Cleared on connect, idle reset and time discontinuities.
+    last: Option<PpsSample>,
+    /// `svs.time` of the last completed window.
+    last_ms: i32,
+    /// Whether the last completed window was over the limit: the log's
+    /// edge-trigger state, so `proxy_sv_clientPpsLog` prints once when a
+    /// client starts using too many packets and once when it stops.
+    over: bool,
 }
 
 impl PpsState {
@@ -286,17 +345,48 @@ impl PpsState {
         self.limit
     }
 
+    /// Whether the last completed window was over the limit (the logging
+    /// edge state).
+    pub fn over(&self) -> bool {
+        self.over
+    }
+
+    /// Forget the edge state without touching the measurement windows: used
+    /// while `proxy_sv_clientPpsLog` is off, so turning it on reports the next
+    /// over-limit window.
+    pub fn clear_over(&mut self) {
+        self.over = false;
+    }
+
+    /// The last completed window, if it is recent enough to describe the
+    /// client's current traffic. `None` while the first window fills, after a
+    /// 2 s silence (the rate would be stale) and after a reset.
+    pub fn status(&self, now_ms: i32) -> Option<PpsSample> {
+        let sample = self.last?;
+        let age = now_ms.wrapping_sub(self.last_ms);
+        (0..=IDLE_RESET_MS).contains(&age).then_some(sample)
+    }
+
     /// Account one incoming packet against `limit` (packets/second).
+    ///
+    /// `enforce == false` keeps the accounting/limit (the netStatus table
+    /// renders them) but never drops: it is the measurement-only mode used
+    /// while `proxy_sv_enableClientPpsLimit` is off.
     ///
     /// Returns whether it may be processed, plus the sample of a window that
     /// just completed (if any). `limit == 0` disables enforcement (FPS not
     /// measured yet, or the feature just re-enabled).
-    pub fn on_packet(&mut self, now_ms: i32, limit: i32) -> (bool, Option<PpsSample>) {
+    pub fn on_packet(
+        &mut self,
+        now_ms: i32,
+        limit: i32,
+        enforce: bool,
+    ) -> (bool, Option<PpsSample>) {
         let mut sample = self.advance(now_ms);
 
         let limit = limit.max(0);
         let rate = u64::from(self.prev_rate);
-        let accept = if limit == 0 || rate <= limit as u64 {
+        let accept = if !enforce || limit == 0 || rate <= limit as u64 {
             true
         } else {
             // Desired drop ratio = (rate - limit) / rate. Add the numerator
@@ -319,6 +409,9 @@ impl PpsState {
         if let Some(sample) = sample.as_mut() {
             sample.fps = self.fps;
             sample.limit = limit;
+            self.last = Some(*sample);
+            self.last_ms = now_ms;
+            self.over = sample.over_limit();
         }
         (accept, sample)
     }
@@ -337,11 +430,14 @@ impl PpsState {
         if since_last < 0 {
             // Engine time went backwards (map restart / wrap): never filter on
             // a window that spans the discontinuity, and discard its partial
-            // count instead of reporting a bogus rate.
+            // count instead of reporting a bogus rate. The log edge state is
+            // bookkeeping, not a rate: keep it so a restart does not duplicate
+            // an "over limit" line (and still reports the "back under" one).
             *self = Self {
                 started: true,
                 window_start_ms: now_ms,
                 last_packet_ms: now_ms,
+                over: self.over,
                 ..Self::default()
             };
             return None;
@@ -350,11 +446,14 @@ impl PpsState {
         if since_last >= IDLE_RESET_MS {
             // Idle across two whole windows: drop the stale rate (a returning
             // player must not be filtered on what they sent before they went
-            // quiet) and start a fresh window with this packet.
+            // quiet) and start a fresh window with this packet. Keep the log
+            // edge state: when the returning player completes an under-limit
+            // window, the "back under limit" line is still due.
             *self = Self {
                 started: true,
                 window_start_ms: now_ms,
                 last_packet_ms: now_ms,
+                over: self.over,
                 ..Self::default()
             };
             return None;
@@ -394,13 +493,24 @@ pub fn reset_client(client_num: usize) {
     });
 }
 
-/// Reset every client's limiter (feature off -> on).
+/// Reset every client's limiter (measurement or enforcement (re)started).
 pub fn reset_all() {
     state::with_state(|s| {
         for client in s.clients.iter_mut() {
             client.pps.reset();
         }
     });
+}
+
+/// The shared over-limit verdict for one client (see [`PpsSample`]): the same
+/// completed window the limiter logs and enforces from. `None` while the first
+/// window fills or when the traffic is stale.
+pub fn status(client_num: usize, now_ms: i32) -> Option<PpsSample> {
+    state::with_state(|s| {
+        s.clients
+            .get(client_num)
+            .and_then(|client| client.pps.status(now_ms))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -411,18 +521,31 @@ pub fn reset_all() {
 /// processed. Called by the `SV_Netchan_Process` entry wrapper.
 ///
 /// `true` = hand the packet to the pristine function, `false` = drop it.
+/// Accounting runs while either the limiter or the netStatus table needs it;
+/// packets are only dropped while the limiter cvar is on.
 ///
 /// # Safety
 ///
 /// `cl` must be the valid `client_t*` the engine passed to
 /// `SV_Netchan_Process`.
 pub unsafe fn on_incoming_packet(cl: usize) -> bool {
-    if ENABLED.load(Ordering::Relaxed) == 0 {
-        PPS_WAS_OFF.store(true, Ordering::Relaxed);
+    if MEASURE.load(Ordering::Relaxed) == 0 {
+        MEASURE_WAS_OFF.store(true, Ordering::Relaxed);
         return true;
     }
-    if PPS_WAS_OFF.swap(false, Ordering::Relaxed) {
+    let enforce = ENABLED.load(Ordering::Relaxed) != 0;
+    if MEASURE_WAS_OFF.swap(false, Ordering::Relaxed) {
         reset_all();
+        ENFORCE_WAS_OFF.store(!enforce, Ordering::Relaxed);
+    } else if enforce {
+        if ENFORCE_WAS_OFF.swap(false, Ordering::Relaxed) {
+            // Enforcement started while accounting already ran: keep D-014's
+            // measurement-only first second instead of filtering on an old
+            // rate.
+            reset_all();
+        }
+    } else {
+        ENFORCE_WAS_OFF.store(true, Ordering::Relaxed);
     }
 
     // A stale/foreign pointer (e.g. after a disconnect) must fail open rather
@@ -438,39 +561,43 @@ pub unsafe fn on_incoming_packet(cl: usize) -> bool {
     let log = LOG.load(Ordering::Relaxed) != 0;
     // SAFETY: engine memory layer initialised (hooks run after GAME_INIT).
     let now = unsafe { svs_time() };
-    let (accept, sample) = state::with_state(|s| {
+    let (accept, sample, was_over) = state::with_state(|s| {
         let client = &mut s.clients[client_num];
+        if !log {
+            // No history is kept while logging is off: turning it on must
+            // report the next over-limit window, not a stale edge.
+            client.pps.clear_over();
+        }
         if client.pps.fps_due(now) {
             let fps = trusted_fps(&client.netstatus, now);
             client.pps.refresh_fps(now, fps, global_max_pps);
         }
+        let was_over = client.pps.over();
         let limit = client.pps.limit();
-        client.pps.on_packet(now, limit)
+        let (accept, sample) = client.pps.on_packet(now, limit, enforce);
+        (accept, sample, was_over)
     });
 
     if log {
         if let Some(sample) = sample {
-            // The user wants output only for clients above their limit; a
-            // client inside it stays silent.
-            if sample.limit > 0 && sample.rate > sample.limit as u32 {
-                print_sample(cl, sample);
+            // Edge-triggered: one line when the client starts using too many
+            // packets, one when a completed window brings it back under, and
+            // another if it starts again. Staying on the same side is silent.
+            let over = sample.over_limit();
+            if over != was_over {
+                print_transition(cl, sample, over);
             }
         }
     }
     accept
 }
 
-/// Print one over-limit window after the state lock is released (the engine
-/// print trap must not run under the proxy mutex).
-fn print_sample(cl: usize, sample: PpsSample) {
+/// Print one over-limit / back-under-limit transition after the state lock is
+/// released (the engine print trap must not run under the proxy mutex).
+fn print_transition(cl: usize, sample: PpsSample, over: bool) {
     // SAFETY: cl is the client_t* whose packet we just accounted.
     let label = unsafe { crate::hooks::engine_sv::client_label(cl) };
-    let accepted = sample.observed.saturating_sub(sample.dropped);
-    let line = format!(
-        "----- proxy-rs: pps over limit: observed={} accepted={accepted} dropped={} rate={} \
-         limit={} fps={} window_ms={} {label}\n",
-        sample.observed, sample.dropped, sample.rate, sample.limit, sample.fps, sample.window_ms,
-    );
+    let line = transition_line(sample, over, &label);
     match std::ffi::CString::new(line) {
         // SAFETY: engine syscall pointer registered by dllEntry; text is
         // NUL-terminated and outlives the call.
@@ -482,6 +609,21 @@ fn print_sample(cl: usize, sample: PpsSample) {
             String::from_utf8_lossy(&err.into_vec())
         ),
     }
+}
+
+/// The text of one transition line: only the rates and the client identity.
+/// The raw observed/accepted/dropped counters are limiter internals, not
+/// operator information.
+fn transition_line(sample: PpsSample, over: bool, label: &str) -> String {
+    let what = if over {
+        "pps over limit"
+    } else {
+        "pps back under limit"
+    };
+    format!(
+        "----- proxy-rs: {what}: rate={} limit={} fps={} window_ms={} {label}\n",
+        sample.rate, sample.limit, sample.fps, sample.window_ms,
+    )
 }
 
 #[cfg(test)]
@@ -497,10 +639,22 @@ mod tests {
         step_ms: i32,
         limit: i32,
     ) -> Vec<bool> {
+        feed_with(state, start_ms, count, step_ms, limit, true)
+    }
+
+    /// [`feed`] with an explicit enforcement flag (`false` = measurement only).
+    fn feed_with(
+        state: &mut PpsState,
+        start_ms: i32,
+        count: u32,
+        step_ms: i32,
+        limit: i32,
+        enforce: bool,
+    ) -> Vec<bool> {
         (0..count)
             .map(|i| {
                 let now = start_ms + (i as i32) * step_ms;
-                state.on_packet(now, limit).0
+                state.on_packet(now, limit, enforce).0
             })
             .collect()
     }
@@ -643,7 +797,7 @@ mod tests {
         // 100 packets over the first second, then the packet that rolls the
         // window (the roll happens before that packet is counted).
         for i in 0..=100 {
-            let (_, s2) = s.on_packet(i * 10, limit);
+            let (_, s2) = s.on_packet(i * 10, limit, true);
             if let Some(s2) = s2 {
                 sample = Some(s2);
             }
@@ -663,7 +817,7 @@ mod tests {
         let mut sample = None;
         // 60 packets over ~1 s (17 ms apart), then the rolling packet.
         for i in 0..=60 {
-            let (_, s2) = s.on_packet(i * 17, limit);
+            let (_, s2) = s.on_packet(i * 17, limit, true);
             if let Some(s2) = s2 {
                 sample = Some(s2);
             }
@@ -688,8 +842,146 @@ mod tests {
         let mut s = PpsState::default();
         assert!(feed(&mut s, 5000, 100, 10, 63).iter().all(|&a| a));
         // Engine time discontinuity (map restart / wrap): fail open.
-        let (accept, sample) = s.on_packet(10, 63);
+        let (accept, sample) = s.on_packet(10, 63, true);
         assert!(accept);
         assert!(sample.is_none());
+    }
+
+    #[test]
+    fn measurement_without_enforcement_never_drops_but_status_flags_the_excess() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        // 100 pps over a second, enforcement off: every packet passes ...
+        let accepted = feed_with(&mut s, 0, 101, 10, limit, false);
+        assert!(accepted.iter().all(|&a| a));
+        // ... and the completed window reports the same over-limit verdict the
+        // limiter's log line uses.
+        let status = s.status(1000).expect("a window completed");
+        assert_eq!(status.rate, 100);
+        assert_eq!(status.limit, limit);
+        assert_eq!(status.dropped, 0);
+        assert!(status.over_limit());
+    }
+
+    #[test]
+    fn inside_the_limit_status_does_not_flag() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        feed_with(&mut s, 0, 60, 17, limit, false);
+        let status = s.status(1003).expect("a window completed");
+        assert!(status.rate <= status.limit as u32);
+        assert!(!status.over_limit());
+    }
+
+    #[test]
+    fn a_fail_open_limit_never_flags() {
+        let sample = PpsSample {
+            rate: 600,
+            window_ms: 1000,
+            observed: 600,
+            dropped: 0,
+            fps: 0,
+            limit: 0,
+        };
+        assert!(!sample.over_limit());
+    }
+
+    #[test]
+    fn status_is_none_while_filling_and_expires_when_idle() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        // First window still filling: no completed sample yet.
+        feed_with(&mut s, 0, 50, 10, limit, false);
+        assert!(s.status(500).is_none());
+        // Complete it, then the sample is current ...
+        feed_with(&mut s, 500, 60, 10, limit, false);
+        assert!(s.status(1100).is_some());
+        // ... but a silent client must not keep showing a stale red cell.
+        assert!(s.status(4000).is_none());
+    }
+
+    #[test]
+    fn an_idle_reset_clears_the_shared_status() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        feed_with(&mut s, 0, 101, 10, limit, false);
+        assert!(s.status(1000).is_some());
+        // The packet after a 2 s silence resets the windows: the status must
+        // describe the new traffic, not the pre-idle one.
+        s.on_packet(6000, limit, false);
+        assert!(s.status(6000).is_none());
+    }
+
+    #[test]
+    fn the_log_edge_state_follows_over_then_under_then_over() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        // First over-limit window: starts the log edge.
+        feed_with(&mut s, 0, 101, 10, limit, false);
+        assert!(s.over(), "the first over-limit window must arm the edge");
+        // A full under-limit second clears it (one "back under" line).
+        feed_with(&mut s, 1000, 51, 20, limit, false);
+        assert!(!s.over(), "an under-limit window must clear the edge");
+        // Over again: the next window re-arms it (a second "over" line).
+        feed_with(&mut s, 2000, 101, 10, limit, false);
+        assert!(s.over(), "the edge must re-arm after a clean window");
+        // Connect/disconnect (full reset) clears it.
+        s.reset();
+        assert!(!s.over());
+    }
+
+    #[test]
+    fn clearing_the_edge_does_not_touch_the_measurement_windows() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        feed_with(&mut s, 0, 101, 10, limit, false);
+        assert!(s.over());
+        // The log cvar turning off only forgets the edge.
+        s.clear_over();
+        assert!(!s.over());
+        assert!(s.status(1000).is_some());
+        assert_eq!(s.limit(), limit);
+    }
+
+    #[test]
+    fn an_idle_gap_keeps_the_log_edge_state() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 60, 100);
+        let limit = s.limit();
+        feed_with(&mut s, 0, 101, 10, limit, false);
+        assert!(s.over());
+        // The windows restart on the packet after the silence, but a returning
+        // player still owes the "back under limit" line once they are clean.
+        s.on_packet(6000, limit, false);
+        assert!(s.over());
+    }
+
+    #[test]
+    fn transition_lines_report_the_rates_and_identity_only() {
+        let over = PpsSample {
+            rate: 100,
+            window_ms: 1000,
+            observed: 120,
+            dropped: 37,
+            fps: 60,
+            limit: 62,
+        };
+        assert_eq!(
+            transition_line(over, true, "client=2 name=\"p\""),
+            "----- proxy-rs: pps over limit: rate=100 limit=62 fps=60 window_ms=1000 \
+             client=2 name=\"p\"\n"
+        );
+        let under = PpsSample { rate: 40, ..over };
+        assert_eq!(
+            transition_line(under, false, "client=2 name=\"p\""),
+            "----- proxy-rs: pps back under limit: rate=40 limit=62 fps=60 window_ms=1000 \
+             client=2 name=\"p\"\n"
+        );
     }
 }

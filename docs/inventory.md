@@ -69,8 +69,8 @@ forwarded to the game; lines are flushed to `proxy_debug.log` before dispatch.
 `0`) is a Rust-only, D-014 feature. The per-client limit is the highest
 `f / ceil(f / globalMaxPps)` over `FPS ± 2` (capped by `globalMaxPps`) using
 the same `netstatus_est::fps_pps` calculation as the netStatus table; the shared
-usercmd feed stays active while the limiter is on, even if the table is off,
-and logging only reports clients above their limit. It adds one entry wrapper,
+usercmd feed stays active while the limiter, the log cvar or the table is on.
+It adds one entry wrapper,
 `SV_Netchan_Process` (`0x8057e14`, six stealable bytes), the engine's first
 sequenced-packet point that already holds the `client_t*` (address + qport
 matched, `sv_main.cpp:623`). The wrapper counts every incoming packet per
@@ -80,8 +80,19 @@ never entered, `lastPacketTime` is not refreshed and no client message runs.
 Drops are spread evenly through the window by a deterministic accumulator; a
 client at or below its FPS-derived limit passes untouched, the FPS estimate is
 refreshed once a second, and the first window after connect (or after a 2 s
-silence) is measurement-only. `clientPpsLog 1` prints a line only for clients
-whose completed window is above their limit.
+silence) is measurement-only. `clientPpsLog 1` logs transitions: one line when
+a client starts using too many packets, one when a completed window brings it
+back under, and another if it starts again (same-side windows are silent). The
+log line reports the rate, limit, FPS, window length and client identity only,
+and the cvar is sufficient on its own (it keeps the accounting and FPS feed
+running without the limiter). The accounting also runs while
+only `proxy_sv_enableNetStatus` is on (without dropping anything), so the
+table's `packets/s` cell shows the limiter's real incoming-packet rate —
+including empty/duplicate packets the record ring cannot see. An over-limit
+client is red there: with the limiter on the cell is the effective rate the
+limiter lets through (observed capped at the limit), with it off the limit
+follows in the default colour. Both surfaces use the same
+`PpsSample::over_limit` predicate.
 
 ## Wanted
 

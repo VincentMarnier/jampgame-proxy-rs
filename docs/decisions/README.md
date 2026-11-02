@@ -68,4 +68,9 @@
   `proxy_sv_clientPpsLog`; `SV_Netchan_Process` entry wrapper, the shared
   `fps_pps` calculation (same as the netStatus table), one-second measurement
   windows, deterministic evenly-spread drops (never a tail drop), fail-open
-  guards for short/stale command streams, and over-limit-only logging.
+  guards for short/stale command streams, and edge-triggered logging (starts /
+  stops being over the limit). The
+  accounting also runs while only the netStatus table is on, and the table's
+  `packets/s` cell renders the same `over_limit` verdict: red, showing the
+  effective rate with the limiter on and `<actual>/<limit>` (red actual,
+  default limit colour) with it off — see D-014.6.

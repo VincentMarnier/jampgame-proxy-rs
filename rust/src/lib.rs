@@ -462,10 +462,19 @@ fn update_proxy_cvars() {
         // The diagnostics level is mirrored into a lock-free atomic so engine
         // hook call sites can gate their formatting without re-entering state.
         diagnostics::set_level(s.cvars[state::CVAR_DEBUG_LOG].integer);
-        // The packet-rate limiter's three cvars are mirrored into lock-free
-        // atomics: the check runs once per incoming packet.
+        // The packet-rate limiter's cvars are mirrored into lock-free
+        // atomics: the check runs once per incoming packet. Accounting also
+        // runs for the netStatus table (its `packets/s` cell renders this
+        // module's measured rate) and for `proxy_sv_clientPpsLog` on its own;
+        // enforcement only follows the limiter cvar.
+        let measure = i32::from(
+            s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
+                || s.cvars[state::CVAR_ENABLE_NET_STATUS].integer != 0
+                || s.cvars[state::CVAR_CLIENT_PPS_LOG].integer != 0,
+        );
         pps::set_config(
             s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer,
+            measure,
             s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
             s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
         );

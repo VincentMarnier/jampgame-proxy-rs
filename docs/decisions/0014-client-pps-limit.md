@@ -15,8 +15,8 @@ limiter. When active, each client's **maximum allowed pps is computed from its
 own measured FPS**, not from a fixed server-wide number; the per-client value
 is an integer downscale of that FPS, capped by a global maximum.
 The limiter must drop excess packets evenly through the second, and
-`proxy_sv_clientPpsLog` must only print something when a client is above its
-limit.
+`proxy_sv_clientPpsLog` must report when a client starts and stops being above
+its limit (not once per window).
 
 An earlier iteration exposed fixed caps (`proxy_sv_maxClientPps`,
 `proxy_sv_maxAllowedPps`); this record replaces that design.
@@ -90,8 +90,9 @@ everything).
 The netStatus machinery already records, per packet, the new (non-duplicate)
 usercmds the engine processed (`feed_cmd` runs from `SV_ClientThink`; duplicates
 are dropped by `SV_UserMove` before the feed). To keep the limiter independent
-of `proxy_sv_enableNetStatus`, the record feed now runs when **either**
-`proxy_sv_enableNetStatus` or `proxy_sv_enableClientPpsLimit` is on.
+of `proxy_sv_enableNetStatus`, the record feed now runs when **any** of
+`proxy_sv_enableNetStatus`, `proxy_sv_enableClientPpsLimit` or
+`proxy_sv_clientPpsLog` is on.
 
 **There is one FPS calculation.** The limiter calls
 `netstatus_est::fps_pps` — the exact function behind the netStatus table's
@@ -136,23 +137,60 @@ of every legit batch. Instead:
 `svs.time` is the clock: it is the engine's own server clock and the same value
 every other proxy feature uses.
 
-### D-014.4 — Logging only above the limit
+### D-014.4 — Edge-triggered logging
 
-`proxy_sv_clientPpsLog 1` prints a line only for a completed window whose
-measured rate is above its effective limit (FPS-derived, capped by the global
-maximum); clients inside their limit produce no output. The line carries the
-observed rate, accepted and dropped counts, the limit, the FPS estimate, the
-window length and the client identity.
+`proxy_sv_clientPpsLog 1` logs **transitions**, not every window: one line when
+a client is first seen above its limit, one when a completed window brings it
+back under, and another if it starts again. A client staying on the same side
+of its limit produces no output. The line carries the observed rate, the limit,
+the FPS estimate, the window length and the client identity (the raw
+observed/accepted/dropped counters are limiter internals and are not printed).
+The log cvar is sufficient on its own: it keeps the accounting and the
+per-usercmd FPS feed running without `proxy_sv_enableClientPpsLimit`, so it
+reports the limit the limiter *would* enforce. While the cvar is `0` no edge
+state is kept, so enabling it reports the next over-limit window.
+
+### D-014.6 — One shared over-limit verdict; the netStatus table renders it
+
+The rate accounting (counting every incoming sequenced packet over a one-second
+window) runs whenever **any** of `proxy_sv_enableClientPpsLimit`,
+`proxy_sv_enableNetStatus` or `proxy_sv_clientPpsLog` is on; only the dropping
+of the excess requires the limiter cvar. The last completed window is kept as a
+[`PpsSample`](../../rust/src/pps.rs) and `PpsSample::over_limit()` is the single
+predicate behind both surfaces, so the log line and the table cannot disagree:
+
+- `proxy_sv_clientPpsLog` logs the `over_limit` **transitions**: one line when
+  a client starts using too many packets, one when a completed window brings
+  it back under, and another if it starts again (same-side windows are silent);
+- the netStatus `packets/s` cell shows the limiter's measured rate instead of
+  the `netstatus_est::fps_pps` packet count, because the record ring only
+  counts packets that carried **new usercmds**. A client flooding
+  empty/duplicate packets (the shape D-014 targets) left the old cell at
+  `pps = fps`; the limiter's counter sees those packets. Before the first
+  completed window the cell falls back to the record-ring value.
+- When the client is over its limit the cell is red (`^1`), in a right-aligned
+  9-column. With `proxy_sv_enableClientPpsLimit` on it shows the **effective**
+  rate — the observed rate capped at the limit, i.e. what the limiter lets
+  through: 200 pps observed with a limit of 100 renders
+  `^1      100^7`. With the limiter off there is no effective rate, so it
+  appends the limit the limiter would enforce in the default colour (`^7`
+  before it, `^1   100^7/73`), flagging over-use without pretending the packets
+  are being dropped.
+- A completed window older than 2 s is stale (the client went silent) and is
+  neither shown nor flagged; resetting the windows (connect, idle, backwards
+  `svs.time`, accounting off→on, enforcement off→on) clears the shared status.
 
 ### D-014.5 — Scope and fail-open rules
 
 - Every client is measured/filtered, LAN/loopback included.
 - Bots never send client packets, so they never reach the hook.
 - An unknown/out-of-range `client_t*` fails open.
-- With the feature off the wrapper is a plain passthrough behind one atomic
-  check; `proxy_sv_enable 0` detaches the hook entirely.
+- With all three cvars off the wrapper is a plain passthrough behind one atomic
+  check; with only the netStatus table or `proxy_sv_clientPpsLog` on it
+  accounts packets without ever dropping; `proxy_sv_enable 0` detaches the
+  hook entirely.
 - Per-client state is reset on first connect and dropped with the slot on
-  disconnect; the feature off→on edge resets every window.
+  disconnect; starting accounting or enforcement resets every window.
 - Enabling the feature does not require enabling the netStatus table.
 
 ## Limitations (explicit)
@@ -178,7 +216,18 @@ window length and the client identity.
   min(f / ceil(f / globalMaxPps), globalMaxPps)`, one-second refresh,
   first-window measurement, exact-limit pass, one-over-limit filtering, even
   drop spread (no tail truncation, longest accept run), over-limit vs
-  inside-limit samples, idle-gap reset and backwards-time reset.
+  inside-limit samples, idle-gap reset and backwards-time reset, the shared
+  status: measurement-only (no drops) reports the excess, a fail-open limit
+  never flags, the status is absent while the first window fills and expires
+  on silence, and an idle reset clears it; and the log edge: over → under →
+  over transitions arm/clear/re-arm, a full reset clears it, clearing it while
+  the log cvar is off leaves the measurement windows intact, and an idle gap
+  keeps it; the log line reports only the rate, limit, FPS, window length and
+  client identity (no raw observed/accepted/dropped counters).
+- `rust/src/hooks/netstatus.rs` unit tests: the `packets/s` cell stays 9
+  visible columns, is plain inside the limit, is red and rate-only while the
+  limiter is on, renders `^1<actual>^7/<limit>` while it is off (including
+  drops on an at-limit window) and never truncates a wide limit.
 - `rust/src/patch.rs`: `SV_Netchan_Process` steal-length fixture (6 bytes).
 - Runtime differential validation on the i386 engine is not yet recorded; the
   over-limit log is the intended first live check.

@@ -40,9 +40,21 @@
 //! With `proxy_sv_enableNetStatus 0` the table and every estimator computation
 //! are **completely inert** (user directive, 2026-10-26). The raw per-cmd
 //! record feed is also what the per-client packet-rate limiter uses to derive
-//! each client's FPS (`crate::pps`), so it stays active when
-//! `proxy_sv_enableClientPpsLimit` is on; with both cvars off it does nothing
-//! beyond one cvar mirror read per usercmd message.
+//! each client's FPS (`crate::pps`), so it stays active while
+//! `proxy_sv_enableClientPpsLimit` or `proxy_sv_clientPpsLog` is on; with all
+//! three cvars off it does nothing beyond one cvar mirror read per usercmd
+//! message.
+//!
+//! The table's `packets/s` cell is rendered from the limiter's own accounting
+//! (`crate::pps::status`), not from the record ring: the ring only counts
+//! packets that carried new usercmds, so it cannot see a client flooding
+//! empty/duplicate packets. The same completed window and the same
+//! `over_limit` predicate drive the `proxy_sv_clientPpsLog` line, so the table
+//! and the log always agree. An over-limit cell is red: with
+//! `proxy_sv_enableClientPpsLimit` on it shows the effective rate (the observed
+//! rate capped at the limit, i.e. what the limiter lets through); with the
+//! limiter off it appends the limit it would enforce
+//! (`^1<actual>^7/<limit>`, actual red, limit default colour).
 
 use core::ffi::{c_char, c_int};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -57,15 +69,19 @@ use crate::sdk::{
     OFFSET_CLIENT_RATE, OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT, OFFSET_CLIENT_SNAPSHOT_MSEC,
     OFFSET_CLIENT_STATE, PACKET_MASK, SIZEOF_CLIENT_SNAPSHOT_T, SIZEOF_CLIENT_T, Usercmd,
 };
-use crate::state::{self, CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS};
+use crate::state::{
+    self, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS,
+};
 use crate::syscall;
 
 /// Whether the shared per-usercmd record feed must run: the netStatus table
-/// needs it, and the packet-rate limiter derives each client's FPS from it.
+/// needs it, the packet-rate limiter derives each client's FPS from it, and
+/// `proxy_sv_clientPpsLog` uses that same FPS-derived limit.
 fn feed_enabled() -> bool {
     state::with_state(|s| {
         s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0
             || s.cvars[CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
+            || s.cvars[CVAR_CLIENT_PPS_LOG].integer != 0
     })
 }
 
@@ -359,10 +375,54 @@ fn fps_pps_of(client_num: usize) -> (i32, i32) {
 // Proxy_Engine_ClientCommand_NetStatus
 // ---------------------------------------------------------------------------
 
+/// Width of the `packets/s` column in the printed table (`packets/s` is
+/// exactly nine characters). An over-limit client shows the limit after a `/`
+/// only while the limiter is off; colour codes are not counted, so the column
+/// stays aligned.
+const PPS_COL_WIDTH: usize = 9;
+
+/// The `packets/s` cell for one client: the shared limiter counter
+/// (`crate::pps::`) as the rate actually in effect. With the limiter on, an
+/// over-limit client shows the rate the limiter lets through (the observed
+/// rate capped at the limit — e.g. 200 pps observed, limit 100 → `100`) and is
+/// red (`^1`, the next cell restores the colour). With the limiter off there is
+/// no effective rate to show, so the red actual rate is followed by the limit
+/// it would enforce, in the default colour (`^7` before it).
+fn pps_cell(status: Option<crate::pps::PpsSample>, fallback_pps: i32, enforcing: bool) -> String {
+    let Some(sample) = status else {
+        // Before the first completed window the record ring's cmd-carrying
+        // packet count is the best available value (never red).
+        return format!("{fallback_pps:>PPS_COL_WIDTH$}");
+    };
+    if !sample.over_limit() {
+        return format!("{:>PPS_COL_WIDTH$}", sample.rate);
+    }
+    if enforcing {
+        // `limit > 0` here: `over_limit` is false for a fail-open limit.
+        let effective = sample.rate.min(sample.limit as u32);
+        format!("^1{effective:>PPS_COL_WIDTH$}^7")
+    } else {
+        let actual = sample.rate.to_string();
+        let limit = sample.limit.to_string();
+        // `actual/limit` is right-aligned in the column (the digits of
+        // `actual` carry the padding, not the colour codes).
+        let pad = PPS_COL_WIDTH
+            .saturating_sub(limit.len() + 1)
+            .max(actual.len());
+        format!("^1{actual:>pad$}^7/{limit}")
+    }
+}
+
 /// `Proxy_Engine_ClientCommand_NetStatus` (`Proxy_Engine_ClientCommand.cpp:
 /// 13-96`): print the per-player net status table to `client_num` (rate-limited
 /// to once per 500 ms of game time). D-007 columns:
-/// `ping rtt jit fps pps timeNudge snaps rate name`.
+/// `ping rtt jit fps packets/s timeNudge snaps rate name`.
+///
+/// The `packets/s` cell renders the shared per-client packet accounting in
+/// `crate::pps` (the limiter's own counter, which sees every sequenced packet
+/// including ones with no new usercmd). An over-limit client is red; with the
+/// limiter on the value is the effective rate (observed capped at the limit),
+/// with the limiter off the limit follows as `^1<actual>^7/<limit>`.
 ///
 /// # Safety
 ///
@@ -382,16 +442,16 @@ pub fn client_command_net_status(client_num: c_int) {
     let clients = unsafe { clients_base() };
 
     let mut status: Vec<u8> = Vec::new();
-    // header + rule, same widths as the rows below (4/6/5/4/4/13/4/6)
+    // header + rule, same widths as the rows below (4/6/5/4/9/13/4/6)
     status.extend_from_slice(
         format!(
-            "{:>4} {:>6} {:>5} {:>4} {:>4} {:>13} {:>4} {:>6} {}\n",
-            "ping", "rtt", "jit", "fps", "pps", "timeNudge", "snaps", "rate", "name"
+            "{:>4} {:>6} {:>5} {:>4} {:>9} {:>13} {:>4} {:>6} {}\n",
+            "ping", "rtt", "jit", "fps", "packets/s", "timeNudge", "snaps", "rate", "name"
         )
         .as_bytes(),
     );
     status.extend_from_slice(
-        b"---- ------ ----- ---- ---- ------------- ----- ------ ---------------\n",
+        b"---- ------ ----- ---- --------- ------------- ----- ------ ---------------\n",
     );
 
     for i in 0..maxclients {
@@ -421,6 +481,14 @@ pub fn client_command_net_status(client_num: c_int) {
         let msg_interval = unsafe { frames_msg_interval(cl, svs_time) };
         let est = compute(i as usize, svs_time, msg_interval);
         let (fps, pps) = fps_pps_of(i as usize);
+        // The limiter's own accounting, shared with the `clientPpsLog` line:
+        // it sees every sequenced packet (empty/duplicate ones included), unlike
+        // the record ring above, which only counts packets carrying new cmds.
+        let pps_cell = pps_cell(
+            crate::pps::status(i as usize, svs_time),
+            pps,
+            crate::pps::enforcing(),
+        );
         let (tn_cell, rtt, jit) = match est {
             Some(est) => (
                 format!("[{:.1}..{:.1}]", est.lo, est.hi),
@@ -461,7 +529,7 @@ pub fn client_command_net_status(client_num: c_int) {
 
         status.extend_from_slice(
             format!(
-                "{ping_str} {rtt:>6} {jit:>5} {fps:4} {pps:4} {tn_cell:>13} {snaps:5} {rate:6} "
+                "{ping_str} {rtt:>6} {jit:>5} {fps:4} {pps_cell} {tn_cell:>13} {snaps:5} {rate:6} "
             )
             .as_bytes(),
         );
@@ -490,5 +558,61 @@ pub fn client_command_net_status(client_num: c_int) {
         let cstr = unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(&full) };
         // SAFETY: engine syscall registered.
         unsafe { syscall::send_server_command(client_num, cstr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pps::PpsSample;
+
+    fn sample(rate: u32, limit: i32, dropped: u32) -> PpsSample {
+        PpsSample {
+            rate,
+            window_ms: 1000,
+            observed: rate,
+            dropped,
+            fps: 60,
+            limit,
+        }
+    }
+
+    #[test]
+    fn pps_cell_is_nine_wide_and_plain_inside_the_limit() {
+        assert_eq!(pps_cell(Some(sample(60, 62, 0)), 60, false), "       60");
+        assert_eq!(pps_cell(Some(sample(60, 62, 0)), 60, true), "       60");
+        assert_eq!(pps_cell(None, 30, false), "       30");
+    }
+
+    #[test]
+    fn pps_cell_is_red_only_and_shows_the_effective_rate_while_enforcing() {
+        // Example: 200 pps observed, the limit is 100 -> the limiter lets 100
+        // through, and that is what the table shows (red).
+        assert_eq!(
+            pps_cell(Some(sample(200, 100, 100)), 0, true),
+            "^1      100^7"
+        );
+        // Over the limit: the capped rate, not the raw one.
+        assert_eq!(
+            pps_cell(Some(sample(100, 73, 27)), 0, true),
+            "^1       73^7"
+        );
+        // Limiter off: red actual, default-colour limit.
+        assert_eq!(
+            pps_cell(Some(sample(100, 73, 27)), 0, false),
+            "^1   100^7/73"
+        );
+        // The red flag also comes from drops on a just-completed window; the
+        // effective rate is still the observed one (nothing above the limit).
+        assert_eq!(pps_cell(Some(sample(73, 73, 1)), 0, true), "^1       73^7");
+        assert_eq!(pps_cell(Some(sample(73, 73, 1)), 0, false), "^1    73^7/73");
+    }
+
+    #[test]
+    fn pps_cell_never_truncates_a_wide_limit() {
+        assert_eq!(
+            pps_cell(Some(sample(200_000, 100_000, 0)), 0, false),
+            "^1200000^7/100000"
+        );
     }
 }
