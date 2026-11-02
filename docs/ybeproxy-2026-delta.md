@@ -70,7 +70,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | 10-25 F9 | `netStatus` modifies engine state | Medium | **N/A** (different design) |
 | 10-25 F10 | low-priority bugs | Low | **N/A / one cosmetic gap** |
 | 10-25 F11 | `dumpuser` crash on a long userinfo value | Medium | **LIVE** |
-| O1 | `ip` userinfo key not maintained | High | **LIVE** |
+| O1 | `ip` userinfo key not maintained | High | **FIXED** 2026-11-02 |
 | O2 | out-of-band rate limiting | High | **FIXED** 2026-11-02 (= F6) |
 | O3 | userinfo sanitised before the game sees it | High | **LIVE** (= F2) |
 | O4 | `writeconfig` | Medium | **LIVE** (= F7) |
@@ -132,7 +132,7 @@ is the command filter, as upstream chose.
 A direct port of `d9daa68`:
 
 - `MAX_COMMAND_LENGTH = 512` (`shared_api.rs:32`) and the pure predicate
-  `command_line_too_long(cmd, args)` (`shared_api.rs:683-685`), which is
+  `command_line_too_long(cmd, args)` (`shared_api.rs:690-692`), which is
   literally `cmd.len() + 1 + args.len() > 512` — the separating space is
   counted even with no arguments, as upstream.
 - The check runs in `client_command` right after `args_concat` is computed
@@ -176,11 +176,11 @@ A direct port of `94c89b0`, using the range table the other votes already go
 through:
 
 - `clientkick_max_slot(sv_maxclients) = sv_maxclients - 1`
-  (`shared_api.rs:705-707`).
+  (`shared_api.rs:712-714`).
 - The `clientkick` entry in the `callvote` table (`shared_api.rs:296-305`)
   sets `min = 0`, `max = clientkick_max_slot(sv_maxclients)`, so the existing
   final test `vote_value_out_of_range(value, min, max)`
-  (`shared_api.rs:712-714`, also extracted) drops both directions:
+  (`shared_api.rs:719-721`, also extracted) drops both directions:
   `value < 0` and `value >= sv_maxclients`. Upstream's applied code uses the
   same `min = 0`, so a negative number is refused by the proxy as well, even
   though the game would also refuse it.
@@ -226,7 +226,7 @@ A direct port of `85403cd`, with the same choices:
 
 - `GC_ORDERS_COUNT = 7` (`shared_api.rs:34-36`), from `g_cmds.c:1721-1729`.
 - The pure predicate `gc_command_denied(player, order, sv_maxclients)`
-  (`shared_api.rs:697-699`, Helpers) is
+  (`shared_api.rs:704-706`, Helpers) is
   `atoi(player) >= sv_maxclients || atoi(order) >= GC_ORDERS_COUNT`. The
   `client_command` guard (`shared_api.rs:240-257`) calls it and drops the
   command with a debug-log line.
@@ -268,8 +268,8 @@ The old proxy rule accepted 18 shapes of 22–24 characters; **8 of them carry
 only 16 or 17 powers**. The 2026 fix requires at least 18 digits after the
 second `-` and rejects digits outside `0..=3`.
 
-**Our code (SOURCE (ours), TESTED).** `shared_api.rs:522-546` calls
-`forcepowers_is_valid` (`shared_api.rs:653-673`). The rule is the old one:
+**Our code (SOURCE (ours), TESTED).** `shared_api.rs:529-553` calls
+`forcepowers_is_valid` (`shared_api.rs:660-680`). The rule is the old one:
 22–24 characters, digits only, exactly two `-` at positions 1–5, never
 adjacent. It does **not** require 18 digits and accepts `4`–`9`.
 
@@ -305,9 +305,9 @@ must cooperate (about 10–15 by upstream's estimate). The 2026 fix cuts each at
 1 + 13 characters).
 
 **Our code (SOURCE (ours)).** `sanitize_userinfo` touches `name`,
-`model` and `forcepowers` only (`shared_api.rs:441-549`); the engine-side
+`model` and `forcepowers` only (`shared_api.rs:441-556`); the engine-side
 `SV_UserinfoChanged` wrapper touches `model` only
-(`hooks/engine_sv.rs:505-562`). `color1`/`color2` are never read or rewritten.
+(`hooks/engine_sv.rs:556-619`). `color1`/`color2` are never read or rewritten.
 
 **Impact.** Multi-client denial of service (gamestate overflow) on the retail
 client. Not a server crash.
@@ -358,11 +358,11 @@ A port of `3b3b252` with two parts:
      and the per-field counts compared without case. Extended ASCII is not
      checked. No cvar: the default is hardcoded, as upstream.
 2. **Sanitiser integration** (`shared_api.rs`):
-   - `sanitize_userinfo_bytes` (`shared_api.rs:441-549`) is the pure core:
+   - `sanitize_userinfo_bytes` (`shared_api.rs:441-556`) is the pure core:
      validation first (when `validate`), then name, model and forcepowers, with
      every write checked. A failed write returns
      `"Userinfo string length exceeded."` instead of leaving the old value.
-   - `sanitize_userinfo` (`shared_api.rs:559-605`) is the FFI wrapper: reads
+   - `sanitize_userinfo` (`shared_api.rs:566-612`) is the FFI wrapper: reads
      the engine userinfo, calls the core, stores `clean_name`, writes back. A
      refusal returns the reason instead; nothing is written.
    - `GAME_CLIENT_USERINFO_CHANGED` validates every non-bot client: the
@@ -372,7 +372,7 @@ A port of `3b3b252` with two parts:
      a `darksidetools` model keeps the chat.
    - The engine-side `SV_UserinfoChanged` wrapper uses the checked writer for
      its `model` → `kyle` rewrite and calls `SV_DropClient` when it does not
-     fit (`hooks/engine_sv.rs:552-556`), as JK2MV and upstream do.
+     fit (`hooks/engine_sv.rs:609-613`), as JK2MV and upstream do.
    - The unused game `Info_SetValueForKey` binding was removed from
      `jampgame.rs`; nothing calls the unchecked game writer anymore.
 
@@ -432,7 +432,7 @@ challenge.
 **Test.** A byte-site verification test (like the existing pristine-byte
 assertions) can be added with the fix; behaviour needs a server.
 
-### S9. `ip` userinfo key is not maintained — High
+### S9. `ip` userinfo key is not maintained — High — **FIXED 2026-11-02**
 
 Upstream: O1, commit `e54cb88` (*"fix: O1"*).
 
@@ -444,16 +444,38 @@ for every client at each map change) does not apply to a player already on the
 server. The fix re-derives `ip` from `netchan.remoteAddress` in
 `SV_UserinfoChanged` and refuses a connect without room for it, as OpenJK.
 
-**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:505-562`
-(`sv_userinfo_changed`) checks only the `model` key and then calls the
-original. No `ip` repair, no length refusal. `client_connect`
-(`shared_api.rs:88-119`) sends the banner only.
+**Our code before the fix (SOURCE (ours)).** `sv_userinfo_changed` checked
+only the `model` key and then called the original. There was no `ip` repair
+and no length refusal; `client_connect` sent the banner only.
 
 **Impact.** IP-ban bypass on map change; misleading game logs. Note this also
-undermines any future IP-based feature (O5).
+undermined any future IP-based feature (O5).
 
-**Test.** Pure `NET_AdrToString` formatting/length arithmetic could be unit
-tested once implemented.
+#### Applied (2026-11-02)
+
+Both halves of `e54cb88`:
+
+- `hooks/engine_sv::refresh_ip` (`hooks/engine_sv.rs:509-546`), called at the
+  start of `sv_userinfo_changed` (`:556-619`) before the model fix and the
+  original:
+  - `ip = "localhost"` for `NA_LOOPBACK`, otherwise the engine's own
+    `NET_AdrToString(remoteAddress)` (`a.b.c.d:port`, `bot`, …);
+  - writes it with the checked `userinfo::set_value_for_key`;
+  - on failure, `SV_DropClient(cl, "userinfo string length exceeded")` and the
+    original is not called.
+- The S6 pure core (`shared_api.rs:441-556`) refuses a **validated** userinfo
+  with no `ip` (`Userinfo string length exceeded.`). That covers the connect
+  packet too long for the engine to append `ip` in `SV_DirectConnect`. The
+  userinfo-change path is already repaired by `refresh_ip` before
+  `GAME_CLIENT_USERINFO_CHANGED` runs.
+- Bots keep an `ip` too (`NET_AdrToString` gives `bot`); the connect
+  requirement is skipped for them, as upstream.
+
+**Tests (TESTED, 1 new).**
+`sanitizer_requires_ip_for_a_validated_connect` pins the connect refusal and
+the bot exemption. `refresh_ip`'s address formatting and `SV_DropClient` path
+need the runtime check (fake `userinfo`, then `map_restart`, then read the
+game's `ip`).
 
 ### S10. Userinfo is not sanitised on connect — High — **FIXED 2026-11-02**
 
@@ -484,11 +506,11 @@ made S4 (forcepowers) and the model rules effective only after a subsequent
 
 The upstream design, split into a sanitiser and its two callers:
 
-- `sanitize_userinfo_bytes` (`shared_api.rs:441-549`) is the old
+- `sanitize_userinfo_bytes` (`shared_api.rs:441-556`) is the old
   `client_userinfo_changed` body as a pure core. It stops with the
   `darksidetools` anti-cheat reason on that model, **without producing a
   userinfo to write**; otherwise it sanitises and returns the new bytes. The
-  FFI wrapper `sanitize_userinfo` (`shared_api.rs:559-605`) reads the engine
+  FFI wrapper `sanitize_userinfo` (`shared_api.rs:566-612`) reads the engine
   userinfo, calls the core, and writes the result with `SetUserinfo`, turning a
   rejection into `Option<SanitizeRejection>`.
 - `GAME_CLIENT_CONNECT` (`lib.rs:153-195`) runs it for every non-bot connect
@@ -499,7 +521,7 @@ The upstream design, split into a sanitiser and its two callers:
   return as a refusal (its own `Banned.` path), prints the reason to the client
   and never enters the game. No banner, no TFFA/teamlock bookkeeping, no game
   call.
-- `client_userinfo_changed` (`shared_api.rs:614-639`) keeps the change-path
+- `client_userinfo_changed` (`shared_api.rs:621-646`) keeps the change-path
   behaviour: on the same reason it sends the anti-cheat chat and calls
   `DropClient`, then returns `false`; `vmMain` (`lib.rs:301-308`) returns 0
   instead of forwarding `GAME_CLIENT_USERINFO_CHANGED`.
@@ -566,14 +588,14 @@ from the connectionless entry wrappers:
 - The address table is a `HashMap` capped at 65536 entries, garbage-collected
   once per second; a new address beyond the cap is dropped. Only `NA_IP`
   sources are limited (loopback, bots and bad addresses are not).
-- `svc_status`/`svc_info` (`hooks/engine_sv.rs:390-450`) apply
+- `svc_status`/`svc_info` (`hooks/engine_sv.rs:393-453`) apply
   `status_allowed` after the q3infoboom length check.
-- `svc_remote_command` (`hooks/engine_sv.rs:298-388`) computes the password
+- `svc_remote_command` (`hooks/engine_sv.rs:301-358`) computes the password
   match once, logs the attempt (redacted), calls `rcon_allowed(valid)`, and
   only then applies the `writeconfig` `.cfg` filter (so a bad password still
   gets the engine's `Bad rconpassword.` reply).
 - New entry wrappers `sv_get_challenge` / `sv_direct_connect`
-  (`hooks/engine_sv.rs:456-485`) apply `address_allowed`; two new hooks
+  (`hooks/engine_sv.rs:459-488`) apply `address_allowed`; two new hooks
   (`SV_GetChallenge`, `SV_DirectConnect`) with pinned prologues. A dropped
   packet gets no `challengeResponse`/`connectResponse`. The getchallenge
   wrapper then answers statelessly (S18); the connect wrapper admits the
@@ -607,7 +629,7 @@ Cbuf), allows `x.so` (4 characters), and does not block `..`. The fix hooks
 `Com_WriteConfig_f` itself and accepts only `.cfg`, no `..`, not
 `mpdefault.cfg`/`default.cfg`, copying OpenJK.
 
-**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:298-388` is the old
+**Our code (SOURCE (ours)).** `hooks/engine_sv.rs:301-358` is the old
 `SVC_RemoteCommand` filter:
 
 ```rust
@@ -827,7 +849,7 @@ non-active clients, as Quake3e.
 
 **Our code (SOURCE (ours)).** We do not patch `SV_MapRestart_f`'s client-state
 store. We **do** port the `SV_ExecuteClientMessage` upstream gate (see
-`hooks/engine_sv.rs:1090-1116`), which is the other half of this interaction.
+`hooks/engine_sv.rs:1147-1173`), which is the other half of this interaction.
 A client that is connecting during a `map_restart` may still be stuck. Low
 functional impact.
 
@@ -867,7 +889,7 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 | 10-25 F3 (anti-cheat) | The 2026 corrected rule is largely what we have: `darksidetools` is a fixed-length prefix (kicks every suffixed model), `rancor`/`wampa` are prefixes (skins caught). S10 also implemented the "after the drop, return the reason; do not call `SetUserinfo` and do not forward" part, so the game no longer rewrites `CS_PLAYERS` for a dropped slot. Two minor differences remain: (a) we still only catch `jedi_/red` and `jedi_/blue`, not `jedi_` alone or other skins; (b) an empty model is left empty instead of forced to `kyle` (upstream says the retail game handles it, and we did not reproduce a problem). Neither is a bypass of the *kick*; they are cosmetic/robustness. |
 | 10-25 F4 (OpenJK API) | The Rust module exports only `dllEntry` and `vmMain` (`lib.rs:87-120`), i.e. upstream's chosen option A. No `GetModuleAPI`. |
 | 10-25 F5 (wrong cvars) | The Rust proxy does not register `sv_gametype`/`sv_fps` at all (`state.rs:22-43`); it reads what it needs through the engine. The bogus cvar cannot be created. |
-| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:881-941` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
+| 10-25 F8 (`SV_SvEntityForGentity`) | **COVERED, stricter**: `hooks/engine_sv.rs:938-998` validates `s.number`, the array base, the element size/alignment and the final index, then `Com_Error(ERR_DROP)`. Unlike JK2MV/2026 it does not fall back to `s.number` when the pointer is outside `g_entities`; it errors instead. Safe, but a behaviour difference if a game ever passes such a pointer (the retail game passes `&g_entities[n]`). |
 | 10-25 F9 (`netStatus` engine state) | Our netStatus only **reads** `cl->snapshotMsec` (`hooks/netstatus.rs:276`) and derives fps/packets itself; it does not write `snapshotMsec`. The bug (a display command changing a player's snapshot rate) does not exist. |
 | 10-25 F10 | F10.1/F10.5/F10.8 are refuted or engine-specific and not present. F10.2 (`1000 / sv_fps`): our netstatus/pps arithmetic is hardened (D-010). F10.4: we still compare command names/arguments by prefix (`shared_api.rs`), so we over-block (`teamvote`, `saber_*` NPCs, `gc…`) exactly like the 2019 proxy; the game compares whole names, so this is not a bypass. Cosmetic, Low. F10.6/F10.7 are about C++ code we do not have. |
 | O6 (server commands > 1022) | **Do not port**, upstream's own conclusion: the retail `scores` command legitimately exceeds 1022 and retail clients handle the truncation. |
@@ -890,19 +912,19 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
 `rust/src/shared_api.rs`:
 
 - the forcepowers shape check was moved **verbatim** out of the userinfo
-  sanitiser into the pure `forcepowers_is_valid` (`shared_api.rs:653-673`).
-- `command_line_too_long` (`shared_api.rs:683-685`) is the S1 predicate.
-- `gc_command_denied` (`shared_api.rs:697-699`) is the S3 predicate; the
+  sanitiser into the pure `forcepowers_is_valid` (`shared_api.rs:660-680`).
+- `command_line_too_long` (`shared_api.rs:690-692`) is the S1 predicate.
+- `gc_command_denied` (`shared_api.rs:704-706`) is the S3 predicate; the
   `client_command` guard only reads the cvar and calls it.
-- `clientkick_max_slot` (`shared_api.rs:705-707`) and
-  `vote_value_out_of_range` (`shared_api.rs:712-714`) are the S2 seam.
+- `clientkick_max_slot` (`shared_api.rs:712-714`) and
+  `vote_value_out_of_range` (`shared_api.rs:719-721`) are the S2 seam.
 - `connect_userinfo_sanitized` (`shared_api.rs:363-365`) is the S10 bot
   exemption.
-- `sanitize_userinfo_bytes` (`shared_api.rs:441-549`) is the S6 pure core. The
+- `sanitize_userinfo_bytes` (`shared_api.rs:441-556`) is the S6 pure core. The
   whole userinfo path is tested without an engine: name/model/forcepowers
   rewrites, duplicate-key refusal, the O8 write that cannot fit, the
   `darksidetools` refusal, and the bot path.
-- 20 new tests in this module: `connect_sanitiser_skips_bots_only`,
+- 21 new tests in this module: `connect_sanitiser_skips_bots_only`,
   `command_line_is_capped_at_512_bytes`,
   `gc_accepts_a_real_slot_and_a_listed_order`,
   `gc_drops_the_order_past_the_end`,
@@ -920,8 +942,9 @@ careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
   `sanitizer_rewrites_a_bad_name_model_and_forcepowers`,
   `sanitizer_refuses_a_duplicate_key`,
   `sanitizer_refuses_the_o8_write_that_cannot_fit`,
-  `sanitizer_refuses_darksidetools_without_writing` and
-  `sanitizer_skips_validation_for_bots`. The `*_known_gap_*` tests are
+  `sanitizer_refuses_darksidetools_without_writing`,
+  `sanitizer_skips_validation_for_bots` and
+  `sanitizer_requires_ip_for_a_validated_connect`. The `*_known_gap_*` tests are
   characterisation tests: they pin a live gap and say, in their doc comments,
   that they must be inverted when the finding is fixed.
 
@@ -944,7 +967,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 300 unit tests pass; the i686 release cdylib builds. No server was
+Result: 301 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1008,8 +1031,11 @@ None of these has been run yet; they are the runtime half of the fixes.
   client retries must reuse its entry.
 - S7: plant a 600-character userinfo value, then `rcon dumpuser <client>`.
 - S8: `connect` with a 1007-character userinfo.
-- S9: `userinfo` with a fake `ip`, then `map_restart`; check the game's logged
-  address.
+- S9: `userinfo` with a fake `ip`, then `map_restart`; the game must still see
+  the real address (the engine wrapper overwrote it). Also `connect` with a
+  userinfo too long for `ip` (1007 characters plus the engine's pair): the
+  proxy must refuse the client instead of letting the game check bans against
+  no address.
 
 ## 7. Order of work (most urgent first)
 
@@ -1032,8 +1058,8 @@ dependencies. It is the order the fixes are being applied in.
    unauthenticated DoS). *Fixed 2026-11-02.*
 7. ✅ **S18** — stateless/renewed challenges (availability companion of S11).
    *Fixed 2026-11-02.*
-8. **S9** — re-derive the `ip` userinfo key (High; IP-ban bypass, only
-   observable when bans are used).
+8. ✅ **S9** — re-derive the `ip` userinfo key (High; IP-ban bypass, only
+   observable when bans are used). *Fixed 2026-11-02.*
 9. **S4** — forcepowers 18 digits / 0..3 (Medium; the `*_known_gap_*` tests are
    ready to invert once S10 lands).
 10. **S5** — cut `color1`/`color2` at 15 (Medium, multi-client DoS).
@@ -1076,17 +1102,17 @@ Game behaviour (our authoritative copy for the game module):
 Rust rewrite (this repository):
 `rust/src/shared_api.rs:73-80` (`get_usercmd`), `:88-119` (`client_connect`),
 `:162-357` (`client_command`), `:363-365` (`connect_userinfo_sanitized`),
-`:441-549` (`sanitize_userinfo_bytes`, pure core), `:559-605`
-(`sanitize_userinfo`, FFI wrapper), `:614-639` (`client_userinfo_changed`),
-`:653-673` (`forcepowers_is_valid`), `:683-685` (`command_line_too_long`),
-`:697-699` (`gc_command_denied`), `:705-707` (`clientkick_max_slot`),
-`:712-714` (`vote_value_out_of_range`), and its `mod tests`;
+`:441-556` (`sanitize_userinfo_bytes`, pure core), `:566-612`
+(`sanitize_userinfo`, FFI wrapper), `:621-646` (`client_userinfo_changed`),
+`:660-680` (`forcepowers_is_valid`), `:690-692` (`command_line_too_long`),
+`:704-706` (`gc_command_denied`), `:712-714` (`clientkick_max_slot`),
+`:719-721` (`vote_value_out_of_range`), and its `mod tests`;
 `rust/src/userinfo.rs:145-338` (`value_for_key`, `set_value_for_key*`,
 `validate_userinfo`) and its `mod tests`;
 `rust/src/lib.rs:153-195` and `:301-308`;
-`rust/src/hooks/engine_sv.rs:298-388` (rcon), `:390-450` (status/info),
-`:456-485` (challenge/connect), `:505-562` (`SV_UserinfoChanged`),
-`:881-941` (`SV_SvEntityForGentity`);
+`rust/src/hooks/engine_sv.rs:301-358` (rcon), `:393-453` (status/info),
+`:459-488` (challenge/connect), `:509-546` (`refresh_ip`), `:556-619`
+(`SV_UserinfoChanged`), `:938-998` (`SV_SvEntityForGentity`);
 `rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-797`
 (engine hook table) and `:452-489` (trampoline copy);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;

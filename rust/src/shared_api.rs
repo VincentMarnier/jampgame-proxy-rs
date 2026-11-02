@@ -452,6 +452,13 @@ fn sanitize_userinfo_bytes(
     if info.is_empty() {
         return Ok(None);
     }
+    // S9 (10-25 O1): the engine adds `ip` from the real address before
+    // GAME_CLIENT_CONNECT; if it could not (a userinfo too long for the key),
+    // refuse instead of letting the game check bans against no address. The
+    // userinfo-change path re-adds `ip` in `SV_UserinfoChanged` first.
+    if validate && userinfo::value_for_key(info, b"ip").is_empty() {
+        return Err(rejection("Userinfo string length exceeded."));
+    }
     let mut info = info.to_vec();
 
     let name_val = userinfo::value_for_key(&info, b"name").to_vec();
@@ -1118,5 +1125,26 @@ mod tests {
             outcome.info.is_some(),
             "the bot userinfo is still sanitised, just not validated"
         );
+    }
+
+    /// S9 (10-25 O1): a non-bot connect whose userinfo has no `ip` was too long
+    /// for the engine to add it, so the game's ban check would see no address.
+    /// The connect is refused. A bot is not validated and keeps its userinfo.
+    #[test]
+    fn sanitizer_requires_ip_for_a_validated_connect() {
+        let without_ip = String::from_utf8(valid_userinfo())
+            .unwrap()
+            .replace("\\ip\\127.0.0.1:29070", "")
+            .into_bytes();
+        assert!(!without_ip.is_empty());
+
+        let outcome = sanitize_with(&without_ip, true);
+        assert!(!outcome.anti_cheat);
+        assert_eq!(outcome.reason.unwrap(), "Userinfo string length exceeded.");
+        assert!(outcome.info.is_none(), "nothing is written on a refusal");
+
+        let outcome = sanitize_with(&without_ip, false);
+        assert!(outcome.reason.is_none());
+        assert!(outcome.info.is_some(), "the bot path does not require `ip`");
     }
 }

@@ -39,6 +39,9 @@ pub struct Netadr {
     pub port: u16,
 }
 
+/// `netadr_t.type` for a loopback address (`NA_LOOPBACK`).
+const NA_LOOPBACK: i32 = 2;
+
 /// True once `attach_all` installed the detours.
 static HOOKS_ATTACHED: AtomicBool = AtomicBool::new(false);
 
@@ -495,9 +498,57 @@ fn cmd_argv_len(n: c_int) -> usize {
 // SV_UserinfoChanged (model path length) — entry wrapper
 // ---------------------------------------------------------------------------
 
+/// S9 (10-25 O1): the game's IP-ban check reads the `ip` userinfo key, which a
+/// client can replace with any `userinfo` command. Re-derive it from the real
+/// address before the game sees the userinfo. Returns `false` when the client
+/// was dropped because the key does not fit.
+///
+/// # Safety
+///
+/// `cl` must be a valid `client_t*`.
+unsafe fn refresh_ip(cl: usize) -> bool {
+    let userinfo = cl + OFFSET_CLIENT_USERINFO;
+    // SAFETY: cl is a valid client_t; netchan.remoteAddress is a netadr_t.
+    let from =
+        unsafe { core::ptr::read_unaligned((cl + OFFSET_NETCHAN_REMOTE_ADDRESS) as *const Netadr) };
+
+    let ip = if from.kind == NA_LOOPBACK {
+        // What the engines use for a local client (the engine's own
+        // SV_DirectConnect uses "localhost" too).
+        b"localhost".to_vec()
+    } else {
+        // `const char *NET_AdrToString(netadr_t)` (`0x807b314`) returns a
+        // static buffer; copy it before any other engine call.
+        // SAFETY: fixed engine address, cdecl `(netadr_t)`.
+        let f: unsafe extern "C" fn(Netadr) -> *const c_char =
+            unsafe { core::mem::transmute(engine::functions::NET_ADR_TO_STRING) };
+        let text = unsafe { f(from) };
+        if text.is_null() {
+            return true;
+        }
+        // SAFETY: the engine's static string is NUL-terminated.
+        unsafe { CStr::from_ptr(text) }.to_bytes().to_vec()
+    };
+
+    // SAFETY: cl->userinfo is a char[MAX_INFO_STRING] inside client_t.
+    let buffer = unsafe {
+        core::slice::from_raw_parts_mut(userinfo as *mut u8, crate::sdk::MAX_INFO_STRING)
+    };
+    if crate::userinfo::set_value_for_key(buffer, b"ip", &ip) {
+        return true;
+    }
+
+    // No room left: the fake or absent value would stay. Drop the client, as
+    // ioq3/OpenJK do (10-25 O1).
+    // SAFETY: cl is a valid client_t; literal reason.
+    unsafe { sv_drop_client(cl, c"userinfo string length exceeded") };
+    false
+}
+
 /// `Proxy_SV_UserinfoChanged` (`Proxy_sv_client.cpp:404-424`): force a valid
 /// model into `cl->userinfo` before the game's `ClientUserinfoChanged` runs
-/// (connection-time model-length / non-ASCII crash fix).
+/// (connection-time model-length / non-ASCII crash fix). Also re-derives `ip`
+/// (S9) before anything else.
 ///
 /// # Safety
 ///
@@ -517,6 +568,12 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
                 crate::diagnostics::escape_bytes(info, 512)
             ),
         );
+    }
+    // S9: before the model fix and the original, so the game never reads a
+    // client-supplied `ip`.
+    // SAFETY: cl is a valid client_t.
+    if !unsafe { refresh_ip(cl) } {
+        return;
     }
     // SAFETY: cl is a valid client_t; userinfo is NUL-terminated.
     let model =
