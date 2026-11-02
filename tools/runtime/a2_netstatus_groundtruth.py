@@ -33,6 +33,8 @@
 #   python3 /rt/a2_netstatus_groundtruth.py --mode single --sv-fps 20 \
 #       --client-fps 60 --snaps 20 --cl-maxpackets 30 --tn -15 --duration 15
 #   python3 /rt/a2_netstatus_groundtruth.py --mode matrix
+#   ... --server-set proxy_sv_voidTimeNudge=1 --server-set rconpassword=test
+#       (extra +set cvars for the server; used by a3_timenudge_void.sh)
 #
 # Read-only reference: nothing here writes under original/.
 
@@ -674,10 +676,23 @@ def run_batch(
     jitter_ms=0.0,
     request_table=True,
     seed=1,
+    server_sets=(),
 ):
     """One server run with a set of synthetic clients."""
+    extra_args = []
+    for item in server_sets:
+        key, _, value = item.partition("=")
+        extra_args += ["+set", key, value]
     log_path = os.path.join(artifacts, f"a2_{tag}_server.log")
-    server = ServerRun(engine, port, sv_fps, gamedata, log_path, net_forcenonlocal=net_forcenonlocal)
+    server = ServerRun(
+        engine,
+        port,
+        sv_fps,
+        gamedata,
+        log_path,
+        extra_args=extra_args,
+        net_forcenonlocal=net_forcenonlocal,
+    )
     try:
         if not server.wait_ready(port):
             raise RuntimeError(f"server did not become ready (see {log_path})")
@@ -920,6 +935,7 @@ def run_matrix(args):
                 tag=tag,
                 loss=loss,
                 jitter_ms=jitter,
+                server_sets=args.server_sets,
                 seed=idx,
             )
             run["sv_fps"] = sv_fps
@@ -996,6 +1012,14 @@ def main():
         action="store_true",
         help="server-side: net_forcenonlocal 1 (Sys_IsLANAddress false for everyone)",
     )
+    ap.add_argument(
+        "--server-set",
+        action="append",
+        default=[],
+        dest="server_sets",
+        metavar="KEY=VALUE",
+        help="extra server cvar (+set KEY VALUE), repeatable",
+    )
     args = ap.parse_args()
     os.makedirs(args.artifacts, exist_ok=True)
 
@@ -1020,6 +1044,7 @@ def main():
             tag="single",
             loss=args.loss,
             jitter_ms=args.jitter_ms,
+            server_sets=args.server_sets,
         )
         with open(os.path.join(args.artifacts, "a2_single.json"), "w") as fh:
             json.dump(run, fh, indent=1)

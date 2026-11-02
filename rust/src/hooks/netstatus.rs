@@ -41,9 +41,17 @@
 //! are **completely inert** (user directive, 2026-10-26). The raw per-cmd
 //! record feed is also what the per-client packet-rate limiter uses to derive
 //! each client's FPS (`crate::pps`), so it stays active while
-//! `proxy_sv_enableClientPpsLimit` or `proxy_sv_clientPpsLog` is on; with all
-//! three cvars off it does nothing beyond one cvar mirror read per usercmd
+//! `proxy_sv_enableClientPpsLimit` or `proxy_sv_clientPpsLog` is on. The same
+//! feed backs the optional `cl_timeNudge` neutralisation (D-015): while
+//! `proxy_sv_voidTimeNudge` or `proxy_sv_voidTimeNudgeLog` is on, the packet
+//! start refreshes the estimator verdict (every 500 ms) and the stub rewrites
+//! the cmd's `serverTime` (see `crate::timenudge`). With every one of those
+//! cvars off the feed does nothing beyond one cvar mirror read per usercmd
 //! message.
+//!
+//! The estimator is always fed the client's **raw** stamp, even while the
+//! cmd rewrite is active: feeding the adjusted value would make the estimator
+//! converge to "no nudge" and switch the correction off.
 //!
 //! The table's `packets/s` cell is rendered from the limiter's own accounting
 //! (`crate::pps::status`), not from the record ring: the ring only counts
@@ -61,28 +69,37 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine;
 use crate::hooks::engine_sv::{
-    client_num_from_addr, clients_base, cstr_bytes, read_i32, read_usize, svs_time,
+    client_num_from_addr, clients_base, cstr_bytes, read_i32, read_usize, svs_time, write_i32,
 };
 use crate::netstatus_est::{self, Estimate};
 use crate::sdk::{
-    CS_CONNECTED, CS_ZOMBIE, OFFSET_CLIENT_FRAMES, OFFSET_CLIENT_NAME, OFFSET_CLIENT_PING,
-    OFFSET_CLIENT_RATE, OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT, OFFSET_CLIENT_SNAPSHOT_MSEC,
-    OFFSET_CLIENT_STATE, PACKET_MASK, SIZEOF_CLIENT_SNAPSHOT_T, SIZEOF_CLIENT_T, Usercmd,
+    CS_CONNECTED, CS_ZOMBIE, OFFSET_CLIENT_FRAMES, OFFSET_CLIENT_LAST_USERCMD, OFFSET_CLIENT_NAME,
+    OFFSET_CLIENT_PING, OFFSET_CLIENT_RATE, OFFSET_CLIENT_SNAPSHOT_MESSAGE_SENT,
+    OFFSET_CLIENT_SNAPSHOT_MSEC, OFFSET_CLIENT_STATE, PACKET_MASK, SIZEOF_CLIENT_SNAPSHOT_T,
+    SIZEOF_CLIENT_T, Usercmd,
 };
 use crate::state::{
     self, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS,
+    CVAR_VOID_TIME_NUDGE, CVAR_VOID_TIME_NUDGE_LOG,
 };
 use crate::syscall;
+use crate::timenudge;
 
-/// Whether the shared per-usercmd record feed must run: the netStatus table
-/// needs it, the packet-rate limiter derives each client's FPS from it, and
-/// `proxy_sv_clientPpsLog` uses that same FPS-derived limit.
+/// Whether the shared per-usercmd record feed must run for `s`: the netStatus
+/// table needs it, the packet-rate limiter derives each client's FPS from it,
+/// `proxy_sv_clientPpsLog` uses that same FPS-derived limit, and
+/// `proxy_sv_voidTimeNudge`/`proxy_sv_voidTimeNudgeLog` (D-015) need the
+/// estimator's `cl_timeNudge` range.
+fn feed_enabled_in(s: &state::ProxyState) -> bool {
+    s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0
+        || s.cvars[CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
+        || s.cvars[CVAR_CLIENT_PPS_LOG].integer != 0
+        || s.cvars[CVAR_VOID_TIME_NUDGE].integer != 0
+        || s.cvars[CVAR_VOID_TIME_NUDGE_LOG].integer != 0
+}
+
 fn feed_enabled() -> bool {
-    state::with_state(|s| {
-        s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0
-            || s.cvars[CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
-            || s.cvars[CVAR_CLIENT_PPS_LOG].integer != 0
-    })
+    state::with_state(|s| feed_enabled_in(s))
 }
 
 /// `server.cvars.sv_maxclients->integer` (cvar slot 0x8273ea4). Returns 0 when
@@ -258,26 +275,47 @@ pub unsafe fn mark_packet_start(cl: usize, message_acknowledge: i32) {
     // SAFETY: cl is a valid client_t.
     let snapshot_msec = unsafe { read_i32(cl + OFFSET_CLIENT_SNAPSHOT_MSEC) };
     let fps = sv_fps();
-    state::with_state(|s| {
+    let void_enabled = timenudge::enabled();
+    let void_log = timenudge::logging();
+    let due = state::with_state(|s| {
         let c = &mut s.clients[client_num];
         c.packet_counter = c.packet_counter.wrapping_add(1);
-        let ns = &mut c.netstatus;
         // reset rules (D-007 step 4): sv_fps or snapshotMsec change
         // invalidates the window
-        if ns.sv_fps != fps || ns.snapshot_msec != snapshot_msec {
-            if ns.sv_fps != 0 || ns.snapshot_msec != 0 {
-                ns.reset();
+        if c.netstatus.sv_fps != fps || c.netstatus.snapshot_msec != snapshot_msec {
+            if c.netstatus.sv_fps != 0 || c.netstatus.snapshot_msec != 0 {
+                c.netstatus.reset();
+                // The new window does not describe the current clock yet:
+                // ramp the correction away instead of keeping a stale shift.
+                c.nudge_void.stop();
             }
-            ns.sv_fps = fps;
-            ns.snapshot_msec = snapshot_msec;
+            c.netstatus.sv_fps = fps;
+            c.netstatus.snapshot_msec = snapshot_msec;
         }
-        ns.mark_packet_start(now, message_sent, message_acknowledge);
+        c.netstatus
+            .mark_packet_start(now, message_sent, message_acknowledge);
+        (void_enabled || void_log) && c.nudge_void.due(now)
     });
+
+    // D-015: refresh the timeNudge-neutralisation verdict at most every
+    // `timenudge::REFRESH_MS`. The estimator itself must not run per command:
+    // it copies and sorts the window.
+    if due {
+        // SAFETY: cl is a valid client_t.
+        let msg_interval = unsafe { frames_msg_interval(cl, now) };
+        let est = compute(client_num, now, msg_interval);
+        if let Some(transition) =
+            timenudge::update(client_num, now, est.as_ref(), void_enabled, void_log)
+        {
+            // SAFETY: cl is a valid client_t.
+            unsafe { timenudge::print_transition(cl, transition) };
+        }
+    }
 }
 
 /// Per-usercmd feed: accumulate the cmd into the open packet record.
-pub fn feed_cmd(client_num: usize, cmd: &Usercmd) {
-    state::with_state(|s| s.clients[client_num].netstatus.feed_cmd(cmd.server_time));
+pub fn feed_cmd(client_num: usize, server_time: i32) {
+    state::with_state(|s| s.clients[client_num].netstatus.feed_cmd(server_time));
 }
 
 /// Drop one client's estimator window (connect/disconnect, D-007 step 4).
@@ -285,17 +323,20 @@ pub fn reset_client(client_num: usize) {
     state::with_state(|s| {
         if let Some(client) = s.clients.get_mut(client_num) {
             client.netstatus.reset();
+            client.nudge_void.clear();
         }
     });
 }
 
 /// Drop every estimator window (the shared feed off -> on). The reset is
 /// deferred to each client's next usercmd packet (`reset_pending`) so the hot
-/// path never clears the 512-record ring mid-packet.
+/// path never clears the 512-record ring mid-packet; the neutralisation state
+/// is cleared right away because no shift was applied while the feed was off.
 pub fn reset_all() {
     state::with_state(|s| {
         for client in s.clients.iter_mut() {
             client.netstatus.reset_pending = true;
+            client.nudge_void.clear();
         }
     });
 }
@@ -306,32 +347,75 @@ static FEED_WAS_OFF: AtomicBool = AtomicBool::new(false);
 
 /// `sv_client_think_stub` — the retarget of `call SV_ClientThink` inside the
 /// pristine `SV_UserMove` (0x804e891). Runs the pristine `SV_ClientThink`,
-/// then the per-usercmd netStatus feed (D-002.1 technique 3).
+/// then the per-usercmd netStatus feed (D-002.1 technique 3). While
+/// `proxy_sv_voidTimeNudge` is on, the cmd's `serverTime` is shifted by the
+/// client's estimated `cl_timeNudge` first (D-015, `crate::timenudge`), so the
+/// game processes the move on the neutral clock.
+///
+/// The estimator is fed the client's **raw** stamp: correcting the value the
+/// estimator sees would make it converge to "no nudge" and switch itself off.
 ///
 /// # Safety
 ///
 /// Entered from the engine's usercmd loop with `(client_t*, usercmd_t*)`.
 pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
-    // SAFETY: engine function at the fixed table; args from the engine loop.
-    unsafe { engine::sv_client_think(cl, cmd as usize) };
-
-    if !feed_enabled() {
-        FEED_WAS_OFF.store(true, Ordering::Relaxed);
-        return;
-    }
-    if FEED_WAS_OFF.swap(false, Ordering::Relaxed) {
-        reset_all();
-    }
-    // SAFETY: cmd is the engine's usercmd buffer.
-    let ucmd = unsafe { &*cmd };
     let client_num = client_num_from_addr(cl);
     // A stale `client_t*` (e.g. after disconnect) can yield an out-of-range
     // slot: fail closed instead of panicking (= abort) in the move-packet hot
     // path.
     if client_num >= crate::sdk::MAX_CLIENTS {
+        // Still run the pristine call: this stub replaces it.
+        // SAFETY: engine function at the fixed table; args from the engine loop.
+        unsafe { engine::sv_client_think(cl, cmd as usize) };
         return;
     }
-    feed_cmd(client_num, ucmd);
+
+    let voiding = timenudge::enabled();
+    let (feed, offset) = state::with_state(|s| {
+        let feed = feed_enabled_in(s);
+        // One ramp step per usercmd; the target is refreshed at packet start.
+        let offset = if feed && voiding {
+            s.clients[client_num].nudge_void.step()
+        } else {
+            0
+        };
+        (feed, offset)
+    });
+    let offset = if !feed {
+        FEED_WAS_OFF.store(true, Ordering::Relaxed);
+        0
+    } else if FEED_WAS_OFF.swap(false, Ordering::Relaxed) {
+        reset_all();
+        0
+    } else {
+        offset
+    };
+
+    // SAFETY: cmd is the engine's usercmd buffer.
+    let original = unsafe { (*cmd).server_time };
+    if offset != 0 {
+        // SAFETY: cmd is the engine's usercmd buffer, valid for this call.
+        unsafe { (*cmd).server_time = original.wrapping_add(offset) };
+    }
+
+    // SAFETY: engine function at the fixed table; args from the engine loop.
+    unsafe { engine::sv_client_think(cl, cmd as usize) };
+
+    if offset != 0 {
+        // Restore the engine's buffer and, more importantly, the stamp the
+        // pristine `SV_UserMove` compares the next packet's `cl_packetdup`
+        // copies against. The game already read the adjusted value through
+        // `trap_GetUsercmd` inside `SV_ClientThink`.
+        // SAFETY: cmd and cl are valid as above.
+        unsafe {
+            (*cmd).server_time = original;
+            write_i32(cl + OFFSET_CLIENT_LAST_USERCMD, original);
+        }
+    }
+
+    if feed {
+        feed_cmd(client_num, original);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +497,51 @@ fn pps_cell(status: Option<crate::pps::PpsSample>, fallback_pps: i32, enforcing:
     }
 }
 
+/// Width of the `timeNudge` column in the printed table (the same 13 as the
+/// header/rule; the `[lo..hi]` cell can be one character wider, as before).
+const TN_COL_WIDTH: usize = 13;
+
+/// The `timeNudge` cell for one client (D-007 diagnostic, D-015 colour rules).
+///
+/// Without `proxy_sv_voidTimeNudge` the cell reports the estimated range:
+///
+/// * red (`^1`) when the whole range is outside the release client's legal
+///   `[-30, 30]` — `hi < -30` or `lo > 30`: the player is outside the range the
+///   engine's own clamp can produce;
+/// * yellow (`^3`) when 0 is not in the range but the range is not entirely
+///   outside the legal clamp: the player is confidently using a non-zero
+///   setting;
+/// * white when 0 is in the range (consistent with the default setting).
+///
+/// With the feature active the column reports the value the server enforces:
+/// `0` for every client, red on the clients whose range excludes 0 (the
+/// timenudges being voided). A stale/filling window has no estimate, so it
+/// keeps the `-` placeholder (white).
+///
+/// Colour codes are not counted in [`TN_COL_WIDTH`], so the coloured cells stay
+/// aligned; `^7` restores the default colour for the following columns.
+fn tn_cell(est: Option<Estimate>, voiding: bool) -> String {
+    let Some(est) = est else {
+        return format!("{:>TN_COL_WIDTH$}", "-");
+    };
+    if voiding {
+        let zero = "0";
+        if est.lo > 0.0 || est.hi < 0.0 {
+            return format!("^1{zero:>TN_COL_WIDTH$}^7");
+        }
+        return format!("{zero:>TN_COL_WIDTH$}");
+    }
+    let range = format!("[{:.1}..{:.1}]", est.lo, est.hi);
+    let legal = timenudge::MAX_SHIFT_MS as f32;
+    if est.hi < -legal || est.lo > legal {
+        format!("^1{range:>TN_COL_WIDTH$}^7")
+    } else if est.lo > 0.0 || est.hi < 0.0 {
+        format!("^3{range:>TN_COL_WIDTH$}^7")
+    } else {
+        format!("{range:>TN_COL_WIDTH$}")
+    }
+}
+
 /// `Proxy_Engine_ClientCommand_NetStatus` (`Proxy_Engine_ClientCommand.cpp:
 /// 13-96`): print the per-player net status table to `client_num` (rate-limited
 /// to once per 500 ms of game time). D-007 columns:
@@ -438,6 +567,9 @@ pub fn client_command_net_status(client_num: c_int) {
 
     let maxclients = sv_maxclients().clamp(0, crate::sdk::MAX_CLIENTS as c_int);
     let fps_cvar = sv_fps();
+    // The `timeNudge` column reports the enforced value while D-015 is active;
+    // latch it once so one table cannot mix both renditions.
+    let voiding = timenudge::enabled();
     // SAFETY: engine memory layer initialised.
     let clients = unsafe { clients_base() };
 
@@ -489,13 +621,13 @@ pub fn client_command_net_status(client_num: c_int) {
             pps,
             crate::pps::enforcing(),
         );
-        let (tn_cell, rtt, jit) = match est {
+        let (tn, rtt, jit) = match est {
             Some(est) => (
-                format!("[{:.1}..{:.1}]", est.lo, est.hi),
+                tn_cell(Some(est), voiding),
                 format!("{:.1}", est.rtt_mean),
                 format!("{:.1}", est.rtt_dev),
             ),
-            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+            None => (tn_cell(None, voiding), "-".to_string(), "-".to_string()),
         };
 
         // SAFETY: cl is a valid client_t.
@@ -528,10 +660,8 @@ pub fn client_command_net_status(client_num: c_int) {
         }
 
         status.extend_from_slice(
-            format!(
-                "{ping_str} {rtt:>6} {jit:>5} {fps:4} {pps_cell} {tn_cell:>13} {snaps:5} {rate:6} "
-            )
-            .as_bytes(),
+            format!("{ping_str} {rtt:>6} {jit:>5} {fps:4} {pps_cell} {tn} {snaps:5} {rate:6} ")
+                .as_bytes(),
         );
         status.extend_from_slice(&clean_name);
         status.extend_from_slice(b"^7\n");
@@ -614,5 +744,86 @@ mod tests {
             pps_cell(Some(sample(200_000, 100_000, 0)), 0, false),
             "^1200000^7/100000"
         );
+    }
+
+    fn estimate(lo: f32, hi: f32) -> Estimate {
+        Estimate {
+            samples: 10,
+            messages: 10,
+            cmd_interval: 16.0,
+            lag: 0.0,
+            ackdelay: 0.0,
+            clock_gap: 0.0,
+            rtt_mean: 0.0,
+            rtt_dev: 0.0,
+            tn: (lo + hi) / 2.0,
+            tn_plan: 0.0,
+            raw_mean: 0.0,
+            se: 0.0,
+            lo,
+            hi,
+            step: false,
+        }
+    }
+
+    #[test]
+    fn tn_cell_is_white_when_zero_is_in_the_range() {
+        assert_eq!(tn_cell(Some(estimate(-2.0, 3.0)), false), "  [-2.0..3.0]");
+        // A range that exceeds the legal clamp on both sides still contains 0:
+        // the client could be at the default setting, so it stays white.
+        assert_eq!(tn_cell(Some(estimate(-40.0, 40.0)), false), "[-40.0..40.0]");
+    }
+
+    #[test]
+    fn tn_cell_is_yellow_when_zero_is_outside_a_legal_range() {
+        assert_eq!(
+            tn_cell(Some(estimate(-17.9, -10.5)), false),
+            "^3[-17.9..-10.5]^7"
+        );
+        // On the clamp boundary the reading is still legal (`hi == -30`).
+        assert_eq!(
+            tn_cell(Some(estimate(-30.0, -25.0)), false),
+            "^3[-30.0..-25.0]^7"
+        );
+    }
+
+    #[test]
+    fn tn_cell_is_red_when_the_whole_range_is_outside_the_clamp() {
+        assert_eq!(
+            tn_cell(Some(estimate(-40.0, -33.0)), false),
+            "^1[-40.0..-33.0]^7"
+        );
+        assert_eq!(
+            tn_cell(Some(estimate(33.0, 40.0)), false),
+            "^1 [33.0..40.0]^7"
+        );
+        // `hi < -30` / `lo > 30` are strict: -30 itself is not red.
+        assert_eq!(
+            tn_cell(Some(estimate(-40.0, -30.0)), false),
+            "^3[-40.0..-30.0]^7"
+        );
+    }
+
+    #[test]
+    fn tn_cell_reports_zero_while_the_feature_voids() {
+        // 0 is in the range: the neutral setting, nothing to void.
+        assert_eq!(tn_cell(Some(estimate(-2.0, 3.0)), true), "            0");
+        // The range excludes 0: this timenudge is being voided (red).
+        assert_eq!(
+            tn_cell(Some(estimate(-17.9, -10.5)), true),
+            "^1            0^7"
+        );
+        // Even a range entirely outside the clamp is reported as a red 0.
+        assert_eq!(
+            tn_cell(Some(estimate(-40.0, -33.0)), true),
+            "^1            0^7"
+        );
+    }
+
+    #[test]
+    fn tn_cell_keeps_the_placeholder_without_an_estimate() {
+        assert_eq!(tn_cell(None, false), "            -");
+        // The feature cannot void without a reading; it stays unknown.
+        assert_eq!(tn_cell(None, true), "            -");
     }
 }

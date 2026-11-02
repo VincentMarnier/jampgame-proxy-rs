@@ -74,3 +74,10 @@
   `packets/s` cell renders the same `over_limit` verdict: red, showing the
   effective rate with the limiter on and `<actual>/<limit>` (red actual,
   default limit colour) with it off — see D-014.6.
+- `0015-void-timenudge.md` — opt-in server-side `cl_timeNudge`
+  neutralisation (D-015): `proxy_sv_voidTimeNudge` rewrites each usercmd's
+  `serverTime` by the estimator's setting when the reported range excludes 0
+  (clamped to ±30, 1 ms per command ramp, two-reading confirmation), and
+  `proxy_sv_voidTimeNudgeLog` reports the non-zero / back-to-zero transitions
+  without applying the shift; the engine's duplicate filtering keeps the raw
+  stamps (`lastUsercmd.serverTime` restored after `SV_ClientThink`).

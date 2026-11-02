@@ -19,7 +19,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features.
-pub const PROXY_CVARS: [(&CStr, &CStr); 19] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableRconCmdCooldown", c"0"),
     (c"proxy_sv_enableNetStatus", c"0"),
@@ -39,6 +39,8 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 19] = [
     (c"proxy_sv_enableClientPpsLimit", c"0"),
     (c"proxy_sv_globalMaxPps", c"100"),
     (c"proxy_sv_clientPpsLog", c"0"),
+    (c"proxy_sv_voidTimeNudge", c"0"),
+    (c"proxy_sv_voidTimeNudgeLog", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -83,6 +85,12 @@ pub const CVAR_GLOBAL_MAX_PPS: usize = 17;
 /// `proxy_sv_clientPpsLog`: print one line for a client whose window is above
 /// its limit (clients inside their limit stay silent).
 pub const CVAR_CLIENT_PPS_LOG: usize = 18;
+/// `proxy_sv_voidTimeNudge`: rewrite the usercmd `serverTime` of a client whose
+/// estimated `cl_timeNudge` range excludes 0 (D-015, `crate::timenudge`).
+pub const CVAR_VOID_TIME_NUDGE: usize = 19;
+/// `proxy_sv_voidTimeNudgeLog`: log the non-zero/back-to-zero transitions;
+/// works without `proxy_sv_voidTimeNudge` (the shift is reported, not applied).
+pub const CVAR_VOID_TIME_NUDGE_LOG: usize = 20;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -596,6 +604,9 @@ pub struct ClientEntry {
     pub netstatus: NetstatusState,
     /// Incoming packet-rate accounting / smoothing (`crate::pps`).
     pub pps: crate::pps::PpsState,
+    /// `cl_timeNudge` neutralisation (`crate::timenudge`, D-015): the applied
+    /// usercmd `serverTime` shift, its ramp target and the log edge.
+    pub nudge_void: crate::timenudge::VoidState,
     pub last_time_net_status: i32,
     /// Monotonic packet-identity counter for the cmdStats feed: bumped once
     /// per usercmd client message by the `SV_ExecuteClientMessage` entry
@@ -617,6 +628,7 @@ impl Default for ClientEntry {
             muted: false,
             netstatus: NetstatusState::default(),
             pps: crate::pps::PpsState::default(),
+            nudge_void: crate::timenudge::VoidState::default(),
             last_time_net_status: 0,
             packet_counter: 0,
             game_stats: [GameStats::default(); MAX_CLIENTS],
@@ -874,6 +886,8 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_CLIENT_PPS_LIMIT].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_GLOBAL_MAX_PPS].1.to_bytes(), b"100");
         assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_LOG].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

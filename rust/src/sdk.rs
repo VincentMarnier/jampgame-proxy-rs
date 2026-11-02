@@ -522,6 +522,10 @@ pub const OFFSET_CLIENT_MESSAGE_ACKNOWLEDGE: usize = 132116;
 /// `offsetof(client_t, gamestateMessageNum)` (binary: `SV_ExecuteClientMessage`
 /// compares the ack against `0x20418` for the dropped-gamestate resend).
 pub const OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM: usize = 132120;
+/// `offsetof(client_t, lastUsercmd)` — `usercmd_t` (binary: the whole-struct
+/// copy at the top of `SV_ClientThink` (0x804e634) stores 28 bytes at
+/// `cl+0x20420`; `serverTime` is the first word, `cl+0x20420`).
+pub const OFFSET_CLIENT_LAST_USERCMD: usize = 132128;
 /// `offsetof(client_t, lastClientCommandString)` — `char[MAX_STRING_CHARS]`
 /// (binary: `SV_ClientCommand` keeps it at `cl+0x20444`, right before `gentity`;
 /// also the original proxy's `strstr(..., "nextdl")` haystack).
@@ -842,6 +846,13 @@ mod tests {
         assert_eq!(OFFSET_CLIENT_RELIABLE_ACKNOWLEDGE, 132108);
         assert_eq!(OFFSET_CLIENT_MESSAGE_ACKNOWLEDGE, 132116);
         assert_eq!(OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM, 132120);
+        assert_eq!(OFFSET_CLIENT_LAST_USERCMD, 132128);
+        // `lastUsercmd` (28) + `lastMessageNum` (4) + `lastClientCommand` (4)
+        // end exactly where the binary places `lastClientCommandString`.
+        assert_eq!(
+            OFFSET_CLIENT_LAST_USERCMD + SIZEOF_USERCMD + 8,
+            OFFSET_CLIENT_LAST_CLIENT_COMMAND
+        );
         assert_eq!(OFFSET_CLIENT_LAST_CLIENT_COMMAND, 132164);
         assert_eq!(OFFSET_CLIENT_GENTITY, 133188);
         assert_eq!(OFFSET_CLIENT_DOWNLOAD_NAME, 133224);

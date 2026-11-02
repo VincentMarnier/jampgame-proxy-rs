@@ -47,6 +47,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± 2, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_globalMaxPps`               | 100     | global hard ceiling on accepted packets per second per client (`0` = no ceiling); the per-client FPS-derived limit is capped to it |
 | `proxy_sv_clientPpsLog`               | 0       | log client packet-rate limit transitions (starts using too many packets / back under the limit); works on its own without the limiter |
+| `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
+| `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -203,12 +205,73 @@ ping    rtt   jit  fps packets/s     timeNudge snaps   rate name
   stamped with and reported as a range: the likely interval, e.g.
   `[-17.9..-10.5]` means "between -17.9 and -10.5" (true value -15 here).
   `-` means there is not enough data yet. Values are never clamped to ±30:
-  a reading outside that range is evidence of a modified client.
+  a reading outside that range is evidence of a modified client. The value is
+  coloured:
+  - **white** when 0 is inside the range (consistent with the default
+    setting);
+  - **yellow** when 0 is outside the range but the range is not entirely
+    outside the legal clamp (the player is confidently using a non-zero
+    setting);
+  - **red** when the whole range is outside the client's ±30 clamp
+    (`max < -30` or `min > 30`), i.e. the reading cannot come from a stock
+    client.
+
+  With `proxy_sv_voidTimeNudge` active, the column instead shows the value the
+  server enforces: `0` for every player, in **red** on the players whose range
+  excludes 0 (their timenudge is being voided), white on the rest.
 * **snaps** — how many times per second the server sends this player a view of
   the game (their `snaps` setting, capped by the server's `sv_fps`).
 * **rate** — the player's bandwidth setting (bytes per second the game is
   allowed to use).
 * **name** — the player.
+
+### Time nudge neutralisation
+
+`cl_timeNudge` is a client-side setting that shifts the clock the player's game
+stamps into its moves: a negative value makes the client run "ahead" of the
+server. It is never transmitted, but the [net status](#net-status) estimator
+recovers it. With `proxy_sv_voidTimeNudge 1`, the proxy uses that estimate to
+put the game back on the neutral clock: when the reported range **excludes 0**
+(so the player is confidently using a non-zero setting) every usercmd's
+`serverTime` is shifted by the estimated setting before the game processes it.
+The client keeps its own setting; the server stops accepting the timing
+advantage.
+
+Details worth knowing:
+
+- The shift is the rounded estimate, clamped to ±30 ms — the 2003 release
+  client's own `cl_timeNudge` clamp. A reading beyond that is left uncorrected
+  rather than amplified.
+- It engages only after two consecutive refreshed ranges exclude 0 (about one
+  second), because the first window after a connect can still contain startup
+  artifacts, and it needs the ~5 s estimation window to settle. A range that
+  contains 0 disengages immediately.
+- The applied shift moves by 1 ms per command in either direction, so engaging
+  or disengaging never drops a move (a 30 ms jump would fail the game's
+  `msec < 1` guard) or creates one oversized movement frame. The player's
+  timeline is shifted by the same total amount either way.
+- Only the server side is corrected: the player's own prediction and rendering
+  still run on their shifted clock, but the game no longer processes their
+  moves on it.
+- While the feature is active the netStatus table's `timeNudge` column shows
+  what the server enforces: `0` for every player, **red** on the players being
+  voided (their estimated range excludes 0) and white on the rest (a player
+  with no settled estimate keeps `-`). The estimator itself still reads the raw
+  command stamps, so the red marks and the log follow the player's real
+  setting.
+- It needs `proxy_sv_enable 1` like every feature, but not
+  `proxy_sv_enableNetStatus`.
+
+`proxy_sv_voidTimeNudgeLog 1` logs transitions, like the packet-rate log:
+
+```text
+----- proxy-rs: timeNudge non-zero: estimate=[-17.0..-11.1] shift=-14 client=2 name="..." adr="..."
+----- proxy-rs: timeNudge back to zero: estimate=[-1.2..3.1] client=2 name="..." adr="..."
+```
+
+It works on its own: with `proxy_sv_voidTimeNudge 0` it still reports the shift
+the feature *would* apply, without rewriting any command. A client that stays
+on the same side of zero is silent.
 
 ### Client packet rate
 

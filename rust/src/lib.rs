@@ -47,6 +47,7 @@ mod syscall;
 mod teamlock;
 mod teamoverlay;
 mod tffa;
+mod timenudge;
 mod utils;
 
 use core::ffi::c_int;
@@ -453,7 +454,7 @@ fn update_proxy_cvars() {
     if !original::is_loaded() {
         return;
     }
-    let enabled = state::with_state(|s| {
+    let (enabled, void_nudge, void_nudge_log) = state::with_state(|s| {
         for (i, _) in PROXY_CVARS.iter().enumerate() {
             let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
             // SAFETY: cvar is stable within the state.
@@ -478,9 +479,23 @@ fn update_proxy_cvars() {
             s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
             s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
         );
-        s.cvars[state::CVAR_ENABLE].integer != 0
+        (
+            s.cvars[state::CVAR_ENABLE].integer,
+            s.cvars[state::CVAR_VOID_TIME_NUDGE].integer,
+            s.cvars[state::CVAR_VOID_TIME_NUDGE_LOG].integer,
+        )
     });
-    state::set_proxy_enabled(enabled);
+    // Mirrored after the state lock is released: the off -> on edge clears the
+    // per-client shifts, which itself takes the lock.
+    timenudge::set_config(void_nudge, void_nudge_log);
+    let was_enabled = state::proxy_enabled();
+    state::set_proxy_enabled(enabled != 0);
+    // The hook layer is detached while the master switch is off, so a shift
+    // left in the state would otherwise be applied on the first packet after a
+    // runtime re-enable.
+    if enabled == 0 && was_enabled {
+        timenudge::clear_offsets();
+    }
 }
 
 // ---------------------------------------------------------------------------
