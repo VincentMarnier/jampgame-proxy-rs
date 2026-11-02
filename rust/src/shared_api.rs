@@ -526,6 +526,14 @@ fn sanitize_userinfo_bytes(
         }
     }
 
+    // F5 (10-25): `color1` and `color2` are copied whole into `CS_PLAYERS`,
+    // which is part of every client's gamestate (16000 characters at most).
+    // Cut each at 15, as OpenJK; TaystJK/EternalJK put a hat or cape name after
+    // the colour (1 + 13 characters).
+    if !truncate_colors(&mut info) {
+        return Err(rejection("Userinfo string length exceeded."));
+    }
+
     // Fix forcepowers crash (`Proxy_SharedAPI.cpp:270-324`).
     let mut force_powers = [0u8; 30];
     let fp_val = userinfo::value_for_key(&info, b"forcepowers").to_vec();
@@ -741,6 +749,21 @@ fn clientkick_max_slot(sv_maxclients: i32) -> i32 {
 /// with `0..=clientkick_max_slot(sv_maxclients)`.
 fn vote_value_out_of_range(value: i32, min: i32, max: i32) -> bool {
     value < min || value > max
+}
+
+/// Cut `color1` and `color2` at 15 characters (F5, upstream `01adba1`): the
+/// values go as they are into the player's `CS_PLAYERS` configstring, which is
+/// part of every client's gamestate. A colour is 1 digit plus up to 13
+/// characters of a hat/cape name in TaystJK/EternalJK, so 15 keeps the
+/// cosmetics. Returns `false` when the (shorter) write does not fit.
+fn truncate_colors(info: &mut Vec<u8>) -> bool {
+    for key in [b"color1".as_slice(), b"color2".as_slice()] {
+        let color = userinfo::value_for_key(info, key).to_vec();
+        if color.len() > 15 && !userinfo::set_value_for_key_vec(info, key, &color[..15]) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Log a command the proxy refused to forward (or a client that tried to send
@@ -1165,5 +1188,35 @@ mod tests {
         let outcome = sanitize_with(&without_ip, false);
         assert!(outcome.reason.is_none());
         assert!(outcome.info.is_some(), "the bot path does not require `ip`");
+    }
+
+    /// F5 (10-25): `color1`/`color2` go into every client's gamestate; cut them
+    /// at 15, keeping the `<colour><hat/cape>` cosmetics.
+    #[test]
+    fn sanitizer_cuts_color1_and_color2_to_15() {
+        let input = String::from_utf8(valid_userinfo())
+            .unwrap()
+            .replace("\\color1\\4", "\\color1\\4abcdefghijklmnopqrstuvwxyz")
+            .replace("\\color2\\4", "\\color2\\4ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            .into_bytes();
+
+        let outcome = sanitize_with(&input, true);
+        assert!(outcome.reason.is_none());
+        let out = outcome
+            .info
+            .expect("the sanitised userinfo must be written");
+        assert_eq!(
+            crate::userinfo::value_for_key(&out, b"color1"),
+            b"4abcdefghijklmn"
+        );
+        assert_eq!(
+            crate::userinfo::value_for_key(&out, b"color2"),
+            b"4ABCDEFGHIJKLMN"
+        );
+        assert_eq!(
+            crate::userinfo::value_for_key(&out, b"color1").len(),
+            15,
+            "1 colour digit + 14 characters"
+        );
     }
 }
