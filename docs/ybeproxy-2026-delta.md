@@ -81,7 +81,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | O9 | movement events that lag every player | Medium | **ACCEPTED** (not fixed upstream) |
 | O10 | `forwardmove` of −128 | Low | **LIVE** |
 | O11 | `MSG_ReadBits` reads past the message | Low | **LIVE** |
-| O12 | `Info_SetValueForKey` writes one byte past | Medium | **LIVE** |
+| O12 | `Info_SetValueForKey` writes one byte past | Medium | **FIXED** 2026-11-02 |
 
 Additional 2026 fixes that are not in either audit are listed in
 [Section 4](#4-crash-and-availability-fixes-outside-the-two-audits).
@@ -450,7 +450,7 @@ The 2026 option 2, as a full rewrite (the original is never called):
 `info_print_leaves_a_long_key_unpadded`. The live `rcon dumpuser` check is in
 [Section 6](#6-tests-and-test-plan).
 
-### S8. `Info_SetValueForKey` writes one byte past the buffer — Medium
+### S8. `Info_SetValueForKey` writes one byte past the buffer — Medium — **FIXED 2026-11-02**
 
 Upstream: O12, commit `ed11d28` (*"fix: O12"*).
 
@@ -462,18 +462,35 @@ through `SV_DirectConnect`'s local `userinfo[1024]` after the engine appends
 `\ip\<address>` (17 characters). The fix flips `jbe` to `jb` at four
 immediate-byte sites, on both functions and platforms.
 
-**Our code (SOURCE (ours)).** The Rust port has no such inline patch: the
-engine patches applied at attach are the rcon timer NOP, the redirect-buffer
-byte, the `ipAuthorize` call NOP, the RMG branch and the two call-site
-retargets (`hooks/mod.rs:283-307`). There is no `Info_SetValueForKey` length
-patch in `patch.rs`/`engine.rs`.
+**Our code before the fix (SOURCE (ours)).** The Rust port had no such inline
+patch: the engine patches applied at attach did not touch the length test.
 
 **Impact.** One-byte stack overflow on connect (crash/corruption depending on
 what follows the local buffer). Triggerable unauthenticated with a valid
 challenge.
 
-**Test.** A byte-site verification test (like the existing pristine-byte
-assertions) can be added with the fix; behaviour needs a server.
+#### Applied (2026-11-02)
+
+A direct port of `ed11d28`, for the Linux engine:
+
+- `engine::patches` now holds the two sites and the byte values
+  (`INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR = 0x807fe24`,
+  `..._BIG_LENGTH_JBE_ADDR = 0x8080024`, pristine `0x76`, patched `0x72`),
+  verified on `linuxjampded` (`cmp $0x400,%ebx; jbe` and
+  `cmp $0x2000,%ebx; jbe`).
+- `attach_all` (`hooks/mod.rs`) flips both bytes to `jb`; `revert_inline_patches`
+  restores `jbe` when the master switch is off, so `proxy_sv_enable 0` gives
+  the pristine engine.
+- This covers every engine caller, not only `SV_DirectConnect`: `connect`
+  userinfo, `serverinfo`/`systeminfo` (the `_Big` variant) and anything else
+  that writes an info string near the boundary. The proxy's own writes already
+  use the fixed `>=` in `userinfo::set_value_for_key`.
+
+**Tests (TESTED, 1 new).**
+`info_set_value_for_key_length_sites_are_pinned` pins both addresses, the
+pristine/patched bytes and their presence in the engine text range. The
+behavioural check remains the runtime one in
+[Section 6](#6-tests-and-test-plan).
 
 ### S9. `ip` userinfo key is not maintained — High — **FIXED 2026-11-02**
 
@@ -1037,6 +1054,9 @@ every null-instance group and the `void**` dereference.
 20-character key padding, a 600-character value kept intact (the retail 512
 buffer would overflow), a long key left unpadded, and `MISSING VALUE`.
 
+`rust/src/patch.rs` (1 new test): the `Info_SetValueForKey` length sites and
+the pristine/patched `jbe`/`jb` bytes.
+
 Run:
 
 ```sh
@@ -1046,7 +1066,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 307 unit tests pass; the i686 release cdylib builds. No server was
+Result: 308 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1114,7 +1134,10 @@ None of these has been run yet; they are the runtime half of the fixes.
   expired one must get `No or bad challenge for address.`, and a `connect` the
   client retries must reuse its entry.
 - S7: plant a 600-character userinfo value, then `rcon dumpuser <client>`.
-- S8: `connect` with a 1007-character userinfo.
+- S8: `connect` with a 1007-character userinfo (the engine's `\ip\<address>`
+  pair brings the sum to exactly 1024): the request must be refused by the
+  length test, with no corruption/crash. Also exercise `serverinfo`/`systeminfo`
+  near `BIG_INFO_STRING`.
 - S9: `userinfo` with a fake `ip`, then `map_restart`; the game must still see
   the real address (the engine wrapper overwrote it). Also `connect` with a
   userinfo too long for `ip` (1007 characters plus the engine's pair): the
@@ -1150,7 +1173,8 @@ dependencies. It is the order the fixes are being applied in.
 11. ✅ **S19** — null Ghoul2 instance (Medium crash, trigger not reproduced).
     *Fixed 2026-11-02.*
 12. ✅ **S7** — `Info_Print` / `dumpuser` (Medium). *Fixed 2026-11-02.*
-13. **S8** — `Info_SetValueForKey` one-byte overflow (Medium, connect path).
+13. ✅ **S8** — `Info_SetValueForKey` one-byte overflow (Medium, connect path).
+    *Fixed 2026-11-02.*
 14. **S12** — `Com_WriteConfig_f` (Medium, rcon admin only; mind the A1
     relocation note).
 15. **O5** — connections per IP address (Medium, optional availability).
@@ -1200,7 +1224,7 @@ its `mod tests`;
 `:557-582` (`info_print`), `:603-640` (`refresh_ip`), `:650-713`
 (`SV_UserinfoChanged`),
 `:1032-1092` (`SV_SvEntityForGentity`);
-`rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-799`
+`rust/src/hooks/mod.rs:286-384` (intra patches), `rust/src/patch.rs:692-799`
 (engine hook table) and `:452-489` (trampoline copy);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its

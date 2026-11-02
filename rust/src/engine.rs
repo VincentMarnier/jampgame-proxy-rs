@@ -136,6 +136,19 @@ pub mod patches {
     pub const SVC_REMOTE_COMMAND_TIMER_NOP_LEN: usize = 25;
     pub const SVC_REMOTE_COMMAND_REDIRECT_LEN_ADDR: usize = 0x0805_6c7d;
     pub const SVC_REMOTE_COMMAND_REDIRECT_LEN_BYTE: u8 = 0x03;
+
+    /// `Info_SetValueForKey` length test: `cmp $0x400, %ebx; jbe` at
+    /// `0x807fe24`. `jbe` lets a pair that brings the string to exactly
+    /// `MAX_INFO_STRING` through, and the `strcat`/`strcpy` then write the
+    /// terminator one byte past the caller's 1024-byte buffer (O12/S8).
+    /// Changing `0x76` to `0x72` (`jb`) refuses that boundary.
+    pub const INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR: usize = 0x0807_fe24;
+    /// Same site in `Info_SetValueForKey_Big` (`cmp $0x2000`), at
+    /// `0x8080024`.
+    pub const INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR: usize = 0x0808_0024;
+    /// The retail `jbe` (`0x76`) and the patched `jb` (`0x72`).
+    pub const INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE: u8 = 0x76;
+    pub const INFO_SET_VALUE_FOR_KEY_JBE_PATCHED: u8 = 0x72;
 }
 
 #[allow(dead_code)]

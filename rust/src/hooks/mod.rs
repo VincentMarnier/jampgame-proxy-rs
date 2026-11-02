@@ -296,6 +296,17 @@ pub unsafe fn attach_all() {
             crate::engine::patches::SVC_REMOTE_COMMAND_REDIRECT_LEN_ADDR,
             crate::engine::patches::SVC_REMOTE_COMMAND_REDIRECT_LEN_BYTE,
         );
+        // Info_SetValueForKey(_Big): `jbe` -> `jb`, so a pair that brings the
+        // string to exactly MAX_INFO_STRING (or BIG_INFO_STRING) is refused
+        // instead of writing the terminator one byte past the buffer (O12/S8).
+        patch::patch_byte(
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR,
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PATCHED,
+        );
+        patch::patch_byte(
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR,
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PATCHED,
+        );
         // anti-DDoS: drop the SV_AuthorizeIpPacket dispatch (NOP the call).
         patch::nop_bytes(patch::CALL_IP_AUTHORIZE, 5);
         // SV_SendClientGameState: force the old-RMG else path

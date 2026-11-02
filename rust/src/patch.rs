@@ -987,6 +987,14 @@ pub unsafe fn revert_inline_patches() {
             crate::engine::patches::SVC_REMOTE_COMMAND_REDIRECT_LEN_ADDR,
             &[PRISTINE_SVC_REMOTE_COMMAND_REDIRECT_BYTE],
         );
+        restore_code_if_changed(
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR,
+            &[crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE],
+        );
+        restore_code_if_changed(
+            crate::engine::patches::INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR,
+            &[crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE],
+        );
         restore_code_if_changed(CALL_IP_AUTHORIZE, &PRISTINE_CALL_IP_AUTHORIZE);
         restore_code_if_changed(RMG_BRANCH, &PRISTINE_RMG_BRANCH);
     }
@@ -1306,6 +1314,25 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, ENGINE_SITES.len() + GAME_SITES.len());
+    }
+
+    #[test]
+    fn info_set_value_for_key_length_sites_are_pinned() {
+        use crate::engine::patches::{
+            INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR, INFO_SET_VALUE_FOR_KEY_JBE_PATCHED,
+            INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE, INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR,
+        };
+        // `cmp $0x400, %ebx; jbe` / `cmp $0x2000, %ebx; jbe` on linuxjampded.
+        assert_eq!(INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR, 0x0807_fe24);
+        assert_eq!(INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR, 0x0808_0024);
+        assert_eq!(INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE, 0x76); // jbe
+        assert_eq!(INFO_SET_VALUE_FOR_KEY_JBE_PATCHED, 0x72); // jb
+        for addr in [
+            INFO_SET_VALUE_FOR_KEY_LENGTH_JBE_ADDR,
+            INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR,
+        ] {
+            assert!((crate::engine::ENGINE_TEXT_LO..crate::engine::ENGINE_TEXT_HI).contains(&addr));
+        }
     }
 
     #[test]
