@@ -128,6 +128,11 @@ pub const G_GET_CONFIGSTRING: i32 = 21;
 pub const G_GET_USERINFO: i32 = 22;
 pub const G_SET_USERINFO: i32 = 23;
 pub const G_GET_USERCMD: i32 = 40;
+/// `G_SEND_CONSOLE_COMMAND(int exec_when, const char *text)` (`g_public.h:138`,
+/// enum-counted 16). S14 screens the vote's `EXEC_APPEND clientkick`.
+pub const G_SEND_CONSOLE_COMMAND: i32 = 16;
+/// `cbufExec_t::EXEC_APPEND` (`qcommon.h`): run at the next `Cbuf_Execute`.
+pub const EXEC_APPEND: i32 = 2;
 pub const G_NAV_FREE: i32 = 201;
 /// `G_NAV_LOAD` (`g_public.h:298-300`, right after `G_NAV_FREE`): the game's
 /// single nav load (`g_main.c:1034`).
@@ -534,6 +539,9 @@ pub const EF_PLAYER_EVENT: i32 = 1 << 5;
 /// (`cgs.scores1/2`), `CS_PLAYERS + n` carries client `n`'s `n\t\…` info.
 pub const CS_SCORES1: i32 = 6;
 pub const CS_SCORES2: i32 = 7;
+/// `CS_VOTE_TIME` (`bg_public.h:65`): set to the vote start time, emptied at
+/// the end. S14 snapshots the slot addresses when it becomes non-empty.
+pub const CS_VOTE_TIME: i32 = 8;
 /// `CS_PLAYERS = CS_ICONS + MAX_ICONS = 1131` (`bg_public.h` chain:
 /// `CS_AMBIENT_SET 37 + MAX_AMBIENT_SETS 256 → … → CS_SOUNDS 811 +
 /// MAX_SOUNDS 256 → CS_ICONS 1067 + MAX_ICONS 64`).

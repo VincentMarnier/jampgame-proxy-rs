@@ -54,6 +54,7 @@ mod tffa;
 mod timenudge;
 mod userinfo;
 mod utils;
+mod votes;
 
 use core::ffi::c_int;
 

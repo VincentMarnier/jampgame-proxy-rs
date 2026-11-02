@@ -90,6 +90,25 @@ pub unsafe fn sv_ptr() -> usize {
     engine::vars::SV
 }
 
+/// Raw 20-byte `netadr_t` of `svs.clients[slot].netchan.remoteAddress`, used by
+/// the vote-slot check (S14).
+///
+/// # Safety
+///
+/// Engine memory layer initialised and `slot < sv_maxclients`: the engine
+/// allocates `svs.clients` for `sv_maxclients` entries only.
+pub unsafe fn client_address_bytes(slot: usize) -> [u8; 20] {
+    // SAFETY: engine memory layer initialised (hooks only run after GAME_INIT).
+    let base = unsafe { clients_base() };
+    if base == 0 || slot >= MAX_CLIENTS {
+        return [0u8; 20];
+    }
+    let addr = base + slot * SIZEOF_CLIENT_T + OFFSET_NETCHAN_REMOTE_ADDRESS;
+    // SAFETY: the caller guarantees `slot < sv_maxclients`, so the 20 bytes
+    // of `netchan.remoteAddress` are inside the clients array.
+    unsafe { core::ptr::read_unaligned(addr as *const [u8; 20]) }
+}
+
 /// `(cl - svs->clients)` — the original's `getClientNumFromAddr`.
 pub fn client_num_from_addr(cl: usize) -> usize {
     // SAFETY: engine memory layer initialised (hooks only run after GAME_INIT).

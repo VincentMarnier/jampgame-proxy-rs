@@ -23,8 +23,8 @@ use core::ffi::{CStr, c_int};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sdk::{
-    CS_PLAYERS, CS_SCORES1, CS_SCORES2, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET, G_CVAR_UPDATE,
-    G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
+    CS_PLAYERS, CS_SCORES1, CS_SCORES2, CS_VOTE_TIME, G_ARGV, G_CVAR_REGISTER, G_CVAR_SET,
+    G_CVAR_UPDATE, G_CVAR_VARIABLE_INTEGER_VALUE, G_CVAR_VARIABLE_STRING_BUFFER, G_DROP_CLIENT,
     G_G2_ABSURDSMOOTHING, G_G2_ADDBOLT, G_G2_ANGLEOVERRIDE, G_G2_ANIMATEG2MODELS,
     G_G2_ATTACHINSTANCETOENTNUM, G_G2_COLLISIONDETECT, G_G2_COLLISIONDETECTCACHE,
     G_G2_COPYGHOUL2INSTANCE, G_G2_COPYSPECIFICGHOUL2MODEL, G_G2_DOESBONEEXIST,
@@ -36,8 +36,8 @@ use crate::sdk::{
     G_G2_REMOVEGHOUL2MODEL, G_G2_REMOVEGHOUL2MODELS, G_G2_SETBOLTINFO, G_G2_SETBONEIKSTATE,
     G_G2_SETMODELS, G_G2_SETNEWORIGIN, G_G2_SETRAGDOLL, G_G2_SETROOTSURFACE, G_G2_SETSKIN,
     G_G2_SETSURFACEONOFF, G_G2_SIZE, G_GET_CONFIGSTRING, G_GET_USERCMD, G_GET_USERINFO,
-    G_LOCATE_GAME_DATA, G_MILLISECONDS, G_NAV_FREE, G_NAV_LOAD, G_PRINT, G_SEND_SERVER_COMMAND,
-    G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
+    G_LOCATE_GAME_DATA, G_MILLISECONDS, G_NAV_FREE, G_NAV_LOAD, G_PRINT, G_SEND_CONSOLE_COMMAND,
+    G_SEND_SERVER_COMMAND, G_SET_CONFIGSTRING, G_SET_USERINFO, MAX_CLIENTS, VmCvar,
 };
 
 /// The engine syscall pointer as handed to `dllEntry`.
@@ -508,6 +508,15 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // own mini-HUD scores and its own team-overlay client names. The
         // corrections arrive after the broadcast and win per client.
         G_SET_CONFIGSTRING => {
+            // S14: `CS_VOTE_TIME` becoming non-empty marks a vote start; copy
+            // every slot's address so the vote's kick can be tied to the
+            // client it was called about.
+            if crate::state::proxy_enabled() && a0 == CS_VOTE_TIME && a1 != 0 {
+                // SAFETY: the game passes a NUL-terminated configstring.
+                let value = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
+                crate::votes::on_configstring(a0, value.to_bytes());
+            }
+
             // Parallel TFFA keeps `level.teamScores` neutralised, so the game's
             // own `CalculateRanks` rewrites `CS_SCORES1/2` on every reconnect
             // (and every restart telefrag) of the `map_restart` burst. Each
@@ -560,6 +569,20 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     }
                 }
                 return response;
+            }
+        }
+        // `G_SEND_CONSOLE_COMMAND(int exec, const char *text)`: S14 drops the
+        // vote's `EXEC_APPEND clientkick <slot>` when the slot no longer holds
+        // the client it held when the vote started. The team-killer kick uses
+        // `EXEC_INSERT` and is left alone.
+        G_SEND_CONSOLE_COMMAND => {
+            if crate::state::proxy_enabled()
+                && !crate::votes::console_command_from_ptr(
+                    a0,
+                    a1 as usize as *const core::ffi::c_char,
+                )
+            {
+                return 0;
             }
         }
         _ => {}

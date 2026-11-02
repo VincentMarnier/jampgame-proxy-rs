@@ -57,7 +57,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | 11-01 F5 | `color1`/`color2` fill the gamestate | Medium | **FIXED** 2026-11-02 |
 | 11-01 F6 | `vote` parsing / `callvote kick <name>` lookup | Low, not security | **LIVE** |
 | 11-01 F7 | `modelFullPath` overflow with `d_perPlayerGhoul2` | Low | **ACCEPTED** (unreachable on retail) |
-| 11-01 F8 | kick vote can kick the next client of the slot | Low | **LIVE** |
+| 11-01 F8 | kick vote can kick the next client of the slot | Low | **FIXED** 2026-11-02 |
 | 11-01 H1 | refuse `"`/control characters in chat | — | **N/A** (refuted) |
 | 10-25 F1 | crash on `rcon map` / `rcon map_restart` | Critical | **COVERED** (D-007) |
 | 10-25 F2 | userinfo not sanitised on connect | High | **FIXED** 2026-11-02 |
@@ -766,7 +766,7 @@ whole-byte bound, the Huffman bit bound (including the exact end), negative
 bit counts and the post-read overshoot. The live malformed-packet check is in
 [Section 6](#6-tests-and-test-plan).
 
-### S14. A kick vote can kick the next client of the slot — Low
+### S14. A kick vote can kick the next client of the slot — Low — **FIXED 2026-11-02**
 
 Upstream: 11-01 F8, commit `013c7a7` (*"fix: cancel a vote kick when its target
 left the slot"*).
@@ -778,16 +778,40 @@ kicked. The 2026 fix snapshots each slot's client address on
 `G_SET_CONFIGSTRING` of `CS_VOTE_TIME` and drops the `EXEC_APPEND clientkick`
 when the slot changed hands.
 
-**Our code (SOURCE (ours)).** The syscall forwarder intercepts
-`G_SET_CONFIGSTRING` for `CS_SCORES1/2`/`CS_PLAYERS` only (`syscall.rs:510`)
-and does not intercept `G_SEND_CONSOLE_COMMAND`/`EXEC_APPEND`; there is no vote
-tracking anywhere. So the retail behaviour remains.
+**Our code before the fix (SOURCE (ours)).** The syscall forwarder intercepted
+`G_SET_CONFIGSTRING` for `CS_SCORES1/2`/`CS_PLAYERS` only and did not intercept
+`G_SEND_CONSOLE_COMMAND`; there was no vote tracking.
 
-**Impact.** A player can get someone else kicked by leaving during the vote.
+**Impact.** A player could get someone else kicked by leaving during the vote.
 Not a crash.
 
-**Test.** The slot/address comparison is pure once implemented; the hooks need
-the game.
+#### Applied (2026-11-02)
+
+A port of `013c7a7` into `rust/src/votes.rs`:
+
+- `on_configstring` (`votes.rs`) runs from the `G_SET_CONFIGSTRING` arm when
+  `CS_VOTE_TIME` becomes non-empty and copies every slot's 20-byte `netadr_t`
+  from `svs.clients[slot].netchan.remoteAddress`
+  (`engine_sv::client_address_bytes`) into a static table. The engine
+  allocates only `sv_maxclients` slots, so the loop stops there.
+- `console_command` runs from the `G_SEND_CONSOLE_COMMAND` arm: only
+  `EXEC_APPEND` with the `clientkick ` prefix (case-insensitive — the game
+  keeps the case the player typed) is screened; the slot is parsed with
+  `atoi`; a slot outside `sv_maxclients` is left to the engine; if the slot's
+  current address differs from the snapshot, the command is dropped and
+  `print "Vote kick canceled: the player left the server."` goes to every
+  player.
+- The team-killer automatic kick uses `EXEC_INSERT` and is untouched.
+- Limits, as upstream: a target who reconnects into the same slot with the
+  same address is still kicked; bots have an `NA_BOT` address, so a bot
+  replacing a bot is still kicked.
+- New constants: `CS_VOTE_TIME = 8`, `G_SEND_CONSOLE_COMMAND = 16`,
+  `EXEC_APPEND = 2` (`sdk.rs`).
+
+**Tests (TESTED, 3 new).** `only_exec_append_clientkick_is_the_vote`,
+`the_slot_is_parsed_and_ranged` (including `atoi` text/negative/32), and
+`a_changed_slot_address_drops_the_kick`. The engine address read and the
+broadcast need the runtime check in [Section 6](#6-tests-and-test-plan).
 
 ### S15. `forwardmove`/`rightmove`/`upmove` of −128 — Low
 
@@ -942,7 +966,7 @@ A port of `99f5599` in the syscall forwarder:
   attachment cleanups are left alone, as upstream. The bolt matrix of
   `G_G2_GETBOLT` is left untouched.
 - The ordinals (585–629, after `BOTLIB_PC_SOURCE_FILE_AND_LINE` = 581) are in
-  `sdk.rs:171-221`, with the null-return rule documented per group.
+  `sdk.rs:176-226`, with the null-return rule documented per group.
 
 **Tests (TESTED, 1 new).** `null_ghoul2_instances_are_answered` covers every
 group, the `void**` dereference (both the pointer and its target), and the traps
@@ -1100,6 +1124,9 @@ the pristine/patched `jbe`/`jb` bytes.
 extension, dot in a directory part, empty name) and `compare_extension`
 (case-insensitive suffix).
 
+`rust/src/votes.rs` (new, 3 tests): the `EXEC_APPEND clientkick` recognition,
+the slot parse/range, and the changed-address decision.
+
 Run:
 
 ```sh
@@ -1109,7 +1136,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 311 unit tests pass; the i686 release cdylib builds. No server was
+Result: 314 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1194,6 +1221,12 @@ None of these has been run yet; they are the runtime half of the fixes.
   userinfo too long for `ip` (1007 characters plus the engine's pair): the
   proxy must refuse the client instead of letting the game check bans against
   no address.
+- S14: start a `callvote kick <name>`, let the target leave during the vote,
+  and have another client take the slot before it executes. The new client
+  must not be kicked, and every player must see
+  `Vote kick canceled: the player left the server.`. Separately, the automatic
+  team-killer kick (`EXEC_INSERT`) must still kick the current client of the
+  slot.
 
 ## 7. Order of work (most urgent first)
 
@@ -1230,7 +1263,7 @@ dependencies. It is the order the fixes are being applied in.
 15. **O5** — connections per IP address (Medium, optional availability).
 16. ✅ **S13** — `MSG_ReadBits` bounds (Low, CVE-2017-11721).
     *Fixed 2026-11-02.*
-17. **S14** — kick vote slot reuse (Low).
+17. ✅ **S14** — kick vote slot reuse (Low). *Fixed 2026-11-02.*
 18. **S15** — `forwardmove` −128 (Low; the test seam already exists).
 19. **S16** — vote parsing / name lookup (Low, not security).
 20. **S20** — sub-BSP buffer leak (Low/Medium availability).
@@ -1282,8 +1315,10 @@ its `mod tests`;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its
 tests; `rust/src/sdk.rs:582-593` (challenge layout constants);
 `rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:141-203`
-(`g2_null_result`), `:205-579` (intercepted traps), `rust/src/pps.rs`
+(`g2_null_result`), `:205-602` (intercepted traps), `rust/src/pps.rs`
 (sequenced-packet limiter);
-`rust/src/sdk.rs:171-221` (Ghoul2 ordinals);
+`rust/src/votes.rs:43-129` (S14 vote-slot snapshot and screening);
+`rust/src/sdk.rs:133` (`G_SEND_CONSOLE_COMMAND`), `:544` (`CS_VOTE_TIME`),
+`:176-226` (Ghoul2 ordinals);
 `rust/src/hooks/compat.rs:42-83` (`default_extension`, `compare_extension`),
 `:123-152` (tokenizer).
