@@ -10,6 +10,9 @@ This directory contains knowledge derived from the original implementation and t
 - `runtime-environment.md` — how to build and run the original binaries in a container for runtime investigation (Dockerfiles, layout, verified behaviour).
 - `inventory.md` — per-feature map of the original proxy: keep/drop decision
   per D-002 and the implementation technique for each hook.
+- `ybeproxy-2026-delta.md` — the 2026 security/crash fixes of the C++ proxy
+  (JKA_YBEProxy) and which of them this rewrite still lacks; tests and
+  priorities for the later work.
 - `decisions/` — important architectural decisions once the project becomes more mature.
 
 ## Evidence levels

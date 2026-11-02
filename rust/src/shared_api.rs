@@ -26,6 +26,11 @@ use crate::utils;
 
 const MAX_CVAR_VALUE_STRING: usize = 256;
 
+/// Longest command line (name, space and arguments) a client may send to the
+/// game (upstream `d9daa68`, 11-01 F1). The game logs some command lines whole
+/// in a 1024-byte buffer; no command of the game needs more than this.
+const MAX_COMMAND_LENGTH: usize = 512;
+
 // ---------------------------------------------------------------------------
 // Trap interception (import table — traps the game issues to the engine)
 // ---------------------------------------------------------------------------
@@ -177,6 +182,22 @@ pub fn client_command(client_num: c_int) -> bool {
     // SAFETY: game module loaded (GAME_INIT ran before any client command).
     let args_concat = unsafe { jampgame::concat_args(1) };
     let args_concat = cstr_bytes_or_empty(args_concat);
+
+    // Fix: stack overflow in the game's G_LogPrintf (`vsprintf` in a buffer of
+    // 1024 bytes). At intermission the game turns every command it does not
+    // know into a public chat message of the whole command line, and logs it
+    // before cutting it. The limits on "say", "say_team" and "tell" below do
+    // not cover that. 512 leaves a wide margin: the overflow starts at about
+    // 970 characters.
+    if command_line_too_long(cmd, args_concat) {
+        log_blocked(
+            client_num,
+            "command line longer than 512 bytes",
+            cmd,
+            args_concat,
+        );
+        return false;
+    }
 
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"say".as_ptr(), 3) } == 0
         || unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"say_team".as_ptr(), 8) } == 0
@@ -433,34 +454,7 @@ pub fn client_userinfo_changed(client_num: c_int) {
     utils::strncpyz(&mut force_powers, cstr_bytes_or_empty(fp_ptr));
     let fp_len = utils::c_strlen(&force_powers);
 
-    let mut bad_force = false;
-    if (22..=24).contains(&fp_len) {
-        let mut seps = 0u32;
-        for (i, &b) in force_powers[..fp_len].iter().enumerate() {
-            if b != b'-' && !b.is_ascii_digit() {
-                bad_force = true;
-                break;
-            }
-            if !(1..=5).contains(&i) && b == b'-' {
-                bad_force = true;
-                break;
-            }
-            if i > 0 && force_powers[i - 1] == b'-' && b == b'-' {
-                bad_force = true;
-                break;
-            }
-            if b == b'-' {
-                seps += 1;
-            }
-        }
-        if seps != 2 {
-            bad_force = true;
-        }
-    } else {
-        bad_force = true;
-    }
-
-    if bad_force {
+    if !forcepowers_is_valid(&force_powers[..fp_len]) {
         if diagnostics::suspicious_enabled() {
             diagnostics::suspicious(
                 "userinfo.forcepowers",
@@ -495,9 +489,51 @@ pub fn client_userinfo_changed(client_num: c_int) {
     unsafe { syscall::set_userinfo(client_num, userinfo_cstr) };
 }
 
+/// Whether a `forcepowers` value passes the proxy's shape check
+/// (`Proxy_SharedAPI.cpp:270-324`, as ported).
+///
+/// The rule, verbatim from the inline loop it replaces: 22 to 24 characters,
+/// only digits and `-`, exactly two `-` at positions 1 to 5, never adjacent.
+/// It is a pure function so the audit vectors of
+/// `docs/ybeproxy-2026-delta.md` (F4) can be pinned by unit tests; the caller
+/// still writes the default string on failure.
+///
+/// Known gap (F4, 2026-11-01 audit): the rule does not require the 18 power
+/// digits that `BG_LegalizedForcePowers` reads after the second `-`, and it
+/// accepts a power digit above 3. See the tests below.
+fn forcepowers_is_valid(powers: &[u8]) -> bool {
+    if !(22..=24).contains(&powers.len()) {
+        return false;
+    }
+    let mut seps = 0u32;
+    for (i, &b) in powers.iter().enumerate() {
+        if b != b'-' && !b.is_ascii_digit() {
+            return false;
+        }
+        if !(1..=5).contains(&i) && b == b'-' {
+            return false;
+        }
+        if i > 0 && powers[i - 1] == b'-' && b == b'-' {
+            return false;
+        }
+        if b == b'-' {
+            seps += 1;
+        }
+    }
+    seps == 2
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether the command line `cmd` + `" "` + `args` exceeds
+/// [`MAX_COMMAND_LENGTH`]. Mirrors upstream's
+/// `strlen(cmd) + 1 + strlen(argsConcat) > 512`: the separating space is
+/// counted even when there are no arguments (11-01 F1).
+fn command_line_too_long(cmd: &[u8], args: &[u8]) -> bool {
+    cmd.len() + 1 + args.len() > MAX_COMMAND_LENGTH
+}
 
 /// Log a command the proxy refused to forward (or a client that tried to send
 /// one before it was fully in the game).
@@ -560,4 +596,136 @@ fn client_netname(client_num: c_int) -> String {
     // SAFETY: netname is a NUL-terminated MAX_NETNAME string inside gclient_t.
     let bytes = unsafe { CStr::from_ptr(netname_ptr as *const c_char) }.to_bytes();
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_line_too_long, forcepowers_is_valid, get_usercmd};
+    use crate::sdk::{FP_LEVITATION, ROLL, Usercmd};
+
+    /// 11-01 F1: the whole command line (name, one separating space, then the
+    /// arguments) is capped at 512 bytes, and exactly 512 is still allowed.
+    /// This is the upstream `strlen(cmd) + 1 + strlen(argsConcat) > 512`.
+    #[test]
+    fn command_line_is_capped_at_512_bytes() {
+        // 3 + 1 + 508 = 512: allowed.
+        assert!(!command_line_too_long(b"say", &[b'a'; 508]));
+        // 3 + 1 + 509 = 513: dropped.
+        assert!(command_line_too_long(b"say", &[b'a'; 509]));
+
+        // The separating space is counted even without arguments.
+        assert!(!command_line_too_long(b"x", b""));
+        assert!(!command_line_too_long(b"", &[b'a'; 511]));
+        assert!(command_line_too_long(b"", &[b'a'; 512]));
+
+        // The attack shape: a full `ConcatArgs(0)` line of 1022 characters.
+        assert!(command_line_too_long(b"x", &[b'a'; 1022]));
+    }
+
+    /// `get_usercmd` still sanitises `forcesel` and `ROLL`. The engine writes
+    /// the struct first; the proxy only mutates it in place.
+    #[test]
+    fn get_usercmd_sanitises_forcesel_and_roll() {
+        let mut cmd = Usercmd {
+            forcesel: FP_LEVITATION,
+            angles: [1, 2, 3],
+            ..Default::default()
+        };
+        // SAFETY: a local `Usercmd` is a valid pointer; the function only
+        // mutates the struct, no engine or game call is made.
+        unsafe { get_usercmd(0, &mut cmd) };
+        assert_eq!(cmd.forcesel, 0xFF);
+        assert_eq!(cmd.angles[ROLL], 0);
+    }
+
+    /// O10 known gap (2026-10-25 audit): ioq3/OpenJK clamp a movement axis of
+    /// -128 to -127 so a negative move is never one step longer than a
+    /// positive one. Our `get_usercmd` leaves -128 untouched.
+    ///
+    /// When O10 is fixed, this test must be inverted.
+    #[test]
+    fn o10_known_gap_get_usercmd_leaves_minus_128() {
+        let mut cmd = Usercmd {
+            forwardmove: -128,
+            rightmove: -128,
+            upmove: -128,
+            ..Default::default()
+        };
+        // SAFETY: see the test above.
+        unsafe { get_usercmd(0, &mut cmd) };
+        assert_eq!(
+            (cmd.forwardmove, cmd.rightmove, cmd.upmove),
+            (-128, -128, -128)
+        );
+    }
+
+    /// The value the retail client sends at full rank with 18 power levels.
+    /// `BG_LegalizedForcePowers` reads exactly `NUM_FORCE_POWERS` (18) digits
+    /// after the second `-`.
+    #[test]
+    fn retail_forcepowers_value_is_accepted() {
+        assert!(forcepowers_is_valid(b"7-1-030000000000003332"));
+    }
+
+    /// Every power at 0..=3 is a legal level. A string of the wrong length or
+    /// shape is left to the game's default.
+    #[test]
+    fn length_and_separator_shape_is_enforced() {
+        assert!(!forcepowers_is_valid(b"7-1-"));
+        // 21 and 25 characters are outside the accepted window.
+        assert!(!forcepowers_is_valid(b"7-1-00000000000000000"));
+        assert!(!forcepowers_is_valid(b"7-1-000000000000000000000"));
+        // Only two `-`, never adjacent, and only at positions 1..=5.
+        assert!(!forcepowers_is_valid(b"7--0300000000000003332"));
+        assert!(!forcepowers_is_valid(b"7-1-00000000000000333-"));
+        assert!(!forcepowers_is_valid(b"7-1-a00000000000003332"));
+    }
+
+    /// F4 known gap (2026-11-01 audit): our accepted window is exactly the 18
+    /// shapes the audit enumerated, and 8 of them carry fewer than the 18
+    /// digits `BG_LegalizedForcePowers` reads after the second `-`. The
+    /// missing entries stay uninitialised on the stack and are used as indices
+    /// (`bgForcePowerCost[i][countDown]` in the retail game), which can crash
+    /// the server.
+    ///
+    /// When F4 is fixed, this test must be inverted: `short` must be 0 and
+    /// every short shape must be refused.
+    #[test]
+    fn f4_known_gap_accepts_shapes_with_16_or_17_powers() {
+        let mut accepted = 0;
+        let mut short = 0;
+
+        for len in 22..=24 {
+            for first in 1..=5 {
+                for second in (first + 2)..=5 {
+                    let mut value = vec![b'1'; len];
+                    value[first] = b'-';
+                    value[second] = b'-';
+
+                    if forcepowers_is_valid(&value) {
+                        accepted += 1;
+                        // The game reads a digit for every index from the byte
+                        // after the second `-` to the end of the string.
+                        if len - second - 1 < 18 {
+                            short += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(accepted, 18, "the accepted window has 18 shapes");
+        assert_eq!(
+            short, 8,
+            "8 of them give BG_LegalizedForcePowers 16 or 17 digits"
+        );
+    }
+
+    /// F4 known gap, second half: `BG_LegalizedForcePowers` uses the digit as
+    /// a column of `bgForcePowerCost` before clamping it to 3, so 4..=9 read
+    /// past the table. The 2026 fix refuses anything outside 0..=3, as OpenJK.
+    #[test]
+    fn f4_known_gap_accepts_power_digits_above_three() {
+        assert!(forcepowers_is_valid(b"7-1-333333333333333399"));
+    }
 }
