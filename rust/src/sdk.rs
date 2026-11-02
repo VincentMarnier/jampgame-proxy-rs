@@ -234,6 +234,12 @@ pub const SVC_DOWNLOAD: i32 = 6;
 /// `errorParm_t::ERR_DROP` (`q_shared.h:425`).
 pub const ERR_DROP: i32 = 1;
 
+/// `TAG_BSP_DISKIMAGE` (`tags.hpp:38`; `TAGDEF(ALL)` 0, `BOTLIB` 1,
+/// `CLIENTS` 2, `BOTGAME` 3, `DOWNLOAD` 4, `GENERAL` 5, `CLIPBOARD` 6,
+/// `SND_MP3STREAMHDR` 7, `SND_DYNAMICMUSIC` 8, `BSP_DISKIMAGE` 9). S20 frees
+/// this tag after `GAME_INIT` (sub-BSP images the engine leaves behind).
+pub const TAG_BSP_DISKIMAGE: i32 = 9;
+
 // ---------------------------------------------------------------------------
 // vmMain commands (SDK `gameExport_t`, `g_public.h:735+`)
 // ---------------------------------------------------------------------------

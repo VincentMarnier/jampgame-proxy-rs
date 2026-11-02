@@ -332,6 +332,20 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `vmMain(GAME_INIT, levelTime, randomSeed, restart)` — mirrors
 /// `Proxy_Main.cpp:88-126` (without the patch attach, which is a later
 /// milestone).
+/// `Z_TagFree(TAG_BSP_DISKIMAGE)` (S20): frees the sub-BSP disk images the
+/// engine's `CM_LoadMap_Actual` leaves behind on each map load.
+///
+/// # Safety
+///
+/// Engine memory layer initialised; only called from `GAME_INIT` after the
+/// original module has run.
+unsafe fn free_bsp_disk_images() {
+    // SAFETY: fixed engine address, cdecl `(memtag_t)`.
+    let f: unsafe extern "C" fn(core::ffi::c_int) =
+        unsafe { core::mem::transmute(engine::functions::Z_TAG_FREE) };
+    unsafe { f(crate::sdk::TAG_BSP_DISKIMAGE) };
+}
+
 fn game_init(args: &[c_int; 12]) -> c_int {
     eprintln!("========================================================================");
     eprintln!("----- proxy-rs {VERSION}: bootstrap core loaded");
@@ -376,6 +390,16 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 
     // Forward GAME_INIT itself: the pristine game must initialise.
     let response = forward(GAME_INIT, args);
+
+    // S20 (2026 `23e84f1`): the engine's `CM_LoadMap_Actual` reads every
+    // sub-BSP (`misc_bsp`, model `#name`) into a `TAG_BSP_DISKIMAGE` buffer
+    // and never frees it (only the main map's buffer is freed). Free the tag
+    // once the game has loaded them. Gated by the master switch like the other
+    // fixes.
+    if state::proxy_enabled() {
+        // SAFETY: engine memory layer initialised; Z_TagFree takes the tag.
+        unsafe { free_bsp_disk_images() };
+    }
 
     // The original proxy registers its cvars inside the game's G_RegisterCvars
     // (a game detour, later milestone); we register them here, after the game
@@ -633,5 +657,16 @@ mod tests {
 
         // Restore the process-wide default for the other tests.
         state::set_proxy_enabled(true);
+    }
+
+    /// S20: the tag value (`tags.hpp` order) and the `Z_TagFree` address.
+    #[test]
+    fn bsp_disk_image_tag_and_address_are_pinned() {
+        assert_eq!(crate::sdk::TAG_BSP_DISKIMAGE, 9);
+        assert_eq!(crate::engine::functions::Z_TAG_FREE, 0x0808_04e4);
+        assert!(
+            (crate::engine::ENGINE_TEXT_LO..crate::engine::ENGINE_TEXT_HI)
+                .contains(&crate::engine::functions::Z_TAG_FREE)
+        );
     }
 }

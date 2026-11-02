@@ -125,6 +125,9 @@ pub mod functions {
     pub const HUFF_DECOMPRESS: usize = 0x0807_c224;
     pub const Z_FREE: usize = 0x0808_0474;
     pub const Z_MALLOC: usize = 0x0808_00f4;
+    /// `Z_TagFree(memtag_t)` (`0x80804e4`): frees every allocation of a tag
+    /// (S20 frees `TAG_BSP_DISKIMAGE` after `GAME_INIT`).
+    pub const Z_TAG_FREE: usize = 0x0808_04e4;
     pub const CM_BOX_TRACE: usize = 0x0807_2bc4;
     pub const SV_TRACE: usize = 0x0805_a4c4;
     pub const SV_CLIENT_COMMAND: usize = 0x0804_e4b4;

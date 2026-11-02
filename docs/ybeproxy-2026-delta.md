@@ -974,7 +974,7 @@ deliberately left alone. **Not reproduced at runtime**: triggering it needs a
 model that fails to load, so it stays in the runtime list as a `dG2` scenario
 without a reproduction.
 
-### S20. Sub-BSP buffers leak on every map load
+### S20. Sub-BSP buffers leak on every map load — **FIXED 2026-11-02**
 
 Upstream: commit `23e84f1`.
 
@@ -982,9 +982,23 @@ Upstream: commit `23e84f1`.
 `TAG_BSP_DISKIMAGE` buffer and never frees it (the main map's buffer is freed).
 The proxy calls `Z_TagFree(TAG_BSP_DISKIMAGE)` after `GAME_INIT`.
 
-**Our code (SOURCE (ours)).** No `Z_TagFree`/BSP buffer handling. The nav-graph
-leak is handled (D-008 / `G_NAV_FREE`), but not this one. Long-running servers
-with sub-BSP maps leak per map change. Low/Medium availability.
+**Our code before the fix (SOURCE (ours)).** No `Z_TagFree`/BSP handling. The
+nav-graph leak was already handled (D-008 / `G_NAV_FREE`), but not this one.
+
+#### Applied (2026-11-02)
+
+A port of `23e84f1`: after forwarding `GAME_INIT` (`lib.rs`), when the master
+switch is on, `free_bsp_disk_images` calls the engine's
+`Z_TagFree(TAG_BSP_DISKIMAGE)` (`0x80804e4`, verified on `linuxjampded`). The
+tag is `TAG_BSP_DISKIMAGE = 9` (`tags.hpp` order); `GAME_INIT` has loaded the
+sub-BSPs at that point. The main map's buffer is already freed by the engine.
+
+**Impact.** Long-running servers with sub-BSP maps (`misc_bsp`, model
+`#name`) no longer leak a disk-image buffer per map change.
+
+**Tests (TESTED, 1 new).** `bsp_disk_image_tag_and_address_are_pinned` pins the
+tag value and the `Z_TagFree` address. The leak itself is a runtime memory
+measurement; see [Section 6](#6-tests-and-test-plan).
 
 ### S21. `map_restart` puts connecting clients back in the world
 
@@ -1127,6 +1141,9 @@ extension, dot in a directory part, empty name) and `compare_extension`
 `rust/src/votes.rs` (new, 3 tests): the `EXEC_APPEND clientkick` recognition,
 the slot parse/range, and the changed-address decision.
 
+`rust/src/lib.rs` (1 new test): the `TAG_BSP_DISKIMAGE` value and the
+`Z_TagFree` address.
+
 Run:
 
 ```sh
@@ -1136,7 +1153,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 314 unit tests pass; the i686 release cdylib builds. No server was
+Result: 315 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1227,6 +1244,9 @@ None of these has been run yet; they are the runtime half of the fixes.
   `Vote kick canceled: the player left the server.`. Separately, the automatic
   team-killer kick (`EXEC_INSERT`) must still kick the current client of the
   slot.
+- S20: load a map with `misc_bsp`/model sub-BSPs several times (`map`/
+  `map_restart`) and check `Z_MemSize(TAG_BSP_DISKIMAGE)` (or RSS) does not
+  grow per load.
 
 ## 7. Order of work (most urgent first)
 
@@ -1266,7 +1286,8 @@ dependencies. It is the order the fixes are being applied in.
 17. ✅ **S14** — kick vote slot reuse (Low). *Fixed 2026-11-02.*
 18. ✅ **S15** — `forwardmove` −128 (Low). *Fixed 2026-11-02.*
 19. **S16** — vote parsing / name lookup (Low, not security).
-20. **S20** — sub-BSP buffer leak (Low/Medium availability).
+20. ✅ **S20** — sub-BSP buffer leak (Low/Medium availability). *Fixed
+    2026-11-02.*
 21. **S21** — `map_restart` and connecting clients (Low functional).
 22. **S22** — engine counter wrap (Low/Medium availability).
 
@@ -1302,7 +1323,8 @@ Rust rewrite (this repository):
 its `mod tests`;
 `rust/src/userinfo.rs:145-338` (`value_for_key`, `set_value_for_key*`,
 `validate_userinfo`) and its `mod tests`;
-`rust/src/lib.rs:153-195` and `:301-308`;
+`rust/src/lib.rs:153-195` and `:301-308`, `:342-350`
+(`free_bsp_disk_images`);
 `rust/src/hooks/engine_sv.rs:301-331` (rcon), `:366-426` (status/info),
 `:439-461` (challenge/connect), `:471-504` (`info_print_lines`), `:1734-1790`
 (`msg_read_bits` bounds),
@@ -1318,7 +1340,7 @@ tests; `rust/src/sdk.rs:582-593` (challenge layout constants);
 (`g2_null_result`), `:205-602` (intercepted traps), `rust/src/pps.rs`
 (sequenced-packet limiter);
 `rust/src/votes.rs:43-129` (S14 vote-slot snapshot and screening);
-`rust/src/sdk.rs:133` (`G_SEND_CONSOLE_COMMAND`), `:544` (`CS_VOTE_TIME`),
-`:176-226` (Ghoul2 ordinals);
+`rust/src/sdk.rs:133` (`G_SEND_CONSOLE_COMMAND`), `:241`
+(`TAG_BSP_DISKIMAGE`), `:544` (`CS_VOTE_TIME`), `:176-226` (Ghoul2 ordinals);
 `rust/src/hooks/compat.rs:42-83` (`default_extension`, `compare_extension`),
 `:123-152` (tokenizer).
