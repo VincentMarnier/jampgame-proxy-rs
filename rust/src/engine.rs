@@ -39,6 +39,12 @@ pub mod functions {
     /// `Info_Print` (`0x8073504`): retail `char key[512]` / `char value[512]`
     /// stack buffers; rewritten with growable buffers (S7/10-25 F11).
     pub const INFO_PRINT: usize = 0x0807_3504;
+    /// `Com_WriteConfig_f` (`0x8074d64`): `.cfg`-only / no `..` / reserved
+    /// names check (S12/10-25 F7).
+    pub const COM_WRITE_CONFIG_F: usize = 0x0807_4d64;
+    /// `Com_WriteConfigToFile(const char*)` (`0x8074cb4`), called by the
+    /// rewritten command.
+    pub const COM_WRITE_CONFIG_TO_FILE: usize = 0x0807_4cb4;
     pub const SV_CALCPINGS: usize = 0x0805_7204;
     pub const SV_SEND_MESSAGE_TO_CLIENT: usize = 0x0805_8c84;
     pub const SV_SEND_CLIENT_GAME_STATE: usize = 0x0804_cee4;

@@ -689,7 +689,7 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `SV_Netchan_Process` is a Rust-only entry wrapper for the per-client packet
 /// rate limiter (`crate::pps`): it accounts one incoming packet and may return
 /// `qfalse` (drop) before the pristine body decodes it.
-pub static ENGINE_HOOKS: [Hook; 20] = [
+pub static ENGINE_HOOKS: [Hook; 21] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -778,6 +778,11 @@ pub static ENGINE_HOOKS: [Hook; 20] = [
         false,
     ),
     Hook::new("Info_Print", crate::engine::functions::INFO_PRINT, false),
+    Hook::new(
+        "Com_WriteConfig_f",
+        crate::engine::functions::COM_WRITE_CONFIG_F,
+        false,
+    ),
 ];
 
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
@@ -1164,6 +1169,11 @@ mod tests {
             name: "Info_Print",
             bytes: b"\x55\x8b\xec\x81\xec\x20\x04\x00\x00",
             want: 9,
+        },
+        Site {
+            name: "Com_WriteConfig_f",
+            bytes: b"\x55\x8b\xec\x83\xec\x50",
+            want: 6,
         },
         Site {
             name: "Com_Printf",

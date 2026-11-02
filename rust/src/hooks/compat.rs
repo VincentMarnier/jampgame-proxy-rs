@@ -36,6 +36,49 @@ pub fn check_dir_traversal(checkdir: &[u8]) -> bool {
     false
 }
 
+/// `COM_DefaultExtension` (OpenJK `q_shared.c`): append `extension` when the
+/// last path component has no `.`. Operates on a NUL-terminated buffer;
+/// truncates rather than overflowing when the result does not fit.
+pub fn default_extension(path: &mut [u8], extension: &[u8]) {
+    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if len == 0 || len >= path.len() {
+        // The retail reads before the buffer for an empty name; leave it
+        // empty so the caller's extension check refuses it.
+        return;
+    }
+
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        if path[i] == b'.' {
+            return; // already has an extension
+        }
+        if path[i] == b'/' || path[i] == b'\\' {
+            break;
+        }
+    }
+
+    let mut at = len;
+    for &b in extension {
+        if at + 1 >= path.len() {
+            break;
+        }
+        path[at] = b;
+        at += 1;
+    }
+    path[at] = 0;
+}
+
+/// `COM_CompareExtension` (OpenJK `q_shared.c`): case-insensitive suffix test.
+/// `extension` includes the dot.
+pub fn compare_extension(path: &[u8], extension: &[u8]) -> bool {
+    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if extension.len() > len {
+        return false;
+    }
+    path[len - extension.len()..len].eq_ignore_ascii_case(extension)
+}
+
 /// `FS_FilenameCompare` (`Proxy_sv_client.cpp:520-547`): case-folded, `\`/`:`
 /// normalised to `/`, byte compare; returns true when the strings *differ*
 /// (the original returns `qtrue` = different).
@@ -237,5 +280,38 @@ mod tests {
         assert!(!filename_compare(b"a/b.pk3", b"a:b.pk3"));
         assert!(filename_compare(b"foo.pk3", b"bar.pk3"));
         assert!(!filename_compare(b"", b""));
+    }
+
+    #[test]
+    fn default_extension_appends_only_without_one() {
+        let mut buf = [0u8; 64];
+        buf[..4].copy_from_slice(b"name");
+        default_extension(&mut buf, b".cfg");
+        assert_eq!(&buf[..8], b"name.cfg");
+
+        let mut buf = [0u8; 64];
+        buf[..8].copy_from_slice(b"name.cfg");
+        default_extension(&mut buf, b".cfg");
+        assert_eq!(&buf[..8], b"name.cfg");
+
+        // A dot in the directory part does not count as an extension.
+        let mut buf = [0u8; 64];
+        buf[..11].copy_from_slice(b"dir.v1/name");
+        default_extension(&mut buf, b".cfg");
+        assert_eq!(&buf[..15], b"dir.v1/name.cfg");
+
+        // Empty name: left empty, so the extension check refuses it.
+        let mut buf = [0u8; 64];
+        default_extension(&mut buf, b".cfg");
+        assert_eq!(buf[0], 0);
+    }
+
+    #[test]
+    fn compare_extension_is_case_insensitive() {
+        assert!(compare_extension(b"name.cfg", b".cfg"));
+        assert!(compare_extension(b"NAME.CFG", b".cfg"));
+        assert!(!compare_extension(b"name.cfg", b".CFG2"));
+        assert!(!compare_extension(b"name.txt", b".cfg"));
+        assert!(!compare_extension(b"cfg", b".cfg"));
     }
 }

@@ -321,36 +321,9 @@ pub unsafe extern "C" fn svc_remote_command(from: Netadr, msg: usize) {
         return; // dropped silently
     }
 
-    // Only a valid rcon runs the command: a bad password still gets the
-    // engine's own "Bad rconpassword." reply below.
-    if valid {
-        // Only allow writeconfig on cfg files.
-        // SAFETY: engine Cmd_Argv is valid in the connectionless context.
-        let argv2 = unsafe { engine::cmd_argv(2) };
-        if !argv2.is_null()
-            && unsafe { jampgame::q_stricmpn(argv2, c"writeconfig".as_ptr(), 11) } == 0
-        {
-            // SAFETY: Cmd_Argv returns NUL-terminated strings.
-            let arg3 = unsafe { engine::cmd_argv(3) };
-            let arg3_len = cstr_len(arg3);
-            if arg3_len >= 5
-                && unsafe { *arg3.add(arg3_len - 4) } == b'.' as i8
-                && unsafe { jampgame::q_stricmpn(arg3.add(arg3_len - 4), c".cfg".as_ptr(), 4) } != 0
-            {
-                if crate::diagnostics::suspicious_enabled() {
-                    crate::diagnostics::suspicious(
-                        "rcon.writeconfig",
-                        format!(
-                            "from=\"{}\" rejected=\"{}\"",
-                            netadr_string(&from),
-                            crate::diagnostics::escape_bytes(cstr_bytes(arg3), 256)
-                        ),
-                    );
-                }
-                return;
-            }
-        }
-    }
+    // The `writeconfig` policy now lives in the command itself
+    // (`com_write_config_f`), so `vstr`/`exec` and the console are covered
+    // too.
 
     // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
     let original = original_call(crate::hooks::engine_hook_original_svc_remote_command);
@@ -541,6 +514,76 @@ unsafe fn com_printf(format: *const c_char, text: *const c_char) {
     let f: unsafe extern "C" fn(*const c_char, *const c_char) =
         unsafe { core::mem::transmute(engine::functions::COM_PRINTF) };
     unsafe { f(format, text) };
+}
+
+/// Print a proxy-formatted line through the engine's `Com_Printf`.
+fn print_text(text: &str) {
+    let Ok(text) = std::ffi::CString::new(text) else {
+        return;
+    };
+    // SAFETY: NUL-terminated string; engine printf valid.
+    unsafe { com_printf(c"%s".as_ptr(), text.as_ptr()) };
+}
+
+/// `Com_WriteConfig_f` (S12/10-25 F7): only a `.cfg` name, no directory
+/// traversal, and not the reserved default configs, then
+/// `Com_WriteConfigToFile`. The original is never called. The check lives in
+/// the command itself, so `vstr`, `exec` and the dedicated console cannot
+/// bypass it.
+///
+/// # Safety
+///
+/// Entered from `Cmd_ExecuteString` with the command arguments in the engine
+/// `Cmd_Argc`/`Cmd_Argv` globals.
+pub unsafe extern "C" fn com_write_config_f() {
+    if unsafe { engine::cmd_argc() } != 2 {
+        print_text("Usage: writeconfig <filename>\n");
+        return;
+    }
+
+    let mut filename = [0u8; MAX_QPATH];
+    // SAFETY: Cmd_Argv is valid in the command context and NUL-terminated.
+    let arg = unsafe { engine::cmd_argv(1) };
+    let bytes = if arg.is_null() {
+        &b""[..]
+    } else {
+        // SAFETY: Cmd_Argv returns a NUL-terminated string.
+        unsafe { CStr::from_ptr(arg) }.to_bytes()
+    };
+    utils::strncpyz(&mut filename, bytes);
+    crate::hooks::compat::default_extension(&mut filename, b".cfg");
+
+    let len = utils::c_strlen(&filename);
+    let name = &filename[..len];
+
+    if !crate::hooks::compat::compare_extension(name, b".cfg") {
+        print_text(
+            "Com_WriteConfig_f: Only the \".cfg\" extension is supported by this command!\n",
+        );
+        return;
+    }
+    if crate::hooks::compat::check_dir_traversal(name) {
+        print_text(&format!(
+            "Com_WriteConfig_f: The filename \"{}\" must not contain \"..\"!\n",
+            String::from_utf8_lossy(name)
+        ));
+        return;
+    }
+    if !crate::hooks::compat::filename_compare(name, b"mpdefault.cfg")
+        || !crate::hooks::compat::filename_compare(name, b"default.cfg")
+    {
+        print_text(&format!(
+            "^3Com_WriteConfig_f: The filename \"{}\" is reserved! Please choose another name.\n",
+            String::from_utf8_lossy(name)
+        ));
+        return;
+    }
+
+    print_text(&format!("Writing {}.\n", String::from_utf8_lossy(name)));
+    // SAFETY: fixed engine address, cdecl `(const char*)`.
+    let f: unsafe extern "C" fn(*const c_char) =
+        unsafe { core::mem::transmute(engine::functions::COM_WRITE_CONFIG_TO_FILE) };
+    unsafe { f(filename.as_ptr() as *const c_char) };
 }
 
 /// `Info_Print` (S7/10-25 F11): the retail function copies each key and value

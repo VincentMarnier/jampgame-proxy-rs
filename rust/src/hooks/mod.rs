@@ -344,6 +344,7 @@ pub unsafe fn attach_all() {
         engine_sv::sv_get_challenge as usize,
         engine_sv::sv_direct_connect as usize,
         engine_sv::info_print as usize,
+        engine_sv::com_write_config_f as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine
