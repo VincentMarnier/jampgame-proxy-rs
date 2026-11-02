@@ -35,6 +35,10 @@ const MAX_COMMAND_LENGTH: usize = 512;
 /// upstream `85403cd`, 11-01 F3).
 const GC_ORDERS_COUNT: i32 = 7;
 
+/// Reason given to the engine (connect refusal) or to `DropClient` (userinfo
+/// change) when the `darksidetools` anti-cheat fires (10-25 F3).
+const ANTI_CHEAT_KICK_REASON: &CStr = c"(Anti-Cheat system) you got kicked cause of cheating";
+
 // ---------------------------------------------------------------------------
 // Trap interception (import table — traps the game issues to the engine)
 // ---------------------------------------------------------------------------
@@ -341,18 +345,34 @@ pub fn client_command(client_num: c_int) -> bool {
     true
 }
 
-/// `Proxy_SharedAPI_ClientUserinfoChanged` (`Proxy_SharedAPI.cpp:222-329`):
-/// sanitise the client's name/model/forcepowers in their userinfo.
-pub fn client_userinfo_changed(client_num: c_int) {
+/// Whether `GAME_CLIENT_CONNECT` runs the userinfo sanitiser (10-25 F2):
+/// every non-bot connect, first or reconnect. Bots are skipped: their userinfo
+/// comes from the bot files and has no `forcepowers`, so the sanitiser would
+/// only add the default string (and `WP_InitForcePowers` ignores it for bots).
+pub fn connect_userinfo_sanitized(is_bot: bool) -> bool {
+    !is_bot
+}
+
+/// `Proxy_SharedAPI_SanitizeUserinfo` (10-25 F2): clean the name, model and
+/// `forcepowers` of a client's userinfo in place.
+///
+/// Returns `Some(reason)` when the client must be refused (the
+/// `darksidetools` anti-cheat); in that case nothing is written back. Returns
+/// `None` otherwise (including an out-of-range client or an empty userinfo).
+///
+/// The function never drops the client itself. On a connect the engine expects
+/// the reason as the `GAME_CLIENT_CONNECT` return value, and calling
+/// `DropClient` during that event is unsafe: the slot is still `CS_FREE`.
+pub fn sanitize_userinfo(client_num: c_int) -> Option<&'static CStr> {
     if !(0..crate::sdk::MAX_CLIENTS as c_int).contains(&client_num) {
-        return;
+        return None;
     }
     let mut userinfo_buf = [0u8; MAX_INFO_STRING];
     // SAFETY: engine syscall registered; buffer writable.
     unsafe { syscall::get_userinfo(client_num, &mut userinfo_buf) };
     let info_len = utils::c_strlen(&userinfo_buf);
     if info_len == 0 {
-        return;
+        return None;
     }
     // userinfo_buf is a NUL-terminated info string the whole time (the engine
     // writes it, Info_SetValueForKey keeps it terminated); hand out the base
@@ -402,7 +422,9 @@ pub fn client_userinfo_changed(client_num: c_int) {
         let is_wampa = model.len() >= 5
             && unsafe { jampgame::q_stricmpn(model_ptr, c"wampa".as_ptr(), 5) } == 0;
 
-        // Anti-cheat: darksidetools model.
+        // Anti-cheat: darksidetools model. The caller refuses the client: the
+        // engine gets the reason on connect, and a userinfo change is dropped
+        // after `DropClient`. Nothing is written back here (10-25 F3).
         if is_darkside_tools {
             if diagnostics::suspicious_enabled() {
                 diagnostics::suspicious(
@@ -414,19 +436,7 @@ pub fn client_userinfo_changed(client_num: c_int) {
                     ),
                 );
             }
-            let name = String::from_utf8_lossy(&clean_name[..utils::c_strlen(&clean_name)]);
-            let chat =
-                format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
-            // SAFETY: formatted text has no interior NUL.
-            let cchat = CString::new(chat).expect("chat text has no interior NUL");
-            unsafe { syscall::send_server_command(-1, &cchat) };
-            // SAFETY: literal reason string.
-            unsafe {
-                syscall::drop_client(
-                    client_num,
-                    c"(Anti-Cheat system) you got kicked cause of cheating",
-                )
-            };
+            return Some(ANTI_CHEAT_KICK_REASON);
         }
 
         // Fix bugged / overlong models (also the model length crash fix; a
@@ -505,6 +515,33 @@ pub fn client_userinfo_changed(client_num: c_int) {
     userinfo_buf[MAX_INFO_STRING - 1] = 0;
     let userinfo_cstr = unsafe { CStr::from_ptr(userinfo_buf.as_ptr() as *const c_char) };
     unsafe { syscall::set_userinfo(client_num, userinfo_cstr) };
+
+    None
+}
+
+/// `Proxy_SharedAPI_ClientUserinfoChanged` (`Proxy_SharedAPI.cpp:222-329`):
+/// sanitise the userinfo on a `userinfo` change.
+///
+/// Returns `false` when the client was dropped for the anti-cheat, so `vmMain`
+/// does not forward `GAME_CLIENT_USERINFO_CHANGED` to the game. The game's
+/// `ClientUserinfoChanged` does not test that the client is connected and would
+/// rewrite `CS_PLAYERS` for a slot that is being cleared (10-25 F3).
+pub fn client_userinfo_changed(client_num: c_int) -> bool {
+    let Some(reason) = sanitize_userinfo(client_num) else {
+        return true;
+    };
+
+    // `sanitize_userinfo` stored the cleaned name before the anti-cheat check.
+    let name = state::with_state(|s| s.clients[client_num as usize].clean_name);
+    let name = String::from_utf8_lossy(&name[..utils::c_strlen(&name)]);
+    let chat = format!("chat \"^3(Anti-Cheat system) ^7{name}^3 got kicked cause of cheating^7\"");
+    // SAFETY: formatted text has no interior NUL.
+    let cchat = CString::new(chat).expect("chat text has no interior NUL");
+    unsafe { syscall::send_server_command(-1, &cchat) };
+    // SAFETY: literal reason string.
+    unsafe { syscall::drop_client(client_num, reason) };
+
+    false
 }
 
 /// Whether a `forcepowers` value passes the proxy's shape check
@@ -648,10 +685,18 @@ fn client_netname(client_num: c_int) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clientkick_max_slot, command_line_too_long, forcepowers_is_valid, gc_command_denied,
-        get_usercmd, vote_value_out_of_range,
+        clientkick_max_slot, command_line_too_long, connect_userinfo_sanitized,
+        forcepowers_is_valid, gc_command_denied, get_usercmd, vote_value_out_of_range,
     };
     use crate::sdk::{FP_LEVITATION, ROLL, Usercmd};
+
+    /// 10-25 F2: the connect sanitiser runs for every non-bot first connection
+    /// and reconnect; bots keep the userinfo from their bot file.
+    #[test]
+    fn connect_sanitiser_skips_bots_only() {
+        assert!(connect_userinfo_sanitized(false));
+        assert!(!connect_userinfo_sanitized(true));
+    }
 
     /// 11-01 F1: the whole command line (name, one separating space, then the
     /// arguments) is capped at 512 bytes, and exactly 512 is still allowed.

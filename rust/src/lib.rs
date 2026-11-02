@@ -149,6 +149,31 @@ pub unsafe extern "C" fn vmMain(
             response
         }
         GAME_CLIENT_CONNECT => {
+            // 10-25 F2: the engine calls GAME_CLIENT_CONNECT before
+            // SV_UserinfoChanged, and the game's ClientConnect calls
+            // ClientUserinfoChanged directly, so the game would otherwise see
+            // the raw connect userinfo and never the proxy's fixes. Sanitise
+            // it first, for both a first connection and the reconnect after a
+            // map change. Bots are skipped: their userinfo comes from the bot
+            // files and has no `forcepowers`.
+            if state::proxy_enabled() && shared_api::connect_userinfo_sanitized(a2 != 0) {
+                if let Some(reason) = shared_api::sanitize_userinfo(a0) {
+                    if diagnostics::verbose_enabled() {
+                        diagnostics::verbose(
+                            "client.connect.refused",
+                            format!(
+                                "{} reason=\"{}\"",
+                                hooks::engine_sv::client_label_for_num(a0),
+                                reason.to_string_lossy()
+                            ),
+                        );
+                    }
+                    // A non-null return is the engine's refusal path (the
+                    // game's own "Banned."): it prints the reason to the
+                    // client and never enters the game. Nothing is forwarded.
+                    return reason.as_ptr() as usize as c_int;
+                }
+            }
             if state::proxy_enabled() {
                 shared_api::client_connect(a0, a1 != 0, a2 != 0);
                 tffa::on_client_connect(a0, a1 != 0);
@@ -272,8 +297,10 @@ pub unsafe extern "C" fn vmMain(
             response
         }
         GAME_CLIENT_USERINFO_CHANGED => {
-            if state::proxy_enabled() {
-                shared_api::client_userinfo_changed(a0);
+            if state::proxy_enabled() && !shared_api::client_userinfo_changed(a0) {
+                // The anti-cheat dropped the client: do not let the game
+                // rewrite CS_PLAYERS for a slot that is being cleared.
+                return 0;
             }
             forward(command, &args)
         }
