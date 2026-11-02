@@ -652,6 +652,11 @@ pub const OFFSET_SV_GENTITY_SIZE: usize = 647864;
 pub const OFFSET_SVS_TIME: usize = 4;
 /// `offsetof(serverStatic_t, clients)` — `client_t[MAX_CLIENTS]` array start.
 pub const OFFSET_SVS_CLIENTS: usize = 12;
+/// `offsetof(serverStatic_t, numSnapshotEntities)` — snapshot capacity.
+pub const OFFSET_SVS_NUM_SNAPSHOT_ENTITIES: usize = 16;
+/// `offsetof(serverStatic_t, nextSnapshotEntities)` — grows by the entities of
+/// every snapshot built; a map change resets it (S22 watches it).
+pub const OFFSET_SVS_NEXT_SNAPSHOT_ENTITIES: usize = 20;
 /// `offsetof(serverStatic_t, challenges)` — `challenge_t[MAX_CHALLENGES]`
 /// (`server.h:222`). Fields before it are `initialized` (0), `time` (4),
 /// `snapFlagServerBit` (8), `clients` (12), `numSnapshotEntities` (16),

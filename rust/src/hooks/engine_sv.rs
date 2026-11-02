@@ -22,8 +22,8 @@ use crate::sdk::{
     OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_OOB, OFFSET_MSG_READCOUNT,
     OFFSET_NETCHAN_REMOTE_ADDRESS, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
     OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
-    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY,
-    SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
+    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, OFFSET_SVS_TIME, SIZEOF_CLIENT_T,
+    SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
 };
 use crate::state::{self, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
@@ -70,7 +70,7 @@ pub fn attached() -> bool {
 /// Engine memory layer must be initialised.
 pub unsafe fn svs_time() -> i32 {
     // SAFETY: validated engine RW address (R-018).
-    unsafe { read_i32(engine::vars::SVS + 4) }
+    unsafe { read_i32(engine::vars::SVS + OFFSET_SVS_TIME) }
 }
 
 /// `svs->clients` array base (`serverStatic_t.clients` pointer @ 0x83121ec).

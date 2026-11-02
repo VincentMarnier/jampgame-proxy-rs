@@ -1047,7 +1047,7 @@ engine text range, and that `jne +0x13` lands exactly after the
 downloading client during `map_restart`; see
 [Section 6](#6-tests-and-test-plan).
 
-### S22. Engine counter wrap (`svs.time`, `nextSnapshotEntities`)
+### S22. Engine counter wrap (`svs.time`, `nextSnapshotEntities`) — **FIXED 2026-11-02**
 
 Upstream: commit `a0d322b`.
 
@@ -1058,10 +1058,46 @@ not running"), dropping everyone and leaving the server map-less. The proxy
 reloads the map shortly before the limits (with `killserver` first for the time
 wrap).
 
-**Our code (SOURCE (ours)).** No equivalent. The Rust `pps`/netStatus code is
-careful about *its own* unsigned wrap (`pps.rs`, `svc_remote_command` uses
-`wrapping_sub`), but the engine's shutdown bug remains. Availability after
-~21 days, or on a busy single map. Low/Medium.
+**Our code before the fix (SOURCE (ours)).** No equivalent. The Rust
+`pps`/netStatus code was already careful about *its own* unsigned wrap
+(`pps.rs`, `svc_remote_command` uses `wrapping_sub`), but the engine's shutdown
+bug remained.
+
+#### Applied (2026-11-02)
+
+A port of `a0d322b` in the new `restart.rs`, with the decision split out pure:
+
+- `wrap_reason(time, nextSnapshotEntities, numSnapshotEntities)` picks
+  `Time` when `time > 0x70000000 - 60000` (one minute before `SV_Frame`'s
+  check), else `SnapshotEntities` when
+  `next >= 0x7FFFFFFE - 2 * numSnapshotEntities` (two frame margins, as
+  upstream). Time wins when both are near their limit.
+- `restart_command` builds the upstream text: `map <mapname>\n` for the
+  snapshot counter, `killserver\nmap <mapname>\n` for the time counter.
+- `before_wrap` (`restart.rs:121`) reads the three `serverStatic_t` fields at
+  their SDK offsets (`sdk.rs:656`, `:659`), reads the `mapname` cvar through
+  `Cvar_VariableStringBuffer`, prints the upstream console line and sends the
+  command with `G_SEND_CONSOLE_COMMAND(EXEC_APPEND, …)`.
+- It runs at `GAME_RUN_FRAME` before the frame is forwarded (`lib.rs:152`), so
+  the appended command reaches the next `Cbuf_Execute` ahead of `SV_Frame`'s
+  own wrap check. It is gated by `proxy_sv_enable`, like the other fixes.
+- Once per load: upstream's static lives in a game module the engine reloads
+  at every map load, `map_restart` included. Our module is pinned across map
+  changes (D-007), so `GAME_INIT` calls `reset_for_load` (`lib.rs:373`) to
+  reproduce that.
+
+**Impact.** A server left on one map with many players (`nextSnapshotEntities`)
+now changes map before the counter can stop it, and the players stay connected;
+after ~21 days (`svs.time`) it runs `killserver` then the map, dropping players
+as ioq3/OpenJK do, instead of staying map-less until someone restarts it.
+
+**Tests (TESTED, 3 new).** `wrap_reason_uses_the_upstream_thresholds` checks
+both strict boundaries, the wider entity margin and time precedence;
+`restart_commands_match_the_upstream_text` pins both command strings and the
+counter names; `server_static_offsets_match_the_sdk_layout` pins the
+`serverStatic_t` prefix against the already-pinned `challenges` offset. The
+wraps themselves need a long-running server or a debugger poke; see
+[Section 6](#6-tests-and-test-plan).
 
 ### S23. NPC navigation data / other fixed items
 
@@ -1184,7 +1220,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 316 unit tests pass; the i686 release cdylib builds. No server was
+Result: 319 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1200,10 +1236,11 @@ Most of the rules above are not reachable in a host-architecture `cargo test`:
 - `sanitize_userinfo` itself is now split: the policy core
   (`sanitize_userinfo_bytes`) is pure and tested, and only the FFI wrapper
   needs the engine.
-- The remaining engine-side findings (S7, S8, S13, S20, S21, S22) are byte
+- The remaining engine-side findings (S7, S8, S13, S20, S21) are byte
   patches, engine calls or entry wrappers over `linuxjampded`; they need the
-  container runtime under `tools/runtime`. S11, S18 and S19 have pure tests for
-  their policy (buckets, SipHash, null groups), but their live paths do too.
+  container runtime under `tools/runtime`. S11, S18, S19 and S22 have pure
+  tests for their policy (buckets, SipHash, null groups, wrap thresholds), but
+  their live paths do too.
 
 To make the missing rules testable without duplicating them, the later work
 should split the decision logic from the I/O the way `forcepowers_is_valid`
@@ -1282,6 +1319,12 @@ None of these has been run yet; they are the runtime half of the fixes.
   `rcon map_restart` is issued. It must stay `CS_CONNECTED`, finish the
   download and enter the world; without the patch it waits on a black screen.
   A second, fully active client must still re-enter and play.
+- S22: with a debugger, set `svs.time` to `0x70000000 - 59999` (or
+  `svs.nextSnapshotEntities` to `0x7FFFFFFE - 2 * numSnapshotEntities`) and
+  let a frame run. The console must show the wrap line, the snapshot path must
+  change the map with the players still connected, and the time path must run
+  `killserver` then the map. The engine's own
+  `Restarting server due to ... wrapping` must not be reached.
 
 ## 7. Order of work (most urgent first)
 
@@ -1325,7 +1368,8 @@ dependencies. It is the order the fixes are being applied in.
     2026-11-02.*
 21. ✅ **S21** — `map_restart` and connecting clients (Low functional).
     *Fixed 2026-11-02.*
-22. **S22** — engine counter wrap (Low/Medium availability).
+22. ✅ **S22** — engine counter wrap (Low/Medium availability). *Fixed
+    2026-11-02.*
 
 Items to leave alone, matching upstream: S17 / 11-01 F7 (unreachable without
 the cheat cvar), H1 (refuted), O6 (do not port), O9 (not fixed upstream).
@@ -1359,8 +1403,9 @@ Rust rewrite (this repository):
 its `mod tests`;
 `rust/src/userinfo.rs:145-338` (`value_for_key`, `set_value_for_key*`,
 `validate_userinfo`) and its `mod tests`;
-`rust/src/lib.rs:153-195` and `:301-308`, `:342-350`
-(`free_bsp_disk_images`);
+`rust/src/lib.rs:130-159` (`GAME_RUN_FRAME`, S22 call at `:152`),
+`:350-355` (`free_bsp_disk_images`), `:357-378` (`game_init`, S22 reset at
+`:373`);
 `rust/src/hooks/engine_sv.rs:301-331` (rcon), `:366-426` (status/info),
 `:439-461` (challenge/connect), `:471-504` (`info_print_lines`), `:1734-1790`
 (`msg_read_bits` bounds),
@@ -1371,14 +1416,16 @@ its `mod tests`;
 (S21 site constants), `rust/src/patch.rs:705-822`
 (engine hook table), `:452-489` (trampoline copy), `:574-579` (`write_code`),
 `:1023-1026` (S21 revert) and `:1376-1401` (the S21 site pin);
+`rust/src/restart.rs:38-176` (S22 thresholds, command text, `before_wrap`) and
+its tests;
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its
-tests; `rust/src/sdk.rs:582-593` (challenge layout constants);
+tests; `rust/src/sdk.rs:652-670` (serverStatic_t offsets);
 `rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:141-203`
 (`g2_null_result`), `:205-602` (intercepted traps), `rust/src/pps.rs`
 (sequenced-packet limiter);
 `rust/src/votes.rs:43-129` (S14 vote-slot snapshot and screening);
 `rust/src/sdk.rs:133` (`G_SEND_CONSOLE_COMMAND`), `:241`
-(`TAG_BSP_DISKIMAGE`), `:544` (`CS_VOTE_TIME`), `:176-226` (Ghoul2 ordinals);
+(`TAG_BSP_DISKIMAGE`), `:550` (`CS_VOTE_TIME`), `:176-226` (Ghoul2 ordinals);
 `rust/src/hooks/compat.rs:42-83` (`default_extension`, `compare_extension`),
 `:123-152` (tokenizer).

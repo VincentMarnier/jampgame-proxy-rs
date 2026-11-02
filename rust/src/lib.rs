@@ -42,6 +42,7 @@ mod patch;
 mod player_target;
 mod pps;
 mod ratelimit;
+mod restart;
 mod rules;
 mod scoreboard;
 mod sdk;
@@ -142,6 +143,13 @@ pub unsafe extern "C" fn vmMain(
                 teamlock::on_run_frame();
                 rules::on_run_frame();
                 tffa::on_frame_start();
+                // S22: if an engine counter is about to wrap, append the map
+                // (or killserver + map) command before this frame is forwarded,
+                // so it runs at the next Cbuf_Execute, ahead of SV_Frame's own
+                // check.
+                // SAFETY: original module loaded, memory layer initialised, the
+                // server is running, and the engine syscall is registered.
+                unsafe { crate::restart::before_wrap() };
             }
             let response = forward(GAME_RUN_FRAME, &args);
             if state::proxy_enabled() {
@@ -359,6 +367,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // exactly like a fresh module load.
     let restart = args[2] != 0;
     state::reset_session(restart);
+    // S22: the upstream once-per-load flag lives in a game module the engine
+    // reloads at every map load (map_restart included); our module is pinned
+    // across map changes, so reset it here instead.
+    crate::restart::reset_for_load();
 
     // Version gate: only run on the pristine engine (R-009).
     if !engine_version_matches() {
