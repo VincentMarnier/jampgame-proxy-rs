@@ -80,7 +80,7 @@ Legend: **LIVE** = the Rust rewrite is exposed; **FIXED** = addressed in
 | O8 | userinfo validation bypass | High | **FIXED** 2026-11-02 |
 | O9 | movement events that lag every player | Medium | **ACCEPTED** (not fixed upstream) |
 | O10 | `forwardmove` of −128 | Low | **LIVE** |
-| O11 | `MSG_ReadBits` reads past the message | Low | **LIVE** |
+| O11 | `MSG_ReadBits` reads past the message | Low | **FIXED** 2026-11-02 |
 | O12 | `Info_SetValueForKey` writes one byte past | Medium | **FIXED** 2026-11-02 |
 
 Additional 2026 fixes that are not in either audit are listed in
@@ -726,7 +726,7 @@ The upstream design, a full rewrite of the command itself:
 (`Cmd_Argv`, `Com_Printf`, `Com_WriteConfigToFile`) remain runtime-only; the
 check is in [Section 6](#6-tests-and-test-plan).
 
-### S13. `MSG_ReadBits` reads past the message — Low (CVE-2017-11721)
+### S13. `MSG_ReadBits` reads past the message — Low (CVE-2017-11721) — **FIXED 2026-11-02**
 
 Upstream: O11, commit `331f29c` (*"fix: O11"*).
 
@@ -736,13 +736,35 @@ read past the OOB/Huffman data. In JKA the receive buffer is a local
 memory. ioq3/OpenJK added bounds; the 2026 proxy wraps `MSG_ReadBits` with
 before/after checks (4-argument retail signature).
 
-**Our code (SOURCE (ours)).** No `MSG_ReadBits` hook. `engine.rs` exposes
-`MSG_READ_BYTE/SHORT/LONG/STRING/…` but not `MSG_ReadBits`, and no wrapper in
-`hooks/engine_sv.rs`. The retail read path is unchanged.
+**Our code before the fix (SOURCE (ours)).** No `MSG_ReadBits` hook; the
+retail read path was unchanged.
 
 **Impact.** Remote out-of-bounds read (stack) from a malformed packet. Low.
 
-**Test.** The bounds arithmetic could be unit tested; the hook needs a server.
+#### Applied (2026-11-02)
+
+A direct port of `331f29c`:
+
+- `msg_read_bits` (`hooks/engine_sv.rs:1734-1772`) is an entry wrapper around
+  the original (`MSG_ReadBits`, `0x8077834`). Before the read:
+  - `readcount > cursize` → return 0;
+  - out-of-band: `readcount + bits/8 > cursize` → set `readcount = cursize + 1`
+    and return 0;
+  - Huffman: `bit + bits%8 > cursize*8` → same.
+  After the original: a Huffman read whose `bit` went past `cursize*8` gets 0
+  and the same marker. The one-symbol overshoot stays inside the receive
+  buffer.
+- The two decisions are pure helpers (`readbits_over_bound`,
+  `readbits_post_over`, `:1776-1790`) and are unit tested.
+- `OFFSET_MSG_OOB = 8` added to `sdk.rs` (the SDK `msg_t` has `allowoverflow`,
+  `overflowed`, `oob` before `data`), pinned with the other message offsets.
+- New `MSG_ReadBits` hook with its site prologue
+  (`55 8b ec 83 ec 38`, verified on `linuxjampded`).
+
+**Tests (TESTED, 1 new).** `msg_read_bits_bounds_match_ioq3` covers the OOB
+whole-byte bound, the Huffman bit bound (including the exact end), negative
+bit counts and the post-read overshoot. The live malformed-packet check is in
+[Section 6](#6-tests-and-test-plan).
 
 ### S14. A kick vote can kick the next client of the slot — Low
 
@@ -1066,9 +1088,10 @@ the `challenge_t`/`serverStatic_t` offsets.
 `rust/src/syscall.rs` (1 new test): `null_ghoul2_instances_are_answered` covers
 every null-instance group and the `void**` dereference.
 
-`rust/src/hooks/engine_sv.rs` (3 new tests): the `Info_Print` formatter —
+`rust/src/hooks/engine_sv.rs` (4 new tests): the `Info_Print` formatter —
 20-character key padding, a 600-character value kept intact (the retail 512
-buffer would overflow), a long key left unpadded, and `MISSING VALUE`.
+buffer would overflow), a long key left unpadded, `MISSING VALUE` — and the
+`MSG_ReadBits` bounds.
 
 `rust/src/patch.rs` (1 new test): the `Info_SetValueForKey` length sites and
 the pristine/patched `jbe`/`jb` bytes.
@@ -1086,7 +1109,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 310 unit tests pass; the i686 release cdylib builds. No server was
+Result: 311 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1163,6 +1186,9 @@ None of these has been run yet; they are the runtime half of the fixes.
   mpdefault.cfg`/`default.cfg` must be refused; and the same command reached
   through `set x "writeconfig evil.so"; vstr x` (or `exec`) must be refused
   from the command itself, not the rcon packet.
+- S13: truncate a client message inside a bit-packed field (or fuzz the message
+  readers); `MSG_ReadBits` must return 0 past the end and the server must stay
+  up. Best run against an ASan build of the engine if one is available.
 - S9: `userinfo` with a fake `ip`, then `map_restart`; the game must still see
   the real address (the engine wrapper overwrote it). Also `connect` with a
   userinfo too long for `ip` (1007 characters plus the engine's pair): the
@@ -1202,7 +1228,8 @@ dependencies. It is the order the fixes are being applied in.
     *Fixed 2026-11-02.*
 14. ✅ **S12** — `Com_WriteConfig_f` (Medium). *Fixed 2026-11-02.*
 15. **O5** — connections per IP address (Medium, optional availability).
-16. **S13** — `MSG_ReadBits` bounds (Low, CVE-2017-11721).
+16. ✅ **S13** — `MSG_ReadBits` bounds (Low, CVE-2017-11721).
+    *Fixed 2026-11-02.*
 17. **S14** — kick vote slot reuse (Low).
 18. **S15** — `forwardmove` −128 (Low; the test seam already exists).
 19. **S16** — vote parsing / name lookup (Low, not security).
@@ -1244,11 +1271,12 @@ its `mod tests`;
 `validate_userinfo`) and its `mod tests`;
 `rust/src/lib.rs:153-195` and `:301-308`;
 `rust/src/hooks/engine_sv.rs:301-331` (rcon), `:366-426` (status/info),
-`:439-461` (challenge/connect), `:471-504` (`info_print_lines`),
+`:439-461` (challenge/connect), `:471-504` (`info_print_lines`), `:1734-1790`
+(`msg_read_bits` bounds),
 `:538-587` (`com_write_config_f`), `:600-625` (`info_print`), `:646-683`
 (`refresh_ip`), `:693-756` (`SV_UserinfoChanged`),
 `:1075-1135` (`SV_SvEntityForGentity`);
-`rust/src/hooks/mod.rs:286-385` (intra patches), `rust/src/patch.rs:692-804`
+`rust/src/hooks/mod.rs:286-391` (intra patches), `rust/src/patch.rs:692-809`
 (engine hook table) and `:452-489` (trampoline copy);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its

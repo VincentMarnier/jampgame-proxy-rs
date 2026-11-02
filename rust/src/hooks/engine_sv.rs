@@ -19,10 +19,11 @@ use crate::sdk::{
     OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_CLIENT_NUM, OFFSET_ENTITY_NUMBER, OFFSET_GENTITY_CLIENT,
     OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS, OFFSET_GENTITY_S_ETYPE,
     OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
-    OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_READCOUNT, OFFSET_NETCHAN_REMOTE_ADDRESS,
-    OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST,
-    OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE,
-    OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
+    OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_OOB, OFFSET_MSG_READCOUNT,
+    OFFSET_NETCHAN_REMOTE_ADDRESS, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
+    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
+    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, SIZEOF_CLIENT_T, SIZEOF_GENTITY,
+    SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
 };
 use crate::state::{self, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
@@ -1715,6 +1716,77 @@ fn owners_in_viewer_match(
     true
 }
 
+// ---------------------------------------------------------------------------
+// MSG_ReadBits (CVE-2017-11721) — entry wrapper (S13/O11)
+// ---------------------------------------------------------------------------
+
+/// `MSG_ReadBits` (S13/O11, CVE-2017-11721): the retail function has no bound
+/// and reads whatever follows the message in the receive buffer. These are the
+/// ioq3/OpenJK bounds: once the end is passed, the read returns 0 and
+/// `readcount` stays above `cursize`, which the callers test. The original is
+/// still called for the read itself, so one Huffman symbol can go a few bytes
+/// past the end before the post-test; that stays inside the receive buffer and
+/// the value is dropped.
+///
+/// # Safety
+///
+/// Entered from the engine's message readers with a valid `msg_t*`.
+pub unsafe extern "C" fn msg_read_bits(msg: usize, bits: c_int) -> c_int {
+    // SAFETY: msg is a valid msg_t from the engine's receive path.
+    let readcount = unsafe { read_i32(msg + OFFSET_MSG_READCOUNT) };
+    let cursize = unsafe { read_i32(msg + OFFSET_MSG_CURSIZE) };
+
+    if readcount > cursize {
+        return 0;
+    }
+
+    // SAFETY: msg is a valid msg_t; `oob` is the third boolean, `bit` the
+    // last int.
+    let (oob, bit) = unsafe {
+        (
+            read_i32(msg + OFFSET_MSG_OOB) != 0,
+            read_i32(msg + OFFSET_MSG_BIT),
+        )
+    };
+
+    if readbits_over_bound(readcount, cursize, bit, bits, oob) {
+        // SAFETY: msg is writable; this is the engine's own "past end"
+        // marker.
+        unsafe { write_i32(msg + OFFSET_MSG_READCOUNT, cursize + 1) };
+        return 0;
+    }
+
+    // SAFETY: trampoline attached at GAME_INIT; arguments unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_msg_read_bits);
+    let value = unsafe { original(msg, bits) };
+
+    // SAFETY: msg is a valid msg_t.
+    let bit = unsafe { read_i32(msg + OFFSET_MSG_BIT) };
+    if readbits_post_over(bit, cursize, oob) {
+        // SAFETY: msg is writable.
+        unsafe { write_i32(msg + OFFSET_MSG_READCOUNT, cursize + 1) };
+        return 0;
+    }
+
+    value
+}
+
+/// Whether a `MSG_ReadBits(msg, bits)` request starts past the end of the
+/// message (ioq3/OpenJK pre-check).
+fn readbits_over_bound(readcount: i32, cursize: i32, bit: i32, bits: i32, oob: bool) -> bool {
+    let bit_count = if bits < 0 { -bits } else { bits };
+    if oob {
+        readcount + (bit_count >> 3) > cursize
+    } else {
+        bit + (bit_count & 7) > (cursize << 3)
+    }
+}
+
+/// Whether the read left the bit cursor past the end (ioq3/OpenJK post-check).
+fn readbits_post_over(bit: i32, cursize: i32, oob: bool) -> bool {
+    !oob && bit > (cursize << 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2302,5 +2374,27 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0, key);
         assert_eq!(lines[0].1.as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn msg_read_bits_bounds_match_ioq3() {
+        // Out-of-band: whole bytes.
+        assert!(!readbits_over_bound(0, 2, 0, 16, true));
+        assert!(readbits_over_bound(0, 2, 0, 24, true));
+        assert!(!readbits_over_bound(2, 2, 0, 0, true));
+
+        // Huffman: bit cursor, the exact end is still allowed.
+        assert!(!readbits_over_bound(0, 2, 8, 8, false));
+        assert!(!readbits_over_bound(0, 2, 15, 1, false));
+        assert!(readbits_over_bound(0, 2, 16, 1, false));
+
+        // Negative bit counts use their magnitude.
+        assert!(readbits_over_bound(0, 2, 0, -24, true));
+
+        // After the read: one Huffman symbol may overshoot, then the value is
+        // dropped and the cursor stays past the end.
+        assert!(!readbits_post_over(16, 2, false));
+        assert!(readbits_post_over(17, 2, false));
+        assert!(!readbits_post_over(17, 2, true));
     }
 }

@@ -739,6 +739,9 @@ pub const OFFSET_LEVEL_TEAM_SCORES_BLUE: usize = 52;
 pub const OFFSET_LEVEL_FOLLOW1: usize = 212;
 pub const OFFSET_LEVEL_FOLLOW2: usize = 216;
 
+/// `offsetof(msg_t, oob)` — the three booleans before `data`
+/// (`allowoverflow` 0, `overflowed` 4, `oob` 8; `qcommon.h:17-26`).
+pub const OFFSET_MSG_OOB: usize = 8;
 /// `offsetof(msg_t, data)` — the message bytes (`SV_ExecuteClientMessage` peek).
 pub const OFFSET_MSG_DATA: usize = 12;
 /// `offsetof(msg_t, cursize)`.
@@ -991,8 +994,11 @@ mod tests {
         assert_eq!(ET_MOVER, 6);
         assert_eq!(CONTENTS_TRIGGER, 0x400);
         assert_eq!(CONTENTS_SOLID, 1);
+        assert_eq!(OFFSET_MSG_OOB, 8);
         assert_eq!(OFFSET_MSG_DATA, 12);
         assert_eq!(OFFSET_MSG_CURSIZE, 20);
+        assert_eq!(OFFSET_MSG_READCOUNT, 24);
+        assert_eq!(OFFSET_MSG_BIT, 28);
         assert_eq!(OFFSET_NETCHAN_REMOTE_ADDRESS, 234556);
         assert_eq!(OFFSET_NETCHAN_QPORT, 28);
         assert_eq!(OFFSET_NETCHAN_UNSENT_FRAGMENTS, 49200);

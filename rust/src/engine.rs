@@ -100,6 +100,9 @@ pub mod functions {
     pub const NET_OUT_OF_BAND_PRINT: usize = 0x0807_b744;
     pub const NET_COMPARE_BASE_ADR: usize = 0x0807_b284;
     pub const MSG_INIT: usize = 0x0807_74a4;
+    /// `MSG_ReadBits` (`0x8077834`): no bound in the retail code
+    /// (CVE-2017-11721); wrapped with the ioq3/OpenJK bounds (S13/O11).
+    pub const MSG_READ_BITS: usize = 0x0807_7834;
     pub const MSG_READ_BYTE: usize = 0x0807_7df4;
     pub const MSG_READ_DELTA_USERCMD_KEY: usize = 0x0807_8b34;
     pub const MSG_READ_SHORT: usize = 0x0807_7e34;
