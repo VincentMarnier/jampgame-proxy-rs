@@ -575,7 +575,9 @@ from the connectionless entry wrappers:
 - New entry wrappers `sv_get_challenge` / `sv_direct_connect`
   (`hooks/engine_sv.rs:456-485`) apply `address_allowed`; two new hooks
   (`SV_GetChallenge`, `SV_DirectConnect`) with pinned prologues. A dropped
-  packet gets no `challengeResponse`/`connectResponse`.
+  packet gets no `challengeResponse`/`connectResponse`. The getchallenge
+  wrapper then answers statelessly (S18); the connect wrapper admits the
+  challenge before the original runs.
 - `proxy_sv_enableRconCmdCooldown` is **deleted** (`state.rs` cvar table now
   21 entries, later indices shifted); the engine's 500 ms timer stays NOP'd.
   This matches the 2026 decision; the old cvar was the broken global gate.
@@ -731,7 +733,7 @@ unless a custom-skeleton build is used.
 These came from the same 2026 commit range and are worth tracking even though
 they are not in the audit files.
 
-### S18. Challenge table can be evicted by a spoofed `getchallenge` flood
+### S18. Challenge table can be evicted by a spoofed `getchallenge` flood — **FIXED 2026-11-02**
 
 Upstream: commit `6c8ce8c` (*"fix: renew the challenge at each getchallenge"*)
 then `ae62510` (*"feat: stateless challenges"*).
@@ -744,17 +746,46 @@ player's round trip evict that player's challenge, and they cannot connect. The
 address and a timestamp and only inserts the challenge at `connect`, so nothing
 can be evicted.
 
-**Our code (SOURCE (ours)).** No `SV_GetChallenge`/`SV_DirectConnect` hook is
-installed (`patch.rs` engine hook table, `hooks/mod.rs`); the retail stateful
-table is used. `engine.rs` has the addresses (`SV_GET_CHALLENGE`,
-`SV_DIRECT_CONNECT`) but no user.
+**Our code before the fix (SOURCE (ours)).** No `SV_GetChallenge` /
+`SV_DirectConnect` hook was installed; the retail stateful table was used.
 
-**Impact.** A spoofed flood can keep new players out (availability), and the
-related ping trick (getchallenge immediately before connect) bypasses
+**Impact.** A spoofed flood could keep new players out (availability), and the
+related ping trick (getchallenge immediately before connect) bypassed
 `sv_minPing`/`sv_maxPing`. Medium/High for a public server.
 
-**Test.** A stateless challenge is a pure function (SipHash of address +
-timestamp) and can be unit tested against reference vectors, as upstream did.
+#### Applied (2026-11-02)
+
+A port of `ae62510` (which supersedes the `6c8ce8c` renewal) into
+`rust/src/challenge.rs`:
+
+- `getchallenge` is answered by the proxy with
+  `challengeResponse %i` (`answer`), and the original engine handler is not
+  called. The challenge is
+  `SipHash-2-4(key, ip | port << 32, timestamp)` with 31 bits of the hash and
+  the timestamp parity in the top bit; nothing is stored.
+- `connect` is validated in the `SV_DirectConnect` wrapper (`admit`): a valid
+  challenge (current or previous 16.384 s timestamp) writes its entry into
+  `svs.challenges` just before the original looks it up; a repeated connect
+  reuses its existing entry even after expiry. An invalid challenge inserts
+  nothing and the engine replies `No or bad challenge for address.`
+- The entry's `pingTime` is `svs.time - ceil(sv_minPing)`, so the original
+  `sv_minPing`/`sv_maxPing` checks pass; neither can be enforced on a stateless
+  challenge, as in OpenJK, TaystJK and Quake3e.
+- The key is a process-lifetime `LazyLock<[u64; 2]>` seeded from std's
+  `RandomState` (OS entropy). Upstream keeps it in a hidden cvar because the
+  engine unloads the module on every map change; our module is pinned (D-007),
+  so a challenge sent just before a map change stays valid without a cvar.
+- New offsets in `sdk.rs`: `OFFSET_SVS_CHALLENGES = 32` (confirmed on the
+  retail binary: `SV_GetChallenge` uses `0x8312200` = `svs` + 32),
+  `SIZEOF_CHALLENGE_T = 40`, `MAX_CHALLENGES = 1024`, pinned by a layout test.
+- The `SV_GetChallenge`/`SV_DirectConnect` hooks were added with S11; the
+  getchallenge trampoline is now unused (the original is never called).
+
+**Tests (TESTED, 5 new).** The SipHash-2-4 reference vector, the
+current/previous-timestamp validity and the future-timestamp rejection, the
+address+port binding, the base-address comparison, and the `sdk.rs` layout
+pins. The engine write into `svs.challenges` and the `challengeResponse` on the
+wire need the runtime check in [Section 6](#6-tests-and-test-plan).
 
 ### S19. Ghoul2 calls with a null instance
 
@@ -899,6 +930,11 @@ time wrap, per-address buckets keyed by IP with the non-IP exemption, the
 65536-entry cap, and the per-second garbage collection. `address_allowed_at`
 takes the time as a parameter, so the table is tested without the engine.
 
+`rust/src/challenge.rs` (new, 4 tests) and `sdk.rs` (1 layout test): the
+SipHash-2-4 reference vector, a challenge valid at its timestamp and the next
+one but not later, the address+port binding, the base-address comparison, and
+the `challenge_t`/`serverStatic_t` offsets.
+
 Run:
 
 ```sh
@@ -908,7 +944,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 295 unit tests pass; the i686 release cdylib builds. No server was
+Result: 300 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -924,9 +960,10 @@ Most of the rules above are not reachable in a host-architecture `cargo test`:
 - `sanitize_userinfo` itself is now split: the policy core
   (`sanitize_userinfo_bytes`) is pure and tested, and only the FFI wrapper
   needs the engine.
-- The engine-side findings (S7, S8, S11, S13, S18, S19, S20, S21, S22) are
+- The remaining engine-side findings (S7, S8, S13, S19, S20, S21, S22) are
   byte patches or entry wrappers over `linuxjampded`; they need the container
-  runtime under `tools/runtime`, not a unit test.
+  runtime under `tools/runtime`. S11 and S18 have pure tests for their policy
+  (buckets, SipHash, timestamps), but their live paths do too.
 
 To make the missing rules testable without duplicating them, the later work
 should split the decision logic from the I/O the way `forcepowers_is_valid`
@@ -964,6 +1001,11 @@ None of these has been run yet; they are the runtime half of the fixes.
   remain for the slot. Also send a `userinfo` command with that model to a
   connected client and confirm it is dropped with no ghost configstring.
 - S1/S11: rcon password guessing and `getstatus` amplification rate.
+- S18: flood `getchallenge` from more than 1024 spoofed addresses while a real
+  client connects; the client must still connect (the stateless answer stores
+  nothing). Also: a valid challenge must survive a map change, an invalid or
+  expired one must get `No or bad challenge for address.`, and a `connect` the
+  client retries must reuse its entry.
 - S7: plant a 600-character userinfo value, then `rcon dumpuser <client>`.
 - S8: `connect` with a 1007-character userinfo.
 - S9: `userinfo` with a fake `ip`, then `map_restart`; check the game's logged
@@ -988,7 +1030,8 @@ dependencies. It is the order the fixes are being applied in.
    and a reliable S4). *Fixed 2026-11-02.*
 6. ✅ **S11** — out-of-band rate limits and the rcon policy (High,
    unauthenticated DoS). *Fixed 2026-11-02.*
-7. **S18** — stateless/renewed challenges (availability companion of S11).
+7. ✅ **S18** — stateless/renewed challenges (availability companion of S11).
+   *Fixed 2026-11-02.*
 8. **S9** — re-derive the `ip` userinfo key (High; IP-ban bypass, only
    observable when bans are used).
 9. **S4** — forcepowers 18 digits / 0..3 (Medium; the `*_known_gap_*` tests are
@@ -1047,6 +1090,8 @@ Rust rewrite (this repository):
 `rust/src/hooks/mod.rs:283-307` (intra patches), `rust/src/patch.rs:692-797`
 (engine hook table) and `:452-489` (trampoline copy);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
+`rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its
+tests; `rust/src/sdk.rs:582-593` (challenge layout constants);
 `rust/src/state.rs:22-43` (proxy cvars), `rust/src/syscall.rs:145-430`
 (intercepted traps), `rust/src/pps.rs` (sequenced-packet limiter);
 `rust/src/hooks/compat.rs:74-103` (tokenizer).

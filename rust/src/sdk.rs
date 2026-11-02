@@ -579,6 +579,18 @@ pub const OFFSET_SV_GENTITY_SIZE: usize = 647864;
 pub const OFFSET_SVS_TIME: usize = 4;
 /// `offsetof(serverStatic_t, clients)` — `client_t[MAX_CLIENTS]` array start.
 pub const OFFSET_SVS_CLIENTS: usize = 12;
+/// `offsetof(serverStatic_t, challenges)` — `challenge_t[MAX_CHALLENGES]`
+/// (`server.h:222`). Fields before it are `initialized` (0), `time` (4),
+/// `snapFlagServerBit` (8), `clients` (12), `numSnapshotEntities` (16),
+/// `nextSnapshotEntities` (20), `snapshotEntities` (24) and
+/// `nextHeartbeatTime` (28). Confirmed on the retail binary:
+/// `SV_GetChallenge` uses `0x8312200` = `svs` (0x83121e0) + 32.
+pub const OFFSET_SVS_CHALLENGES: usize = 32;
+/// `sizeof(challenge_t)` on i386: `netadr_t` (20) + challenge/time/pingTime/
+/// firstTime (16) + `qboolean connected` (4).
+pub const SIZEOF_CHALLENGE_T: usize = 40;
+/// `MAX_CHALLENGES` (`server.h:190`).
+pub const MAX_CHALLENGES: usize = 1024;
 
 /// `offsetof(sharedEntity_t, r.svFlags)` (binary: `SV_CalcPings` at
 /// `0x8057273` loads `0x238(%gentity)` and tests bit 3 to identify bots).
@@ -743,6 +755,15 @@ mod tests {
     use super::layout_pins::*;
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn server_static_challenge_layout_matches_sdk() {
+        // `serverStatic_t` prefix and `challenge_t` on i386 (server.h:193-220).
+        assert_eq!(OFFSET_SVS_CHALLENGES, 32);
+        assert_eq!(SIZEOF_CHALLENGE_T, 40);
+        assert_eq!(MAX_CHALLENGES, 1024);
+        assert_eq!(core::mem::size_of::<crate::hooks::engine_sv::Netadr>(), 20);
+    }
 
     #[test]
     fn usercmd_layout_matches_sdk() {

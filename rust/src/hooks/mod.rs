@@ -106,11 +106,6 @@ engine_trampoline!(
     unsafe extern "C" fn(usize, usize)
 );
 engine_trampoline!(
-    engine_hook_original_sv_get_challenge,
-    17,
-    unsafe extern "C" fn(engine_sv::Netadr)
-);
-engine_trampoline!(
     engine_hook_original_sv_direct_connect,
     18,
     unsafe extern "C" fn(engine_sv::Netadr)

@@ -29,6 +29,7 @@
 //! both mirroring the original proxy's forwarders. See `src/syscall.rs`,
 //! `src/original.rs`, `src/sdk.rs`.
 
+mod challenge;
 mod diagnostics;
 mod engine;
 mod hooks;

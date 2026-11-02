@@ -453,8 +453,9 @@ pub unsafe extern "C" fn svc_info(from: Netadr) {
 // SV_GetChallenge / SV_DirectConnect — per-address rate limit (10-25 F6/O2)
 // ---------------------------------------------------------------------------
 
-/// `SV_GetChallenge(netadr_t)`: per-address limit, as Quake3e. A dropped
-/// request gets no `challengeResponse`.
+/// `SV_GetChallenge(netadr_t)`: per-address limit, then a **stateless**
+/// challenge answer (S18). The original engine handler is never called, so
+/// nothing is stored in `svs.challenges` at this point.
 ///
 /// # Safety
 ///
@@ -463,14 +464,12 @@ pub unsafe extern "C" fn sv_get_challenge(from: Netadr) {
     if !crate::ratelimit::address_allowed(&from, "getchallenge") {
         return;
     }
-    // SAFETY: trampoline attached at GAME_INIT; the argument is unchanged.
-    let original = original_call(crate::hooks::engine_hook_original_sv_get_challenge);
-    unsafe { original(from) };
+    crate::challenge::answer(&from);
 }
 
-/// `SV_DirectConnect(netadr_t)`: per-address limit, sharing the
-/// getstatus/getinfo bucket, as Quake3e. A dropped request gets no
-/// `connectResponse`.
+/// `SV_DirectConnect(netadr_t)`: per-address limit, then validate the stateless
+/// challenge and write its entry into `svs.challenges` for the original, which
+/// then receives the call unchanged.
 ///
 /// # Safety
 ///
@@ -479,6 +478,7 @@ pub unsafe extern "C" fn sv_direct_connect(from: Netadr) {
     if !crate::ratelimit::address_allowed(&from, "connect") {
         return;
     }
+    crate::challenge::admit(&from);
     // SAFETY: trampoline attached at GAME_INIT; the argument is unchanged.
     let original = original_call(crate::hooks::engine_hook_original_sv_direct_connect);
     unsafe { original(from) };
