@@ -563,6 +563,19 @@ pub unsafe fn patch_byte(addr: usize, byte: u8) {
     }
 }
 
+/// Write a whole instruction sequence at `addr` (S21's 7-byte `map_restart`
+/// store replacement).
+///
+/// # Safety
+///
+/// `addr..addr + bytes.len()` must be a patchable engine/game range tiling the
+/// instructions to replace; the bytes must have been verified from the shipped
+/// binary.
+pub unsafe fn write_code(addr: usize, bytes: &[u8]) {
+    // SAFETY: caller guarantees the range and provenance.
+    unsafe { write_code_bytes(addr, bytes) };
+}
+
 /// `Patch_NOP_Bytes`: NOP out `len` bytes at `addr`.
 ///
 /// # Safety
@@ -1005,6 +1018,10 @@ pub unsafe fn revert_inline_patches() {
             crate::engine::patches::INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR,
             &[crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE],
         );
+        restore_code_if_changed(
+            crate::engine::patches::SV_MAP_RESTART_SET_ACTIVE_ADDR,
+            &crate::engine::patches::SV_MAP_RESTART_SET_ACTIVE_PRISTINE,
+        );
         restore_code_if_changed(CALL_IP_AUTHORIZE, &PRISTINE_CALL_IP_AUTHORIZE);
         restore_code_if_changed(RMG_BRANCH, &PRISTINE_RMG_BRANCH);
     }
@@ -1353,6 +1370,39 @@ mod tests {
         ] {
             assert!((crate::engine::ENGINE_TEXT_LO..crate::engine::ENGINE_TEXT_HI).contains(&addr));
         }
+    }
+
+    #[test]
+    fn sv_map_restart_set_active_site_is_pinned() {
+        use crate::engine::patches::{
+            SV_MAP_RESTART_SET_ACTIVE_ADDR, SV_MAP_RESTART_SET_ACTIVE_PATCHED,
+            SV_MAP_RESTART_SET_ACTIVE_PRISTINE,
+        };
+        // `client->state = CS_ACTIVE` (`movl $4,(%esi,%ecx,1)`) at 0x804f23f on
+        // linuxjampded, followed by the `SV_ClientEnterWorld` call at 0x804f253.
+        assert_eq!(SV_MAP_RESTART_SET_ACTIVE_ADDR, 0x0804_f23f);
+        assert_eq!(
+            SV_MAP_RESTART_SET_ACTIVE_PRISTINE,
+            [0xc7, 0x04, 0x0e, 0x04, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            SV_MAP_RESTART_SET_ACTIVE_PATCHED,
+            [0x83, 0x3c, 0x0e, 0x04, 0x75, 0x13, 0x90]
+        );
+        assert!(
+            (crate::engine::ENGINE_TEXT_LO..crate::engine::ENGINE_TEXT_HI)
+                .contains(&SV_MAP_RESTART_SET_ACTIVE_ADDR)
+        );
+        // The patches must not grow past the 7-byte store they replace.
+        assert_eq!(SV_MAP_RESTART_SET_ACTIVE_PRISTINE.len(), 7);
+        assert_eq!(SV_MAP_RESTART_SET_ACTIVE_PATCHED.len(), 7);
+        // `jne +0x13` from the end of the 6-byte compare/jne jumps over the
+        // 5-byte `call SV_ClientEnterWorld` (0x804f253..=0x804f258) and lands
+        // on its continuation at 0x804f258.
+        let call_addr = 0x0804_f253usize;
+        assert_eq!(call_addr - SV_MAP_RESTART_SET_ACTIVE_ADDR, 0x14);
+        let jne_end = SV_MAP_RESTART_SET_ACTIVE_ADDR + 6;
+        assert_eq!(jne_end + 0x13, call_addr + 5);
     }
 
     #[test]

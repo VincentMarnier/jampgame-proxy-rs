@@ -1000,7 +1000,7 @@ sub-BSPs at that point. The main map's buffer is already freed by the engine.
 tag value and the `Z_TagFree` address. The leak itself is a runtime memory
 measurement; see [Section 6](#6-tests-and-test-plan).
 
-### S21. `map_restart` puts connecting clients back in the world
+### S21. `map_restart` puts connecting clients back in the world — **FIXED 2026-11-02**
 
 Upstream: commit `48d4da5`.
 
@@ -1010,11 +1010,42 @@ gamestate. Combined with the proxy's donedl/update-state guards (which we
 ported), such a client can wait forever. The fix makes `map_restart` skip
 non-active clients, as Quake3e.
 
-**Our code (SOURCE (ours)).** We do not patch `SV_MapRestart_f`'s client-state
-store. We **do** port the `SV_ExecuteClientMessage` upstream gate (see
-`hooks/engine_sv.rs:1284-1310`), which is the other half of this interaction.
-A client that is connecting during a `map_restart` may still be stuck. Low
-functional impact.
+**Our code before the fix (SOURCE (ours)).** We did not patch
+`SV_MapRestart_f`'s client-state store. We **do** port the
+`SV_ExecuteClientMessage` upstream gate (see `hooks/engine_sv.rs:1307-1390`),
+which is the other half of this interaction.
+
+#### Applied (2026-11-02)
+
+A byte-for-byte port of `48d4da5` with no new hook. On `linuxjampded` the
+pristine store at `0x804f23f` is `c7 04 0e 04 00 00 00`
+(`client->state = CS_ACTIVE`), followed by the argument setup and the
+`call SV_ClientEnterWorld` at `0x804f253`. The patch replaces the store with
+`83 3c 0e 04 75 13 90`:
+
+```
+cmpl $4,(%esi,%ecx,1)   ; state == CS_ACTIVE?
+jne  +0x13              ; no: skip EnterWorld
+nop
+```
+
+The `jne` lands at `0x804f258`, right after the 5-byte call, so only clients
+already `CS_ACTIVE` are re-entered. A client in `CS_CONNECTED`/`CS_PRIMED`
+keeps its state, finishes connecting, and receives the gamestate through the
+normal path. The site is applied in `attach_all` via `patch::write_code`
+(`hooks/mod.rs`) and restored to the pristine 7-byte store in
+`revert_inline_patches` (`patch.rs`), so `proxy_sv_enable 0` gives back the
+pristine engine (`engine.rs:170-176`, `patch.rs:574`, `:1023-1026`).
+
+**Impact.** Functional/availability only: a client connecting while an admin
+or a vote issues `map_restart` no longer gets stuck on a black screen.
+
+**Tests (TESTED, 1 new).** `sv_map_restart_set_active_site_is_pinned`
+(`patch.rs`) pins the address, both byte sequences, the 7-byte length, the
+engine text range, and that `jne +0x13` lands exactly after the
+`SV_ClientEnterWorld` call. The end-to-end behaviour needs a paused/slow
+downloading client during `map_restart`; see
+[Section 6](#6-tests-and-test-plan).
 
 ### S22. Engine counter wrap (`svs.time`, `nextSnapshotEntities`)
 
@@ -1153,7 +1184,7 @@ rust/dev.sh cargo fmt --check
 rust/dev.sh cargo build --offline --target i686-unknown-linux-gnu --release
 ```
 
-Result: 315 unit tests pass; the i686 release cdylib builds. No server was
+Result: 316 unit tests pass; the i686 release cdylib builds. No server was
 started.
 
 ### Why the other findings have no unit test yet
@@ -1170,9 +1201,9 @@ Most of the rules above are not reachable in a host-architecture `cargo test`:
   (`sanitize_userinfo_bytes`) is pure and tested, and only the FFI wrapper
   needs the engine.
 - The remaining engine-side findings (S7, S8, S13, S20, S21, S22) are byte
-  patches or entry wrappers over `linuxjampded`; they need the container
-  runtime under `tools/runtime`. S11, S18 and S19 have pure tests for their
-  policy (buckets, SipHash, null groups), but their live paths do too.
+  patches, engine calls or entry wrappers over `linuxjampded`; they need the
+  container runtime under `tools/runtime`. S11, S18 and S19 have pure tests for
+  their policy (buckets, SipHash, null groups), but their live paths do too.
 
 To make the missing rules testable without duplicating them, the later work
 should split the decision logic from the I/O the way `forcepowers_is_valid`
@@ -1247,6 +1278,10 @@ None of these has been run yet; they are the runtime half of the fixes.
 - S20: load a map with `misc_bsp`/model sub-BSPs several times (`map`/
   `map_restart`) and check `Z_MemSize(TAG_BSP_DISKIMAGE)` (or RSS) does not
   grow per load.
+- S21: have a client still downloading (or one whose packets are paused) when
+  `rcon map_restart` is issued. It must stay `CS_CONNECTED`, finish the
+  download and enter the world; without the patch it waits on a black screen.
+  A second, fully active client must still re-enter and play.
 
 ## 7. Order of work (most urgent first)
 
@@ -1288,7 +1323,8 @@ dependencies. It is the order the fixes are being applied in.
 19. **S16** — vote parsing / name lookup (Low, not security).
 20. ✅ **S20** — sub-BSP buffer leak (Low/Medium availability). *Fixed
     2026-11-02.*
-21. **S21** — `map_restart` and connecting clients (Low functional).
+21. ✅ **S21** — `map_restart` and connecting clients (Low functional).
+    *Fixed 2026-11-02.*
 22. **S22** — engine counter wrap (Low/Medium availability).
 
 Items to leave alone, matching upstream: S17 / 11-01 F7 (unreachable without
@@ -1331,8 +1367,10 @@ its `mod tests`;
 `:538-587` (`com_write_config_f`), `:600-625` (`info_print`), `:646-683`
 (`refresh_ip`), `:693-756` (`SV_UserinfoChanged`),
 `:1075-1135` (`SV_SvEntityForGentity`);
-`rust/src/hooks/mod.rs:286-391` (intra patches), `rust/src/patch.rs:692-809`
-(engine hook table) and `:452-489` (trampoline copy);
+`rust/src/hooks/mod.rs:284-401` (intra patches), `rust/src/engine.rs:166-176`
+(S21 site constants), `rust/src/patch.rs:705-822`
+(engine hook table), `:452-489` (trampoline copy), `:574-579` (`write_code`),
+`:1023-1026` (S21 revert) and `:1376-1401` (the S21 site pin);
 `rust/src/ratelimit.rs:61-186` (bucket arithmetic and policies) and its tests;
 `rust/src/challenge.rs:85-265` (SipHash, create/verify, answer/admit) and its
 tests; `rust/src/sdk.rs:582-593` (challenge layout constants);

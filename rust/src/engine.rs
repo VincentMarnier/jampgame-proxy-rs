@@ -161,6 +161,19 @@ pub mod patches {
     /// The retail `jbe` (`0x76`) and the patched `jb` (`0x72`).
     pub const INFO_SET_VALUE_FOR_KEY_JBE_PRISTINE: u8 = 0x76;
     pub const INFO_SET_VALUE_FOR_KEY_JBE_PATCHED: u8 = 0x72;
+
+    /// `SV_MapRestart_f`: `client->state = CS_ACTIVE` at `0x804f23f`
+    /// (`c7 04 0e 04 00 00 00`, 7 bytes), followed by the argument setup and
+    /// the `SV_ClientEnterWorld` call at `0x804f253`. The patched sequence
+    /// compares the state and skips the call for a client that is still
+    /// `CS_CONNECTED`/`CS_PRIMED` (S21 / upstream `48d4da5`).
+    pub const SV_MAP_RESTART_SET_ACTIVE_ADDR: usize = 0x0804_f23f;
+    pub const SV_MAP_RESTART_SET_ACTIVE_PRISTINE: [u8; 7] =
+        [0xc7, 0x04, 0x0e, 0x04, 0x00, 0x00, 0x00];
+    /// `cmp $4,(%esi,%ecx,1); jne +0x13; nop` — the jump lands at
+    /// `0x804f258`, right after the `call` (which ends there).
+    pub const SV_MAP_RESTART_SET_ACTIVE_PATCHED: [u8; 7] =
+        [0x83, 0x3c, 0x0e, 0x04, 0x75, 0x13, 0x90];
 }
 
 #[allow(dead_code)]

@@ -312,6 +312,13 @@ pub unsafe fn attach_all() {
             crate::engine::patches::INFO_SET_VALUE_FOR_KEY_BIG_LENGTH_JBE_ADDR,
             crate::engine::patches::INFO_SET_VALUE_FOR_KEY_JBE_PATCHED,
         );
+        // SV_MapRestart_f: only re-enter clients that are already CS_ACTIVE,
+        // so a client still connecting finishes and receives its gamestate
+        // (S21 / upstream 48d4da5).
+        patch::write_code(
+            crate::engine::patches::SV_MAP_RESTART_SET_ACTIVE_ADDR,
+            &crate::engine::patches::SV_MAP_RESTART_SET_ACTIVE_PATCHED,
+        );
         // anti-DDoS: drop the SV_AuthorizeIpPacket dispatch (NOP the call).
         patch::nop_bytes(patch::CALL_IP_AUTHORIZE, 5);
         // SV_SendClientGameState: force the old-RMG else path
