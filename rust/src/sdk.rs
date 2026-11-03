@@ -86,7 +86,9 @@ pub const PERS_KILLED: usize = 8;
 pub const STAT_HEALTH: usize = 0;
 pub const STAT_ARMOR: usize = 5;
 
-// angles indices (SDK `q_shared.h:346-348`)
+// angles indices (SDK `q_shared.h:374-376`)
+pub const PITCH: usize = 0;
+pub const YAW: usize = 1;
 pub const ROLL: usize = 2;
 
 // force powers (SDK `q_shared.h:590-612`)

@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 25] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 27] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -46,6 +46,8 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 25] = [
     (c"proxy_sv_banFile", c"proxy_bans.txt"),
     (c"proxy_sv_enableGuidBan", c"0"),
     (c"proxy_sv_guidBanFile", c"proxy_guid_bans.txt"),
+    (c"proxy_sv_antiMacro", c"0"),
+    (c"proxy_sv_antiMacroLog", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -114,6 +116,15 @@ pub const CVAR_ENABLE_GUID_BAN: usize = 23;
 /// Path of the GUID ban file (relative to the server's working directory, or
 /// absolute). Ignored when [`CVAR_ENABLE_GUID_BAN`] is `0`.
 pub const CVAR_GUID_BAN_FILE: usize = 24;
+/// Anti-macro input guard (`crate::macroguard`): `0` off, non-zero on (locked
+/// usercmd channels are frozen). Detection always runs while this or
+/// [`CVAR_ANTI_MACRO_LOG`] is on.
+pub const CVAR_ANTI_MACRO: usize = 25;
+/// `proxy_sv_antiMacroLog`: `0` off, `1` log the lock/release transitions,
+/// `2` add the statistics of locked channels once per second, `3` add the
+/// statistics of every channel with a reversal (diagnostic). Works without
+/// `proxy_sv_antiMacro` (reports what would be frozen).
+pub const CVAR_ANTI_MACRO_LOG: usize = 26;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -645,6 +656,9 @@ pub struct ClientEntry {
     pub netstatus: NetstatusState,
     /// Incoming packet-rate accounting / smoothing (`crate::pps`).
     pub pps: crate::pps::PpsState,
+    /// Anti-macro input guard (`crate::macroguard`): per-channel alternation
+    /// runs and locks, fed from every processed usercmd.
+    pub macro_guard: crate::macroguard::MacroState,
     /// `cl_timeNudge` neutralisation (`crate::timenudge`, D-015): the applied
     /// usercmd `serverTime` shift, its ramp target and the log edge.
     pub nudge_void: crate::timenudge::VoidState,
@@ -671,6 +685,7 @@ impl Default for ClientEntry {
             ignored: 0,
             netstatus: NetstatusState::default(),
             pps: crate::pps::PpsState::default(),
+            macro_guard: crate::macroguard::MacroState::default(),
             nudge_void: crate::timenudge::VoidState::default(),
             last_time_net_status: 0,
             packet_counter: 0,
@@ -952,6 +967,8 @@ mod tests {
             PROXY_CVARS[CVAR_GUID_BAN_FILE].1.to_bytes(),
             b"proxy_guid_bans.txt"
         );
+        assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

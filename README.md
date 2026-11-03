@@ -54,6 +54,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_clientPpsLog`               | 0       | log client packet-rate limit transitions (starts using too many packets / back under the limit); works on its own without the limiter |
 | `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
+| `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
+| `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -495,6 +497,71 @@ limiter *would* apply (the same one the netStatus table shows). While the cvar
 is `0` no transition state is kept, so enabling it reports the next over-limit
 window. `proxy_sv_enable 0` detaches the hook, so the whole feature is off with
 the master switch.
+
+### Anti-macro guard
+
+`proxy_sv_antiMacro` (default `0`, off) targets config-file macros that produce
+input a hand cannot: a movement axis, the view, or the attack button reversing
+faster than a person can. Two examples it is aimed at are the scripted ground
+strafe (A/D alternation every few commands, which feeds `PM_Accelerate` a fresh
+`wishdir` each frame) and the turn-key view wiggle used against the saber's
+per-frame position update.
+
+The server never sees "both keys held": `CL_CreateCmd` sums the movement keys
+before sending, so `+moveleft` with `+moveright` arrives as `rightmove == 0`.
+What it does see is the sum's **sign changing between consecutive commands**.
+That is the signal the guard watches, on `forwardmove`, `rightmove`, `upmove`,
+the `yaw`/`pitch` deltas and the attack/alt-attack bits.
+
+The unit is a **burst**, not a time window: reversals are chained into a *run*
+while the gap to the previous one is at most 200 ms, and a longer gap starts a
+new run. This matters because a bind is usually a fixed sequence — six holds,
+five reversals, then a human gap until the key is pressed again. A window that
+spans those gaps averages the burst away; a run does not.
+
+Within a run, two independent tests are used:
+
+- **rate** — the mean interval is shorter than a hand can sustain: at most 3
+  **commands** for a movement axis (the acceleration payoff is per command), 65
+  **ms** for the view (≈15 reversals/s) or 60 ms for the attack button. Four
+  reversals are enough: three frame-exact intervals is already far beyond a hand,
+  and randomising the wait counts changes neither the mean nor the payoff.
+- **spread** — after four reversals, the hold lengths in commands are confined
+  to a range of at most 2. That is what a config `wait` produces at *any* rate
+  and on any channel; a hand's timing spreads over several commands per hold.
+
+Once a channel has fired it stays **wary** for 3 s: the next burst fires after
+only three reversals, so repeated presses are neutralised earlier and earlier.
+
+Amplitude is not a signal: at 200 fps the stock `cl_yawspeed 140` turns 0.7°
+per command for a hand and a macro alike, and a movement axis is `±127` (run) or
+`46` (walk) either way.
+
+Frozen means *held*, not zeroed: the command keeps the value of the last
+command before the run, so the player keeps moving in the direction they already
+chose while the reversal (and its acceleration or wiggle) stops. The guard keeps
+reading the raw command, so a script that keeps reversing stays locked, and the
+lock is released 400 ms after the last reversal. Nothing is sent to the player.
+
+`proxy_sv_antiMacroLog 1` writes lock and release transitions to the server
+console and works without the guard being enabled, so an operator can check the
+thresholds against their own players before freezing anything. `2` adds the
+figures of a locked channel; `3` adds every channel with a run, which is the
+diagnostic mode:
+
+```text
+jampgame-proxy-rs: antiMacro client=2 name="..." adr="..." yaw locked
+jampgame-proxy-rs: antiMacro debug client=2 name="..." adr="..." cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 swing=6deg locked=1
+```
+
+`cmds` proves the command feed is alive, `rev` counts reversals in the run,
+`mean` is the mean interval, `holds` the shortest/longest hold in commands and
+`swing` the view swing in degrees.
+
+Not covered: a single aim snap (one large angle jump is not a reversal), attack
+timing that stays inside the game's own `weaponTime` gate, and a script that both
+randomises its waits widely *and* runs at hand speed (it then looks like a hand
+in both tests, and is correspondingly weaker).
 
 ### Team lock
 

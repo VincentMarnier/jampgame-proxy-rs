@@ -111,6 +111,8 @@ pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
         // a slot reused by the next player must not inherit a filtered rate.
         crate::hooks::netstatus::reset_client(client_num as usize);
         crate::pps::reset_client(client_num as usize);
+        // The anti-macro guard starts from no runs and no lock.
+        crate::macroguard::reset_client(client_num as usize);
     }
     if first_time && !is_bot {
         // Same shape as the original proxy's

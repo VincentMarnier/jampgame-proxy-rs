@@ -38,6 +38,7 @@ mod guidban;
 mod hooks;
 mod ignore;
 mod jampgame;
+mod macroguard;
 mod mute;
 mod netstatus_est;
 mod original;

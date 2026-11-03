@@ -79,8 +79,8 @@ use crate::sdk::{
     SIZEOF_CLIENT_T, Usercmd,
 };
 use crate::state::{
-    self, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS,
-    CVAR_VOID_TIME_NUDGE, CVAR_VOID_TIME_NUDGE_LOG,
+    self, CVAR_ANTI_MACRO, CVAR_ANTI_MACRO_LOG, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT,
+    CVAR_ENABLE_NET_STATUS, CVAR_VOID_TIME_NUDGE, CVAR_VOID_TIME_NUDGE_LOG,
 };
 use crate::syscall;
 use crate::timenudge;
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     }
 
     let voiding = timenudge::enabled();
-    let (feed, offset) = state::with_state(|s| {
+    let (feed, offset, macro_events, macro_log) = state::with_state(|s| {
         let feed = feed_enabled_in(s);
         // One ramp step per usercmd; the target is refreshed at packet start.
         let offset = if feed && voiding {
@@ -379,7 +379,29 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
         } else {
             0
         };
-        (feed, offset)
+        // Anti-macro guard: observes the raw command every time it is on, so
+        // `proxy_sv_antiMacroLog` reports what the guard would freeze; only
+        // `proxy_sv_antiMacro` rewrites the command. The engine's duplicate
+        // filter above this call site means each command is seen once.
+        let anti_macro = s.cvars[CVAR_ANTI_MACRO].integer != 0;
+        let log_level = s.cvars[CVAR_ANTI_MACRO_LOG].integer;
+        let events = if anti_macro || log_level != 0 {
+            // SAFETY: cmd is the engine's usercmd buffer for this call.
+            crate::macroguard::process(
+                &mut s.clients[client_num].macro_guard,
+                unsafe { &mut *cmd },
+                anti_macro,
+                log_level,
+            )
+        } else {
+            // Inert while off; drop any state a previous enable left behind.
+            let guard = &mut s.clients[client_num].macro_guard;
+            if guard.is_active() {
+                *guard = crate::macroguard::MacroState::default();
+            }
+            crate::macroguard::Events::default()
+        };
+        (feed, offset, events, log_level)
     });
     let offset = if !feed {
         FEED_WAS_OFF.store(true, Ordering::Relaxed);
@@ -415,6 +437,77 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
 
     if feed {
         feed_cmd(client_num, original);
+    }
+
+    if macro_events.any() {
+        log_macro_events(cl, &macro_events, macro_log);
+    }
+}
+
+/// Print anti-macro transitions (level ≥ 1) and the once-per-second statistics
+/// (level ≥ 2) after the state lock is released — the engine print trap must
+/// not run under the proxy mutex. Server console only: the player is never
+/// told, so a script cannot learn the thresholds.
+fn log_macro_events(cl: usize, events: &crate::macroguard::Events, level: i32) {
+    if level <= 0 {
+        return;
+    }
+    // SAFETY: cl is the client_t* whose command was just processed.
+    let label = unsafe { crate::hooks::engine_sv::client_label(cl) };
+    for (ch, started) in events.started.iter().enumerate() {
+        if *started {
+            print_macro(&label, crate::macroguard::CHANNEL_NAMES[ch], "locked");
+        }
+    }
+    for (ch, released) in events.released.iter().enumerate() {
+        if *released {
+            print_macro(&label, crate::macroguard::CHANNEL_NAMES[ch], "released");
+        }
+    }
+    if let Some(debug) = events.debug {
+        for (ch, stats) in debug.channels.iter().enumerate() {
+            let Some(stats) = stats else { continue };
+            print_macro_debug(
+                &label,
+                debug.cmds,
+                crate::macroguard::CHANNEL_NAMES[ch],
+                stats,
+            );
+        }
+    }
+}
+
+fn print_macro(label: &str, channel: &str, action: &str) {
+    print_macro_line(format!(
+        "jampgame-proxy-rs: antiMacro {label} {channel} {action}\n"
+    ));
+}
+
+/// `swing` is in `ANGLE2SHORT` units (360°/65536); `holds` are command counts.
+fn print_macro_debug(label: &str, cmds: u32, channel: &str, stats: &crate::macroguard::Stats) {
+    let swing_deg = stats.swing * 360 / 65536;
+    print_macro_line(format!(
+        "jampgame-proxy-rs: antiMacro debug {label} cmds={cmds} {channel} \
+         rev={} mean={}ms/{}cmd holds={}..{} swing={}deg locked={}\n",
+        stats.reversals,
+        stats.mean_ms,
+        stats.mean_cmds,
+        stats.min_hold_cmds,
+        stats.max_hold_cmds,
+        swing_deg,
+        u8::from(stats.locked),
+    ));
+}
+
+fn print_macro_line(line: String) {
+    match std::ffi::CString::new(line) {
+        // SAFETY: engine syscall pointer registered by dllEntry; text is
+        // NUL-terminated and outlives the call.
+        Ok(text) => unsafe { crate::syscall::print(&text) },
+        Err(err) => eprintln!(
+            "----- proxy-rs: antiMacro log line contained a NUL byte: {}",
+            String::from_utf8_lossy(&err.into_vec())
+        ),
     }
 }
 

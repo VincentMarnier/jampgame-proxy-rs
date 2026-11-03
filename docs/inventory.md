@@ -94,6 +94,44 @@ limiter lets through (observed capped at the limit), with it off the limit
 follows in the default colour. Both surfaces use the same
 `PpsSample::over_limit` predicate.
 
+## Anti-macro input guard (Rust addition)
+
+`proxy_sv_antiMacro` (default `0`, off) with `proxy_sv_antiMacroLog` (default
+`0`; `1` transitions, `2` also the statistics of locked channels, `3` every
+channel with a run) is a Rust-only, D-021 feature. The server never sees opposing
+key states — `CL_CreateCmd` sums the movement keys before sending
+(`cl_input.cpp:1637-1666`) — so the guard watches the thing that is observable:
+a channel's sign reversing between consecutive commands, on `forwardmove`,
+`rightmove`, `upmove`, the `yaw`/`pitch` `ANGLE2SHORT` deltas and the
+attack/alt-attack bits. The unit is a **run**: a
+burst of reversals chained while the gap between them is at most 200 ms, so the
+five reversals of a six-hold bind are measured as a burst instead of being
+averaged with the gap until the next key press. Two tests, either firing: **rate**
+(a movement axis with a mean interval of at most 3 commands — the
+`PM_Accelerate` payoff is per command; the view at most 65 ms ≈15/s; attack at
+most 60 ms) and **spread** (after 4 reversals the hold lengths in commands lie
+within a 2-command range — what a config `wait` produces at any rate and on any
+channel). Four reversals suffice, and after a fire the channel stays *wary* for
+3 s so the next burst is caught after three. Regularity is
+deliberately *not* used: `wait N` is an exact frame count
+(`cmd_common.cpp:36-53,292-299`, one usercmd per frame,
+`cl_input.cpp:2266-2313`), but a script can rotate wait counts and keep the
+effect. Rate is the payoff axis, so randomising the waits changes nothing. A
+locked channel is held at its last unlocked value and released 400 ms after the
+last reversal; the player is never notified. This catches the reported
+`bind W "+right;wait 10;…"` burst at 200 fps (six holds of 11 commands, five
+reversals, 0.7° per command) on its fourth reversal — window- and
+regularity-based attempts diluted the burst with the gap before the next press
+and missed it. The motivation is scripted ground-strafe acceleration
+(`PM_WalkMove`/`PM_Accelerate`) and view wiggling against
+`WP_SaberPositionUpdate`; the dropped `proxy_sv_sabersFps` attacked the latter
+from the simulation side and is not revived. **No new hook**: the guard runs
+inside the existing retargeted `call SV_ClientThink` stub (D-002.1 technique 3,
+the same feed as the netStatus/pps/timenudge work), before `SV_ClientThink` and
+before the `voidTimeNudge` clock rewrite. The thresholds are inferred from the
+mechanism plus the operator reports; the level-2 log is the measurement mode
+(D-021 "Uncertainty and experiment").
+
 ## Wanted
 
 ### Security fixes — explicitly named

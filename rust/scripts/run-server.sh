@@ -114,12 +114,22 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
     +set g_gametype "$GAMETYPE" \
     +set sv_hostname "^7proxy-rs^7 ^5test server" \
     +set timelimit 0 +set fraglimit 0 \
-    +set proxy_sv_teamSizeRules "2:1:0:0,3:0:1:0" \
-    +set proxy_sv_enableNetStatus 1 \
     +set g_forcepowerdisable 163837 \
     +set g_weaponDisable 524279 \
     +set g_friendlyFire 1 \
     +set g_friendlySaber 1 \
+    +set proxy_sv_teamSizeRules "2:1:0:0,3:0:1:0" \
+    +set proxy_sv_enableNetStatus 1 \
     +set proxy_tffa_enable 1 \
+    +set proxy_sv_enableIgnore 1 \
+    +set proxy_sv_muteMode 2 \
+    +set proxy_sv_enableBanFile 1 \
+    +set proxy_sv_enableGuidBan 1 \
+    +set proxy_sv_enableRconCmdCooldown 1 \
+    +set proxy_sv_minJumpTime 80 \
+    +set proxy_sv_enableClientPpsLimit 1 \
+    +set proxy_sv_voidTimeNudge 1 \
+    +set proxy_sv_antiMacroLog 1 \
+    +set proxy_sv_antiMacro 0 \
     +map "$MAP" \
     ${JAMP_EXTRA:-}

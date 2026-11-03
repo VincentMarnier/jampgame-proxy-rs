@@ -114,3 +114,14 @@
   provider feeds plus the X4BNet datacenter aggregate, reserved space
   stripped, adjacent ranges merged, a consumer-ISP guard that refuses a broken
   source, and a parse test that fails if the shipped file stops loading.
+- `0021-anti-macro.md` — opt-in anti-macro input guard (`proxy_sv_antiMacro` /
+  `proxy_sv_antiMacroLog`): the server cannot see opposing key states
+  (`CL_CreateCmd` sums and clamps them), so the guard watches sign reversal of
+  `forwardmove`/`rightmove`/`upmove`, the `yaw`/`pitch` deltas and the attack
+  bits, and freezes a channel when a **run** of reversals (chained within 200 ms)
+  is beyond a hand — four reversals at ≤3 commands (movement) or ≤65 ms (view),
+  or frame-exact `wait` holds (spread ≤2) — plus a 3 s *wary* period that catches
+  the next burst sooner; run-based because a bind is a short burst, and rate-based
+  because randomised wait counts keep the mean. Includes the
+  `proxy_sv_antiMacroLog` transition/statistics levels, a never-notify rule, and
+  thresholds to be checked with the log-only mode first.
