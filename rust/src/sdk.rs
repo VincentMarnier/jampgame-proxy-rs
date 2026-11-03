@@ -273,6 +273,16 @@ pub const GAME_CONSOLE_COMMAND: i32 = 9;
 pub const SIZEOF_GENTITY: usize = 1516;
 pub const OFFSET_GENTITY_CLIENT: usize = 864;
 
+/// `offsetof(gclient_t, saber)` — the server-side saber info, including the
+/// hilt's `soundLoop` game sound index (the same value `w_saber.c:7039` copies
+/// to a floating saber entity's `s.loopSound`).
+pub const OFFSET_GCLIENT_SABER: usize = 1952;
+/// `sizeof(saberInfo_t)` (SDK `q_shared.h`) — the stride between
+/// `gclient_t.saber[0]` and `saber[1]`.
+pub const SIZEOF_SABER_INFO: usize = 2156;
+/// `offsetof(saberInfo_t, soundLoop)` — game sound index of the hum.
+pub const OFFSET_SABER_SOUND_LOOP: usize = 204;
+
 /// `sizeof(gclient_t) == 7232`, `offsetof(gclient_t, pers) == 1552`,
 /// `offsetof(clientPersistant_t, netname) == 48` (SDK `g_local.h:440,535`).
 #[allow(dead_code)] // sizeof pin; offsets below are what production code reads
@@ -328,6 +338,36 @@ pub const OFFSET_GENTITY_S_MODELINDEX: usize = 224;
 pub const OFFSET_GENTITY_S_MODELINDEX2: usize = 228;
 /// `entityState_t.solid`.
 pub const OFFSET_GENTITY_S_SOLID: usize = 268;
+/// `entityState_t.weapon` (`byte`) — `WP_SABER` when a drawn saber is in hand.
+pub const OFFSET_GENTITY_S_WEAPON: usize = 296;
+/// `entityState_t.saberHolstered` (`byte`): `0`/`1` draw the blade, `2` hides
+/// it (`cg_players.c:9940`). Also gates the client's native saber hum.
+pub const OFFSET_GENTITY_S_SABER_HOLSTERED: usize = 256;
+/// `entityState_t.saberInFlight` (`byte`) — the floating (thrown) saber case.
+pub const OFFSET_GENTITY_S_SABER_IN_FLIGHT: usize = 240;
+/// `entityState_t.loopSound` (`byte`) — game sound index the client loops at
+/// the entity (`CG_EntityEffects`).
+pub const OFFSET_GENTITY_S_LOOP_SOUND: usize = 204;
+/// `offsetof(entityState_t, iModelScale)` — PC `int` (`q_shared.h:2764`);
+/// `0` means 100%, `1` means 1% (`cg_players.c` divides by 100).
+pub const OFFSET_GENTITY_S_IMODEL_SCALE: usize = 332;
+/// `offsetof(entityState_t, pos.trBase)` (`pos` @16, `trajectory_t.trBase` @12).
+/// The current world position of a player entity, which the FOV wedge test
+/// reads.
+pub const OFFSET_GENTITY_S_POS_TRBASE: usize = 28;
+/// `entityState_t.trickedentindex` … `trickedentindex4` (`q_shared.h:2688-2691`):
+/// per-viewer bitmasks (16 clients each) of the clients the entity is
+/// mind-tricking (`CG_IsMindTricked`, `cg_players.c:6369`).
+pub const OFFSET_GENTITY_S_TRICKED_1: usize = 152;
+pub const OFFSET_GENTITY_S_TRICKED_2: usize = 156;
+pub const OFFSET_GENTITY_S_TRICKED_3: usize = 160;
+pub const OFFSET_GENTITY_S_TRICKED_4: usize = 164;
+
+/// `EF_DEAD` (`bg_public.h:554`, `1<<1`).
+pub const EF_DEAD: i32 = 1 << 1;
+/// `EF_NODRAW` (`bg_public.h:574`, `1<<8`): the client skips the entity's
+/// model but keeps processing its snapshot events.
+pub const EF_NODRAW: i32 = 1 << 8;
 
 // `gentity_t` fields the per-instance world-entity clone pass reads/copies
 // (i386 layout oracle, 2026-10-18: `sizeof == 1516`, `r == 560`, `client == 864`
@@ -419,6 +459,10 @@ pub const OFFSET_GENTITY_ACTIVATOR: usize = 1384;
 /// `playerState_t.clientNum` at +172 → frame+208 (SDK `server.h:96-114`,
 /// `MAX_MAP_AREA_BYTES` 32 from `q_shared.h:416`).
 pub const OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM: usize = 208;
+/// `offsetof(clientSnapshot_t, ps.viewangles)` — `ps` starts at 36
+/// (`areabytes` 4 + `areabits[MAX_MAP_AREA_BYTES]` 32) and `viewangles` is 184
+/// bytes into `playerState_t`; `ps.clientNum` (172) pins the base.
+pub const OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES: usize = 220;
 /// `snapshotEntityNumbers_t` (`sv_snapshot.cpp:264-268`):
 /// `numSnapshotEntities` first, then `snapshotEntities[1024]`.
 pub const OFFSET_SNAPSHOT_ENUMS_COUNT: usize = 0;
@@ -446,6 +490,9 @@ pub const ET_EVENTS: i32 = 18;
 /// Map mover (`bg_public.h:1189-1208`: GENERAL 0, PLAYER 1, ITEM 2, MISSILE 3,
 /// SPECIAL 4, HOLOCRON 5, **MOVER 6**): doors, plats, elevators, `func_rotating`.
 pub const ET_MOVER: i32 = 6;
+
+/// `WP_SABER` (`bg_weapons.h:13`, right after `WP_NONE`).
+pub const WP_SABER: u8 = 1;
 
 /// `ET_GENERAL` (`bg_public.h:1189`) — the default `eType` of entities that are
 /// not players/items/movers/temp events (spawn points, `misc_model_static`,
@@ -1011,10 +1058,27 @@ mod tests {
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 192);
         assert_eq!(OFFSET_GENTITY_S_OWNER, 280);
+        assert_eq!(OFFSET_GENTITY_S_IMODEL_SCALE, 332);
+        assert_eq!(OFFSET_GENTITY_S_WEAPON, 296);
+        assert_eq!(OFFSET_GENTITY_S_SABER_HOLSTERED, 256);
+        assert_eq!(OFFSET_GENTITY_S_SABER_IN_FLIGHT, 240);
+        assert_eq!(OFFSET_GENTITY_S_LOOP_SOUND, 204);
+        assert_eq!(OFFSET_GCLIENT_SABER, 1952);
+        assert_eq!(SIZEOF_SABER_INFO, 2156);
+        assert_eq!(OFFSET_SABER_SOUND_LOOP, 204);
+        assert_eq!(WP_SABER, 1);
+        assert_eq!(OFFSET_GENTITY_S_POS_TRBASE, 28);
+        assert_eq!(OFFSET_GENTITY_S_TRICKED_1, 152);
+        assert_eq!(OFFSET_GENTITY_S_TRICKED_2, 156);
+        assert_eq!(OFFSET_GENTITY_S_TRICKED_3, 160);
+        assert_eq!(OFFSET_GENTITY_S_TRICKED_4, 164);
+        assert_eq!(EF_DEAD, 0x02);
+        assert_eq!(EF_NODRAW, 0x100);
         assert_eq!(OFFSET_GENTITY_R_OWNER, 660);
         assert_eq!(OFFSET_GENTITY_R_CONTENTS, 604);
         assert_eq!(OFFSET_GENTITY_R_LINKED, 560);
         assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, 208);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES, 220);
         assert_eq!(OFFSET_SNAPSHOT_ENUMS_LIST, 4);
         assert_eq!(ENTITYNUM_NONE, 1023);
         assert_eq!(ENTITYNUM_WORLD, 1022);

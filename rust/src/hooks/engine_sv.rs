@@ -1488,6 +1488,12 @@ pub unsafe extern "C" fn sv_netchan_process(cl: usize, msg: usize) -> c_int {
 /// `r.ownerNum`/`s.owner`, obituaries via `s.otherEntityNum*`) are kept only
 /// within the viewer's match (lobby `None` sees lobby).
 ///
+/// After the pristine and TFFA passes, the main-view call also applies the
+/// `proxy_sv_maxFov` cap (`crate::fov`): players outside the viewer's horizontal
+/// wedge get the viewer's mind-trick bit and a 1 % model scale for this
+/// snapshot, and `SV_SendClientSnapshot` restores the shared entity state once
+/// it has been copied.
+///
 /// # Safety
 ///
 /// Entered from the engine with `(origin, frame, eNums, portal)`; all three
@@ -1503,9 +1509,6 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
         original_call(crate::hooks::engine_hook_original_sv_add_entities_visible_from_point);
     unsafe { original(origin, frame, e_nums, portal) };
 
-    if !crate::tffa::enabled() {
-        return;
-    }
     if frame == 0 || e_nums == 0 {
         return;
     }
@@ -1518,50 +1521,80 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    // Snapshot the match table and the sound attribution once (no per-entity
-    // locking); the viewer's own match is follow-aware (spectating someone
-    // adopts their instance).
-    let viewer_match = crate::tffa::effective_match(viewer);
-    let (table, sound_source, entity_instance) = state::with_state(|s| {
-        (
-            s.tffa.client_match,
-            s.tffa.sound_source,
-            s.tffa.entity_instance,
-        )
-    });
-    // SAFETY: eNums is a valid snapshotEntityNumbers_t.
-    let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
-    if count <= 0 {
-        return;
-    }
-    let count = (count as usize).min(crate::sdk::MAX_SNAPSHOT_ENTITIES);
-    let mut kept = 0usize;
-    for i in 0..count {
-        // SAFETY: list holds `count` ints.
-        let ent_num = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4) };
-        let keep = snapshot_keep(
-            viewer_match,
-            &table,
-            &sound_source,
-            &entity_instance,
-            g_entities,
-            ent_num,
-        );
-        if keep {
-            if kept != i {
-                // SAFETY: both slots are inside the eNums list.
-                unsafe {
-                    let v = read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4);
-                    *((e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + kept * 4) as *mut c_int) = v;
+    if crate::tffa::enabled() {
+        // Snapshot the match table and the sound attribution once (no
+        // per-entity locking); the viewer's own match is follow-aware
+        // (spectating someone adopts their instance).
+        let viewer_match = crate::tffa::effective_match(viewer);
+        let (table, sound_source, entity_instance) = state::with_state(|s| {
+            (
+                s.tffa.client_match,
+                s.tffa.sound_source,
+                s.tffa.entity_instance,
+            )
+        });
+        // SAFETY: eNums is a valid snapshotEntityNumbers_t.
+        let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
+        if count <= 0 {
+            return;
+        }
+        let count = (count as usize).min(crate::sdk::MAX_SNAPSHOT_ENTITIES);
+        let mut kept = 0usize;
+        for i in 0..count {
+            // SAFETY: list holds `count` ints.
+            let ent_num = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4) };
+            let keep = snapshot_keep(
+                viewer_match,
+                &table,
+                &sound_source,
+                &entity_instance,
+                g_entities,
+                ent_num,
+            );
+            if keep {
+                if kept != i {
+                    // SAFETY: both slots are inside the eNums list.
+                    unsafe {
+                        let v = read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + i * 4);
+                        *((e_nums + OFFSET_SNAPSHOT_ENUMS_LIST + kept * 4) as *mut c_int) = v;
+                    }
                 }
+                kept += 1;
             }
-            kept += 1;
+        }
+        // SAFETY: count slot is a plain int we own post-body.
+        unsafe {
+            *((e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) as *mut c_int) = kept as c_int;
         }
     }
-    // SAFETY: count slot is a plain int we own post-body.
-    unsafe {
-        *((e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) as *mut c_int) = kept as c_int;
-    }
+    // FOV cap (`proxy_sv_maxFov`, D-022): run after the TFFA compaction so an
+    // entity the viewer will not receive is not touched, and for the main view
+    // only (portal viewpoints render elsewhere on screen).
+    //
+    // SAFETY: origin/frame/eNums are the engine's arguments; g_entities is the
+    // located game array.
+    unsafe { crate::fov::apply(viewer, origin, frame, e_nums, g_entities, portal) };
+}
+
+// ---------------------------------------------------------------------------
+// SV_SendClientSnapshot — restore the per-viewer FOV mutations (D-022)
+// ---------------------------------------------------------------------------
+
+/// `void SV_SendClientSnapshot(client_t *client)` (`sv_snapshot.cpp:740`):
+/// build the client's snapshot (which runs the `SV_AddEntitiesVisibleFromPoint`
+/// wrapper and copies the entity states), send it, then put back the entity
+/// fields the FOV cap changed. The restore must happen after the copy, not at
+/// the end of `SV_AddEntitiesVisibleFromPoint`, or the snapshot would carry the
+/// original state.
+///
+/// # Safety
+///
+/// Entered from the engine with a valid `client_t*`.
+pub unsafe extern "C" fn sv_send_client_snapshot(client: usize) {
+    // SAFETY: trampoline attached at GAME_INIT; `client` forwarded unchanged.
+    let original = original_call(crate::hooks::engine_hook_original_sv_send_client_snapshot);
+    unsafe { original(client) };
+    crate::fov::restore();
 }
 
 /// Snapshot predicate for one entity number (pure given the match tables).

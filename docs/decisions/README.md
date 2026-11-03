@@ -126,3 +126,11 @@
   because randomised wait counts keep the mean. Includes the
   `proxy_sv_antiMacroLog` transition/statistics levels, a never-notify rule, and
   thresholds to be checked with the log-only mode first.
+- `0022-fov-cap.md` — opt-in `proxy_sv_maxFov` visibility cap: stock clients
+  never report `cg_fov`, so the proxy caps the entity stream instead — players
+  outside a `maxFov`-degree cone around the viewer are hidden per viewer with
+  the client's mind-trick bit plus a 1 % `iModelScale` (dead ones with
+  `EF_NODRAW`), keeping footsteps, swings and the saber hum at the true
+  position; the shared entity state is restored right after
+  `SV_SendClientSnapshot` copies the snapshot. Thrown sabers stay as-is; Force
+  Sight and a custom client that strips both fields are documented limits.

@@ -56,6 +56,9 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
 | `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
 | `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
+| `proxy_sv_maxFov`                     | 0       | maximum `cg_fov` value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing; `0` = off (see [FOV cap](#fov-cap)) |
+| `proxy_sv_maxFovAspect`               | 1.7777778 | screen aspect used to turn `proxy_sv_maxFov` into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's `cg_fovAspectAdjust 1`; use `1.3333334` for 4:3/stock clients or higher for ultrawide) |
+| `proxy_sv_maxFovCameraRange`          | 100     | third-person camera setback (world units) assumed by the frustum test; `100` matches the stock `cg_thirdPersonRange`, `0` tests from the player's eye (first-person-strict) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -562,6 +565,80 @@ Not covered: a single aim snap (one large angle jump is not a reversal), attack
 timing that stays inside the game's own `weaponTime` gate, and a script that both
 randomises its waits widely *and* runs at hand speed (it then looks like a hand
 in both tests, and is correspondingly weaker).
+
+### FOV cap
+
+`proxy_sv_maxFov` (default `0`, off) caps the `cg_fov` value a client can
+benefit from. Stock Jedi Academy never sends `cg_fov` to the server — it is a
+cgame-only cvar — so the proxy cannot see who raised it. Instead it caps what
+every viewer receives. A player outside the view frustum that corresponds to
+the cap is hidden for that viewer; a client running a larger `cg_fov` sees no
+more players than one at the cap, and the extra field is empty. Legitimate
+values below the cap are unaffected, and the viewer's own entity is never
+touched. The test uses both the horizontal and vertical FOV, so looking up or
+down does not hide players that are still on screen; above 45° of pitch the cap
+pauses entirely, because the client's third-person camera pitch then diverges
+too far from the server's aim for the server to know what is on screen.
+
+`cg_fov` is not the rendered horizontal angle on modern clients: OpenJK and
+TaystJK default to `cg_fovAspectAdjust 1`, which widens it for the screen
+aspect (`fov_x = 2*atan(tan(cg_fov/2) * 0.75 * aspect)`). `proxy_sv_maxFov` is
+therefore converted with `proxy_sv_maxFovAspect` (default 16:9) before the
+frustum test, so `proxy_sv_maxFov 100` still covers `cg_fov 97` on a 16:9 screen
+(where `cg_fov 97` renders as about 113°). Set it to `1.3333334` for 4:3
+clients or stock behaviour, and to the actual aspect for ultrawide screens
+(e.g. `2.3333334` for 21:9).
+
+Third person matters too: the client renders from a camera up to
+`cg_thirdPersonRange` (default 100) behind the player, so a close target at
+the screen edge has a smaller bearing from the camera than from the player's
+eye. `proxy_sv_maxFovCameraRange` (default `100`) shifts the test point back by
+that many world units, which keeps close edge targets visible in third person,
+and the frustum test uses the camera's pitch as well as its yaw;
+set it to `0` for a first-person-strict server, or raise it if your players use
+a larger `cg_thirdPersonRange`.
+
+Hiding is instant: the player entity is marked `EF_NODRAW` for that viewer, so
+cgame's `CG_Player` returns at the top instead of fading. The entity stays in
+the snapshot, so its server events (footsteps, weapon/force sounds) still fire
+at the true position. A per-viewer mind-trick bit and a 1% model scale remain
+as layers for a client that ignores `EF_NODRAW`. `iModelScale` only scales the
+model and its hand bolts, not the client-side saber blade length, so a drawn
+saber is also marked `saberHolstered = 2` (hidden) and its native hum is
+replaced by `s.loopSound` at the hilt's own sound index:
+
+- walking/running footsteps (`EV_FOOTSTEP`, surface-aware) still play at the
+  true position;
+- the saber hum, swings, hits and unholsters still play (the hum is the
+  entity loop at the hilt's own sound index, so a client that turns
+  `cg_ambientSounds` off hears no entity loops at all, as with any other loop);
+- a **thrown** saber is left visible and audible as-is.
+
+The per-viewer changes are reverted immediately after the engine copies that
+viewer's snapshot, so the server's shared game state is never left modified.
+
+Two limits are worth knowing:
+
+- a viewer with **Force Sight** active bypasses the stock mind-trick check; the
+  entity is still `EF_NODRAW`, so nothing is drawn, and the 1% scale is there
+  for a client that strips NODRAW too;
+- a determined custom client can strip `EF_NODRAW`, ignore the mind-trick bit
+  and normalise the model scale; removing the player entity from the packet
+  would stop that, but it would also remove the client-side footsteps and saber
+  hum;
+- the replacement hum is an entity loop: TaystJK/OpenJK's `CG_EntityEffects`
+  plays it even for `NODRAW`, but the stock 1.01 cgame skips loop sounds on
+  `NODRAW`, so a stock client would lose the replaced hum (it never had the
+  mind-trick instant hide either).
+
+Set it at startup or at runtime:
+
+```text
+seta proxy_sv_maxFov 100
+```
+
+or `rcon proxy_sv_maxFov 100`. Like every proxy feature it needs
+`proxy_sv_enable 1`.
 
 ### Team lock
 

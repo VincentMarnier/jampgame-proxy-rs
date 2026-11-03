@@ -34,6 +34,7 @@ mod banfile;
 mod challenge;
 mod diagnostics;
 mod engine;
+mod fov;
 mod guidban;
 mod hooks;
 mod ignore;
