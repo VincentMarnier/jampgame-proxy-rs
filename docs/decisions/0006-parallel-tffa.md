@@ -1406,6 +1406,81 @@ in the disable test (password and authorisations die with the id). `cargo test`
 374/374, `clippy --all-targets -D warnings`, `fmt --check`, i686 release build
 and the engine smoke test (`rust/scripts/engine-test.sh`) are green.
 
+### D-006.16 — A deferred base `CS_PLAYERS` push is replayed, not assumed
+
+*Status: landed (live bug report, 2026-11-03). Runtime matched pair below.*
+
+Reported: *"Someone has a visible prefix `(TFFA 1)`, his skin & saber color did
+not match his team's color & he was absent from scoreboard."* All three are the
+same per-viewer `CS_PLAYERS` state: the player was demoted to a prefixed
+spectator (`n = "(TFFA 1) Name"`, `t = 3`), so the cgame did not force his team
+skin/saber colour and the tab grouped him in the spectator rows (often the
+first thing the board drops for lack of room) instead of his team's.
+
+**Root cause.** A per-viewer demotion is undone by sending the player's **base**
+`CS_PLAYERS` string back to that viewer when the player (or the viewer) changes
+match (`broadcast_cs_players_slot` / `refresh_cs_players_for_viewer`). That send
+goes through `send_cs_to_client`, which **defers** under reliable pressure
+(`reliable_pressure`: 16 unacknowledged commands, D-006.12) and only flags
+`pending_view_refresh`; `push_cs_players` then does not record it. The deferred
+work is drained by `send_all_overrides_to_client`, which *also* runs on every
+`GAME_CLIENT_BEGIN` (respawn, team change, connect). That function assumed the
+client had just received a gamestate and therefore:
+1. dropped the whole per-viewer record, and
+2. recorded the server's base string for **every** slot as held, without sending
+   it, pushing only the outsiders' demotions.
+
+For a slot that had just moved into the viewer's match, the owed base was
+therefore recorded as delivered (the client still held the old demotion) and
+every later refresh compared `desired == base` against the record `base` and
+skipped it: the `(TFFA N)` prefix became permanent until a fresh gamestate or a
+game-side base broadcast happened to touch that slot.
+
+**Fix.** The assumption is now scoped to what actually delivered the bases.
+`TffaState::view_bases_from_gamestate[viewer]` is set by `forget_view_overrides`
+(the `SV_SendClientGameState` wrapper) and cleared on connect/disconnect, a new
+round and a disable; `send_all_overrides_to_client` consumes it:
+- set ⇒ a gamestate just carried every base string: rebuild the record from the
+  bases and push only the demotions (the D-006.12 reconnect-burst behaviour is
+  unchanged);
+- clear ⇒ an ordinary full re-push: leave the record alone and push every
+  slot's **desired** value (`override_push_plan` → `desired_cs_players`), so the
+  per-viewer dedup re-queues exactly the base (or demotion) that is still owed.
+
+`forget_all_view_overrides` (master-switch re-enable) clears the flag: the proxy
+cannot know whether a disable-era override survived on a slot the game did not
+broadcast, so that re-push is conservative and sends every desired value once.
+
+**Proof (matched pair, same build tree).** Temporary probe build that defers
+the first base push of slot 0 to viewer 2 unconditionally (a stand-in for
+reliable pressure), `mp/ctf1`, `g_gametype 6`, `proxy_tffa_enable 1`,
+`g_teamAutoJoin 1`, four synthetic protocol clients: alpha creates match 1,
+bravo joins it, charlie stays in main and then `tffa_join 1`, delta spectates
+and follows alpha (D-006.6 follow round). Before the fix charlie's final
+`CS_PLAYERS` for slot 0 was `n = "(TFFA 1) alpha"`, `t = 3` — visible prefix,
+no team colour, grouped as a spectator — and later `score` requests did not
+repair it. With the fix, the same forced deferral ends with `n = "alpha"`,
+`t = 1`: the plain re-push replayed the owed base. The normal (undeferred) run
+is unchanged: charlie's/alpha's/bravo's entries are all base and only real
+spectators carry `t = 3`. The probe is not part of the automated suite.
+
+**Tests.** `a_deferred_base_push_is_replayed_by_the_next_plain_resync` (the
+demotion held by the viewer, the base owed after the move: the plain plan queues
+it; the gamestate plan owes only demotions), plus the existing
+`the_scoreboard_refresh_covers_both_own_and_outsider_slots` and
+`a_steady_roster_needs_no_second_player_override_push` (no traffic regression:
+a steady roster still queues nothing). `cargo test` 376/376,
+`clippy --all-targets -D warnings`, `fmt --check`, the i686 release build and
+the engine smoke test are green.
+
+**Diagnostic for a recurrence.** Every deferred `CS_PLAYERS` push is now logged
+at `proxy_sv_debugLog 2` as
+`tffa.cs_players.deferred <client> slot=N base=true|false player_match=M`:
+`base=true` on a slot whose player is in the viewer's match is exactly the shape
+that used to become permanent, and it names the one client whose view is at
+risk. With the fix the next full re-push replays it, so the log is evidence
+that the trigger occurred and that the repair ran, not a symptom by itself.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
@@ -2505,3 +2580,20 @@ and the engine smoke test (`rust/scripts/engine-test.sh`) are green.
   run: bots never spectate, so it rests on the source-equivalent resolution
   (the same one the runtime-verified `teamoverlay` feed uses) plus the unit
   test.
+
+  **Correction (2026-11-03, after the recurrence).** The shipped
+  `Proxy_SharedAPI` client-command filter blocks `team follow1`/`team
+  follow2` outright (`shared_api::client_command`, "team follow crash guard",
+  ported from the 2026 C++ proxy), so a real client cannot reach the alias
+  state this fix handles. A synthetic-protocol-client probe confirmed it:
+  `team follow1` never reaches `SetTeam`, while `follow <name>`,
+  `follownext` and `followprev` all set a **direct** `sess.spectatorClient`
+  slot and resolved to the followed match (unprefixed/same-team
+  `CS_PLAYERS`) both before and after the alias fix. With the crash guard
+  temporarily bypassed, `team follow1` stores `-1` and resolves through
+  `level.follow1` to the followed match, as intended — but that is a
+  configuration no shipped client can reach. The recurring prefix/wrong
+  colour/scoreboard report was therefore **not** this path; it is the
+  deferred base push in D-006.16. The alias resolution is kept (it costs one
+  comparison and makes the two paths agree), but it is not the fix for the
+  live report.

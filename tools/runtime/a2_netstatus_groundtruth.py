@@ -244,9 +244,17 @@ class ClientModel:
             except (IndexError, ValueError):
                 return
             self.state = CA_CHALLENGING
+            # A full retail userinfo: the proxy's connect sanitiser
+            # (`shared_api::sanitize_userinfo`) refuses a client whose userinfo
+            # lacks `forcepowers` (or the other required retail keys), so a
+            # minimal name/rate/snaps/model block never reaches the game.
             info = (
                 f"\\name\\{self.name}\\rate\\25000\\snaps\\{self.snaps}"
                 f"\\model\\kyle\\handicap\\100\\cl_anonymous\\0"
+                f"\\forcepowers\\7-1-030000000000003332"
+                f"\\color1\\4\\color2\\4\\cg_predictItems\\1"
+                f"\\saber1\\single_1\\saber2\\none"
+                f"\\char_color_red\\255\\char_color_green\\255\\char_color_blue\\255"
                 f"\\protocol\\{jp.PROTOCOL_VERSION}\\qport\\{self.qport}"
                 f"\\challenge\\{self.challenge}"
             )

@@ -517,6 +517,16 @@ pub struct TffaState {
     /// step; a client that gets a fresh gamestate (connect, resend, restart)
     /// has its row dropped (`tffa::forget_view_overrides`).
     pub cs_players_sent: [[String; MAX_CLIENTS]; MAX_CLIENTS],
+    /// Whether each viewer's `cs_players_sent` row must be rebuilt from the
+    /// server's **base** strings because its client just received a gamestate
+    /// (`SV_SendClientGameState` → `tffa::forget_view_overrides`). The gamestate
+    /// delivers every `CS_PLAYERS` base string, so a fresh row may record them
+    /// as held without re-sending (D-006.12). Any other full re-push (a respawn
+    /// or team change begin, a deferred refresh) must **not** assume the base:
+    /// the client still holds whatever the proxy last sent, and a base push that
+    /// was deferred under reliable pressure is still owed. Consumed by
+    /// `tffa::send_all_overrides_to_client`.
+    pub view_bases_from_gamestate: [bool; MAX_CLIENTS],
     /// Last per-viewer `CS_SCORES1/2` sent, to skip redundant corrections
     /// (the 128-slot reliable buffer overflows otherwise: every frag would
     /// re-push unchanged scores to every client).
@@ -686,6 +696,7 @@ impl Default for TffaState {
             pending_sound_source: crate::tffa::SOURCE_WORLD,
             cs_players_base: core::array::from_fn(|_| String::new()),
             cs_players_sent: core::array::from_fn(|_| core::array::from_fn(|_| String::new())),
+            view_bases_from_gamestate: [false; MAX_CLIENTS],
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission_boards: [0; MAX_CLIENTS],

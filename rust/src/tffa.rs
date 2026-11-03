@@ -609,7 +609,31 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
     // adds anything (D-006.12). The client is re-pushed after the burst.
     if reliable_pressure(client_num) || state::with_state(|s| s.tffa.restart_burst) {
         if (0..MAX_CLIENTS as c_int).contains(&client_num) {
-            state::with_state(|s| s.tffa.pending_view_refresh[client_num as usize] = true);
+            // A deferred **base** `CS_PLAYERS` push is the one that can leave a
+            // same-match player demoted on this viewer only (D-006.16); log it
+            // at the verbose level so a recurrence points at the client. The
+            // flag below re-queues it on the next full re-push either way.
+            if crate::diagnostics::verbose_enabled() {
+                let (slot, base, player_match) = state::with_state(|s| {
+                    s.tffa.pending_view_refresh[client_num as usize] = true;
+                    let slot = cs_players_slot(index);
+                    let base = slot.is_some_and(|slot| s.tffa.cs_players_base[slot] == value);
+                    let player_match = slot.map(|slot| s.tffa.client_match[slot]);
+                    (slot, base, player_match)
+                });
+                if let Some(slot) = slot {
+                    crate::diagnostics::verbose(
+                        "tffa.cs_players.deferred",
+                        format!(
+                            "{} slot={slot} base={base} player_match={}",
+                            crate::hooks::engine_sv::client_label_for_num(client_num),
+                            player_match.unwrap_or(MAIN_MATCH),
+                        ),
+                    );
+                }
+            } else {
+                state::with_state(|s| s.tffa.pending_view_refresh[client_num as usize] = true);
+            }
         }
         return false;
     }
@@ -799,6 +823,10 @@ fn record_cs_players_broadcast(slot: usize, value: &str) {
 /// per-viewer override the proxy believed it held is gone. A connected client
 /// is marked for the next frame's full refresh (`pending_view_refresh`); a
 /// connecting one gets it from `GAME_CLIENT_BEGIN` anyway.
+///
+/// Also records that the viewer's next full re-push may treat the stored bases
+/// as held (the gamestate just delivered them), which is what keeps the
+/// `map_restart` reconnect burst from re-sending every base string (D-006.12).
 pub fn forget_view_overrides(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
@@ -808,6 +836,7 @@ pub fn forget_view_overrides(client_num: c_int) {
         for slot in s.tffa.cs_players_sent[viewer].iter_mut() {
             slot.clear();
         }
+        s.tffa.view_bases_from_gamestate[viewer] = true;
         if s.clients[viewer].is_connected {
             s.tffa.pending_view_refresh[viewer] = true;
         }
@@ -825,6 +854,11 @@ pub fn forget_all_view_overrides() {
             for slot in s.tffa.cs_players_sent[viewer].iter_mut() {
                 slot.clear();
             }
+            // The master switch may have been off without a view restore: an
+            // override queued before the disable can still be what the client
+            // holds, so the re-push compares against the (now empty) record and
+            // sends every desired value instead of assuming base strings.
+            s.tffa.view_bases_from_gamestate[viewer] = false;
             if s.clients[viewer].is_connected {
                 s.tffa.pending_view_refresh[viewer] = true;
             }
@@ -1056,7 +1090,24 @@ fn get_live_cs_players(slot: i32) -> Option<String> {
 }
 
 /// Push every current per-viewer override to one client (fresh connects get
-/// the server gamestate with base strings, then these corrections).
+/// the server gamestate with base strings, then these corrections), or repair
+/// the ones the client is missing after a deferred send.
+///
+/// There are two very different callers, told apart by
+/// `TffaState::view_bases_from_gamestate`:
+///
+/// - **the client just received a gamestate** (connect, `map_restart`
+///   reconnect, resend): every `CS_PLAYERS` base string came in it, so the
+///   stored bases may be recorded as held and only the playing outsiders'
+///   demotions are owed (D-006.12: re-sending all bases is what overflowed the
+///   reliable window during the reconnect burst);
+/// - **any other full re-push** (a respawn/team-change `GAME_CLIENT_BEGIN`, or
+///   the deferred work after reliable pressure): the client still holds
+///   whatever the proxy last queued, which the per-viewer record mirrors. The
+///   record must be trusted and every slot's **desired** value compared against
+///   it. Recording a base the client never received would skip its push forever
+///   and leave a `(TFFA N)` prefix + spectator team on a same-match player
+///   (D-006.16).
 pub fn send_all_overrides_to_client(client_num: c_int) {
     if !enabled() {
         return;
@@ -1079,24 +1130,11 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
     });
     send_cs_to_client(client_num, CS_SCORES1, &red.to_string());
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
-    // A fresh gamestate carries the server's **base** `CS_PLAYERS` strings, not
-    // our per-viewer overrides: drop this viewer's record, then record what the
-    // gamestate just delivered so the demotions below are the only sends.
-    state::with_state(|s| {
-        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
-            for slot in s.tffa.cs_players_sent[client_num as usize].iter_mut() {
-                slot.clear();
-            }
-        }
+    let from_gamestate = state::with_state(|s| {
+        core::mem::take(&mut s.tffa.view_bases_from_gamestate[client_num as usize])
     });
     let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
-    // Same-match and real-spectator slots already hold the base string (a
-    // fresh connect got it in the gamestate, a `map_restart` reconnect gets it
-    // from the game's own `CS_PLAYERS` broadcast): re-sending it only queued
-    // one redundant reliable command per slot per client, which is what filled
-    // the 128-slot buffer during the reconnect burst (D-006.12). Only the
-    // playing outsiders of another match need a rewrite.
     for (slot, base) in bases.iter_mut().enumerate() {
         if base.is_empty() {
             if let Some(live) = get_live_cs_players(slot as i32) {
@@ -1107,13 +1145,42 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
             }
         }
     }
-    for (slot, base) in bases.iter().enumerate() {
-        if !base.is_empty() {
-            record_cs_players_sent(client_num, slot, base);
+    // Only a gamestate delivered the server's base strings: drop this viewer's
+    // record and record what it just received, so the demotions below are the
+    // only sends. Any other re-push leaves the record alone; it is what the
+    // viewer actually holds (see the doc comment).
+    if from_gamestate {
+        state::with_state(|s| {
+            for slot in s.tffa.cs_players_sent[client_num as usize].iter_mut() {
+                slot.clear();
+            }
+        });
+        for (slot, base) in bases.iter().enumerate() {
+            if !base.is_empty() {
+                record_cs_players_sent(client_num, slot, base);
+            }
         }
     }
-    for (slot, value) in demotions_for_viewer(viewer_match, &table, &bases) {
+    for (slot, value) in override_push_plan(from_gamestate, viewer_match, &table, &bases) {
         push_cs_players(client_num, slot as usize, &value);
+    }
+}
+
+/// Full re-push candidate list for one viewer. A gamestate delivered the base
+/// strings, so only the playing outsiders' demotions are owed; otherwise every
+/// slot's desired value (base or demotion) is a candidate and
+/// `push_cs_players`'s per-viewer record decides what is actually sent, which
+/// re-queues a base whose earlier push was deferred. Pure for the tests.
+fn override_push_plan(
+    from_gamestate: bool,
+    viewer_match: u8,
+    table: &[u8; MAX_CLIENTS],
+    bases: &[String; MAX_CLIENTS],
+) -> Vec<(i32, String)> {
+    if from_gamestate {
+        demotions_for_viewer(viewer_match, table, bases)
+    } else {
+        desired_cs_players(viewer_match, table, bases)
     }
 }
 
@@ -1802,6 +1869,9 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
             slot.clear();
         }
     }
+    // The reconnect's gamestate sets this again per client; until then a full
+    // re-push must not assume the base strings are held.
+    t.view_bases_from_gamestate = [false; MAX_CLIENTS];
     // Re-arm the score dedup so round-start 0-0 is pushed.
     t.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
     // New round: fraglimit handling runs again.
@@ -1922,6 +1992,7 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
+        s.tffa.view_bases_from_gamestate[client_num as usize] = false;
         s.tffa.deferred_begin[client_num as usize] = false;
         s.tffa.pending_view_refresh[client_num as usize] = false;
     });
@@ -1943,6 +2014,7 @@ pub fn on_client_disconnect(client_num: c_int) {
         s.tffa.cs_scores_sent[client_num as usize] = (i32::MIN, i32::MIN);
         s.tffa.viewer_match_cache[client_num as usize] = MAIN_MATCH;
         s.tffa.intermission_boards[client_num as usize] = MAIN_MATCH;
+        s.tffa.view_bases_from_gamestate[client_num as usize] = false;
         s.tffa.deferred_begin[client_num as usize] = false;
         s.tffa.pending_view_refresh[client_num as usize] = false;
     });
@@ -2178,6 +2250,7 @@ fn disable_parallel_tffa() {
                 slot.clear();
             }
         }
+        s.tffa.view_bases_from_gamestate = [false; MAX_CLIENTS];
         s.tffa.cs_scores_sent = [(i32::MIN, i32::MIN); MAX_CLIENTS];
         s.tffa.viewer_match_cache = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.intermission_boards = [MAIN_MATCH; MAX_CLIENTS];
@@ -7070,6 +7143,46 @@ mod tests {
         assert_eq!(sent[1], outsider);
         // And it stays quiet again.
         assert_eq!(queued(&table, &bases, &mut sent), 0);
+    }
+
+    /// D-006.16: a base push deferred under reliable pressure must be replayed
+    /// by the next full re-push. Treating the stored bases as held outside a
+    /// gamestate recorded a value the client never received, so the
+    /// `(TFFA N)` demotion of a same-match player survived every later refresh
+    /// (wrong skin/saber colour, grouped as a spectator and therefore missing
+    /// from the viewer's team rows).
+    #[test]
+    fn a_deferred_base_push_is_replayed_by_the_next_plain_resync() {
+        let base = "n\\Alora\\t\\1\\model\\alora";
+        let demoted = rewrite_cs_players_for_viewer(base, 1, MAIN_MATCH).expect("playing outsider");
+        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        bases[1] = base.to_owned();
+        // The viewer is in the same match as slot 1 now, so the desired value
+        // is the base string.
+        let table = [MAIN_MATCH; MAX_CLIENTS];
+
+        // What the viewer holds: the demotion, because the base push was
+        // deferred (the record is left as the demotion too, `push_cs_players`
+        // only records what it sent).
+        let mut sent: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        sent[1] = demoted;
+
+        // A plain resync compares every desired value against the record, so
+        // the owed base is queued.
+        let plan = override_push_plan(false, MAIN_MATCH, &table, &bases);
+        let owed: Vec<&(i32, String)> = plan
+            .iter()
+            .filter(|(slot, value)| sent[*slot as usize] != *value)
+            .collect();
+        assert_eq!(owed, vec![&(1, base.to_owned())]);
+
+        // A gamestate delivered the base strings, so its resync owes only the
+        // demotions of the viewers' outsiders and records the bases as held.
+        let plan = override_push_plan(true, MAIN_MATCH, &table, &bases);
+        assert!(
+            plan.iter().all(|(slot, _)| *slot != 1),
+            "a same-match base is already held: {plan:?}"
+        );
     }
 
     #[test]
