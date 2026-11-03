@@ -103,3 +103,9 @@
   movaps — the last three because prebuilt `std` keeps SSE2 paths while the
   engine enters the module with a 4-byte-aligned stack (D-001). Includes the
   rule for future engine-reachable code.
+- `0019-guid-bans-and-ban-command.md` — `ja_guid` ban registry
+  (`proxy_sv_enableGuidBan` / `proxy_sv_guidBanFile`) kept in its own strictly
+  validated file (a client-asserted value can only add a GUID, never an IP
+  range), enforced at connect, plus `rcon ban <client|name>`: IP through the
+  active `addip`, GUID when enabled, then kick; `addguid`/`removeguid`/
+  `listguid`; `reloadbans` reloads both registries.

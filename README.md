@@ -33,6 +33,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableIgnore`               | 0       | let any player hide another player's chat from their own client with `/ignore`/`/unignore`; see [Player ignore](#player-ignore) |
 | `proxy_sv_enableBanFile`              | 0       | file-backed IP ban list: `addip`/`removeip` edit `proxy_sv_banFile`, `listip` prints it, `reloadbans` re-reads it, and every connect is checked against it (IPv4 addresses and CIDR ranges; see [IP bans](#ip-bans)) |
 | `proxy_sv_banFile`                    | `proxy_bans.txt` | ban file path, relative to the server's working directory or absolute; ignored while `proxy_sv_enableBanFile 0` |
+| `proxy_sv_enableGuidBan`              | 0       | file-backed `ja_guid` ban registry (separate file and cvar from the IP list); `rcon ban <player>` adds the target's GUID, `addguid`/`removeguid`/`listguid` manage it (see [GUID bans](#guid-bans)) |
+| `proxy_sv_guidBanFile`                | `proxy_guid_bans.txt` | GUID ban file path, relative to the server's working directory or absolute; ignored while `proxy_sv_enableGuidBan 0` |
 | `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
@@ -132,8 +134,8 @@ With `proxy_sv_enableBanFile 1` the proxy takes the ban list over:
 - `addip <ip[/prefix]>` adds an exact address or a **CIDR range**
   (`addip 84.17.32.0/19`) and writes it to `proxy_sv_banFile`;
   `removeip <ip[/prefix]>` removes it; `listip` prints the loaded list;
-  `reloadbans` re-reads the file after a hand edit. All four work over rcon and
-  on the dedicated server's console.
+  `reloadbans` re-reads the ban files after a hand edit. All four work over
+  rcon and on the dedicated server's console.
 - Every connect is checked at `GAME_CLIENT_CONNECT` against the engine's
   real `ip` (the value `SV_DirectConnect` forces into the userinfo), and a
   listed address is refused with the stock `Banned.` message before the player
@@ -170,6 +172,51 @@ Notes:
   one-line warning if `g_banIPs` is non-empty; move those entries to the file and
   run `set g_banIPs ""`.
 - IPv4 only (the engine is IPv4), like the rest of the ban path.
+
+### GUID bans
+
+Some modern clients add a `ja_guid` key to their userinfo. A GUID ban is a
+separate, optional registry (`proxy_sv_enableGuidBan`, default `0`) with its own
+file (`proxy_sv_guidBanFile`, default `proxy_guid_bans.txt`).
+
+`ja_guid` is **client-asserted**: the player controls the value and can change
+it. A GUID ban is therefore a deterrent (it keeps a known install out
+cheaply), not a security boundary; a cheater can pick a fresh value and rejoin.
+It is never stored in the IP ban file and never shares it:
+
+- the IP file only ever receives IPv4 addresses/CIDR ranges (through `addip` or
+  the `ban` command's IP half);
+- a GUID line is a strict token (printable ASCII, no whitespace, `#`, `\` or
+  `"`, 1-64 characters, compared and stored lower-case), so a crafted userinfo
+  value can only ever add a GUID, never an address range.
+
+```
+# proxy_sv_guidBanFile — one token per line
+0123456789abcdef0123456789abcdef
+```
+
+Commands (rcon or the dedicated console):
+
+- `ban <clientNumber|playerName>` — the all-in-one admin command. It resolves
+  the target like `mute` (slot, exact name, unique prefix, or name fragment),
+  then:
+  1. bans the target's **IP** through `proxy_sv_banFile` when
+     `proxy_sv_enableBanFile 1`; when that is off it queues the pristine
+     `addip <ip>` instead;
+  2. bans the target's **`ja_guid`** when `proxy_sv_enableGuidBan 1` and the
+     client sends one (a stock client has none: that is reported and the IP
+     ban still happens);
+  3. kicks the target with the stock `Banned.` reason.
+- `addguid <guid>`, `removeguid <guid>`, `listguid` — manage the registry by
+  hand (e.g. to undo a wrong `ban`, or add a value an admin collected outside
+  the game).
+- `reloadbans` — re-reads both ban files after a hand edit.
+
+Enforcement happens at `GAME_CLIENT_CONNECT`, before the game sees the client:
+a listed `ja_guid` is refused with `Banned.`. Like the IP list it applies to
+the next connect (or the reconnect after a map change); a player already in the
+game when you add their GUID is only kicked by `ban`, not by editing the file.
+The reply to `ban` names what was added and why anything was skipped.
 
 ### Crash diagnostics
 

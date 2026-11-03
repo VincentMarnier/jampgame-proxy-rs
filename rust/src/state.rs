@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 23] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 25] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -44,6 +44,8 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 23] = [
     (c"proxy_sv_enableIgnore", c"0"),
     (c"proxy_sv_enableBanFile", c"0"),
     (c"proxy_sv_banFile", c"proxy_bans.txt"),
+    (c"proxy_sv_enableGuidBan", c"0"),
+    (c"proxy_sv_guidBanFile", c"proxy_guid_bans.txt"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -105,6 +107,13 @@ pub const CVAR_ENABLE_BAN_FILE: usize = 21;
 /// Path of the ban file (relative to the server's working directory, or
 /// absolute). Ignored when [`CVAR_ENABLE_BAN_FILE`] is `0`.
 pub const CVAR_BAN_FILE: usize = 22;
+/// File-backed `ja_guid` bans (D-019, `crate::guidban`): `0` off, non-zero on.
+/// Separate registry and cvar from the IP list: `ja_guid` is client-asserted
+/// userinfo, so it must not be able to add an IP entry.
+pub const CVAR_ENABLE_GUID_BAN: usize = 23;
+/// Path of the GUID ban file (relative to the server's working directory, or
+/// absolute). Ignored when [`CVAR_ENABLE_GUID_BAN`] is `0`.
+pub const CVAR_GUID_BAN_FILE: usize = 24;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -938,6 +947,11 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_IGNORE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_BAN_FILE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_BAN_FILE].1.to_bytes(), b"proxy_bans.txt");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_GUID_BAN].1.to_bytes(), b"0");
+        assert_eq!(
+            PROXY_CVARS[CVAR_GUID_BAN_FILE].1.to_bytes(),
+            b"proxy_guid_bans.txt"
+        );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

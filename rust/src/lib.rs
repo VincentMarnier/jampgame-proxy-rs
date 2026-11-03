@@ -29,10 +29,12 @@
 //! both mirroring the original proxy's forwarders. See `src/syscall.rs`,
 //! `src/original.rs`, `src/sdk.rs`.
 
+mod ban;
 mod banfile;
 mod challenge;
 mod diagnostics;
 mod engine;
+mod guidban;
 mod hooks;
 mod ignore;
 mod jampgame;
@@ -168,6 +170,11 @@ pub unsafe extern "C" fn vmMain(
             // (`print\n<reason>`), exactly like the game's own `"Banned."`.
             if state::proxy_enabled() {
                 if let Some(reason) = banfile::refuse_connect(a0, a2 != 0) {
+                    return reason.as_ptr() as usize as c_int;
+                }
+                // GUID registry (D-019): `ja_guid` is client-asserted, so this
+                // is a deterrent, not an identity check.
+                if let Some(reason) = guidban::refuse_connect(a0, a2 != 0) {
                     return reason.as_ptr() as usize as c_int;
                 }
             }
@@ -335,9 +342,15 @@ pub unsafe extern "C" fn vmMain(
             if state::proxy_enabled() && mute::handle_console_command() {
                 return 1;
             }
-            // `addip`/`removeip`/`listip` (and the proxy-only `reloadbans`)
-            // when the file-backed ban list is enabled (D-017).
+            // `ban <client|name>` (IP + GUID + kick, D-019) and the file-backed
+            // command families.
+            if state::proxy_enabled() && ban::handle_console_command() {
+                return 1;
+            }
             if state::proxy_enabled() && banfile::handle_console_command() {
+                return 1;
+            }
+            if state::proxy_enabled() && guidban::handle_console_command() {
                 return 1;
             }
             forward(command, &args)
@@ -549,56 +562,69 @@ fn update_proxy_cvars() {
     if !original::is_loaded() {
         return;
     }
-    let (enabled, void_nudge, void_nudge_log, ban_enabled, ban_path) = state::with_state(|s| {
-        for (i, _) in PROXY_CVARS.iter().enumerate() {
-            let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
-            // SAFETY: cvar is stable within the state.
-            unsafe { syscall::cvar_update(cvar) };
-        }
-        // The diagnostics level is mirrored into a lock-free atomic so engine
-        // hook call sites can gate their formatting without re-entering state.
-        diagnostics::set_level(s.cvars[state::CVAR_DEBUG_LOG].integer);
-        // The packet-rate limiter's cvars are mirrored into lock-free
-        // atomics: the check runs once per incoming packet. Accounting also
-        // runs for the netStatus table (its `packets/s` cell renders this
-        // module's measured rate) and for `proxy_sv_clientPpsLog` on its own;
-        // enforcement only follows the limiter cvar.
-        let measure = i32::from(
-            s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
-                || s.cvars[state::CVAR_ENABLE_NET_STATUS].integer != 0
-                || s.cvars[state::CVAR_CLIENT_PPS_LOG].integer != 0,
-        );
-        pps::set_config(
-            s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer,
-            measure,
-            s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
-            s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
-        );
-        // The ban file path is a string cvar; copied out while the state is
-        // locked, then used (file I/O) after it is released.
-        let ban_path = {
-            let raw = &s.cvars[state::CVAR_BAN_FILE].string;
-            let bytes: Vec<u8> = raw
-                .iter()
-                .take_while(|&&c| c != 0)
-                .map(|&c| c as u8)
-                .collect();
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        (
-            s.cvars[state::CVAR_ENABLE].integer,
-            s.cvars[state::CVAR_VOID_TIME_NUDGE].integer,
-            s.cvars[state::CVAR_VOID_TIME_NUDGE_LOG].integer,
-            s.cvars[state::CVAR_ENABLE_BAN_FILE].integer,
-            ban_path,
-        )
-    });
+    let (enabled, void_nudge, void_nudge_log, ban_enabled, ban_path, guid_enabled, guid_path) =
+        state::with_state(|s| {
+            for (i, _) in PROXY_CVARS.iter().enumerate() {
+                let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
+                // SAFETY: cvar is stable within the state.
+                unsafe { syscall::cvar_update(cvar) };
+            }
+            // The diagnostics level is mirrored into a lock-free atomic so engine
+            // hook call sites can gate their formatting without re-entering state.
+            diagnostics::set_level(s.cvars[state::CVAR_DEBUG_LOG].integer);
+            // The packet-rate limiter's cvars are mirrored into lock-free
+            // atomics: the check runs once per incoming packet. Accounting also
+            // runs for the netStatus table (its `packets/s` cell renders this
+            // module's measured rate) and for `proxy_sv_clientPpsLog` on its own;
+            // enforcement only follows the limiter cvar.
+            let measure = i32::from(
+                s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer != 0
+                    || s.cvars[state::CVAR_ENABLE_NET_STATUS].integer != 0
+                    || s.cvars[state::CVAR_CLIENT_PPS_LOG].integer != 0,
+            );
+            pps::set_config(
+                s.cvars[state::CVAR_ENABLE_CLIENT_PPS_LIMIT].integer,
+                measure,
+                s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
+                s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
+            );
+            // The ban file path is a string cvar; copied out while the state is
+            // locked, then used (file I/O) after it is released.
+            let ban_path = {
+                let raw = &s.cvars[state::CVAR_BAN_FILE].string;
+                let bytes: Vec<u8> = raw
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            let guid_path = {
+                let raw = &s.cvars[state::CVAR_GUID_BAN_FILE].string;
+                let bytes: Vec<u8> = raw
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            (
+                s.cvars[state::CVAR_ENABLE].integer,
+                s.cvars[state::CVAR_VOID_TIME_NUDGE].integer,
+                s.cvars[state::CVAR_VOID_TIME_NUDGE_LOG].integer,
+                s.cvars[state::CVAR_ENABLE_BAN_FILE].integer,
+                ban_path,
+                s.cvars[state::CVAR_ENABLE_GUID_BAN].integer,
+                guid_path,
+            )
+        });
     // Mirrored after the state lock is released: the off -> on edge clears the
     // per-client shifts, which itself takes the lock.
     timenudge::set_config(void_nudge, void_nudge_log);
-    // The ban list is read from disk only when the enable/path pair changes
+    // The ban lists are read from disk only when their enable/path pair changes
     // (and on `reloadbans`), never while the state lock is held.
     banfile::sync_config(ban_enabled != 0, &ban_path);
+    guidban::sync_config(guid_enabled != 0, &guid_path);
     let was_enabled = state::proxy_enabled();
     state::set_proxy_enabled(enabled != 0);
     // The hook layer is detached while the master switch is off, so a shift

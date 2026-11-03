@@ -220,7 +220,7 @@ fn c_path(path: &Path) -> io::Result<CString> {
 }
 
 /// Read a whole file through libc `open`/`read`/`close`.
-fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     const O_RDONLY: c_int = 0;
     const CHUNK: usize = 8192;
     let path = c_path(path)?;
@@ -263,11 +263,6 @@ fn temporary_path(path: &Path) -> PathBuf {
 /// `std::fs::File::metadata`/`statx` uses SSE, which cannot run on the engine's
 /// 4-byte-aligned stack.
 pub fn save(path: &Path, bans: &[Ban]) -> io::Result<()> {
-    const O_WRONLY: c_int = 1;
-    const O_CREAT: c_int = 0o100;
-    const O_TRUNC: c_int = 0o1000;
-    const MODE: c_int = 0o644;
-
     let mut bans = bans.to_vec();
     normalise(&mut bans);
     let mut body = String::from(HEADER);
@@ -275,6 +270,17 @@ pub fn save(path: &Path, bans: &[Ban]) -> io::Result<()> {
         body.push_str(&ban.canonical());
         body.push('\n');
     }
+    write_atomic(path, &body)
+}
+
+/// Replace `path` with `body`: write a sibling temporary file, fsync it and
+/// rename it over the target, so a crash mid-write leaves the old list intact.
+/// Shared with the GUID registry (`crate::guidban`).
+pub(crate) fn write_atomic(path: &Path, body: &str) -> io::Result<()> {
+    const O_WRONLY: c_int = 1;
+    const O_CREAT: c_int = 0o100;
+    const O_TRUNC: c_int = 0o1000;
+    const MODE: c_int = 0o644;
 
     let target = c_path(path)?;
     let temporary_path = temporary_path(path);
@@ -494,7 +500,7 @@ fn find(address: Ipv4Addr) -> Option<Ban> {
 /// Parse the engine's `ip` userinfo value: `a.b.c.d:port`, or `"localhost"`
 /// for a LAN client (`server/sv_client.cpp:327-329`). Anything else (IPv6,
 /// garbage) yields `None` and the connect is not checked.
-fn parse_userinfo_ip(value: &[u8]) -> Option<Ipv4Addr> {
+pub(crate) fn parse_userinfo_ip(value: &[u8]) -> Option<Ipv4Addr> {
     // The engine writes `a.b.c.d:port`; drop the port.
     let value = value.split(|&byte| byte == b':').next()?;
     let text = core::str::from_utf8(value).ok()?;
@@ -555,20 +561,27 @@ pub fn handle_console_command() -> bool {
     if !ours {
         return false;
     }
-    if !enabled() {
-        if matches!(command.as_slice(), b"reloadbans") {
-            print_line("proxy: the ban file is disabled (proxy_sv_enableBanFile 0).");
-            return true;
+    // `reloadbans` covers both registries and is proxy-only, so it is claimed
+    // even when one (or both) of them is off.
+    if matches!(command.as_slice(), b"reloadbans") {
+        let ips = reload();
+        let guids = crate::guidban::reload();
+        if !ips && !guids {
+            print_line(
+                "proxy: no ban list is enabled (proxy_sv_enableBanFile / proxy_sv_enableGuidBan).",
+            );
         }
+        return true;
+    }
+    // The three pristine commands keep the game's handler while the IP file is
+    // off.
+    if !enabled() {
         return false;
     }
     match command.as_slice() {
         b"addip" => add_command(),
         b"removeip" => remove_command(),
         b"listip" => list_command(),
-        b"reloadbans" => {
-            reload();
-        }
         _ => unreachable!(),
     }
     true
@@ -613,29 +626,45 @@ fn parse_argument(text: &str) -> Option<Ban> {
 }
 
 fn add_command() {
-    let Some((path, mut bans)) = snapshot() else {
-        return;
-    };
     let Some(ban) = argument().as_deref().and_then(parse_argument) else {
         return;
     };
+    match add_entry(ban) {
+        Ok(AddOutcome::AlreadyPresent) => print_line(&format!("proxy: {ban} is already banned")),
+        Ok(AddOutcome::Added) => {
+            let count = lock().as_ref().map_or(0, |runtime| runtime.bans.len());
+            print_line(&format!("proxy: banned {ban} ({count} entries)"));
+        }
+        Err(error) => print_line(&format!("proxy: {error}")),
+    }
+}
+
+/// Outcome of an `addip`/`addguid` mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddOutcome {
+    Added,
+    AlreadyPresent,
+}
+
+/// Add one entry to the loaded IP list and to its file (file first).
+fn add_entry(ban: Ban) -> Result<AddOutcome, String> {
+    let Some((path, mut bans)) = snapshot() else {
+        return Err("the IP ban file is disabled (proxy_sv_enableBanFile 0)".to_string());
+    };
     if bans.contains(&ban) {
-        print_line(&format!("proxy: {ban} is already banned"));
-        return;
+        return Ok(AddOutcome::AlreadyPresent);
     }
     bans.push(ban);
     normalise(&mut bans);
-    match save(&path, &bans) {
-        Ok(()) => {
-            let count = bans.len();
-            committed(&path, bans);
-            print_line(&format!("proxy: banned {ban} ({count} entries)"));
-        }
-        Err(error) => print_line(&format!(
-            "proxy: cannot write ban file {}: {error}",
-            path.display()
-        )),
-    }
+    save(&path, &bans)
+        .map_err(|error| format!("cannot write ban file {}: {error}", path.display()))?;
+    committed(&path, bans);
+    Ok(AddOutcome::Added)
+}
+
+/// Ban one address as a `/32` (the `ban` command's IP half).
+pub(crate) fn ban_address(address: Ipv4Addr) -> Result<AddOutcome, String> {
+    add_entry(Ban::new(address, 32))
 }
 
 fn remove_command() {

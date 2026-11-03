@@ -30,6 +30,7 @@ acceptance is wanted.
 """
 
 import argparse
+import random
 import re
 import socket
 import sys
@@ -262,6 +263,11 @@ def main() -> int:
     parser.add_argument("--protocol", default="26")
     parser.add_argument("--model", default=None)
     parser.add_argument(
+        "--valid",
+        action="store_true",
+        help="send the retail mandatory userinfo (passes the proxy's validator)",
+    )
+    parser.add_argument(
         "--extra",
         action="append",
         default=[],
@@ -273,18 +279,41 @@ def main() -> int:
 
     info = [
         ("protocol", args.protocol),
-        ("qport", "4321"),
+        # A fresh qport per probe: reusing one hits the engine's reconnect gate
+        # while the previous CS_CONNECTED slot is still alive.
+        ("qport", str(random.randint(2, 65535))),
         ("name", args.name),
         ("rate", "25000"),
         ("snaps", "20"),
     ]
-    if args.model:
+    if args.model and not args.valid:
         info.append(("model", args.model))
+    if args.valid:
+        # The proxy's OpenJK userinfo validation requires the retail keys.
+        info.extend(
+            [
+                ("model", args.model or "kyle/default"),
+                ("forcepowers", "7-1-030000000000003332"),
+                ("color1", "4"),
+                ("color2", "4"),
+                ("handicap", "100"),
+                ("cg_predictItems", "1"),
+                ("saber1", "single_1"),
+                ("saber2", "none"),
+                ("char_color_red", "255"),
+                ("char_color_green", "255"),
+                ("char_color_blue", "255"),
+            ]
+        )
     for item in args.extra:
         key, sep, value = item.partition("=")
         if not sep:
             parser.error(f"--extra expects KEY=VALUE, got {item!r}")
         info.append((key, value))
+
+    # The userinfo validator refuses duplicate keys; later entries win, so
+    # `--extra` can override a default.
+    fields = {key: value for key, value in info}
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(args.timeout)
@@ -299,7 +328,7 @@ def main() -> int:
         print(f"unexpected challenge reply: {reply[:80]!r}", file=sys.stderr)
         return 1
 
-    fields = "".join(f"\\{key}\\{value}" for key, value in info)
+    fields = "".join(f"\\{key}\\{value}" for key, value in fields.items())
     userinfo = f"\\challenge\\{match.group(1).decode()}{fields}"
     packet = b"\xff\xff\xff\xffconnect " + huff_compress(
         ('"' + userinfo + '"').encode()
