@@ -4,7 +4,8 @@ name: Release
 #   1. bump the crate version from the conventional-commit history,
 #   2. commit the bump and tag it,
 #   3. build the 32-bit jampgamei386.so,
-#   4. publish a GitHub Release with the tag and the .so attached.
+#   4. publish a GitHub Release with the tag, a list of the user-facing commit
+#      titles since the previous tag, and the .so attached.
 on:
   push:
     branches: [main]
@@ -102,9 +103,46 @@ jobs:
           echo "v${last} -> v${new_version} (${bump} bump)"
           {
             echo "last=${last}"
+            echo "last_tag=${last_tag}"
             echo "new=${new_version}"
             echo "bump=${bump}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
+        env:
+          LAST_TAG: ${{ steps.version.outputs.last_tag }}
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$LAST_TAG" ]; then
+            range="HEAD"
+            compare=""
+          else
+            range="${LAST_TAG}..HEAD"
+            compare="https://github.com/${GITHUB_REPOSITORY}/compare/${LAST_TAG}...v${NEW_VERSION}"
+          fi
+
+          # Commit titles only (no bodies, no merge commits), dropping the
+          # housekeeping types that carry no user-visible change.
+          changes=$(git log --no-merges --format='%s' "$range" \
+            | grep -vE '^(chore|ci|build|docs|style|test|refactor)(\([^)]*\))?!?:' \
+            | sed -E 's/^/- /' || true)
+
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$changes" ]; then
+              printf '%s\n' "$changes"
+            else
+              echo "_No user-facing changes._"
+            fi
+            if [ -n "$compare" ]; then
+              echo
+              echo "**Full changelog**: ${compare}"
+            fi
+          } > release-notes.md
+          cat release-notes.md
 
       - name: Bump crate version
         env:
@@ -140,5 +178,5 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.new }}
           name: v${{ steps.version.outputs.new }}
-          generate_release_notes: true
+          body_path: release-notes.md
           files: rust/jampgamei386.so
