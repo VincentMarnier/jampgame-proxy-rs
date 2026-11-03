@@ -1143,6 +1143,108 @@ delivery-loop test, and the record's maintenance paths (broadcast, gamestate,
 connect/disconnect, re-enable) are state transitions reviewed against the
 existing D-006.12 deferral machinery.
 
+### D-006.14 — Idle players no longer stay T-posed after an instance switch
+
+*Status: landed (live report, 2026-11-03). The client half rests on the SDK
+cgame source: this repository has no renderable client, and the runtime smoke
+test is blocked by the pre-existing sub-BSP startup regression (S20,
+`docs/ybeproxy-2026-delta.md`).*
+
+Reported: "When you switch TFFA instance, if ingame players don't move, they
+are displayed T-posing." A player who moves recovers immediately; one who
+stands still stays in bind pose indefinitely.
+
+**Observed / source evidence — where the pose is lost.** The proxy's only
+write in this path is the per-viewer `CS_PLAYERS` correction
+(`rewrite_cs_players_for_viewer`, D-006.5): a player of another match is shown
+as a prefixed spectator (`t=3`), the player's own match is shown from the base
+string. Switching instance therefore *changes that player's `t` in the
+viewer's clientinfo* (`refresh_cs_players_for_viewer`, `tffa.rs`).
+
+On the client the `cs` command reaches `CG_ConfigStringModified`
+(`cg_servercmds.c:841-844`) → `CG_NewClientInfo(..., qtrue)`
+(`cg_players.c:1503`). When the info differs enough that
+`CG_ScanForExistingClientInfo` cannot keep the same ghoul2 handle (the self
+match keeps it only when model/skin/saber/team all match,
+`cg_players.c:1290-1330`; the comment there already notes "Switching
+instances when not necessary produces small animation glitches"), the block at
+`cg_players.c:1837-1901` runs: it re-applies the **current** animation to the
+new `ci->ghoul2Model`, clears `cg_entities[n].currentState.legsAnim/torsoAnim`
+(`:1864`/`:1889`) and **duplicates a fresh ghoul2 instance for the centity**
+(`:1896`). The fresh instance starts unanimated.
+
+The next `CG_PlayerAnimation` (`cg_players.c:3267-3330`) runs
+`CG_RunLerpFrame`, which only calls `CG_SetLerpFrameAnimation` (the only
+`trap_G2API_SetBoneAnim` path for players) when the animation number, broken
+limbs or **flip bit** changed, or when `lf->animation` is null
+(`cg_players.c:3213`). Switching instance does not change a player's
+`legsAnim`/`torsoAnim`; the entity delta the server sends is unchanged too, and
+`MSG_WriteDeltaEntity` emits no unchanged field (`qcommon/msg.cpp`). So the
+new ghoul2 instance is never animated and the model renders in its bind pose
+(the "T-pose") until the player's own animation changes — exactly moving.
+
+**Decision.** Whenever the proxy queues a per-viewer `CS_PLAYERS` write
+(`send_cs_to_client`, the single choke point used by the demotions, the
+match-move refresh, the deferred `map_restart` refresh and the disable
+restore), it marks that player slot for an **animation restart**. At the end of
+the same `GAME_RUN_FRAME` (after the game's `ClientEndFrame` wrote each
+playerstate into its entity state, before `SV_SendClientMessages` builds the
+snapshots) the proxy writes the opposite of the player's own
+`legsFlip`/`torsoFlip` into the entity state's `s.legsFlip`/`s.torsoFlip`
+(`q_shared.h:2753-2754`: "set to opposite when the same anim needs
+restarting"). That is the cgame's own restart mechanism: the unchanged
+animation is re-applied to the new ghoul2 instance by every client, without
+changing which animation is played.
+
+- Only the *untimed* half is flipped (`ps.legsTimer`/`ps.torsoTimer <= 0`):
+  restarting a jump/attack/pain pose would visibly reset it mid-play, and a
+  timed animation recovers by itself when its timer ends and pmove sets the
+  next one.
+- The flip is held for `ANIM_FLIP_FRAMES` (3) game frames and then released
+  (the game's own `BG_PlayerStateToEntityState` writes the playerstate bit
+  back). Per-client snapshots are rate-limited (`client->nextSnapshotTime`), so
+  one frame could be skipped for a slow client; holding the bit costs nothing
+  because it does not change while held, and the release is one more harmless
+  restart of the same animation.
+- Nothing is written into the playerstate and no game code is hooked: the
+  entity state is presentation, re-derived from `ps` every `ClientEndFrame`.
+- The flip is applied to the marked slot for every viewer, not only the one
+  whose clientinfo changed. The clientinfo change is per viewer, but the
+  entity state is shared; the extra viewers get one restart of the animation
+  they are already playing.
+
+**Consequences and limits.** The restart rides the same snapshot as the `cs`
+correction when both are queued in the same game frame (reliable commands are
+written before the snapshot, `sv_snapshot.cpp:800-810`), so the T-pose window
+is at most the one transition that reloads the model. A client that has not yet
+received the player's entity (out of PVS, other instance) needs no restart: the
+first snapshot that shows the player is a baseline send and the normal
+`CG_ResetPlayerEntity` path animates it. The fix also covers the mass
+`CS_PLAYERS` change of `proxy_tffa_enable 0` (`restore_pristine_views`), which
+otherwise would have left every main-game player T-posed to every viewer until
+they moved.
+
+**Verification.** `cargo test` 322/322 (2 new: `cs_players_slot_matches_only_player_configstrings`
+and `anim_flip_restarts_only_untimed_halves`), `clippy --all-targets -D
+warnings`, `fmt --check` and the i686 release build
+(`rust/dev.sh ./scripts/build.sh`) are green. The new SDK offsets are pinned in
+`sdk::tests` (`entityState_t` all-32-bit PC layout; `playerState_t` anchored by
+`clientNum @172`/`weapon @176`). No live client was available, and
+`rust/scripts/engine-test.sh` cannot reach a running server on this tree
+because of the documented S20 startup crash, so the client-side half rests on
+the source chain above.
+
+**Alternatives considered.** *Rewrite the animation number* (the literal
+"force idle") — needs a temporary different animation (a visible one-frame
+flicker, or an idle variant if the player is idle), while the flip restarts
+the exact animation already in the entity state; keeping the number unchanged
+also leaves the game's `ps.legsAnim`/`torsoTimer` semantics untouched.
+*Drop the team demotion in `CS_PLAYERS`* — the team field is what keeps another
+match's players out of the viewer's team overlay and scores grouping (D-006.5,
+D-0012), so the clientinfo change is intended and the restart is the correct
+place to compensate. *Force the flip only for the viewer whose view changed* —
+impossible: the entity state is one shared snapshot source, not per viewer.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`

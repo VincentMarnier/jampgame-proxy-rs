@@ -54,12 +54,14 @@ use crate::sdk::{
     MAX_GENTITIES, MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS,
     OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY,
     OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
-    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN,
-    OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER,
-    OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
-    OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM,
-    OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
-    OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM,
+    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PLAYER_STATE,
+    OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED,
+    OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE,
+    OFFSET_GENTITY_S_LEGS_FLIP, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_S_TORSO_FLIP,
+    OFFSET_GENTITY_TARGET, OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME,
+    OFFSET_GENTITY_TEAM, OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
+    OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PERS_CONNECTED, OFFSET_PS_LEGS_FLIP,
+    OFFSET_PS_LEGS_TIMER, OFFSET_PS_TORSO_FLIP, OFFSET_PS_TORSO_TIMER, OFFSET_SESS_SESSION_TEAM,
     SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
 };
 use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_MAX_MATCHES};
@@ -84,6 +86,14 @@ pub const REMEMBERED_NONE: u8 = 0;
 /// the fallback length of the settle window when no client is left to reconnect
 /// and so no `GAME_CLIENT_CONNECT` can end it.
 const RESTART_SETTLE_FRAMES: u8 = 3;
+/// Game frames a pending "restart the same animation" flip is held for
+/// (D-006.14). The flip rides the entity delta of a snapshot, and snapshots are
+/// rate-limited per client (`client->nextSnapshotTime`), so a single frame can
+/// be skipped for a client; holding the bit for a few frames guarantees that a
+/// client which just reloaded a player's model sees the restart. The value does
+/// not change while it is held, so the client sees one delta (and one more when
+/// the game writes the playerstate's unflipped bit back).
+const ANIM_FLIP_FRAMES: u8 = 3;
 /// `scores ...` entries carry 14 ints each (`g_cmds.c:64-74`); the second
 /// int is `PERS_SCORE` (`g_cmds.c:65-66`).
 const SCORE_ENTRY_INTS: usize = 14;
@@ -616,7 +626,112 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
     };
     // SAFETY: engine syscall registered; cmsg NUL-terminated.
     unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
+    // A changed `CS_PLAYERS` entry makes cgame rebuild that player's
+    // clientinfo and replace its client-side ghoul2 instance
+    // (`CG_NewClientInfo`, `cg_players.c:1837-1901`); the cgame only restarts
+    // the animation when its number or flip changes, so a player who is not
+    // moving stays in bind pose (T-pose) until they do. Queue the game's own
+    // same-animation restart bit for the next snapshots (D-006.14).
+    if let Some(slot) = cs_players_slot(index) {
+        state::with_state(|s| s.tffa.anim_flip_pending[slot] = ANIM_FLIP_FRAMES);
+    }
     true
+}
+
+/// `CS_PLAYERS + slot` slot of a configstring index (`None` for every other
+/// configstring). Pure so the index arithmetic is unit-tested.
+fn cs_players_slot(index: i32) -> Option<usize> {
+    let slot = index - CS_PLAYERS;
+    (0..MAX_CLIENTS as i32)
+        .contains(&slot)
+        .then_some(slot as usize)
+}
+
+/// Entity-state flip values that restart one player's current animation on
+/// every client: the opposite of the playerstate's own flip bit (`legsFlip` /
+/// `torsoFlip`, "set to opposite when the same anim needs restarting",
+/// `q_shared.h:2202`), letting `CG_RunLerpFrame` re-run
+/// `CG_SetLerpFrameAnimation` for the unchanged animation
+/// (`cg_players.c:3203-3225`). A half inside a timed animation is left alone
+/// (`timer > 0`): restarting it would visibly reset a jump/attack/pain pose,
+/// and it recovers on its own when its timer ends and pmove sets a new
+/// animation. Returns `(legs, torso)` new values, `None` where untouched.
+fn anim_flip_values(
+    legs_timer: i32,
+    legs_flip: i32,
+    torso_timer: i32,
+    torso_flip: i32,
+) -> (Option<i32>, Option<i32>) {
+    (
+        (legs_timer <= 0).then_some(legs_flip ^ 1),
+        (torso_timer <= 0).then_some(torso_flip ^ 1),
+    )
+}
+
+/// Flip one live client's entity-state animation restart bits (D-006.14).
+/// Free/freed slots and slots without a playerstate are skipped.
+///
+/// # Safety
+/// `g_entities` must be the game's live `g_entities` array and `slot` a
+/// `MAX_CLIENTS` index.
+unsafe fn flip_player_anim(g_entities: usize, slot: usize) {
+    let ent = g_entities + slot * SIZEOF_GENTITY;
+    // SAFETY: slot < MAX_CLIENTS, so `ent` is inside the g_entities array.
+    if unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } == 0
+        || unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0
+    {
+        return;
+    }
+    // SAFETY: a live client's `playerState` is `&ent->client->ps`
+    // (`g_client.c:2292`); the pointer is only read, never written.
+    let ps = unsafe { read_usize(ent + OFFSET_GENTITY_PLAYER_STATE) };
+    if ps == 0 {
+        return;
+    }
+    // SAFETY: `ps` is a live playerState_t (non-null and owned by the game).
+    let (legs, torso) = unsafe {
+        anim_flip_values(
+            read_i32(ps + OFFSET_PS_LEGS_TIMER),
+            read_i32(ps + OFFSET_PS_LEGS_FLIP),
+            read_i32(ps + OFFSET_PS_TORSO_TIMER),
+            read_i32(ps + OFFSET_PS_TORSO_FLIP),
+        )
+    };
+    // SAFETY: writable presentation fields of a live player's entity state.
+    if let Some(value) = legs {
+        unsafe { write_i32(ent + OFFSET_GENTITY_S_LEGS_FLIP, value) };
+    }
+    if let Some(value) = torso {
+        unsafe { write_i32(ent + OFFSET_GENTITY_S_TORSO_FLIP, value) };
+    }
+}
+
+/// Apply and age the animation restarts queued by `CS_PLAYERS` writes
+/// (D-006.14). Runs at the end of every `GAME_RUN_FRAME`, after the game's own
+/// `ClientEndFrame` copied each playerstate into its entity state and before the
+/// engine builds the snapshots (`SV_Frame` → `SV_SendClientMessages`), so the
+/// flip rides the snapshot that carries (or follows) the `cs` correction that
+/// made cgame reload the model. Called before the feature-gate early return:
+/// the disable path (`restore_pristine_views`) is a mass `CS_PLAYERS` change.
+fn apply_pending_anim_flips() {
+    let pending = state::with_state(|s| s.tffa.anim_flip_pending);
+    if pending.iter().all(|&left| left == 0) {
+        return;
+    }
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    if g_entities != 0 {
+        for (slot, &left) in pending.iter().enumerate() {
+            if left != 0 {
+                // SAFETY: g_entities is the game's live entity array (0 checked).
+                unsafe { flip_player_anim(g_entities, slot) };
+            }
+        }
+    }
+    state::with_state(|s| {
+        for (slot, left) in s.tffa.anim_flip_pending.iter_mut().enumerate() {
+            *left = pending[slot].saturating_sub(1);
+        }
+    });
 }
 
 /// Queue a `cs CS_PLAYERS + slot` value for one viewer unless that viewer is
@@ -2629,6 +2744,12 @@ fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
 /// standard stats for all).
 /// Runs after the frame is forwarded so scores from this frame are visible.
 pub fn on_run_frame_post() {
+    // Restart the current animation of players whose clientinfo a viewer had to
+    // rebuild for a per-viewer `CS_PLAYERS` change (D-006.14). Before the
+    // gate/early returns below: the disable path (`restore_pristine_views`) is a
+    // mass `CS_PLAYERS` change too, and runs in the frame that turns the
+    // feature off.
+    apply_pending_anim_flips();
     if !enabled() {
         return;
     }
@@ -6549,6 +6670,40 @@ mod tests {
         assert_eq!(info_value(&out, "t").as_deref(), Some("3"));
         // Empty base: no change.
         assert_eq!(rewrite_cs_players_for_viewer("", 1, 0), None);
+    }
+
+    /// Only a `CS_PLAYERS` configstring index names a player slot; scores and
+    /// every other configstring must not queue an animation restart.
+    #[test]
+    fn cs_players_slot_matches_only_player_configstrings() {
+        assert_eq!(cs_players_slot(CS_PLAYERS), Some(0));
+        assert_eq!(cs_players_slot(CS_PLAYERS + 7), Some(7));
+        assert_eq!(
+            cs_players_slot(CS_PLAYERS + MAX_CLIENTS as i32 - 1),
+            Some(MAX_CLIENTS - 1)
+        );
+        assert_eq!(cs_players_slot(CS_PLAYERS - 1), None);
+        assert_eq!(cs_players_slot(CS_PLAYERS + MAX_CLIENTS as i32), None);
+        assert_eq!(cs_players_slot(CS_SCORES1), None);
+        assert_eq!(cs_players_slot(CS_SCORES2), None);
+    }
+
+    /// The cgame restarts an animation when the entity's flip bit differs from
+    /// the one it last applied (`cg_players.c:3203-3225`), so the restart writes
+    /// the opposite of the playerstate's own bit. A half in a timed animation is
+    /// left alone: it would reset a jump/attack/pain pose mid-play and pmove
+    /// gives it a new animation when the timer expires anyway.
+    #[test]
+    fn anim_flip_restarts_only_untimed_halves() {
+        // Both halves idle: both restart, opposite to the playerstate bits.
+        assert_eq!(anim_flip_values(0, 0, 0, 1), (Some(1), Some(0)));
+        assert_eq!(anim_flip_values(-1, 1, -1, 0), (Some(0), Some(1)));
+        // A timed legs animation keeps its current animation.
+        assert_eq!(anim_flip_values(120, 0, 0, 0), (None, Some(1)));
+        // A timed torso animation likewise.
+        assert_eq!(anim_flip_values(0, 1, 40, 1), (Some(0), None));
+        // Both timed: nothing is touched.
+        assert_eq!(anim_flip_values(1, 0, 1, 0), (None, None));
     }
 
     #[test]

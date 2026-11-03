@@ -450,6 +450,14 @@ pub struct TffaState {
     /// their reliable window was full; a later frame re-pushes their overrides
     /// once the client acknowledged the burst (D-006.12).
     pub pending_view_refresh: [bool; MAX_CLIENTS],
+    /// Remaining game frames to hold the "restart the same animation" flip bit
+    /// of each player's entity state (`0` = nothing pending), queued by
+    /// [`crate::tffa`] whenever a per-viewer `CS_PLAYERS` write makes cgame
+    /// rebuild a player's clientinfo (D-006.14). cgame replaces that player's
+    /// client-side ghoul2 instance on such a rebuild and only re-applies the
+    /// animation when its number or flip changes, so a player standing still
+    /// would stay in bind pose until they move.
+    pub anim_flip_pending: [u8; MAX_CLIENTS],
     /// A `map_restart` reconnect burst is in progress (D-006.12). Set before
     /// the pristine `GAME_INIT` body runs, so even the configstrings it sets
     /// cannot make the proxy queue commands into the burst. Every proxy `cs`
@@ -572,6 +580,7 @@ impl Default for TffaState {
             pending_join: [crate::tffa::REMEMBERED_NONE; MAX_CLIENTS],
             deferred_begin: [false; MAX_CLIENTS],
             pending_view_refresh: [false; MAX_CLIENTS],
+            anim_flip_pending: [0; MAX_CLIENTS],
             restart_burst: false,
             restart_burst_connects: false,
             restart_burst_trailing: false,

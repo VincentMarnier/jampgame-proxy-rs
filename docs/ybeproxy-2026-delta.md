@@ -974,7 +974,7 @@ deliberately left alone. **Not reproduced at runtime**: triggering it needs a
 model that fails to load, so it stays in the runtime list as a `dG2` scenario
 without a reproduction.
 
-### S20. Sub-BSP buffers leak on every map load — **FIXED 2026-11-02**
+### S20. Sub-BSP buffers leak on every map load — **FIXED 2026-11-02, REGRESSED 2026-11-03 (startup crash, see below)**
 
 Upstream: commit `23e84f1`.
 
@@ -999,6 +999,32 @@ sub-BSPs at that point. The main map's buffer is already freed by the engine.
 **Tests (TESTED, 1 new).** `bsp_disk_image_tag_and_address_are_pinned` pins the
 tag value and the `Z_TagFree` address. The leak itself is a runtime memory
 measurement; see [Section 6](#6-tests-and-test-plan).
+
+#### Runtime regression (2026-11-03) — startup crash
+
+The live call is **not safe at this point**. On the 2003 `linuxjampded` image
+used by `tools/runtime`, a proxy built at `21f0ccb` with the call enabled
+exits `139` (SIGSEGV) during `GAME_INIT`, before the hook layer attaches
+(there is no `----- proxy-rs: Engine properly patched` line):
+
+| build | `mp/duel1` | `mp/ffa1` | `mp/ctf1` |
+| --- | --- | --- | --- |
+| v0.11.0 (no S20 call) | runs | — | — |
+| `21f0ccb`, call enabled | **139** | **139** | **139** |
+| `21f0ccb`, call behind `if false` | runs | — | — |
+
+The v0.11.0 tag and the same HEAD build with only
+`free_bsp_disk_images()` disabled both reach `Engine properly patched` and
+answer protocol-26 queries, so the crash is this call, not the rest of the
+post-v0.11.0 changes. It is map-independent on the three maps above. The
+probable cause is that `TAG_BSP_DISKIMAGE` still holds a buffer the engine or
+game references after `GAME_INIT` (the “main map's buffer is already freed”
+premise does not hold on this engine/GameData), or that the tag's layout
+differs in the shipped binary; the exact dangling reference is not yet
+identified. **Do not ship the call as-is**: either defer it to a verified-safe
+point (after the engine's `SV_SpawnServer` settle frames and a runtime memory
+measurement) or revert it to the prior leak. The pinned address/tag test stays
+valid; the crash is a placement/lifetime bug, not a bad symbol.
 
 ### S21. `map_restart` puts connecting clients back in the world — **FIXED 2026-11-02**
 
@@ -1364,8 +1390,9 @@ dependencies. It is the order the fixes are being applied in.
 17. ✅ **S14** — kick vote slot reuse (Low). *Fixed 2026-11-02.*
 18. ✅ **S15** — `forwardmove` −128 (Low). *Fixed 2026-11-02.*
 19. **S16** — vote parsing / name lookup (Low, not security).
-20. ✅ **S20** — sub-BSP buffer leak (Low/Medium availability). *Fixed
-    2026-11-02.*
+20. **S20** — sub-BSP buffer leak (Low/Medium availability). *Fixed
+    2026-11-02, but the call crashes at `GAME_INIT` (2026-11-03); rework or
+    revert before release.*
 21. ✅ **S21** — `map_restart` and connecting clients (Low functional).
     *Fixed 2026-11-02.*
 22. ✅ **S22** — engine counter wrap (Low/Medium availability). *Fixed
