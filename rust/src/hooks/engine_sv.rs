@@ -531,8 +531,10 @@ fn info_print_lines(bytes: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 unsafe fn com_printf(format: *const c_char, text: *const c_char) {
     // SAFETY: fixed engine address; a cdecl call with `(const char*, const
     // char*)` is a valid use of the variadic function for a `%s` format.
-    let f: unsafe extern "C" fn(*const c_char, *const c_char) =
-        unsafe { core::mem::transmute(engine::functions::COM_PRINTF) };
+    let f: unsafe extern "C" fn(*const c_char, *const c_char) = engine::engine_fn!(
+        unsafe extern "C" fn(*const c_char, *const c_char),
+        engine::functions::COM_PRINTF
+    );
     unsafe { f(format, text) };
 }
 
@@ -601,8 +603,10 @@ pub unsafe extern "C" fn com_write_config_f() {
 
     print_text(&format!("Writing {}.\n", String::from_utf8_lossy(name)));
     // SAFETY: fixed engine address, cdecl `(const char*)`.
-    let f: unsafe extern "C" fn(*const c_char) =
-        unsafe { core::mem::transmute(engine::functions::COM_WRITE_CONFIG_TO_FILE) };
+    let f: unsafe extern "C" fn(*const c_char) = engine::engine_fn!(
+        unsafe extern "C" fn(*const c_char),
+        engine::functions::COM_WRITE_CONFIG_TO_FILE
+    );
     unsafe { f(filename.as_ptr() as *const c_char) };
 }
 
@@ -677,8 +681,10 @@ unsafe fn refresh_ip(cl: usize) -> bool {
         // `const char *NET_AdrToString(netadr_t)` (`0x807b314`) returns a
         // static buffer; copy it before any other engine call.
         // SAFETY: fixed engine address, cdecl `(netadr_t)`.
-        let f: unsafe extern "C" fn(Netadr) -> *const c_char =
-            unsafe { core::mem::transmute(engine::functions::NET_ADR_TO_STRING) };
+        let f: unsafe extern "C" fn(Netadr) -> *const c_char = engine::engine_fn!(
+            unsafe extern "C" fn(Netadr) -> *const c_char,
+            engine::functions::NET_ADR_TO_STRING
+        );
         let text = unsafe { f(from) };
         if text.is_null() {
             return true;
@@ -783,8 +789,10 @@ pub unsafe extern "C" fn sv_userinfo_changed(cl: usize) {
 /// `cl` must be a valid `client_t*` and `reason` a NUL-terminated string.
 unsafe fn sv_drop_client(cl: usize, reason: &CStr) {
     // SAFETY: fixed engine function address, cdecl `(client_t*, const char*)`.
-    let f: unsafe extern "C" fn(usize, *const c_char) =
-        unsafe { core::mem::transmute(crate::engine::functions::SV_DROP_CLIENT) };
+    let f: unsafe extern "C" fn(usize, *const c_char) = crate::engine::engine_fn!(
+        unsafe extern "C" fn(usize, *const c_char),
+        crate::engine::functions::SV_DROP_CLIENT
+    );
     unsafe { f(cl, reason.as_ptr()) };
 }
 

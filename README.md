@@ -31,6 +31,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enable`                     | 1       | master switch: when `0`, detach every hook and forward everything to the original game module (RCON keeps working, with the engine's pristine 500 ms gate) |
 | `proxy_sv_muteMode`                   | 1       | `mute`/`unmute` behaviour: `0` disabled, `1` drop the player's chat and tell them, `2` silent (their own line is echoed back to them, nobody else receives it, no notice); see [Player mute](#player-mute) |
 | `proxy_sv_enableIgnore`               | 0       | let any player hide another player's chat from their own client with `/ignore`/`/unignore`; see [Player ignore](#player-ignore) |
+| `proxy_sv_enableBanFile`              | 0       | file-backed IP ban list: `addip`/`removeip` edit `proxy_sv_banFile`, `listip` prints it, `reloadbans` re-reads it, and every connect is checked against it (IPv4 addresses and CIDR ranges; see [IP bans](#ip-bans)) |
+| `proxy_sv_banFile`                    | `proxy_bans.txt` | ban file path, relative to the server's working directory or absolute; ignored while `proxy_sv_enableBanFile 0` |
 | `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
 | `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
@@ -114,6 +116,60 @@ off, `/ignore` answers that the feature is disabled and no chat is filtered;
 lists already set stay dormant and work again when it is turned back on. Like
 every proxy feature it also needs `proxy_sv_enable 1`.
 
+
+### IP bans
+
+The stock `addip` keeps its filters in memory and mirrors them into the
+`g_banIPs` cvar. That cvar is a 256-byte `vmCvar_t` mirror, and the engine's
+`Cvar_Update` treats a longer value as fatal: about 25 addresses fit, and
+overrunning the limit logs `Cvar_Update: src g_banIPs length N exceeds
+MAX_CVAR_VALUE_STRING`, shuts the game down, and leaves the over-long value in
+`jampserver.cfg` so the next start fails too. The built-in list is therefore
+only usable for a handful of exact addresses.
+
+With `proxy_sv_enableBanFile 1` the proxy takes the ban list over:
+
+- `addip <ip[/prefix]>` adds an exact address or a **CIDR range**
+  (`addip 84.17.32.0/19`) and writes it to `proxy_sv_banFile`;
+  `removeip <ip[/prefix]>` removes it; `listip` prints the loaded list;
+  `reloadbans` re-reads the file after a hand edit. All four work over rcon and
+  on the dedicated server's console.
+- Every connect is checked at `GAME_CLIENT_CONNECT` against the engine's
+  real `ip` (the value `SV_DirectConnect` forces into the userinfo), and a
+  listed address is refused with the stock `Banned.` message before the player
+  enters the game. Bots and LAN/loopback clients are never checked.
+- The file is the only source of truth: `addip`/`removeip` write it before the
+  change is committed, so a failed write leaves the file and the loaded list in
+  agreement. The list is loaded at startup and whenever the two cvars change.
+
+The file is plain text: one address or CIDR range per line, `#` starts a
+comment. Host bits are masked (`84.17.32.5/19` is stored as `84.17.32.0/19`),
+an exact address means `/32`, and a `/0` (ban everyone) is refused. Invalid
+lines are skipped with a console warning naming the line. A missing file is an
+empty list, not an error.
+
+```
+# proxy_sv_banFile — one entry per line
+84.17.32.0/19
+203.0.113.7
+```
+
+A VPN blocklist can be dropped straight into this file: the proxy only
+enforces the ranges, it does not detect VPNs by itself.
+
+Notes:
+
+- `addip`/`removeip` rewrite the file in canonical (sorted, deduplicated) form,
+  so hand-written comments are not preserved by those two commands. `reloadbans`
+  never rewrites it.
+- With `proxy_sv_enableBanFile 0` (the default) the whole feature is off: the
+  pristine `addip`/`removeip`/`listip` handlers run exactly as before, and no
+  connect is checked.
+- A pre-existing `g_banIPs` from an older configuration is still enforced by the
+  game module's own `ClientConnect`. When the proxy loads a ban file it prints a
+  one-line warning if `g_banIPs` is non-empty; move those entries to the file and
+  run `set g_banIPs ""`.
+- IPv4 only (the engine is IPv4), like the rest of the ban path.
 
 ### Crash diagnostics
 

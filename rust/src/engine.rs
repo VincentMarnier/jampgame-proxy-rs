@@ -333,6 +333,13 @@ macro_rules! engine_fn {
     }};
 }
 
+// The macro is used by the hook modules too: a direct `call <absolute>` to an
+// engine address would be encoded relative to the .so's link-time base and
+// land at `base + address` under ASLR (observed: `Z_TagFree`, and every other
+// constant-transmute call site listed in D-018). Routing every such call
+// through this macro keeps it indirect.
+pub(crate) use engine_fn;
+
 /// `server.common.functions.Com_EndRedirect()` (0x8072c74): flush and close the
 /// engine's current redirect. Called at `GAME_SHUTDOWN` because an `rcon map`
 /// change leaves a redirect open (`Proxy_Main.cpp:135`); no-op if none is open.
@@ -343,6 +350,20 @@ macro_rules! engine_fn {
 pub unsafe fn com_end_redirect() {
     let f: unsafe extern "C" fn() = engine_fn!(unsafe extern "C" fn(), functions::COM_END_REDIRECT);
     unsafe { f() };
+}
+
+/// `void Z_TagFree(memtag_t)` (0x80804e4): frees every allocation of a tag.
+///
+/// # Safety
+///
+/// Engine-only; the tag must be a valid `memtag_t` and the engine initialised.
+pub unsafe fn z_tag_free(tag: c_int) {
+    // Indirect through the wrapper macro: a direct `call <absolute>` would be
+    // encoded relative to the .so's link-time base and land anywhere under
+    // ASLR (see the `engine_fn!` note above).
+    let f: unsafe extern "C" fn(c_int) =
+        engine_fn!(unsafe extern "C" fn(c_int), functions::Z_TAG_FREE);
+    unsafe { f(tag) };
 }
 
 /// `char* Cmd_Argv(int)` (0x812c264) — the engine's argv table.

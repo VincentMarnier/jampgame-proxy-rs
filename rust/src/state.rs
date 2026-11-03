@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 23] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -42,6 +42,8 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 21] = [
     (c"proxy_sv_voidTimeNudge", c"0"),
     (c"proxy_sv_voidTimeNudgeLog", c"0"),
     (c"proxy_sv_enableIgnore", c"0"),
+    (c"proxy_sv_enableBanFile", c"0"),
+    (c"proxy_sv_banFile", c"proxy_bans.txt"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -95,6 +97,14 @@ pub const CVAR_VOID_TIME_NUDGE_LOG: usize = 19;
 /// `ignore`/`unignore` only answer that the feature is disabled and no chat is
 /// filtered, even for a player still carrying a mask.
 pub const CVAR_ENABLE_IGNORE: usize = 20;
+/// File-backed IP bans (D-017, `crate::banfile`): `0` off (the pristine
+/// `addip`/`removeip`/`listip` handlers run and no connect is checked), non-zero
+/// on (`addip`/`removeip` edit [`CVAR_BAN_FILE`], `listip` prints it and every
+/// connect is checked against it).
+pub const CVAR_ENABLE_BAN_FILE: usize = 21;
+/// Path of the ban file (relative to the server's working directory, or
+/// absolute). Ignored when [`CVAR_ENABLE_BAN_FILE`] is `0`.
+pub const CVAR_BAN_FILE: usize = 22;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -926,6 +936,8 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_VOID_TIME_NUDGE_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE_IGNORE].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_BAN_FILE].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_BAN_FILE].1.to_bytes(), b"proxy_bans.txt");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

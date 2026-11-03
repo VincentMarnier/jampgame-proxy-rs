@@ -29,6 +29,7 @@
 //! both mirroring the original proxy's forwarders. See `src/syscall.rs`,
 //! `src/original.rs`, `src/sdk.rs`.
 
+mod banfile;
 mod challenge;
 mod diagnostics;
 mod engine;
@@ -161,6 +162,15 @@ pub unsafe extern "C" fn vmMain(
             response
         }
         GAME_CLIENT_CONNECT => {
+            // File-backed bans (D-017): the engine has already forced the real
+            // `ip` userinfo key in `SV_DirectConnect`, so the address is
+            // trustworthy here. A non-null return is the engine's refusal path
+            // (`print\n<reason>`), exactly like the game's own `"Banned."`.
+            if state::proxy_enabled() {
+                if let Some(reason) = banfile::refuse_connect(a0, a2 != 0) {
+                    return reason.as_ptr() as usize as c_int;
+                }
+            }
             // 10-25 F2: the engine calls GAME_CLIENT_CONNECT before
             // SV_UserinfoChanged, and the game's ClientConnect calls
             // ClientUserinfoChanged directly, so the game would otherwise see
@@ -325,6 +335,11 @@ pub unsafe extern "C" fn vmMain(
             if state::proxy_enabled() && mute::handle_console_command() {
                 return 1;
             }
+            // `addip`/`removeip`/`listip` (and the proxy-only `reloadbans`)
+            // when the file-backed ban list is enabled (D-017).
+            if state::proxy_enabled() && banfile::handle_console_command() {
+                return 1;
+            }
             forward(command, &args)
         }
         _ => forward(command, &args),
@@ -348,10 +363,9 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Engine memory layer initialised; only called from `GAME_INIT` after the
 /// original module has run.
 unsafe fn free_bsp_disk_images() {
-    // SAFETY: fixed engine address, cdecl `(memtag_t)`.
-    let f: unsafe extern "C" fn(core::ffi::c_int) =
-        unsafe { core::mem::transmute(engine::functions::Z_TAG_FREE) };
-    unsafe { f(crate::sdk::TAG_BSP_DISKIMAGE) };
+    // SAFETY: fixed engine address, cdecl `(memtag_t)`, called indirectly by
+    // `engine::z_tag_free` so the call survives the module's ASLR base.
+    unsafe { engine::z_tag_free(crate::sdk::TAG_BSP_DISKIMAGE) };
 }
 
 fn game_init(args: &[c_int; 12]) -> c_int {
@@ -535,7 +549,7 @@ fn update_proxy_cvars() {
     if !original::is_loaded() {
         return;
     }
-    let (enabled, void_nudge, void_nudge_log) = state::with_state(|s| {
+    let (enabled, void_nudge, void_nudge_log, ban_enabled, ban_path) = state::with_state(|s| {
         for (i, _) in PROXY_CVARS.iter().enumerate() {
             let cvar = &mut s.cvars[i] as *mut sdk::VmCvar;
             // SAFETY: cvar is stable within the state.
@@ -560,15 +574,31 @@ fn update_proxy_cvars() {
             s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
             s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
         );
+        // The ban file path is a string cvar; copied out while the state is
+        // locked, then used (file I/O) after it is released.
+        let ban_path = {
+            let raw = &s.cvars[state::CVAR_BAN_FILE].string;
+            let bytes: Vec<u8> = raw
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
         (
             s.cvars[state::CVAR_ENABLE].integer,
             s.cvars[state::CVAR_VOID_TIME_NUDGE].integer,
             s.cvars[state::CVAR_VOID_TIME_NUDGE_LOG].integer,
+            s.cvars[state::CVAR_ENABLE_BAN_FILE].integer,
+            ban_path,
         )
     });
     // Mirrored after the state lock is released: the off -> on edge clears the
     // per-client shifts, which itself takes the lock.
     timenudge::set_config(void_nudge, void_nudge_log);
+    // The ban list is read from disk only when the enable/path pair changes
+    // (and on `reloadbans`), never while the state lock is held.
+    banfile::sync_config(ban_enabled != 0, &ban_path);
     let was_enabled = state::proxy_enabled();
     state::set_proxy_enabled(enabled != 0);
     // The hook layer is detached while the master switch is off, so a shift

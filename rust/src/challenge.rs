@@ -23,9 +23,7 @@
 //! on every map change. This module is pinned (D-007), so a process-lifetime
 //! static is enough and a challenge sent just before a map change stays valid.
 
-use core::ffi::{CStr, c_char};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::LazyLock;
 
 use crate::engine;
@@ -55,16 +53,76 @@ const OFFSET_ADR_PORT: usize = 18;
 static KEY: LazyLock<[u64; 2]> = LazyLock::new(random_key);
 
 fn random_key() -> [u64; 2] {
-    // `RandomState` is seeded from the OS (`getrandom`); two different hashes
-    // of two counters give two independent-looking words. No dependency.
-    let state = RandomState::new();
-    let mut key = [0u64; 2];
-    for (i, word) in key.iter_mut().enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write_u64(i as u64);
-        *word = hasher.finish();
+    // `/dev/urandom` through libc, not `std::collections::hash_map::RandomState`:
+    // the prebuilt `std` is compiled with SSE2 and the engine enters the game
+    // module (and therefore this connectionless handler) with a 4-byte-aligned
+    // stack (D-001), so `RandomState::new` faults on its first `movaps`
+    // (observed: getchallenge → `hashmap_random_keys` → SIGSEGV). libc calls
+    // are safe with the 2003 stack; the engine itself calls them.
+    let mut bytes = [0u8; 16];
+    if fill_random(&mut bytes) {
+        return [
+            u64::from_ne_bytes(bytes[..8].try_into().expect("8 bytes")),
+            u64::from_ne_bytes(bytes[8..].try_into().expect("8 bytes")),
+        ];
+    }
+    // No entropy source: mix the millisecond clock, a counter and this
+    // module's own load address (ASLR) rather than leaving the key all-zero.
+    let time = crate::syscall::milliseconds() as u64;
+    let counter = fallback_counter();
+    let address = &KEY as *const _ as usize as u64;
+    let mut key = [
+        time ^ address.rotate_left(17),
+        counter ^ address.rotate_right(9),
+    ];
+    for word in &mut key {
+        *word = word.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        *word ^= word.rotate_right(31);
     }
     key
+}
+
+unsafe extern "C" {
+    /// `int open(const char *path, int flags, ...)`.
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    /// `ssize_t read(int fd, void *buf, size_t count)`.
+    fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    /// `int close(int fd)`.
+    fn close(fd: c_int) -> c_int;
+}
+
+/// Fill `buffer` from `/dev/urandom`; `false` if the device is unavailable.
+fn fill_random(buffer: &mut [u8]) -> bool {
+    const O_RDONLY: c_int = 0;
+    // SAFETY: the path is a NUL-terminated static literal; the buffer is valid
+    // for `buffer.len()` bytes; the descriptor is closed before returning.
+    unsafe {
+        let fd = open(c"/dev/urandom".as_ptr(), O_RDONLY);
+        if fd < 0 {
+            return false;
+        }
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let n = read(
+                fd,
+                buffer.as_mut_ptr().add(filled) as *mut c_void,
+                buffer.len() - filled,
+            );
+            if n <= 0 {
+                break;
+            }
+            filled += n as usize;
+        }
+        close(fd);
+        filled == buffer.len()
+    }
+}
+
+/// Monotonic counter for the no-entropy fallback (never zero).
+fn fallback_counter() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
@@ -147,8 +205,10 @@ unsafe fn out_of_band_print(from: &Netadr, challenge: i32) {
     // SAFETY: fixed engine address with the cdecl argument layout
     // `(netsrc_t, netadr_t, const char*, int)`, which is what a variadic
     // call with one int argument uses.
-    let f: unsafe extern "C" fn(i32, Netadr, *const c_char, i32) =
-        unsafe { core::mem::transmute(engine::functions::NET_OUT_OF_BAND_PRINT) };
+    let f: unsafe extern "C" fn(i32, Netadr, *const c_char, i32) = crate::engine::engine_fn!(
+        unsafe extern "C" fn(i32, Netadr, *const c_char, i32),
+        engine::functions::NET_OUT_OF_BAND_PRINT
+    );
     unsafe {
         f(
             NS_SERVER,

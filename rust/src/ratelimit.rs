@@ -20,7 +20,7 @@
 //! map change. The Rust module is pinned (D-007), so they persist; that only
 //! makes the limit stricter across a map change, never looser.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::diagnostics;
@@ -46,7 +46,14 @@ struct LeakyBucket {
 
 #[derive(Default)]
 struct Table {
-    buckets: HashMap<u32, LeakyBucket>,
+    // `BTreeMap`, not `HashMap`: the prebuilt `std` is compiled with SSE2 and
+    // its `HashMap` (hashbrown) instantiates an aligned `_mm_load_si128` group
+    // load even though this crate disables SSE. The engine enters the game
+    // module with a 4-byte-aligned stack (D-001), so the first connectionless
+    // packet (getchallenge/getstatus/rcon) crashed in `address_allowed`
+    // (D-018). The tree uses no aligned SIMD; a few comparisons per packet at
+    // the 65536-address cap are cheap.
+    buckets: BTreeMap<u32, LeakyBucket>,
     last_gc: u32,
     /// `getstatus`/`getinfo`, every address.
     outbound: LeakyBucket,

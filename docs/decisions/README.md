@@ -90,3 +90,16 @@
   `G_SEND_SERVER_COMMAND` trap with the speaker taken from the synchronous
   `GAME_CLIENT_COMMAND` acting scope, gated by `proxy_sv_enableIgnore` (default
   off).
+- `0017-file-ban-list.md` — file-backed IP bans (`proxy_sv_enableBanFile` /
+  `proxy_sv_banFile`): the file is the only source of truth, `addip`/`removeip`
+  edit real IPv4 CIDR ranges and persist atomically, `listip`/`reloadbans`,
+  the connect gate uses the engine-forced `ip` userinfo and returns the stock
+  `Banned.`; the pristine `g_banIPs` is never written (its 256-byte mirror
+  fatally drops the server above ~25 entries).
+- `0018-engine-call-and-stack-faults.md` — four pre-existing runtime faults
+  found while verifying D-017: direct `call <absolute>` to engine addresses
+  under ASLR (fixed with `engine_fn!`), `RandomState`/`hashmap_random_keys`
+  movaps, `HashMap`/hashbrown `_mm_load_si128`, and `std::fs::read`/`try_statx`
+  movaps — the last three because prebuilt `std` keeps SSE2 paths while the
+  engine enters the module with a 4-byte-aligned stack (D-001). Includes the
+  rule for future engine-reachable code.
