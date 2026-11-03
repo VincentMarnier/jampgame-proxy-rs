@@ -1143,107 +1143,133 @@ delivery-loop test, and the record's maintenance paths (broadcast, gamestate,
 connect/disconnect, re-enable) are state transitions reviewed against the
 existing D-006.12 deferral machinery.
 
-### D-006.14 — Idle players no longer stay T-posed after an instance switch
+### D-006.14 — Players keep their skin and animation after an instance switch
 
-*Status: landed (live report, 2026-11-03). The client half rests on the SDK
-cgame source: this repository has no renderable client, and the runtime smoke
-test is blocked by the pre-existing sub-BSP startup regression (S20,
-`docs/ybeproxy-2026-delta.md`).*
+*Status: landed (live report, 2026-11-03). The client half rests on the
+SDK/TaystJK cgame source; the runtime smoke test is blocked by the pre-existing
+sub-BSP startup regression (S20, `docs/ybeproxy-2026-delta.md`).*
 
 Reported: "When you switch TFFA instance, if ingame players don't move, they
-are displayed T-posing." A player who moves recovers immediately; one who
-stands still stays in bind pose indefinitely.
+are displayed T-posing." Follow-ups narrowed it down: running players first
+started sliding in the bind pose, then (after that was reverted) the remaining
+symptom was **"their skin is reset and they T-pose; opening the scoreboard makes
+their skin and animation correct again."**
 
-**Observed / source evidence — where the pose is lost.** The proxy's only
+**Observed / source evidence — the deferred model load.** The proxy's only
 write in this path is the per-viewer `CS_PLAYERS` correction
 (`rewrite_cs_players_for_viewer`, D-006.5): a player of another match is shown
-as a prefixed spectator (`t=3`), the player's own match is shown from the base
-string. Switching instance therefore *changes that player's `t` in the
-viewer's clientinfo* (`refresh_cs_players_for_viewer`, `tffa.rs`).
+as a prefixed spectator (`t=3`), the player's own match from the base string.
+Switching instance therefore changes that player's `t` in the viewer's
+clientinfo (`refresh_cs_players_for_viewer`, `tffa.rs`).
 
-On the client the `cs` command reaches `CG_ConfigStringModified`
-(`cg_servercmds.c:841-844`) → `CG_NewClientInfo(..., qtrue)`
-(`cg_players.c:1503`). When the info differs enough that
-`CG_ScanForExistingClientInfo` cannot keep the same ghoul2 handle (the self
-match keeps it only when model/skin/saber/team all match,
-`cg_players.c:1290-1330`; the comment there already notes "Switching
-instances when not necessary produces small animation glitches"), the block at
-`cg_players.c:1837-1901` runs: it re-applies the **current** animation to the
-new `ci->ghoul2Model`, clears `cg_entities[n].currentState.legsAnim/torsoAnim`
-(`:1864`/`:1889`) and **duplicates a fresh ghoul2 instance for the centity**
-(`:1896`). The fresh instance starts unanimated.
+The cgame handles the `cs` in `CG_ConfigStringModified`
+(`cg_servercmds.c:879-883`) → `CG_NewClientInfo(..., qtrue)`
+(`cg_players.c:1499`). A team change makes `CG_ScanForExistingClientInfo` fail
+(it requires the same team), so the client falls into
+`CG_SetDeferredClientInfo` (`cg_players.c:1662-1756`): with
+`cg_deferPlayers` on (the **default**, `cg_players.c:2513`) it copies *another*
+client's model into the entry (`CG_CopyClientInfoModel`) and marks the player
+**deferred** instead of loading their real model. That is the reset skin.
 
-The next `CG_PlayerAnimation` (`cg_players.c:3267-3330`) runs
-`CG_RunLerpFrame`, which only calls `CG_SetLerpFrameAnimation` (the only
-`trap_G2API_SetBoneAnim` path for players) when the animation number, broken
-limbs or **flip bit** changed, or when `lf->animation` is null
-(`cg_players.c:3213`). Switching instance does not change a player's
-`legsAnim`/`torsoAnim`; the entity delta the server sends is unchanged too, and
-`MSG_WriteDeltaEntity` emits no unchanged field (`qcommon/msg.cpp`). So the
-new ghoul2 instance is never animated and the model renders in its bind pose
-(the "T-pose") until the player's own animation changes — exactly moving.
+Nothing loads the real model until the scoreboard is drawn: `CG_DrawScoreboard`
+periodically calls `CG_LoadDeferredPlayers` (`cg_scoreboard.c:680-684`), which
+sets `cgQueueLoad`; the next `CG_Player` runs `CG_ActualLoadDeferredPlayers`
+(`cg_view.c:2755`) → `CG_LoadClientInfo` for every deferred entry. That
+function finishes by re-duplicating the newly loaded real model into the
+centity and calling **`CG_ResetPlayerEntity`** for every matching cent
+(`cg_players.c:1403-1411`), which is exactly why the scoreboard fixes both the
+skin and the animation. Until then the cent keeps the deferred copy (wrong
+skin) and the old/stale animation bookkeeping (bind pose).
 
-**Decision.** Whenever the proxy queues a per-viewer `CS_PLAYERS` write
-(`send_cs_to_client`, the single choke point used by the demotions, the
-match-move refresh, the deferred `map_restart` refresh and the disable
-restore), it marks that player slot for an **animation restart**. At the end of
-the same `GAME_RUN_FRAME` (after the game's `ClientEndFrame` wrote each
-playerstate into its entity state, before `SV_SendClientMessages` builds the
-snapshots) the proxy writes the opposite of the player's own
-`legsFlip`/`torsoFlip` into the entity state's `s.legsFlip`/`s.torsoFlip`
-(`q_shared.h:2753-2754`: "set to opposite when the same anim needs
-restarting"). That is the cgame's own restart mechanism: the unchanged
-animation is re-applied to the new ghoul2 instance by every client, without
-changing which animation is played.
+**Decision.** Whenever the proxy queues a per-viewer `CS_PLAYERS` write for a
+player that belongs to the **viewer's own instance** (`send_cs_to_client`, the
+single choke point used by the match-move refresh, the deferred `map_restart`
+refresh and the disable restore — i.e. a promotion back to the base string, or
+a same-instance team change, not a demotion of an outsider), it also marks that
+viewer. At the end of the same `GAME_RUN_FRAME` (after the `cs` commands and
+before `SV_SendClientMessages`) the proxy sends the viewer cgame's own server
+command **`loaddefered`**, once per viewer per frame:
 
-- Only the *untimed* half is flipped (`ps.legsTimer`/`ps.torsoTimer <= 0`):
-  restarting a jump/attack/pain pose would visibly reset it mid-play, and a
-  timed animation recovers by itself when its timer ends and pmove sets the
-  next one.
-- The flip is held for `ANIM_FLIP_FRAMES` (3) game frames and then released
-  (the game's own `BG_PlayerStateToEntityState` writes the playerstate bit
-  back). Per-client snapshots are rate-limited (`client->nextSnapshotTime`), so
-  one frame could be skipped for a slow client; holding the bit costs nothing
-  because it does not change while held, and the release is one more harmless
-  restart of the same animation.
-- Nothing is written into the playerstate and no game code is hooked: the
-  entity state is presentation, re-derived from `ps` every `ClientEndFrame`.
-- The flip is applied to the marked slot for every viewer, not only the one
-  whose clientinfo changed. The clientinfo change is per viewer, but the
-  entity state is shared; the extra viewers get one restart of the animation
-  they are already playing.
+- The cgame's server-command table contains
+  `{ "loaddefered", CG_LoadDeferredPlayers }` (`cg_servercmds.c:1834`; the
+  stock SDK cgame handles the same name at `cg_servercmds.c:1657`), with the
+  comment "loaddeferred can be both a servercmd and a consolecmd". It is the
+  same entry point the scoreboard uses, so the client runs the same real
+  `CG_LoadClientInfo` + `CG_ResetPlayerEntity` path immediately, on stock and
+  TaystJK clients alike.
+- Reliable commands are delivered in order (`SV_UpdateServerCommandsToClient`
+  before the snapshot, `sv_snapshot.cpp:800-810`), so the client first applies
+  the `cs` correction (which may defer the model), then loads it. This is the
+  active fix; no client cvar (`cg_deferPlayers`) has to change.
+- The command is skipped while the `map_restart` reconnect burst is active or
+  the viewer's reliable window is full (D-006.12); the flag stays set and the
+  next frame retries, after the burst's clientinfo corrections were re-pushed.
+  It is also flushed before the feature-gate early return, because the disable
+  path (`restore_pristine_views`) is a mass `CS_PLAYERS` change too.
+- No game state is written: the command only makes the client load the models
+  it already decided to defer. If nothing was deferred (client with
+  `cg_deferPlayers 0`, or a `cs` change that kept the same model/skin/team),
+  the command is a no-op. Outsiders' demotions are deliberately not marked: a
+  demoted player is not in the viewer's snapshots, so its model can stay
+  deferred (that is the point of `cg_deferPlayers`) until it is promoted.
 
-**Consequences and limits.** The restart rides the same snapshot as the `cs`
-correction when both are queued in the same game frame (reliable commands are
-written before the snapshot, `sv_snapshot.cpp:800-810`), so the T-pose window
-is at most the one transition that reloads the model. A client that has not yet
-received the player's entity (out of PVS, other instance) needs no restart: the
-first snapshot that shows the player is a baseline send and the normal
-`CG_ResetPlayerEntity` path animates it. The fix also covers the mass
-`CS_PLAYERS` change of `proxy_tffa_enable 0` (`restore_pristine_views`), which
-otherwise would have left every main-game player T-posed to every viewer until
-they moved.
+**The followed player is a special case — the spectator's playerstate.** A
+spectator who follows a player never receives that player's entity: the engine
+excludes the "own" entity from the snapshot (`e == frame->ps.clientNum`,
+`sv_snapshot.cpp:SV_AddEntitiesVisibleFromPoint`), and for a follower
+`frame->ps.clientNum` is the followed player (`SpectatorClientEndFrame` copies
+the followed player's whole ps into the spectator's, `g_active.c:3655-3680`).
+cgame therefore builds the followed cent from `cg.snap->ps`
+(`CG_TransitionSnapshot`), so an entity-state reset/flip (the previous
+attempts) can never reach it. The recovery is to flip the **spectator's own
+playerstate** animation-restart bits `legsFlip`/`torsoFlip`: those are copied
+from the followed player every game frame and reach the client through
+`cg.snap->ps`; `CG_RunLerpFrame` sees the flip change and re-applies the
+followed player's current animation to the recreated ghoul2 instance. The
+proxy does this for `ANIM_PS_FLIP_FRAMES` (5) game frames after a per-viewer
+`CS_PLAYERS` correction, only for a spectator in `SPECTATOR_FOLLOW`; the game
+rewrites the ps on the next frame, so the followed player's real playerstate is
+untouched.
 
-**Verification.** `cargo test` 322/322 (2 new: `cs_players_slot_matches_only_player_configstrings`
-and `anim_flip_restarts_only_untimed_halves`), `clippy --all-targets -D
-warnings`, `fmt --check` and the i686 release build
-(`rust/dev.sh ./scripts/build.sh`) are green. The new SDK offsets are pinned in
-`sdk::tests` (`entityState_t` all-32-bit PC layout; `playerState_t` anchored by
-`clientNum @172`/`weapon @176`). No live client was available, and
-`rust/scripts/engine-test.sh` cannot reach a running server on this tree
-because of the documented S20 startup crash, so the client-side half rests on
-the source chain above.
+**Attempts and why they were replaced.** The first version (commit `77bd400`)
+toggled `s.legsFlip`/`s.torsoFlip`; live report: running players slid in the
+bind pose, so it was reverted. The second version toggled `EF_TELEPORT_BIT`
+(forces `CG_ResetPlayerEntity`) and nudged idle `legsAnim`/`torsoAnim`; live
+report: *"they are still T-posing, but their skin is reset; opening the
+scoreboard makes skin and animation correct"* — i.e. those recovery paths were
+operating on the **deferred copy**, while the real model had not been loaded
+yet. `loaddefered` makes the client run the load that also performs the reset,
+which is the sequence the scoreboard proved works. A further live report
+narrowed the remaining case to **spectator follow**: *"I spec player 1 in
+TFFA 0, all good; I spec player 2 in TFFA 1, he T-poses; I spec player 1 in
+TFFA 0, he T-poses"* — every newly followed player, including one that was
+fine before. That is the excluded-followed-entity case above; the
+playerstate flip is its recovery.
 
-**Alternatives considered.** *Rewrite the animation number* (the literal
-"force idle") — needs a temporary different animation (a visible one-frame
-flicker, or an idle variant if the player is idle), while the flip restarts
-the exact animation already in the entity state; keeping the number unchanged
-also leaves the game's `ps.legsAnim`/`torsoTimer` semantics untouched.
-*Drop the team demotion in `CS_PLAYERS`* — the team field is what keeps another
-match's players out of the viewer's team overlay and scores grouping (D-006.5,
-D-0012), so the clientinfo change is intended and the restart is the correct
-place to compensate. *Force the flip only for the viewer whose view changed* —
-impossible: the entity state is one shared snapshot source, not per viewer.
+**Consequences and limits.** One extra reliable server command per viewer per
+frame in which one of the viewer's **own** players had a per-viewer clientinfo
+change (a few on an instance switch or a same-instance team change), far below
+the traffic the `cs` strings themselves cost. The cgame loads **all** its deferred players in
+that frame (the same call the scoreboard makes, so the same possible model-load
+hitch the scoreboard already has when it first opens). Nothing is written into
+the playerstate or the entity state, and no game/engine detour is added.
+
+**Verification.** `cargo test` 358/358 (the `cs_players_slot` index test
+remains; the flip/reset only helpers and their tests are gone), `clippy
+--all-targets -D warnings`, `fmt --check` and the i686 release build
+(`rust/dev.sh ./scripts/build.sh`) are green. The client-side proof is the
+reported scoreboard behaviour matched to `CG_LoadClientInfo`'s final
+`CG_ResetPlayerEntity` loop; no renderable client is available in this
+repository.
+
+**Alternatives considered.** *Flip bit* and *teleport reset / idle nudge* —
+tried and replaced (above). *Stop demoting the team in `CS_PLAYERS`* — would
+avoid the reload, but the team field is what keeps another match's players out
+of the viewer's team overlay and tab grouping (D-006.5, D-0012); and dropping
+the tab's outsider rows instead changes the unified scoreboard design.
+*Force `cg_deferPlayers 0`* — a client cvar the server cannot set; `loaddefered`
+uses the client's own deferred-load path instead. *Entity drop and re-add* —
+still leaves the model deferred, so it cannot fix the skin.
 
 ## Consequences
 

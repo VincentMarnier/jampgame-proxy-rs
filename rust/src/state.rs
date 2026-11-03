@@ -480,14 +480,25 @@ pub struct TffaState {
     /// their reliable window was full; a later frame re-pushes their overrides
     /// once the client acknowledged the burst (D-006.12).
     pub pending_view_refresh: [bool; MAX_CLIENTS],
-    /// Remaining game frames to hold the "restart the same animation" flip bit
-    /// of each player's entity state (`0` = nothing pending), queued by
-    /// [`crate::tffa`] whenever a per-viewer `CS_PLAYERS` write makes cgame
-    /// rebuild a player's clientinfo (D-006.14). cgame replaces that player's
-    /// client-side ghoul2 instance on such a rebuild and only re-applies the
-    /// animation when its number or flip changes, so a player standing still
-    /// would stay in bind pose until they move.
-    pub anim_flip_pending: [u8; MAX_CLIENTS],
+    /// Viewers that received a per-viewer `CS_PLAYERS` correction this frame
+    /// and still owe cgame a `loaddefered` server command (D-006.14). A team
+    /// change in a `CS_PLAYERS` string makes cgame rebuild the player's
+    /// clientinfo; with `cg_deferPlayers` (the default) it then copies another
+    /// client's model and marks the entry deferred, so the player renders with
+    /// the wrong skin and in bind pose until the scoreboard triggers
+    /// `CG_LoadClientInfo`. `loaddefered` is cgame's own server command for
+    /// exactly that load; sending it after the `cs` corrections makes the real
+    /// model load (and `CG_ResetPlayerEntity` run) immediately.
+    pub anim_reload_pending: [bool; MAX_CLIENTS],
+    /// Remaining game frames to flip the **spectator's own playerstate**
+    /// animation-restart bits (`legsFlip`/`torsoFlip`) after a per-viewer
+    /// `CS_PLAYERS` correction (D-006.14). A spectator's client renders the
+    /// followed player from `cg.snap->ps`, not from the entity snapshot (the
+    /// engine excludes the followed entity), so an entity-state flip cannot
+    /// reach it; `SpectatorClientEndFrame` copies the followed player's ps into
+    /// the spectator's ps every frame, and flipping it there makes
+    /// `CG_RunLerpFrame` re-apply the followed player's current animation.
+    pub anim_ps_flip_pending: [u8; MAX_CLIENTS],
     /// A `map_restart` reconnect burst is in progress (D-006.12). Set before
     /// the pristine `GAME_INIT` body runs, so even the configstrings it sets
     /// cannot make the proxy queue commands into the burst. Every proxy `cs`
@@ -610,7 +621,8 @@ impl Default for TffaState {
             pending_join: [crate::tffa::REMEMBERED_NONE; MAX_CLIENTS],
             deferred_begin: [false; MAX_CLIENTS],
             pending_view_refresh: [false; MAX_CLIENTS],
-            anim_flip_pending: [0; MAX_CLIENTS],
+            anim_reload_pending: [false; MAX_CLIENTS],
+            anim_ps_flip_pending: [0; MAX_CLIENTS],
             restart_burst: false,
             restart_burst_connects: false,
             restart_burst_trailing: false,

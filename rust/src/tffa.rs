@@ -51,18 +51,17 @@ use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
     CON_CONNECTED, CON_DISCONNECTED, CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2,
     ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS,
-    MAX_GENTITIES, MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS,
-    OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY,
-    OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
-    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PLAYER_STATE,
-    OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED,
-    OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE,
-    OFFSET_GENTITY_S_LEGS_FLIP, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_S_TORSO_FLIP,
-    OFFSET_GENTITY_TARGET, OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME,
-    OFFSET_GENTITY_TEAM, OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
+    MAX_GENTITIES, MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS,
+    OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT,
+    OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
+    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN,
+    OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER,
+    OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
+    OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM,
+    OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
     OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PERS_CONNECTED, OFFSET_PS_LEGS_FLIP,
-    OFFSET_PS_LEGS_TIMER, OFFSET_PS_TORSO_FLIP, OFFSET_PS_TORSO_TIMER, OFFSET_SESS_SESSION_TEAM,
-    SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
+    OFFSET_PS_TORSO_FLIP, OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED,
+    TEAM_SPECTATOR,
 };
 use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_MAX_MATCHES};
 
@@ -86,14 +85,11 @@ pub const REMEMBERED_NONE: u8 = 0;
 /// the fallback length of the settle window when no client is left to reconnect
 /// and so no `GAME_CLIENT_CONNECT` can end it.
 const RESTART_SETTLE_FRAMES: u8 = 3;
-/// Game frames a pending "restart the same animation" flip is held for
-/// (D-006.14). The flip rides the entity delta of a snapshot, and snapshots are
-/// rate-limited per client (`client->nextSnapshotTime`), so a single frame can
-/// be skipped for a client; holding the bit for a few frames guarantees that a
-/// client which just reloaded a player's model sees the restart. The value does
-/// not change while it is held, so the client sees one delta (and one more when
-/// the game writes the playerstate's unflipped bit back).
-const ANIM_FLIP_FRAMES: u8 = 3;
+/// Frames the spectator playerstate animation flip is held for (D-006.14).
+/// `SpectatorClientEndFrame` rewrites the spectator's ps from the followed
+/// player every game frame, so the toggle must be re-applied each frame; the
+/// client sees the flip once and then the restored value once.
+const ANIM_PS_FLIP_FRAMES: u8 = 5;
 /// `scores ...` entries carry 14 ints each (`g_cmds.c:64-74`); the second
 /// int is `PERS_SCORE` (`g_cmds.c:65-66`).
 const SCORE_ENTRY_INTS: usize = 14;
@@ -627,13 +623,25 @@ fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
     // SAFETY: engine syscall registered; cmsg NUL-terminated.
     unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
     // A changed `CS_PLAYERS` entry makes cgame rebuild that player's
-    // clientinfo and replace its client-side ghoul2 instance
-    // (`CG_NewClientInfo`, `cg_players.c:1837-1901`); the cgame only restarts
-    // the animation when its number or flip changes, so a player who is not
-    // moving stays in bind pose (T-pose) until they do. Queue the game's own
-    // same-animation restart bit for the next snapshots (D-006.14).
+    // clientinfo (`CG_NewClientInfo`, `cg_players.c:1499`). With
+    // `cg_deferPlayers` on (the default) a team change can make it copy another
+    // client's model and mark the entry deferred, which renders the player with
+    // the wrong skin and in bind pose until the scoreboard runs
+    // `CG_LoadClientInfo`. Queue cgame's own `loaddefered` server command for
+    // the viewer after the `cs` correction (D-006.14). Only a player of the
+    // viewer's own instance is marked: a demoted outsider is not in the
+    // viewer's snapshots, so its model can stay deferred (that is what
+    // `cg_deferPlayers` is for) until it actually becomes visible.
     if let Some(slot) = cs_players_slot(index) {
-        state::with_state(|s| s.tffa.anim_flip_pending[slot] = ANIM_FLIP_FRAMES);
+        if (0..MAX_CLIENTS as c_int).contains(&client_num) {
+            let player_match = state::with_state(|s| s.tffa.client_match[slot]);
+            if player_match == effective_match(client_num) {
+                state::with_state(|s| {
+                    s.tffa.anim_reload_pending[client_num as usize] = true;
+                    s.tffa.anim_ps_flip_pending[client_num as usize] = ANIM_PS_FLIP_FRAMES;
+                });
+            }
+        }
     }
     true
 }
@@ -647,91 +655,85 @@ fn cs_players_slot(index: i32) -> Option<usize> {
         .then_some(slot as usize)
 }
 
-/// Entity-state flip values that restart one player's current animation on
-/// every client: the opposite of the playerstate's own flip bit (`legsFlip` /
-/// `torsoFlip`, "set to opposite when the same anim needs restarting",
-/// `q_shared.h:2202`), letting `CG_RunLerpFrame` re-run
-/// `CG_SetLerpFrameAnimation` for the unchanged animation
-/// (`cg_players.c:3203-3225`). A half inside a timed animation is left alone
-/// (`timer > 0`): restarting it would visibly reset a jump/attack/pain pose,
-/// and it recovers on its own when its timer ends and pmove sets a new
-/// animation. Returns `(legs, torso)` new values, `None` where untouched.
-fn anim_flip_values(
-    legs_timer: i32,
-    legs_flip: i32,
-    torso_timer: i32,
-    torso_flip: i32,
-) -> (Option<i32>, Option<i32>) {
-    (
-        (legs_timer <= 0).then_some(legs_flip ^ 1),
-        (torso_timer <= 0).then_some(torso_flip ^ 1),
-    )
-}
-
-/// Flip one live client's entity-state animation restart bits (D-006.14).
-/// Free/freed slots and slots without a playerstate are skipped.
+/// Re-apply the followed player's animation for a spectator whose per-viewer
+/// `CS_PLAYERS` correction replaced that player's clientinfo/model (D-006.14).
 ///
-/// # Safety
-/// `g_entities` must be the game's live `g_entities` array and `slot` a
-/// `MAX_CLIENTS` index.
-unsafe fn flip_player_anim(g_entities: usize, slot: usize) {
-    let ent = g_entities + slot * SIZEOF_GENTITY;
-    // SAFETY: slot < MAX_CLIENTS, so `ent` is inside the g_entities array.
-    if unsafe { read_i32(ent + OFFSET_GENTITY_INUSE) } == 0
-        || unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) } == 0
-    {
-        return;
-    }
-    // SAFETY: a live client's `playerState` is `&ent->client->ps`
-    // (`g_client.c:2292`); the pointer is only read, never written.
-    let ps = unsafe { read_usize(ent + OFFSET_GENTITY_PLAYER_STATE) };
-    if ps == 0 {
-        return;
-    }
-    // SAFETY: `ps` is a live playerState_t (non-null and owned by the game).
-    let (legs, torso) = unsafe {
-        anim_flip_values(
-            read_i32(ps + OFFSET_PS_LEGS_TIMER),
-            read_i32(ps + OFFSET_PS_LEGS_FLIP),
-            read_i32(ps + OFFSET_PS_TORSO_TIMER),
-            read_i32(ps + OFFSET_PS_TORSO_FLIP),
-        )
-    };
-    // SAFETY: writable presentation fields of a live player's entity state.
-    if let Some(value) = legs {
-        unsafe { write_i32(ent + OFFSET_GENTITY_S_LEGS_FLIP, value) };
-    }
-    if let Some(value) = torso {
-        unsafe { write_i32(ent + OFFSET_GENTITY_S_TORSO_FLIP, value) };
-    }
-}
-
-/// Apply and age the animation restarts queued by `CS_PLAYERS` writes
-/// (D-006.14). Runs at the end of every `GAME_RUN_FRAME`, after the game's own
-/// `ClientEndFrame` copied each playerstate into its entity state and before the
-/// engine builds the snapshots (`SV_Frame` → `SV_SendClientMessages`), so the
-/// flip rides the snapshot that carries (or follows) the `cs` correction that
-/// made cgame reload the model. Called before the feature-gate early return:
-/// the disable path (`restore_pristine_views`) is a mass `CS_PLAYERS` change.
-fn apply_pending_anim_flips() {
-    let pending = state::with_state(|s| s.tffa.anim_flip_pending);
+/// The engine never sends the followed player's entity to a follower ("never
+/// send client's own entity", `sv_snapshot.cpp`), so cgame renders it from
+/// `cg.snap->ps` and an entity-state reset/flip cannot reach it.
+/// `SpectatorClientEndFrame` copies the followed player's ps into the
+/// spectator's ps every frame (`g_active.c:3655-3680`), and
+/// `CG_TransitionSnapshot` builds the followed cent from it; toggling
+/// `ps.legsFlip`/`ps.torsoFlip` there makes `CG_RunLerpFrame` see a flip
+/// change and re-apply the current animation to the recreated ghoul2 instance.
+/// Only a following spectator is touched; the game rewrites the ps next frame,
+/// so the flip never leaks into the followed player's real state.
+fn apply_pending_spectator_anim_flips() {
+    let pending = state::with_state(|s| s.tffa.anim_ps_flip_pending);
     if pending.iter().all(|&left| left == 0) {
         return;
     }
     let g_entities = state::with_state(|s| s.located_game_data.g_entities);
-    if g_entities != 0 {
-        for (slot, &left) in pending.iter().enumerate() {
-            if left != 0 {
-                // SAFETY: g_entities is the game's live entity array (0 checked).
-                unsafe { flip_player_anim(g_entities, slot) };
+    for (viewer, &left) in pending.iter().enumerate() {
+        if left != 0 && g_entities != 0 && follow_target(viewer as c_int).is_some() {
+            let ent = g_entities + viewer * SIZEOF_GENTITY;
+            // SAFETY: viewer < MAX_CLIENTS, so `ent` is inside the g_entities
+            // array; a following spectator is a live client.
+            let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+            if client != 0 {
+                let ps = client + OFFSET_GCLIENT_PS;
+                // SAFETY: `ps` is the live playerState_t of the spectator, whose
+                // flips were just copied from the followed player.
+                unsafe {
+                    let legs = read_i32(ps + OFFSET_PS_LEGS_FLIP);
+                    let torso = read_i32(ps + OFFSET_PS_TORSO_FLIP);
+                    write_i32(ps + OFFSET_PS_LEGS_FLIP, legs ^ 1);
+                    write_i32(ps + OFFSET_PS_TORSO_FLIP, torso ^ 1);
+                }
             }
         }
     }
     state::with_state(|s| {
-        for (slot, left) in s.tffa.anim_flip_pending.iter_mut().enumerate() {
-            *left = pending[slot].saturating_sub(1);
+        for (viewer, left) in s.tffa.anim_ps_flip_pending.iter_mut().enumerate() {
+            *left = pending[viewer].saturating_sub(1);
         }
     });
+}
+
+/// Send cgame's `loaddefered` server command to every viewer whose
+/// `CS_PLAYERS` correction may have deferred a player model (D-006.14).
+///
+/// The cgame server-command table carries `{ "loaddefered", CG_LoadDeferredPlayers }`
+/// (`cg_servercmds.c`), and `CG_ActualLoadDeferredPlayers` runs at the start of
+/// the next `CG_Player`; `CG_LoadClientInfo` there re-duplicates the real model
+/// to the centity and calls `CG_ResetPlayerEntity`, which is also what fixes
+/// the skin and the bind pose. Sending it after the `cs` commands keeps the
+/// command order (reliable commands are delivered in order): the client first
+/// updates clientinfo, then loads the now-deferred model.
+fn flush_deferred_model_loads() {
+    let pending = state::with_state(|s| s.tffa.anim_reload_pending);
+    if pending.iter().all(|&owed| !owed) {
+        return;
+    }
+    let restart_burst = state::with_state(|s| s.tffa.restart_burst);
+    for (viewer, &owed) in pending.iter().enumerate() {
+        if !owed {
+            continue;
+        }
+        // Never add to the `map_restart` reconnect burst (D-006.12): keep the
+        // flag and send it after the burst, when the clientinfo corrections are
+        // re-pushed as well.
+        let client_num = viewer as c_int;
+        if restart_burst || reliable_pressure(client_num) {
+            continue;
+        }
+        let Ok(cmsg) = std::ffi::CString::new("loaddefered") else {
+            continue;
+        };
+        // SAFETY: engine syscall registered; cmsg NUL-terminated.
+        unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
+        state::with_state(|s| s.tffa.anim_reload_pending[viewer] = false);
+    }
 }
 
 /// Queue a `cs CS_PLAYERS + slot` value for one viewer unless that viewer is
@@ -2744,12 +2746,11 @@ fn finish_map_keeping_matches(connected: &[bool; MAX_CLIENTS], fraglimit: i32) {
 /// standard stats for all).
 /// Runs after the frame is forwarded so scores from this frame are visible.
 pub fn on_run_frame_post() {
-    // Restart the current animation of players whose clientinfo a viewer had to
-    // rebuild for a per-viewer `CS_PLAYERS` change (D-006.14). Before the
-    // gate/early returns below: the disable path (`restore_pristine_views`) is a
-    // mass `CS_PLAYERS` change too, and runs in the frame that turns the
-    // feature off.
-    apply_pending_anim_flips();
+    // Make cgame load any player model its `CS_PLAYERS` correction deferred
+    // (D-006.14). Before the gate/early returns below: the disable path
+    // (`restore_pristine_views`) is a mass `CS_PLAYERS` change too.
+    flush_deferred_model_loads();
+    apply_pending_spectator_anim_flips();
     if !enabled() {
         return;
     }
@@ -2774,6 +2775,9 @@ pub fn on_run_frame_post() {
             refresh_cs_players_for_viewer(v);
         }
     }
+    // The refresh loop above can queue new `cs` corrections after the flush at
+    // the top of this function; load those deferred models in the same frame.
+    flush_deferred_model_loads();
     // While an intermission runs (pristine timelimit exit or a solo-main
     // finish below) the map is ending: no more fraglimit handling.
     if state::with_state(|s| s.tffa.intermission) {
@@ -6686,24 +6690,6 @@ mod tests {
         assert_eq!(cs_players_slot(CS_PLAYERS + MAX_CLIENTS as i32), None);
         assert_eq!(cs_players_slot(CS_SCORES1), None);
         assert_eq!(cs_players_slot(CS_SCORES2), None);
-    }
-
-    /// The cgame restarts an animation when the entity's flip bit differs from
-    /// the one it last applied (`cg_players.c:3203-3225`), so the restart writes
-    /// the opposite of the playerstate's own bit. A half in a timed animation is
-    /// left alone: it would reset a jump/attack/pain pose mid-play and pmove
-    /// gives it a new animation when the timer expires anyway.
-    #[test]
-    fn anim_flip_restarts_only_untimed_halves() {
-        // Both halves idle: both restart, opposite to the playerstate bits.
-        assert_eq!(anim_flip_values(0, 0, 0, 1), (Some(1), Some(0)));
-        assert_eq!(anim_flip_values(-1, 1, -1, 0), (Some(0), Some(1)));
-        // A timed legs animation keeps its current animation.
-        assert_eq!(anim_flip_values(120, 0, 0, 0), (None, Some(1)));
-        // A timed torso animation likewise.
-        assert_eq!(anim_flip_values(0, 1, 40, 1), (Some(0), None));
-        // Both timed: nothing is touched.
-        assert_eq!(anim_flip_values(1, 0, 1, 0), (None, None));
     }
 
     #[test]

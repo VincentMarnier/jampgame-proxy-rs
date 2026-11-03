@@ -328,13 +328,6 @@ pub const OFFSET_GENTITY_S_MODELINDEX: usize = 224;
 pub const OFFSET_GENTITY_S_MODELINDEX2: usize = 228;
 /// `entityState_t.solid`.
 pub const OFFSET_GENTITY_S_SOLID: usize = 268;
-/// `offsetof(entityState_t, legsFlip)` — the client's "restart the same
-/// animation" bit (`q_shared.h:2753`). The i386 PC layout is all 4-byte fields
-/// (`modelindex` @224, `modelindex2` @228 and `clientNum` @232 anchor it):
-/// `legsAnim` @300, `torsoAnim` @304, `legsFlip` @308, `torsoFlip` @312.
-pub const OFFSET_GENTITY_S_LEGS_FLIP: usize = 308;
-/// `offsetof(entityState_t, torsoFlip)` (`q_shared.h:2754`).
-pub const OFFSET_GENTITY_S_TORSO_FLIP: usize = 312;
 
 // `gentity_t` fields the per-instance world-entity clone pass reads/copies
 // (i386 layout oracle, 2026-10-18: `sizeof == 1516`, `r == 560`, `client == 864`
@@ -705,16 +698,12 @@ pub const OFFSET_PS_CLIENT_NUM: usize = 172;
 /// `offsetof(playerState_t, weapon)` — the `tinfo` weapon field the game sends
 /// as `player->client->ps.weapon` (`g_team.c:TeamplayInfoMessage`).
 pub const OFFSET_PS_WEAPON: usize = 176;
-/// `offsetof(playerState_t, legsTimer)` — remaining time of a held legs
-/// animation (`q_shared.h:2196`; the i386 PC layout is all 4-byte fields and
-/// `clientNum` @172 / `weapon` @176 anchor the table).
-pub const OFFSET_PS_LEGS_TIMER: usize = 104;
-/// `offsetof(playerState_t, torsoTimer)` (`q_shared.h:2199`).
-pub const OFFSET_PS_TORSO_TIMER: usize = 112;
 /// `offsetof(playerState_t, legsFlip)` — "set to opposite when the same anim
-/// needs restarting" (`q_shared.h:2202`).
+/// needs restarting" (`q_shared.h:2202`; the shipped `BG_FlipPart` toggles it
+/// at `0x78`). Changing it in the playerstate makes the cgame re-apply the
+/// current legs animation (D-006.14).
 pub const OFFSET_PS_LEGS_FLIP: usize = 120;
-/// `offsetof(playerState_t, torsoFlip)` (`q_shared.h:2203`).
+/// `offsetof(playerState_t, torsoFlip)` (`q_shared.h:2203`; toggled at `0x7c`).
 pub const OFFSET_PS_TORSO_FLIP: usize = 124;
 
 /// `offsetof(gclient_t, ps)` — playerState_t.
@@ -1003,8 +992,6 @@ mod tests {
         assert_eq!(OFFSET_PERS_TEAM_STATE_LOCATION, 100);
         assert_eq!(OFFSET_PERS_TEAM_INFO, 152);
         assert_eq!(OFFSET_PS_WEAPON, 176);
-        assert_eq!(OFFSET_PS_LEGS_TIMER, 104);
-        assert_eq!(OFFSET_PS_TORSO_TIMER, 112);
         assert_eq!(OFFSET_PS_LEGS_FLIP, 120);
         assert_eq!(OFFSET_PS_TORSO_FLIP, 124);
         assert_eq!(OFFSET_ENTITY_POWERUPS, 292);
@@ -1024,8 +1011,6 @@ mod tests {
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 192);
         assert_eq!(OFFSET_GENTITY_S_OWNER, 280);
-        assert_eq!(OFFSET_GENTITY_S_LEGS_FLIP, 308);
-        assert_eq!(OFFSET_GENTITY_S_TORSO_FLIP, 312);
         assert_eq!(OFFSET_GENTITY_R_OWNER, 660);
         assert_eq!(OFFSET_GENTITY_R_CONTENTS, 604);
         assert_eq!(OFFSET_GENTITY_R_LINKED, 560);
