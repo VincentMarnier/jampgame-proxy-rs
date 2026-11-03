@@ -11,6 +11,11 @@ const INSTALL_QUICKSTART = `mv jampgamei386.so jampgame_original.so
 const cvars = [
   ["proxy_sv_enable", "1", "Master switch: when 0, detach every hook and forward everything to the original game module (RCON keeps working on the engine's native gate)", "core"],
   ["proxy_sv_muteMode", "1", "Mute behaviour: 0 disabled, 1 drop the player's chat and tell them, 2 silent (their own line is echoed back, nobody else receives it, no notice)", "mute"],
+  ["proxy_sv_enableIgnore", "0", "Let any player hide another player's chat from their own client with /ignore and /unignore", "chat"],
+  ["proxy_sv_enableBanFile", "0", "File-backed IP ban list: addip / removeip edit proxy_sv_banFile, listip prints it, reloadbans re-reads it, and every connect is checked against it (IPv4 addresses and CIDR ranges)", "bans"],
+  ["proxy_sv_banFile", "proxy_bans.txt", "Ban file path, relative to the server's working directory or absolute; ignored while proxy_sv_enableBanFile 0", "bans"],
+  ["proxy_sv_enableGuidBan", "0", "File-backed ja_guid ban registry (separate file and cvar from the IP list); rcon ban <player> adds the target's GUID, addguid / removeguid / listguid manage it", "bans"],
+  ["proxy_sv_guidBanFile", "proxy_guid_bans.txt", "GUID ban file path, relative to the server's working directory or absolute; ignored while proxy_sv_enableGuidBan 0", "bans"],
   ["proxy_sv_debugLog", "0", "Crash-diagnostics trace: 0 off, 1 suspicious/blocked events, 2 every client command, userinfo and lifecycle event; writes proxy_debug.log", "diagnostics"],
   ["proxy_sv_enableRconCmdCooldown", "0", "Cooldown on RCON commands to avoid flooding", "hardening"],
   ["proxy_sv_maxCallVoteMapRestartValue", "60", "Maximum value allowed on a callvote map_restart", "votes"],
@@ -30,6 +35,8 @@ const cvars = [
   ["proxy_sv_clientPpsLog", "0", "Log client packet-rate limit transitions (starts using too many packets / back under the limit); works without the limiter", "network"],
   ["proxy_sv_voidTimeNudge", "0", "Neutralise a player's non-zero cl_timeNudge on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting", "network"],
   ["proxy_sv_voidTimeNudgeLog", "0", "Log cl_timeNudge non-zero / back-to-zero transitions; works on its own (reports the shift without applying it)", "network"],
+  ["proxy_sv_antiMacro", "0", "Freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact wait holds); hand play is untouched and the player is never told", "hardening"],
+  ["proxy_sv_antiMacroLog", "0", "1 logs anti-macro lock/release transitions, 2 adds the statistics of locked channels, 3 the statistics of every channel with a reversal; works on its own", "diagnostics"],
 ];
 
 const hardening = [
@@ -116,11 +123,12 @@ export default function Home() {
         {/* ---------- hero ---------- */}
         <div className="hero" id="top">
           <div>
-            <span className="status-pill"><span className="pulse" aria-hidden="true" />Exploit protection · Team tools · Parallel matches</span>
+            <span className="status-pill"><span className="pulse" aria-hidden="true" />Exploit protection · Ban lists · Parallel matches</span>
             <h1>Safer servers.<br />More matches.</h1>
             <p className="tagline">
               <strong>jampgame-proxy-rs</strong> protects your Jedi Academy server
-              from exploits and cheats, adds team controls, an RCON player mute,
+              from exploits and cheats, adds file-backed IP and GUID bans, an
+              anti-macro guard, team controls, RCON mute and player ignore,
               spectator HP overlays and live K/D on TaystJK scoreboards, and lets
               more players fight at once — server-side only, no downloads for
               players.
@@ -131,7 +139,7 @@ export default function Home() {
               <a className="btn ghost" href={REPO}>Source</a>
             </div>
             <div className="stat-row" aria-label="Project facts">
-              <div className="stat"><b>21</b><span>server cvars</span></div>
+              <div className="stat"><b>28</b><span>server cvars</span></div>
               <div className="stat"><b>6</b><span>hardening guards</span></div>
               <div className="stat"><b>8</b><span>parallel TFFA max</span></div>
             </div>
@@ -217,7 +225,7 @@ export default function Home() {
 
         {/* ---------- features ---------- */}
         <section className="block" id="features" aria-labelledby="features-title">
-          <SectionHead id="features-title" eyebrow="What you get" title="Hardening, team tools, network control" lede="Security guards run unless the master switch proxy_sv_enable is off. Everything else is opt-in per cvar or command." />
+          <SectionHead id="features-title" eyebrow="What you get" title="Hardening, bans, team tools" lede="Security guards run unless the master switch proxy_sv_enable is off. Everything else is opt-in per cvar or command." />
 
           <h3 className="sub">Built-in security hardening <span className="count">always on</span></h3>
           <ul className="cards danger">
@@ -226,7 +234,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">21 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">28 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -328,6 +336,162 @@ export default function Home() {
               still records the line, so moderation stays auditable.
             </p>
           </div>
+
+          <h3 className="sub">Player ignore <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              Any player can hide another player&apos;s chat from their own client:{" "}
+              <code>/ignore &lt;player&gt;</code> silences that player{" "}
+              <b>for them only</b>, and <code>/unignore &lt;player&gt;</code>{" "}
+              brings them back. The target uses the same shape as{" "}
+              <code>rcon mute</code>: the client number <code>status</code> shows
+              (<code>/ignore 3</code>) or any part of the name — case- and
+              colour-code-insensitive, exact first, then a prefix, then the
+              fragment wherever it sits (<code>/ignore ade</code> finds{" "}
+              <i>Darth Vader</i>). A fragment shared by several players is answered
+              with the candidates and their numbers instead of guessing; a bare{" "}
+              <code>/ignore</code> prints the usage and who you are ignoring.
+            </p>
+            <p>
+              The ignored player is not affected: they keep playing, their lines
+              still reach everyone else, and they are never told. Only client chat
+              is covered (<code>say</code>, <code>say_team</code> and{" "}
+              <code>tell</code>, including the localized variants);{" "}
+              <code>voice_cmd</code> is a sound event, not a chat line, and stays
+              with the admin mute. Ignores are per client slot and last for the
+              session: they are cleared when either player leaves (so the next
+              player in a reused slot is not silently ignored) and kept across a{" "}
+              <code>map_restart</code>; a full map change starts with nobody
+              ignored.
+            </p>
+            <p>
+              The feature is off by default: set <code>proxy_sv_enableIgnore 1</code>{" "}
+              in the server command line or at runtime with{" "}
+              <code>rcon proxy_sv_enableIgnore 1</code>. While it is off,{" "}
+              <code>/ignore</code> answers that the feature is disabled and no
+              chat is filtered; lists already set stay dormant and work again when
+              it is turned back on. Like every proxy feature it also needs{" "}
+              <code>proxy_sv_enable 1</code>.
+            </p>
+          </div>
+          <Code title="player console" text={"/ignore Darth Vader\n/unignore Darth Vader"}>
+            /ignore Darth Vader{"\n"}/unignore Darth Vader
+          </Code>
+
+          <h3 className="sub" id="ipbans">IP bans <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              The stock <code>addip</code> keeps its filters in memory and mirrors
+              them into the 256-byte <code>g_banIPs</code> cvar: about 25 addresses
+              fit, and a longer value is fatal — it logs{" "}
+              <code>Cvar_Update … exceeds MAX_CVAR_VALUE_STRING</code>, shuts the
+              game down, and leaves the over-long value in{" "}
+              <code>jampserver.cfg</code> so the next start fails too. The built-in
+              list is only usable for a handful of exact addresses.
+            </p>
+            <p>
+              With <code>proxy_sv_enableBanFile 1</code> the proxy takes the list
+              over. <code>addip &lt;ip[/prefix]&gt;</code> adds an exact address or
+              a <b>CIDR range</b>, <code>removeip</code> removes it,{" "}
+              <code>listip</code> prints the loaded list and{" "}
+              <code>reloadbans</code> re-reads the files after a hand edit — all
+              over rcon or on the dedicated console. Every connect is checked
+              against the engine&apos;s real IP and a listed address is refused
+              with the stock <code>Banned.</code> message before the player enters
+              the game; bots and LAN/loopback clients are never checked. The file
+              is the only source of truth (written before a change is committed),
+              loaded at startup and whenever the two cvars change.
+            </p>
+            <p>
+              The file is plain text: one address or CIDR range per line,{" "}
+              <code>#</code> starts a comment. Host bits are masked (
+              <code>84.17.32.5/19</code> is stored as <code>84.17.32.0/19</code>),
+              an exact address means <code>/32</code>, and a <code>/0</code> is
+              refused. Invalid lines are skipped with a warning naming the line; a
+              missing file is an empty list, not an error.
+            </p>
+          </div>
+          <Code title="proxy_bans.txt" text={"# one entry per line\n84.17.32.0/19\n203.0.113.7"}>
+            # one entry per line{"\n"}84.17.32.0/19{"\n"}203.0.113.7
+          </Code>
+          <div className="prose">
+            <p>
+              A ready-made cloud/hosting/VPN list ships at{" "}
+              <code>rust/proxy_bans.txt</code> (tens of thousands of ranges).
+              Copy it next to your server, point <code>proxy_sv_banFile</code> at
+              it and enable <code>proxy_sv_enableBanFile</code>. It is a snapshot:
+              regenerate it with <code>tools/update_banlist.py</code> (Python 3,
+              standard library only), which re-fetches the AWS, Google Cloud,
+              Azure, Oracle Cloud, DigitalOcean, Linode and Vultr feeds plus the{" "}
+              <a href="https://github.com/X4BNet/lists_vpn">X4BNet</a>{" "}
+              VPN+datacenter aggregate, strips reserved space, merges adjacent
+              ranges, and refuses to write a list that would cover a consumer ISP
+              wholesale. The proxy only enforces the ranges, it does not detect
+              VPNs by itself — any other blocklist can be dropped into the file as
+              well.
+            </p>
+          </div>
+          <p className="note">
+            With <code>proxy_sv_enableBanFile 0</code> (the default) the pristine{" "}
+            <code>addip</code>/<code>removeip</code>/<code>listip</code> handlers
+            run exactly as before and no connect is checked.{" "}
+            <code>addip</code>/<code>removeip</code> rewrite the file in canonical
+            sorted form, so hand-written comments are not preserved by those
+            commands; <code>reloadbans</code> never rewrites it. A pre-existing
+            non-empty <code>g_banIPs</code> is still enforced by the game module;
+            move those entries to the file and run <code>set g_banIPs &quot;&quot;</code>.
+            IPv4 only, like the rest of the ban path.
+          </p>
+
+          <h3 className="sub" id="guidbans">GUID bans <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              Some modern clients add a <code>ja_guid</code> key to their
+              userinfo. A GUID ban is a separate, optional registry (
+              <code>proxy_sv_enableGuidBan</code>, default <code>0</code>) with
+              its own file (<code>proxy_sv_guidBanFile</code>, default{" "}
+              <code>proxy_guid_bans.txt</code>). <code>ja_guid</code> is{" "}
+              <b>client-asserted</b>: the player controls the value and can change
+              it, so a GUID ban is a deterrent that keeps a known install out
+              cheaply, not a security boundary. It is never stored in the IP ban
+              file — the IP file only receives IPv4 addresses/CIDR ranges, and a
+              GUID line is a strict token, so a crafted userinfo value can never
+              add an address range.
+            </p>
+            <p>
+              <code>ban &lt;clientNumber|playerName&gt;</code> is the all-in-one
+              admin command. It resolves the target like <code>mute</code>, then
+              bans the target&apos;s <b>IP</b> through{" "}
+              <code>proxy_sv_banFile</code> when that is enabled (otherwise it
+              queues the pristine <code>addip</code>), adds the target&apos;s{" "}
+              <code>ja_guid</code> when the GUID registry is enabled and the
+              client sends one (a stock client has none: that is reported and the
+              IP ban still happens), and kicks the target with the stock{" "}
+              <code>Banned.</code> reason. <code>addguid</code>,{" "}
+              <code>removeguid</code> and <code>listguid</code> manage the
+              registry by hand; <code>reloadbans</code> re-reads both ban files.
+            </p>
+            <p>
+              Enforcement happens at connect, before the game sees the client: a
+              listed <code>ja_guid</code> is refused with <code>Banned.</code>{" "}
+              Like the IP list it applies to the next connect (or the reconnect
+              after a map change); a player already in the game when you add their
+              GUID is only kicked by <code>ban</code>, not by editing the file. The
+              reply to <code>ban</code> names what was added and why anything was
+              skipped.
+            </p>
+          </div>
+          <Code
+            title="rcon"
+            text={'rcon ban "Darth Vader"\nproxy: banned #2 "Darth Vader": ip 203.0.113.7 banned; GUID cafebabe01 banned; kicked.'}
+          >
+            rcon ban &quot;Darth Vader&quot;{"\n"}
+            proxy: banned #2 &quot;Darth Vader&quot;: ip 203.0.113.7 banned; GUID
+            cafebabe01 banned; kicked.
+          </Code>
+          <Code title="proxy_guid_bans.txt" text={"# one token per line\n0123456789abcdef0123456789abcdef"}>
+            # one token per line{"\n"}0123456789abcdef0123456789abcdef
+          </Code>
 
           <h3 className="sub">Spectator team overlay <span className="count">default on</span></h3>
           <div className="prose">
@@ -464,6 +628,65 @@ export default function Home() {
             {"----- proxy-rs: timeNudge non-zero: estimate=[-17.0..-11.1] shift=-14 client=2 name=\"...\" adr=\"...\"\n----- proxy-rs: timeNudge back to zero: estimate=[-1.2..3.1] client=2 name=\"...\" adr=\"...\""}
           </Code>
 
+          <h3 className="sub" id="antimacro">Anti-macro guard <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              <code>proxy_sv_antiMacro</code> (default <code>0</code>, off)
+              targets config-file macros that produce input a hand cannot: a
+              movement axis, the view or the attack button reversing faster than
+              a person can. Two examples it is aimed at are the scripted ground
+              strafe (A/D alternation every few commands, which feeds the
+              movement code a fresh direction each frame) and the turn-key view
+              wiggle used against the saber&apos;s per-frame position update.
+            </p>
+            <p>
+              The server never sees &ldquo;both keys held&rdquo;: the client sums
+              the movement keys before sending, so <code>+moveleft</code> with{" "}
+              <code>+moveright</code> arrives as <code>rightmove == 0</code>. What
+              it does see is the sum&apos;s <b>sign changing between consecutive
+              commands</b>. The guard watches that on <code>forwardmove</code>,{" "}
+              <code>rightmove</code>, <code>upmove</code>, the{" "}
+              <code>yaw</code>/<code>pitch</code> deltas and the attack/alt-attack
+              bits. Reversals are chained into a <b>run</b> while the gap to the
+              previous one is at most 200 ms, because a bind is a burst (six
+              holds, five reversals, then a human gap), not a steady stream.
+            </p>
+            <p>
+              Within a run, two independent tests fire: <b>rate</b> — the mean
+              interval is shorter than a hand can sustain (at most 3 commands for
+              a movement axis, 65 ms for the view, 60 ms for attack, with four
+              reversals enough) — and <b>spread</b> — after four reversals the
+              hold lengths in commands fit in a range of at most 2, which is what
+              a config <code>wait</code> produces at any rate. Once a channel has
+              fired it stays <b>wary</b> for 3 s and the next burst fires after
+              only three reversals.
+            </p>
+            <p>
+              Frozen means <b>held</b>, not zeroed: the command keeps the value of
+              the last command before the run, so the player keeps moving in the
+              direction they already chose while the reversal stops, and the lock
+              is released 400 ms after the last reversal. Nothing is sent to the
+              player. <code>proxy_sv_antiMacroLog 1</code> writes lock and release
+              transitions; <code>2</code> adds the figures of a locked channel and{" "}
+              <code>3</code> every channel with a run, for checking the thresholds
+              on your own players before freezing anything.
+            </p>
+            <p>
+              Not covered: a single aim snap (one large angle jump is not a
+              reversal), attack timing that stays inside the game&apos;s own{" "}
+              <code>weaponTime</code> gate, and a script that both randomises its
+              waits widely and runs at hand speed (it then looks like a hand and is
+              correspondingly weaker).
+            </p>
+          </div>
+          <Code
+            title="log"
+            text={'jampgame-proxy-rs: antiMacro client=2 name="..." adr="..." yaw locked\njampgame-proxy-rs: antiMacro debug client=2 name="..." adr="..." cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 swing=6deg locked=1'}
+          >
+            jampgame-proxy-rs: antiMacro client=2 name=&quot;...&quot; adr=&quot;...&quot; yaw locked{"\n"}
+            jampgame-proxy-rs: antiMacro debug client=2 name=&quot;...&quot; adr=&quot;...&quot; cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 swing=6deg locked=1
+          </Code>
+
           <h3 className="sub" id="debuglog">Crash diagnostics <span className="count">opt-in</span></h3>
           <div className="prose">
             <p>
@@ -528,6 +751,7 @@ export default function Home() {
             <li>A match that reaches the fraglimit keeps playing for one second with its damage void, then its players move to spectator. It remembers who played and for which team, so the next <code>map_restart</code> brings the match back with them — while a full map change drops it.</li>
             <li>At the global timelimit, tied matches keep playing sudden death. When no tied match with players remains, the whole map ends with every match intact: each player reads their own instance&apos;s final scoreboard instead of being sent to main, and the next <code>map_restart</code> resumes the same games.</li>
             <li>Spawn points stay shared coordinates, but their occupancy is judged per match: a match only skips spots its own players stand on, so it never drops players onto another match&apos;s bodies and runs out of spawns.</li>
+            <li>Switching instance no longer leaves other players T-posing: the proxy tells the client to load its deferred player models immediately (the same path opening the scoreboard uses), so in-game players keep their skin and animation, and a following spectator gets the animation restart too.</li>
             <li>The scoreboard lists every match&apos;s players, with the other matches grouped as spectators and the red/blue header plus each score taken from your own match. HUD team scores stay global (per-match HUD would need a client mod). Opening it only re-pushes the player overrides that actually changed, so it no longer costs a multi-KB burst of reliable traffic for viewers with many players in other matches.</li>
             <li>A <code>map_restart</code> on a full server stays inside the engine&apos;s reliable-command window: the proxy&apos;s per-viewer pushes and remembered-match auto-joins are deferred and spread over frames instead of piling onto the reconnect burst, so every client is retained.</li>
           </ul>
