@@ -85,6 +85,13 @@ compaction (so an entity the viewer will not receive is not touched) and on
 the main view only (`portal == 0`); portal viewpoints render elsewhere on
 screen and use a different origin.
 
+Only clients actually in the game are capped: `SV_SendClientSnapshot` records
+the real engine client slot (a following spectator's `frame->ps.clientNum` is
+the followed player, so it cannot be used for this), and `apply` returns early
+when that slot's `gclient_t.sess.sessionTeam` is `TEAM_SPECTATOR`. Spectator
+entities are skipped as targets too. Free and following spectators therefore
+see the normal stream.
+
 ### D-022.2 — Per-viewer hide
 
 For an outside-frustum player's gentity `s`:
@@ -158,7 +165,8 @@ entity origins (`Proxy_sv_snapshot.cpp`); only the fields differ.
 horizontal and vertical frustum edges, a screen corner, behind the view
 plane, the third-person camera correction (a close 70° target outside the eye
 frustum but on screen from a camera 100 units back, while a far 70° target
-stays capped), the steep-pitch pause, the 16-client bit mapping, the synthetic apply/restore
+stays capped), the steep-pitch pause, the spectator-viewer gate, the 16-client
+bit mapping, the synthetic apply/restore
 pass (body scale, trick bit, drawn saber hidden with the hilt hum, thrown saber
 untouched, all fields restored). `rust/src/sdk.rs` pins the new offsets
 (`iModelScale` 332, `trickedentindex*` 152/156/160/164, `pos.trBase` 28,

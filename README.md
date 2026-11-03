@@ -575,7 +575,9 @@ every viewer receives. A player outside the view frustum that corresponds to
 the cap is hidden for that viewer; a client running a larger `cg_fov` sees no
 more players than one at the cap, and the extra field is empty. Legitimate
 values below the cap are unaffected, and the viewer's own entity is never
-touched. The test uses both the horizontal and vertical FOV, so looking up or
+touched. The cap applies only to clients actually in the game: a free or
+following spectator is never affected, and spectator entities are never
+hidden. The test uses both the horizontal and vertical FOV, so looking up or
 down does not hide players that are still on screen; above 45° of pitch the cap
 pauses entirely, because the client's third-person camera pitch then diverges
 too far from the server's aim for the server to know what is on screen.

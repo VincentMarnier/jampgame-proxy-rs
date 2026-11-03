@@ -1594,10 +1594,20 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
 ///
 /// Entered from the engine with a valid `client_t*`.
 pub unsafe extern "C" fn sv_send_client_snapshot(client: usize) {
+    // Record the *actual* engine client slot before the build: for a
+    // following spectator `frame->ps.clientNum` is the followed player, and
+    // the FOV cap must know that the viewer is a spectator.
+    if client != 0 {
+        let slot = client_num_from_addr(client);
+        if slot < crate::sdk::MAX_CLIENTS {
+            state::with_state(|s| s.fov.viewer_client = slot as i32);
+        }
+    }
     // SAFETY: trampoline attached at GAME_INIT; `client` forwarded unchanged.
     let original = original_call(crate::hooks::engine_hook_original_sv_send_client_snapshot);
     unsafe { original(client) };
     crate::fov::restore();
+    state::with_state(|s| s.fov.viewer_client = -1);
 }
 
 /// Snapshot predicate for one entity number (pure given the match tables).

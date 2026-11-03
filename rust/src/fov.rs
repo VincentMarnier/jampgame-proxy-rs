@@ -31,13 +31,13 @@ use core::ffi::c_int;
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::sdk::{
     EF_DEAD, EF_NODRAW, MAX_CLIENTS, MAX_SNAPSHOT_ENTITIES, OFFSET_GCLIENT_SABER,
-    OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
+    OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
     OFFSET_GENTITY_S_IMODEL_SCALE, OFFSET_GENTITY_S_LOOP_SOUND, OFFSET_GENTITY_S_POS_TRBASE,
     OFFSET_GENTITY_S_SABER_HOLSTERED, OFFSET_GENTITY_S_SABER_IN_FLIGHT, OFFSET_GENTITY_S_TRICKED_1,
     OFFSET_GENTITY_S_TRICKED_2, OFFSET_GENTITY_S_TRICKED_3, OFFSET_GENTITY_S_TRICKED_4,
-    OFFSET_GENTITY_S_WEAPON, OFFSET_SABER_SOUND_LOOP, OFFSET_SNAPSHOT_ENUMS_COUNT,
-    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES, SIZEOF_GENTITY,
-    SIZEOF_SABER_INFO, WP_SABER,
+    OFFSET_GENTITY_S_WEAPON, OFFSET_SABER_SOUND_LOOP, OFFSET_SESS_SESSION_TEAM,
+    OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES,
+    SIZEOF_GENTITY, SIZEOF_SABER_INFO, TEAM_SPECTATOR, WP_SABER,
 };
 use crate::state;
 
@@ -76,6 +76,10 @@ impl Default for SavedEntity {
 pub struct FovState {
     pub saved: [SavedEntity; MAX_CLIENTS],
     pub count: usize,
+    /// Actual engine client slot of the snapshot being built (not
+    /// `frame->ps.clientNum`, which is the followed player's slot for a
+    /// spectating spectator). Set by the `SV_SendClientSnapshot` wrapper.
+    pub viewer_client: i32,
 }
 
 impl Default for FovState {
@@ -83,6 +87,7 @@ impl Default for FovState {
         FovState {
             saved: [SavedEntity::default(); MAX_CLIENTS],
             count: 0,
+            viewer_client: -1,
         }
     }
 }
@@ -228,13 +233,26 @@ pub unsafe fn apply(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    let (max_fov, aspect, camera_range) = state::with_state(|s| {
+    let (max_fov, aspect, camera_range, requested_viewer) = state::with_state(|s| {
         (
             s.cvars[state::CVAR_MAX_FOV].integer,
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value,
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value,
+            s.fov.viewer_client,
         )
     });
+    let viewer_client = if (0..MAX_CLIENTS as i32).contains(&requested_viewer) {
+        requested_viewer
+    } else {
+        viewer
+    };
+    // The feature only applies to players actually in the game. A following
+    // spectator's `frame->ps.clientNum` is the followed player, so use the
+    // engine client slot recorded by `SV_SendClientSnapshot`.
+    // SAFETY: g_entities is the located game array.
+    if unsafe { is_spectator(g_entities, viewer_client) } {
+        return;
+    }
     let Some((h_half, v_half)) = view_half_angles(max_fov, aspect) else {
         return;
     };
@@ -274,6 +292,12 @@ pub unsafe fn apply(
         // SAFETY: ent is inside the g_entities array; client is a pointer.
         let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
         if client == 0 {
+            continue;
+        }
+        // Never hide a spectator's entity: the feature only concerns the
+        // players actually in the game.
+        // SAFETY: `client` is the live gclient_t of this slot.
+        if unsafe { is_spectator_client(client) } {
             continue;
         }
         // SAFETY: `ent` is a live gentity slot; pos.trBase is a vec3_t.
@@ -417,6 +441,33 @@ pub fn restore() {
             );
         }
     }
+}
+
+/// Whether a game client is on the spectator team (`TEAM_SPECTATOR`).
+///
+/// # Safety
+///
+/// `client` must be a live `gclient_t*`.
+unsafe fn is_spectator_client(client: usize) -> bool {
+    // SAFETY: caller guarantees a live gclient_t; the session team is an int.
+    unsafe { read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) == TEAM_SPECTATOR }
+}
+
+/// Whether the player in `slot` is a spectator (including a following one,
+/// whose playerState is the followed player's but whose session team stays
+/// spectator).
+///
+/// # Safety
+///
+/// `g_entities` must be the located game array and `slot` in `0..MAX_CLIENTS`.
+unsafe fn is_spectator(g_entities: usize, slot: i32) -> bool {
+    if g_entities == 0 || !(0..MAX_CLIENTS as i32).contains(&slot) {
+        return false;
+    }
+    let ent = g_entities + slot as usize * SIZEOF_GENTITY;
+    // SAFETY: slot is inside the g_entities array; client is a pointer.
+    let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+    client != 0 && unsafe { is_spectator_client(client) }
 }
 
 /// Read an `f32` engine/game struct field.
@@ -646,6 +697,7 @@ mod tests {
     struct Hidden {
         entities: Vec<u8>,
         _gclient: Vec<u8>,
+        _viewer_gclient: Vec<u8>,
         trick: i32,
         scale: i32,
         e_flags: i32,
@@ -663,18 +715,32 @@ mod tests {
         camera_range: f32,
         pitch: f32,
         saber: bool,
+        viewer_spectator: bool,
     ) -> Hidden {
         let _guard = state::TEST_STATE_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut entities = vec![0u8; MAX_CLIENTS * SIZEOF_GENTITY];
         let mut gclient = vec![0u8; crate::sdk::SIZEOF_GCLIENT];
+        let mut viewer_gclient = vec![0u8; crate::sdk::SIZEOF_GCLIENT];
         let ent = 1usize;
         let base = ent * SIZEOF_GENTITY;
         // Slot 1 holds a live player: point it at the fake gclient.
         entities[base + OFFSET_GENTITY_CLIENT
             ..base + OFFSET_GENTITY_CLIENT + core::mem::size_of::<usize>()]
             .copy_from_slice(&(gclient.as_mut_ptr() as usize).to_ne_bytes());
+        if viewer_spectator {
+            let viewer = viewer_gclient.as_mut_ptr() as usize;
+            // SAFETY: the buffer has the pinned gclient session field.
+            unsafe {
+                core::ptr::write_unaligned(
+                    (viewer + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM) as *mut i32,
+                    TEAM_SPECTATOR,
+                )
+            };
+            entities[OFFSET_GENTITY_CLIENT..OFFSET_GENTITY_CLIENT + core::mem::size_of::<usize>()]
+                .copy_from_slice(&viewer.to_ne_bytes());
+        }
         if saber {
             let client = gclient.as_mut_ptr() as usize;
             let hum = client + OFFSET_GCLIENT_SABER + OFFSET_SABER_SOUND_LOOP;
@@ -707,6 +773,7 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV].integer = max_fov;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = aspect;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = camera_range;
+            s.fov.viewer_client = 0;
             s.located_game_data.g_entities = entities.as_mut_ptr() as usize;
         });
         let g_entities = entities.as_mut_ptr() as usize;
@@ -735,10 +802,12 @@ mod tests {
             loop_sound: entities[base + OFFSET_GENTITY_S + OFFSET_GENTITY_S_LOOP_SOUND],
             entities,
             _gclient: gclient,
+            _viewer_gclient: viewer_gclient,
         };
         restore();
         state::with_state(|s| {
             s.located_game_data.g_entities = 0;
+            s.fov.viewer_client = -1;
             s.cvars[state::CVAR_MAX_FOV].integer = 0;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = 0.0;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = 0.0;
@@ -749,7 +818,7 @@ mod tests {
     #[test]
     fn an_outside_player_is_mind_tricked_scaled_and_restored() {
         // Behind the viewer: hidden.
-        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false);
+        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
         assert_eq!(hidden.trick, 1, "viewer 0's mind-trick bit must be set");
         assert_eq!(hidden.scale, 1, "the hidden player is scaled to 1%");
         assert_ne!(
@@ -774,7 +843,7 @@ mod tests {
 
     #[test]
     fn an_inside_player_is_untouched() {
-        let hidden = run_hide([100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false);
+        let hidden = run_hide([100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
         assert_eq!(hidden.trick, 0);
         assert_eq!(hidden.scale, 0);
         assert_eq!(hidden.e_flags & EF_NODRAW, 0);
@@ -784,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_hidden_drawn_saber_loses_its_blade_but_keeps_its_hum() {
-        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, true);
+        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, true, false);
         assert_eq!(hidden.trick, 1);
         assert_eq!(hidden.scale, 1);
         assert_eq!(hidden.e_flags & EF_NODRAW, EF_NODRAW);
@@ -880,14 +949,27 @@ mod tests {
     }
 
     #[test]
+    fn a_spectator_viewer_is_not_affected() {
+        // Same hidden target behind the viewer, but the actual client (slot 0)
+        // is on the spectator team: the cap must not apply.
+        let spectator = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, true);
+        assert_eq!(spectator.trick, 0);
+        assert_eq!(spectator.scale, 0);
+        assert_eq!(spectator.e_flags & EF_NODRAW, 0);
+        // A playing viewer in the same setup is capped.
+        let playing = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
+        assert_eq!(playing.trick, 1);
+    }
+
+    #[test]
     fn a_steep_view_pauses_the_cap() {
         // Behind the viewer at a normal pitch: hidden.
-        let level = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false);
+        let level = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
         assert_eq!(level.trick, 1);
         // The same target while looking steeply down/up stays visible: the
         // client's third-person camera pitch diverges from `ps.viewangles`
         // there, so the server frustum is not trustworthy.
-        let steep = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 80.0, false);
+        let steep = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 80.0, false, false);
         assert_eq!(steep.trick, 0);
         assert_eq!(steep.scale, 0);
     }
