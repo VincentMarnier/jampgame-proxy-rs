@@ -464,6 +464,33 @@ struct Block {
     blue_max: i32,
 }
 
+/// A team join refused because the client's match is password protected and
+/// the client has not given the password. A spectator/follow request or a
+/// no-op same-team request is not a join and passes; whether the client's
+/// instance is protected is `tffa`'s decision (which also resolves a promoted
+/// game living in the main slot).
+fn password_blocked_join(ent: usize, s: *const c_char) -> Option<c_int> {
+    if ent == 0 || !state::proxy_enabled() {
+        return None;
+    }
+    let explicit = requested_team(s);
+    if explicit.is_none() && requested_spectator(s) {
+        return None;
+    }
+    let client_num = ent_client_num(ent);
+    if client_num < 0 {
+        return None;
+    }
+    if explicit.is_some() && explicit == client_team(ent) {
+        return None;
+    }
+    if tffa::password_gate_blocks(client_num) {
+        Some(client_num)
+    } else {
+        None
+    }
+}
+
 /// Decide whether a `SetTeam(ent, s)` call must be dropped under the current
 /// lock. An explicit join to a locked, full team is blocked, as is an auto pick
 /// (`team free`/empty → `PickTeam`) once every locked team is full; spectator
@@ -589,6 +616,10 @@ fn send_locked_message(block: &Block) {
 ///
 /// Entered from the game module with the pristine `SetTeam` argument list.
 pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
+    if let Some(client_num) = password_blocked_join(ent, s) {
+        tffa::send_password_required(client_num);
+        return;
+    }
     if let Some(block) = blocked_join(ent, s) {
         send_locked_message(&block);
         return;

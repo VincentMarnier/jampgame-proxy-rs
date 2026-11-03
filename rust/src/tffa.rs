@@ -71,6 +71,11 @@ pub const MAIN_MATCH: u8 = 0;
 pub const MAX_MATCHES: usize = 8;
 /// Backing array size: main slot + created slots.
 pub const TOTAL_MATCH_SLOTS: usize = 1 + MAX_MATCHES;
+/// Maximum length of a match password, in bytes. A password is one client
+/// command argument (`trap_Argv`); quoting it (`tffa_create "my pass"`) allows
+/// spaces, so the limit is on bytes, not words. Longer passwords are refused at
+/// `tffa_create`/`tffa_join` rather than truncated.
+pub const MAX_TFFA_PASSWORD: usize = 32;
 /// Capacity of the per-frame player-owned entity cache (saber entities,
 /// missiles, corpses — one or a few per player).
 pub const OWNED_CAP: usize = 96;
@@ -1711,6 +1716,7 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
     } else {
         // A full map change drops identities with the rest of the overlay.
         t.home = [MAIN_MATCH; MAX_CLIENTS];
+        t.pass_ok = [MAIN_MATCH; MAX_CLIENTS];
     }
     for (i, m) in t.matches.iter_mut().enumerate() {
         m.red = 0;
@@ -1736,6 +1742,9 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
                 }
             }
             m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+            // Main hosts its own id again and is never password protected (a
+            // promoted game keeps its password under its own identity slot).
+            m.clear_password();
             continue;
         }
         // A created id survives when its match was open, when it finished
@@ -1760,6 +1769,9 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
         // session data on reconnect). Its remembered roster dies with it.
         m.active = false;
         m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+        // The id is gone: its protection and everyone's authorisation to it die
+        // with it, so a later match in this slot starts from its own password.
+        m.clear_password();
         let id = i as u8;
         // A promoted id above the lowered limit has its clients assigned to
         // main, not to its slot, so both tables are checked here.
@@ -1769,6 +1781,9 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
             }
             if t.client_match[cn] == id {
                 t.client_match[cn] = MAIN_MATCH;
+            }
+            if t.pass_ok[cn] == id {
+                t.pass_ok[cn] = MAIN_MATCH;
             }
         }
     }
@@ -1868,6 +1883,7 @@ fn discard_instance(id: u8) {
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
             &mut s.tffa.home,
+            &mut s.tffa.pass_ok,
             &mut s.tffa.player_score,
             id,
         );
@@ -2171,8 +2187,10 @@ fn disable_parallel_tffa() {
         // an instance back after a later re-enable. Main hosts its own id again.
         for m in s.tffa.matches.iter_mut() {
             m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+            m.clear_password();
         }
         s.tffa.home = [MAIN_MATCH; MAX_CLIENTS];
+        s.tffa.pass_ok = [MAIN_MATCH; MAX_CLIENTS];
         s.tffa.main_origin = MAIN_MATCH;
         s.tffa.pending_join = [REMEMBERED_NONE; MAX_CLIENTS];
         s.tffa.deferred_begin = [false; MAX_CLIENTS];
@@ -2231,6 +2249,7 @@ fn close_created_matches(created: &[u8]) {
                 &mut s.tffa.matches,
                 &mut s.tffa.client_match,
                 &mut s.tffa.home,
+                &mut s.tffa.pass_ok,
                 &mut s.tffa.player_score,
                 *id,
             );
@@ -3283,6 +3302,8 @@ fn forget_client_everywhere(client_num: c_int) {
         }
         s.tffa.pending_join[cn] = REMEMBERED_NONE;
         s.tffa.home[cn] = MAIN_MATCH;
+        // A new occupant of the slot starts with no match authorisation.
+        s.tffa.pass_ok[cn] = MAIN_MATCH;
     });
 }
 
@@ -4685,6 +4706,10 @@ pub fn handle_client_command(client_num: c_int) -> bool {
         }
         return true;
     }
+    if name == b"tffa_password" {
+        cmd_password(client_num);
+        return true;
+    }
     if name == b"tffa_leave" {
         cmd_leave(client_num);
         return true;
@@ -4747,18 +4772,266 @@ fn travel_to_spectator(client_num: c_int) -> bool {
     }
 }
 
+/// Copy client-command argument `n` into `buf` and return the number of bytes
+/// the engine wrote (the string is NUL-terminated inside `buf`).
+fn cmd_arg(n: c_int, buf: &mut [u8]) -> usize {
+    // SAFETY: engine syscall registered; buffer writable.
+    unsafe { crate::syscall::argv(n, buf) };
+    buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
+}
+
 fn cmd_arg_i32(n: c_int) -> Option<i32> {
     let mut buf = [0u8; 64];
-    // SAFETY: engine syscall registered; buffer writable.
-    unsafe { crate::syscall::argv(n, &mut buf) };
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let end = cmd_arg(n, &mut buf);
     core::str::from_utf8(&buf[..end])
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
 }
 
-const JOIN_USAGE: &str =
-    "print \"Usage: tffa_join <match> (0 = main game, 1..N = created matches, see tffa_list).\n\"";
+const JOIN_USAGE: &str = "print \"Usage: tffa_join <match> [password] (0 = main game, 1..N = created matches, see tffa_list). A password is only needed to play in a protected match; anyone may spectate one.\n\"";
+
+const PASSWORD_USAGE: &str = "print \"Usage: tffa_password <password> (gives the password of the match you are in, so you can join its teams).\n\"";
+
+/// `print` text for a team join refused because the match is protected. Names
+/// no id: a promoted match plays in the main slot and `tffa_password` works
+/// there too.
+const PASSWORD_REQUIRED: &str = "print \"This match is password protected: use tffa_password <password> to play in it. Anyone may spectate.\n\"";
+
+/// The TFFA identity whose game runs in a runtime slot: a created slot's own
+/// id, or the promoted game's id while it lives in the main slot (`main_origin`
+/// `0` = main's own game). Pure for the tests.
+fn slot_identity(main_origin: u8, slot: u8) -> u8 {
+    if slot == MAIN_MATCH {
+        main_origin
+    } else {
+        slot
+    }
+}
+
+/// Whether `client_num` may join RED/BLUE in the match it is currently in:
+/// always true for an open match, and for a protected one only once the client
+/// has given its password (`pass_ok` names its identity). Spectating is never
+/// gated. Pure for the tests.
+fn password_cleared(
+    matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
+    client_match: &[u8; MAX_CLIENTS],
+    main_origin: u8,
+    pass_ok: &[u8; MAX_CLIENTS],
+    client_num: usize,
+) -> bool {
+    let Some(slot) = client_match.get(client_num) else {
+        return false;
+    };
+    let identity = slot_identity(main_origin, *slot);
+    let Some(m) = matches.get(identity as usize) else {
+        return true;
+    };
+    !m.has_password() || pass_ok.get(client_num).copied() == Some(identity)
+}
+
+/// What a `tffa_password` (or a password argument of `tffa_join`) did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Auth {
+    /// The client's match has no password: nothing to unlock.
+    Open,
+    /// The password matched and the client may now join a team.
+    Accepted,
+    /// The password did not match; the client keeps spectating.
+    Wrong,
+    /// Longer than [`MAX_TFFA_PASSWORD`]; never compared.
+    TooLong,
+}
+
+/// Give `given` as the password of the match the client is in, recording the
+/// authorisation by **identity**. No move, no team change: the client picks a
+/// team itself (`/team red|blue`).
+fn authenticate_here(client_num: c_int, given: &[u8]) -> Auth {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return Auth::Wrong;
+    }
+    if given.len() > MAX_TFFA_PASSWORD {
+        return Auth::TooLong;
+    }
+    let cn = client_num as usize;
+    state::with_state(|s| {
+        let identity = slot_identity(s.tffa.main_origin, s.tffa.client_match[cn]);
+        let m = &s.tffa.matches[identity as usize];
+        if !m.has_password() {
+            return Auth::Open;
+        }
+        if !m.password_matches(given) {
+            return Auth::Wrong;
+        }
+        s.tffa.pass_ok[cn] = identity;
+        Auth::Accepted
+    })
+}
+
+/// Tell the client the outcome of a password attempt made out of band (the
+/// `tffa_password` command); `tffa_join <id> <password>` reports its own.
+fn send_auth_outcome(client_num: c_int, auth: Auth) {
+    match auth {
+        Auth::Open => tell(
+            client_num,
+            "print \"This match is not password protected: join a team with /team red|blue.\n\"",
+        ),
+        Auth::Accepted => tell(
+            client_num,
+            "print \"Password accepted: join a team with /team red|blue.\n\"",
+        ),
+        Auth::Wrong => tell(
+            client_num,
+            "print \"Wrong password: you can still spectate this match.\n\"",
+        ),
+        Auth::TooLong => tell(
+            client_num,
+            &format!("print \"Password too long (max {MAX_TFFA_PASSWORD} characters).\n\""),
+        ),
+    }
+}
+
+/// `tffa_password <password>`: unlock team joins in the match the client is
+/// already in. It exists so a spectator of a **promoted** protected match
+/// (which plays in the main slot) can authenticate without naming an id, and
+/// so a spectator who joined with `tffa_join <id>` need not travel again.
+fn cmd_password(client_num: c_int) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    let mut buf = [0u8; MAX_TFFA_PASSWORD + 64];
+    let n = cmd_arg(1, &mut buf);
+    if n == 0 {
+        tell(client_num, PASSWORD_USAGE);
+        return;
+    }
+    if !enabled() {
+        tell(
+            client_num,
+            "print \"TFFA matches are not enabled on this server (GT_TEAM only).\n\"",
+        );
+        return;
+    }
+    let auth = authenticate_here(client_num, &buf[..n]);
+    if auth == Auth::Wrong {
+        crate::diagnostics::suspicious(
+            "tffa",
+            format!("password rejected for client {client_num}"),
+        );
+    }
+    send_auth_outcome(client_num, auth);
+}
+
+/// Whether the `SetTeam` wrapper must refuse this client's team join for lack
+/// of the match password (the client's own instance only: main is normally
+/// open, and a promoted protected game is checked under its identity).
+pub fn password_gate_blocks(client_num: c_int) -> bool {
+    if !enabled() || !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return false;
+    }
+    let cn = client_num as usize;
+    !state::with_state(|s| {
+        password_cleared(
+            &s.tffa.matches,
+            &s.tffa.client_match,
+            s.tffa.main_origin,
+            &s.tffa.pass_ok,
+            cn,
+        )
+    })
+}
+
+/// Tell a client why its team join was refused (the `SetTeam` wrapper).
+pub fn send_password_required(client_num: c_int) {
+    tell(client_num, PASSWORD_REQUIRED);
+}
+
+/// Raw byte spans of the tokens the engine's `Cmd_TokenizeString` would parse
+/// from `cmd` (`cmd_common.cpp:541-620`; the subset the redaction needs:
+/// whitespace is any byte `<= ' '`, a `"` starts a quoted token that runs to the
+/// closing quote or the end, and `//` / `/* */` start a comment).
+fn raw_token_spans(cmd: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    loop {
+        // Skip whitespace and comments, exactly where the engine does.
+        loop {
+            while i < cmd.len() && cmd[i] <= b' ' {
+                i += 1;
+            }
+            if i >= cmd.len() {
+                return spans;
+            }
+            if cmd[i] == b'/' && cmd.get(i + 1) == Some(&b'/') {
+                return spans;
+            }
+            if cmd[i] == b'/' && cmd.get(i + 1) == Some(&b'*') {
+                i += 2;
+                while i + 1 < cmd.len() && !(cmd[i] == b'*' && cmd[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 >= cmd.len() {
+                    return spans;
+                }
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        let start = i;
+        if cmd[i] == b'"' {
+            i += 1;
+            while i < cmd.len() && cmd[i] != b'"' {
+                i += 1;
+            }
+            if i < cmd.len() {
+                i += 1;
+            }
+        } else {
+            while i < cmd.len() {
+                if cmd[i] <= b' ' || cmd[i] == b'"' {
+                    break;
+                }
+                if cmd[i] == b'/' && matches!(cmd.get(i + 1), Some(b'/') | Some(b'*')) {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        spans.push((start, i));
+    }
+}
+
+/// Redact the password argument of `tffa_create`/`tffa_join`/`tffa_password`
+/// from a raw client command before it is written to the verbose diagnostics
+/// log (`proxy_debug.log`). Everything else is returned byte for byte, so a log
+/// line still shows the command shape. Pure for the tests.
+pub fn redact_client_command(cmd: &[u8]) -> Vec<u8> {
+    let spans = raw_token_spans(cmd);
+    let Some(&(first, first_end)) = spans.first() else {
+        return cmd.to_vec();
+    };
+    // A quoted command name is not sent in practice, but `argv(0)` would strip
+    // the quotes, so match it either way.
+    let first_token = &cmd[first..first_end];
+    let name = first_token
+        .strip_prefix(b"\"")
+        .and_then(|inner| inner.strip_suffix(b"\""))
+        .unwrap_or(first_token);
+    let secret_index = match name {
+        b"tffa_create" => 1,
+        b"tffa_join" => 2,
+        b"tffa_password" => 1,
+        _ => return cmd.to_vec(),
+    };
+    let Some(&(secret, secret_end)) = spans.get(secret_index) else {
+        return cmd.to_vec();
+    };
+    let mut out = Vec::with_capacity(cmd.len());
+    out.extend_from_slice(&cmd[..secret]);
+    out.extend_from_slice(b"***");
+    out.extend_from_slice(&cmd[secret_end..]);
+    out
+}
 
 /// Resolve a `tffa_join` argument for a created match slot (`1..=max`).
 ///
@@ -4860,9 +5133,12 @@ fn counted_match_size(
 
 /// Pure `tffa_list` body: the main line counts only connected players in main
 /// (not the free slots that also default to `MAIN_MATCH`), and every active
-/// created match counts only its connected members.
+/// created match counts only its connected members. A password-protected match
+/// is marked, including a protected game promoted into the main slot under its
+/// own identity (`main_origin`).
 fn render_match_list(
     max: usize,
+    main_origin: u8,
     matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS],
     client_match: &[u8; MAX_CLIENTS],
     connected: &[bool; MAX_CLIENTS],
@@ -4877,13 +5153,23 @@ fn render_match_list(
             continue;
         }
         let size = counted_match_size(id, client_match, connected);
+        // Main is open unless it hosts a promoted protected game.
+        let identity = slot_identity(main_origin, id);
+        let protected = matches
+            .get(identity as usize)
+            .map(state::TffaMatch::has_password)
+            .unwrap_or(false);
+        let lock = if protected { " ^3[password]^7" } else { "" };
         if id == MAIN_MATCH {
             out.push_str(&format!(
-                "\n0 (main): {size} players, {}-{}^7",
+                "\n0 (main): {size} players, {}-{}^7{lock}",
                 m.red, m.blue
             ));
         } else {
-            out.push_str(&format!("\n{id}: {size} players, {}-{}^7", m.red, m.blue));
+            out.push_str(&format!(
+                "\n{id}: {size} players, {}-{}^7{lock}",
+                m.red, m.blue
+            ));
         }
     }
     out.push('\n');
@@ -4941,6 +5227,21 @@ fn cmd_create(client_num: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
+    // `tffa_create [password]`: a password makes the match's teams private
+    // while spectating stays open. Refused before the travel below, so a bad
+    // argument never kills the player for nothing.
+    let mut pbuf = [0u8; MAX_TFFA_PASSWORD + 64];
+    let pn = cmd_arg(1, &mut pbuf);
+    if pn > MAX_TFFA_PASSWORD {
+        tell(
+            client_num,
+            &format!(
+                "print \"Password too long (max {MAX_TFFA_PASSWORD} characters); no match created.\n\""
+            ),
+        );
+        return;
+    }
+    let password = &pbuf[..pn];
     // Once the shared timelimit expired the map is winding down: untied
     // matches are closed and a tied one is playing sudden death. Letting
     // someone open a fresh match would keep the map alive past the end; only
@@ -5008,6 +5309,18 @@ fn cmd_create(client_num: c_int) {
         // A new match in this slot starts with no memory of the match that
         // finished here before.
         m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+        // The slot's password is the new match's: a reused slot must never
+        // keep the previous match's protection or anyone's authorisation to it.
+        m.set_password(password);
+        for ok in s.tffa.pass_ok.iter_mut() {
+            if *ok == id {
+                *ok = MAIN_MATCH;
+            }
+        }
+        if m.has_password() {
+            // The creator knows the password they just set.
+            s.tffa.pass_ok[client_num as usize] = id;
+        }
         assign_client_instance(
             &mut s.tffa.client_match,
             &mut s.tffa.home,
@@ -5044,13 +5357,22 @@ fn cmd_create(client_num: c_int) {
     forget_return_rosters(client_num);
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
-    tell(
-        client_num,
-        &format!(
-            "print \"Created match {id} and joined {} team. Invite others with tffa_join {id}.\n\"",
-            if team == TEAM_BLUE { "BLUE" } else { "RED" }
-        ),
-    );
+    let side = if team == TEAM_BLUE { "BLUE" } else { "RED" };
+    if password.is_empty() {
+        tell(
+            client_num,
+            &format!(
+                "print \"Created match {id} and joined {side} team. Invite others with tffa_join {id}.\n\""
+            ),
+        );
+    } else {
+        tell(
+            client_num,
+            &format!(
+                "print \"Created password-protected match {id} and joined {side} team. Players join with tffa_join {id} <password>; anyone may spectate with tffa_join {id}.\n\""
+            ),
+        );
+    }
 }
 
 fn cmd_join(client_num: c_int, id: i32) {
@@ -5075,19 +5397,86 @@ fn cmd_join(client_num: c_int, id: i32) {
         tell(client_num, JOIN_USAGE);
         return;
     };
-    // Already in that instance: there is no move, so do not put the client
-    // through the spectator step (a travel would kill a playing client for
-    // nothing). `tffa_join 0` / `tffa_leave` say the same through `cmd_leave`.
-    if client_match(client_num) == id {
-        tell(
-            client_num,
-            &format!("print \"You are already in match {id}.\n\""),
-        );
+    // Optional password. It is only needed to *play*: joining without one
+    // still travels to the match as a spectator, which is how anyone can watch
+    // a protected match.
+    let mut pbuf = [0u8; MAX_TFFA_PASSWORD + 64];
+    let pn = cmd_arg(2, &mut pbuf);
+    let given = &pbuf[..pn];
+    // Already in the game of `id`: its own runtime slot, or a promoted game
+    // running in the main slot (identity `main_origin`, D-006.11). There is no
+    // move, so do not put the client through the spectator step (a travel would
+    // kill a playing client for nothing). `tffa_join 0` / `tffa_leave` say the
+    // same through `cmd_leave`.
+    let runtime = client_match(client_num);
+    let main_origin = state::with_state(|s| s.tffa.main_origin);
+    if runtime == id || (runtime == MAIN_MATCH && main_origin == id) {
+        // Already allowed to play here — an open match, or the password was
+        // given before — there is nothing to do.
+        if state::with_state(|s| {
+            password_cleared(
+                &s.tffa.matches,
+                &s.tffa.client_match,
+                s.tffa.main_origin,
+                &s.tffa.pass_ok,
+                client_num as usize,
+            )
+        }) {
+            tell(
+                client_num,
+                &format!("print \"You are already in match {id}.\n\""),
+            );
+            return;
+        }
+        // A spectator already in a protected match can unlock its teams
+        // without travelling: the same check `tffa_password` makes.
+        if given.is_empty() {
+            tell(
+                client_num,
+                &format!(
+                    "print \"Match {id} is password protected: you are spectating. Use tffa_password <password> to play in it.\n\""
+                ),
+            );
+            return;
+        }
+        let auth = authenticate_here(client_num, given);
+        if auth == Auth::Wrong {
+            crate::diagnostics::suspicious(
+                "tffa",
+                format!("password rejected for client {client_num} on match {id}"),
+            );
+            tell(
+                client_num,
+                &format!("print \"Wrong password for match {id}: you can still spectate it.\n\""),
+            );
+            return;
+        }
+        if auth == Auth::Accepted {
+            tell(
+                client_num,
+                "print \"Password accepted: join a team with /team red|blue.\n\"",
+            );
+        } else {
+            // `TooLong` (reported by `send_auth_outcome`) and `Open` (the
+            // match lost its password meanwhile) both end here.
+            send_auth_outcome(client_num, auth);
+        }
         return;
     }
     let active = state::with_state(|s| s.tffa.matches[id as usize].active);
     if !active {
-        tell(client_num, "print \"That match is not active.\n\"");
+        if id == main_origin && main_origin != MAIN_MATCH {
+            // Its game is running in the main slot (D-006.11): there is no
+            // active slot to join, the client has to come to main first.
+            tell(
+                client_num,
+                &format!(
+                    "print \"The game of match {id} is running as the main game: use tffa_leave, then tffa_password <password> to play in it.\n\""
+                ),
+            );
+        } else {
+            tell(client_num, "print \"That match is not active.\n\"");
+        }
         return;
     }
     // A match whose outcome is already decided is in its one-second end
@@ -5100,6 +5489,23 @@ fn cmd_join(client_num: c_int, id: i32) {
     if match_size(id) >= max_group_size() {
         tell(client_num, "print \"That match is full.\n\"");
         return;
+    }
+    // Decided before the travel below: the move is not refusable, only the
+    // authorisation to play is. An authorisation this client already holds for
+    // the id (it gave the password before) survives the move.
+    let (protected, authorised) = state::with_state(|s| {
+        let already = s.tffa.pass_ok[client_num as usize] == id;
+        let m = &s.tffa.matches[id as usize];
+        (
+            m.has_password(),
+            m.has_password() && (already || m.password_matches(given)),
+        )
+    });
+    if protected && !authorised && !given.is_empty() {
+        crate::diagnostics::suspicious(
+            "tffa",
+            format!("password rejected for client {client_num} on match {id}"),
+        );
     }
     // Every check that can refuse has passed: a playing client is moved to
     // spectator now (which suicides them), so the instance switch is the only
@@ -5117,13 +5523,44 @@ fn cmd_join(client_num: c_int, id: i32) {
             client_num,
             id,
         );
+        if protected && authorised {
+            s.tffa.pass_ok[client_num as usize] = id;
+        }
     });
     // The old id's roster must not pull them back at the restart.
     forget_return_rosters(client_num);
     reset_game_scores(client_num);
     broadcast_cs_players_slot(client_num);
     refresh_cs_players_for_viewer(client_num);
-    tell(client_num, &format!("print \"Joined match {id}.\n\""));
+    if !protected {
+        tell(client_num, &format!("print \"Joined match {id}.\n\""));
+    } else if authorised {
+        tell(
+            client_num,
+            &format!("print \"Joined match {id}. You may join a team with /team red|blue.\n\""),
+        );
+    } else if given.is_empty() {
+        tell(
+            client_num,
+            &format!(
+                "print \"Joined match {id} as a spectator. It is password protected: use tffa_password <password> to play in it.\n\""
+            ),
+        );
+    } else if given.len() > MAX_TFFA_PASSWORD {
+        tell(
+            client_num,
+            &format!(
+                "print \"Joined match {id} as a spectator: password too long (max {MAX_TFFA_PASSWORD} characters). Use tffa_password <password> to play in it.\n\""
+            ),
+        );
+    } else {
+        tell(
+            client_num,
+            &format!(
+                "print \"Joined match {id} as a spectator: wrong password. Use tffa_password <password> to play in it.\n\""
+            ),
+        );
+    }
 }
 
 fn cmd_leave(client_num: c_int) {
@@ -5195,10 +5632,12 @@ fn close_if_empty(id: u8) {
 /// everyone still assigned (spectators) to main — runtime slot *and* identity,
 /// because the id is gone — reporting the moved clients. Main and out-of-range
 /// ids are a no-op.
+#[allow(clippy::too_many_arguments)]
 fn close_instance_state(
     matches: &mut [state::TffaMatch; TOTAL_MATCH_SLOTS],
     client_match: &mut [u8; MAX_CLIENTS],
     home: &mut [u8; MAX_CLIENTS],
+    pass_ok: &mut [u8; MAX_CLIENTS],
     player_score: &mut [i32; MAX_CLIENTS],
     id: u8,
 ) -> Vec<c_int> {
@@ -5215,6 +5654,11 @@ fn close_instance_state(
         if home[cn] == id {
             home[cn] = MAIN_MATCH;
         }
+        // The id is gone: nobody keeps an authorisation to it, so the slot can
+        // be reused by a new match with its own password.
+        if pass_ok[cn] == id {
+            pass_ok[cn] = MAIN_MATCH;
+        }
     }
     let m = &mut matches[id as usize];
     m.red = 0;
@@ -5223,6 +5667,8 @@ fn close_instance_state(
     m.end_queued_at = 0;
     // A closed instance remembers nobody: the slot is free for a new match.
     m.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+    // Its protection dies with it (a new match in the slot sets its own).
+    m.clear_password();
     moved
 }
 
@@ -5242,6 +5688,7 @@ fn close_instance(id: u8) {
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
             &mut s.tffa.home,
+            &mut s.tffa.pass_ok,
             &mut s.tffa.player_score,
             id,
         )
@@ -5296,8 +5743,9 @@ fn close_empty_created_matches() {
 fn cmd_list(client_num: c_int) {
     // Hoisted before `with_state` (same non-reentrancy as `cmd_create`).
     let max = max_matches();
-    let (matches, table) = state::with_state(|s| (s.tffa.matches, s.tffa.client_match));
-    let out = render_match_list(max, &matches, &table, &connected_clients());
+    let (matches, table, main_origin) =
+        state::with_state(|s| (s.tffa.matches, s.tffa.client_match, s.tffa.main_origin));
+    let out = render_match_list(max, main_origin, &matches, &table, &connected_clients());
     tell(client_num, &format!("print \"{out}\""));
 }
 
@@ -6864,6 +7312,205 @@ mod tests {
         assert_eq!(join_target(i32::MIN, 8), None);
     }
 
+    /// A protected match is marked in `tffa_list`, including a protected game
+    /// promoted into the main slot (its password lives with its identity, so
+    /// the main line has to resolve `main_origin`).
+    #[test]
+    fn tffa_list_marks_password_protected_matches() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[1].active = true;
+        assert!(matches[1].set_password(b"hunter2"));
+        let table = [MAIN_MATCH; MAX_CLIENTS];
+        let connected = [false; MAX_CLIENTS];
+
+        let out = render_match_list(8, MAIN_MATCH, &matches, &table, &connected);
+        assert!(
+            out.contains("\n1: 0 players, 0-0^7 ^3[password]^7"),
+            "{out}"
+        );
+        assert!(!out.contains("0 (main): 0 players, 0-0^7 ^3[password]^7"));
+
+        // After a promotion identity 1 plays in the main slot: the main line
+        // carries its lock.
+        let out = render_match_list(8, 1, &matches, &table, &connected);
+        assert!(
+            out.contains("0 (main): 0 players, 0-0^7 ^3[password]^7"),
+            "{out}"
+        );
+    }
+
+    /// Passwords are exact, case-sensitive and never empty: an open match has
+    /// no password to give.
+    #[test]
+    fn passwords_are_exact_and_case_sensitive() {
+        let mut m = state::TffaMatch::default();
+        assert!(!m.has_password());
+        assert!(!m.password_matches(b""));
+        assert!(m.set_password(b"OpenSesame"));
+        assert!(m.has_password());
+        assert!(m.password_matches(b"OpenSesame"));
+        assert!(!m.password_matches(b"opensesame"));
+        assert!(!m.password_matches(b"OpenSesame "));
+        assert!(!m.password_matches(b"Open"));
+        // Too long for the storage: refused, the previous password is kept.
+        assert!(!m.set_password(&[b'x'; MAX_TFFA_PASSWORD + 1]));
+        assert!(m.password_matches(b"OpenSesame"));
+        m.clear_password();
+        assert!(!m.has_password());
+        assert!(!m.password_matches(b"OpenSesame"));
+    }
+
+    /// Protection gates *playing*, not membership: a client in a protected
+    /// match may spectate without the password, an authorisation for another id
+    /// does not count, and a protected game promoted into the main slot is
+    /// checked under its own identity.
+    #[test]
+    fn a_protected_match_refuses_play_until_its_password_is_given() {
+        let mut matches = [state::TffaMatch::default(); TOTAL_MATCH_SLOTS];
+        matches[MAIN_MATCH as usize].active = true;
+        matches[1].active = true;
+        assert!(matches[1].set_password(b"swordfish"));
+        matches[2].active = true;
+
+        let mut client_match = [MAIN_MATCH; MAX_CLIENTS];
+        let mut pass_ok = [MAIN_MATCH; MAX_CLIENTS];
+        client_match[2] = 1;
+
+        // Spectator of the protected match: still a member (snapshots, scores,
+        // chat) but not allowed to join a team.
+        assert!(!password_cleared(
+            &matches,
+            &client_match,
+            MAIN_MATCH,
+            &pass_ok,
+            2
+        ));
+        // Main stays open.
+        assert!(password_cleared(
+            &matches,
+            &client_match,
+            MAIN_MATCH,
+            &pass_ok,
+            3
+        ));
+        // The password unlocks the match; another id's authorisation does not.
+        pass_ok[2] = 1;
+        assert!(password_cleared(
+            &matches,
+            &client_match,
+            MAIN_MATCH,
+            &pass_ok,
+            2
+        ));
+        pass_ok[2] = 2;
+        assert!(!password_cleared(
+            &matches,
+            &client_match,
+            MAIN_MATCH,
+            &pass_ok,
+            2
+        ));
+        // An open created match needs nothing.
+        client_match[2] = 2;
+        pass_ok[2] = MAIN_MATCH;
+        assert!(password_cleared(
+            &matches,
+            &client_match,
+            MAIN_MATCH,
+            &pass_ok,
+            2
+        ));
+        // Identity 1 promoted into the main slot: a fresh main client cannot
+        // join its teams for free.
+        assert!(!password_cleared(&matches, &client_match, 1, &pass_ok, 4));
+        pass_ok[4] = 1;
+        assert!(password_cleared(&matches, &client_match, 1, &pass_ok, 4));
+        // `slot_identity` maps main to the promoted game and a created slot to
+        // itself.
+        assert_eq!(slot_identity(MAIN_MATCH, MAIN_MATCH), MAIN_MATCH);
+        assert_eq!(slot_identity(1, MAIN_MATCH), 1);
+        assert_eq!(slot_identity(1, 3), 3);
+    }
+
+    /// The verbose client-command log must never contain a match password.
+    #[test]
+    fn client_command_logging_redacts_password_arguments() {
+        assert_eq!(
+            redact_client_command(b"tffa_create hunter2"),
+            &b"tffa_create ***"[..]
+        );
+        assert_eq!(
+            redact_client_command(b"tffa_join 3 hunter2"),
+            &b"tffa_join 3 ***"[..]
+        );
+        assert_eq!(
+            redact_client_command(b"tffa_password hunter2"),
+            &b"tffa_password ***"[..]
+        );
+        // Tokenisation matches the engine's `Cmd_TokenizeString`: the original
+        // separators survive in the log line, and a quoted password (which may
+        // contain spaces) is redacted as a whole.
+        assert_eq!(
+            redact_client_command(b"tffa_join\t3\thunter2"),
+            &b"tffa_join\t3\t***"[..]
+        );
+        assert_eq!(
+            redact_client_command(b"tffa_create \"my pass\""),
+            &b"tffa_create ***"[..]
+        );
+        assert_eq!(
+            redact_client_command(b"tffa_join 3 \"my pass\" // note"),
+            &b"tffa_join 3 *** // note"[..]
+        );
+        // A comment can even swallow the argument, and then nothing is secret.
+        assert_eq!(
+            redact_client_command(b"tffa_create // hunter2"),
+            &b"tffa_create // hunter2"[..]
+        );
+        // No password argument: unchanged, and no marker is invented.
+        assert_eq!(redact_client_command(b"tffa_create"), &b"tffa_create"[..]);
+        assert_eq!(redact_client_command(b"tffa_join 3"), &b"tffa_join 3"[..]);
+        assert_eq!(redact_client_command(b"tffa_list"), &b"tffa_list"[..]);
+        // Other commands are left alone, byte for byte (no UTF-8 assumption).
+        assert_eq!(
+            redact_client_command(b"say_team hunter2"),
+            &b"say_team hunter2"[..]
+        );
+        assert_eq!(redact_client_command(&[0xff, 0xfe]), &[0xff, 0xfe]);
+    }
+
+    /// A `map_restart` keeps a protected match's password; a slot dropped by a
+    /// lowered limit (or a full map change) loses it, so its next match starts
+    /// open unless it sets its own.
+    #[test]
+    fn a_map_restart_keeps_a_matches_password_and_a_dropped_match_loses_it() {
+        let mut t = state::TffaState::default();
+        t.matches[1].active = true;
+        assert!(t.matches[1].set_password(b"pw-one"));
+        t.matches[3].active = true;
+        assert!(t.matches[3].set_password(b"pw-three"));
+        t.client_match[5] = 1;
+        t.home[5] = 1;
+        t.pass_ok[5] = 1;
+
+        reset_round_state(&mut t, true, 2);
+        assert!(t.matches[1].active);
+        assert!(t.matches[1].password_matches(b"pw-one"));
+        assert_eq!(t.pass_ok[5], 1);
+        // Slot 3 is above the live limit: the id is gone with its password.
+        assert!(!t.matches[3].active);
+        assert!(!t.matches[3].has_password());
+
+        let mut t = state::TffaState::default();
+        t.matches[1].active = true;
+        assert!(t.matches[1].set_password(b"pw-one"));
+        t.pass_ok[5] = 1;
+        reset_round_state(&mut t, false, 8);
+        assert!(!t.matches[1].has_password());
+        assert_eq!(t.pass_ok[5], MAIN_MATCH);
+    }
+
     /// Reported bug: on a 32-slot server with 3 connected players, `tffa_list`
     /// showed 32 in main because every free slot defaults to `MAIN_MATCH`.
     /// Player counts are censused over connected clients only.
@@ -6890,7 +7537,7 @@ mod tests {
         connected[3] = true;
         connected[4] = true;
 
-        let out = render_match_list(8, &matches, &table, &connected);
+        let out = render_match_list(8, MAIN_MATCH, &matches, &table, &connected);
         assert!(out.contains("0 (main): 3 players, 5-3"), "{out}");
         assert!(
             !out.contains("0 (main): 32 players"),
@@ -6906,7 +7553,7 @@ mod tests {
         for c in connected.iter_mut().take(3) {
             *c = true;
         }
-        let out = render_match_list(8, &matches, &table, &connected);
+        let out = render_match_list(8, MAIN_MATCH, &matches, &table, &connected);
         assert!(out.contains("0 (main): 3 players"), "{out}");
     }
 
@@ -7159,6 +7806,7 @@ mod tests {
         // match: a disable closes it like any other (only `map_restart`'s carry
         // applies the limit).
         matches[TOTAL_MATCH_SLOTS - 1].active = true;
+        assert!(matches[1].set_password(b"hunter2"));
         // An inactive slot stays out of the sweep (and main is never one).
         assert_eq!(
             created_matches_to_close(&matches),
@@ -7177,9 +7825,24 @@ mod tests {
         home[0] = 1;
         home[7] = 4;
         home[9] = TOTAL_MATCH_SLOTS as u8 - 1;
+        let mut pass_ok = [MAIN_MATCH; MAX_CLIENTS];
+        pass_ok[0] = 1;
+        pass_ok[7] = 4;
         for id in created_matches_to_close(&matches) {
-            close_instance_state(&mut matches, &mut table, &mut home, &mut score, id);
+            close_instance_state(
+                &mut matches,
+                &mut table,
+                &mut home,
+                &mut pass_ok,
+                &mut score,
+                id,
+            );
         }
+        // Closing an id drops everyone's authorisation to it, and its
+        // protection dies with it.
+        assert_eq!(pass_ok[0], MAIN_MATCH);
+        assert_eq!(pass_ok[7], MAIN_MATCH);
+        assert!(!matches[1].has_password());
         assert!(matches[MAIN_MATCH as usize].active);
         assert_eq!(
             (
@@ -7301,7 +7964,17 @@ mod tests {
         score[1] = 2;
         score[2] = 5;
 
-        let moved = close_instance_state(&mut matches, &mut table, &mut home, &mut score, 1);
+        let mut pass_ok = [MAIN_MATCH; MAX_CLIENTS];
+        pass_ok[0] = 1;
+        pass_ok[1] = 1;
+        let moved = close_instance_state(
+            &mut matches,
+            &mut table,
+            &mut home,
+            &mut pass_ok,
+            &mut score,
+            1,
+        );
         assert_eq!(moved, vec![0, 1]);
         assert!(!matches[1].active);
         assert_eq!((matches[1].red, matches[1].blue), (0, 0));
@@ -7326,8 +7999,15 @@ mod tests {
 
         // Main is never closed through this path.
         assert!(
-            close_instance_state(&mut matches, &mut table, &mut home, &mut score, MAIN_MATCH)
-                .is_empty()
+            close_instance_state(
+                &mut matches,
+                &mut table,
+                &mut home,
+                &mut pass_ok,
+                &mut score,
+                MAIN_MATCH
+            )
+            .is_empty()
         );
         assert!(matches[MAIN_MATCH as usize].active);
     }

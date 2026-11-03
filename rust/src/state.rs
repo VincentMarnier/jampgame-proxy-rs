@@ -380,6 +380,14 @@ pub struct TffaMatch {
     /// D-006.11). A client is remembered by at most one id
     /// (`tffa::forget_return_rosters`).
     pub remembered: [u8; MAX_CLIENTS],
+    /// Password protecting team joins to this match's **identity**
+    /// (`crate::tffa::MAX_TFFA_PASSWORD` bytes; `0` = open). The password
+    /// belongs to the id, not to the runtime slot, so it follows a game
+    /// promoted into the main slot and survives a `map_restart` with the
+    /// match. Anyone may spectate a protected match; only a client that gave
+    /// the password (`TffaState::pass_ok`) may join RED/BLUE in it.
+    pub password: [u8; crate::tffa::MAX_TFFA_PASSWORD],
+    pub password_len: u8,
 }
 
 impl TffaMatch {
@@ -388,6 +396,41 @@ impl TffaMatch {
     /// or moved to spectator yet.
     pub fn ending(&self) -> bool {
         self.active && self.end_queued_at != 0
+    }
+
+    /// Whether joining a team in this match needs the password.
+    pub fn has_password(&self) -> bool {
+        self.password_len != 0
+    }
+
+    /// The stored password bytes (`&[]` for an open match).
+    pub fn password_bytes(&self) -> &[u8] {
+        let len = (self.password_len as usize).min(self.password.len());
+        &self.password[..len]
+    }
+
+    /// Whether `given` is this match's password. Exact and case-sensitive; an
+    /// open match has no password and never matches.
+    pub fn password_matches(&self, given: &[u8]) -> bool {
+        self.has_password() && given == self.password_bytes()
+    }
+
+    /// Replace the password (`given` empty = open match). Returns `false`
+    /// without changing the match when `given` is longer than the storage.
+    pub fn set_password(&mut self, given: &[u8]) -> bool {
+        if given.len() > self.password.len() {
+            return false;
+        }
+        self.password = [0; crate::tffa::MAX_TFFA_PASSWORD];
+        self.password[..given.len()].copy_from_slice(given);
+        self.password_len = given.len() as u8;
+        true
+    }
+
+    /// Make the match open again.
+    pub fn clear_password(&mut self) {
+        self.password = [0; crate::tffa::MAX_TFFA_PASSWORD];
+        self.password_len = 0;
     }
 
     /// Whether this slot still remembers the roster of the game of its identity
@@ -430,6 +473,15 @@ pub struct TffaState {
     /// (`tffa::reset_round_state`), so TFFA 0 stays TFFA 0 and TFFA 1 stays
     /// TFFA 1 even after a promotion moved their games around (D-006.11).
     pub home: [u8; MAX_CLIENTS],
+    /// The TFFA **identity** each client has given the password of, or
+    /// `MAIN_MATCH` for none. Only a protected match consumes it: a client may
+    /// join RED/BLUE in a match whose id it names, and anyone may spectate
+    /// without it. It is dropped when the client disconnects or a fresh player
+    /// takes the slot, when the match closes (its slot can be reused with a new
+    /// password), and it is carried across a `map_restart` with the match.
+    /// Identity-keyed rather than slot-keyed so it survives a promotion
+    /// (D-006.11).
+    pub pass_ok: [u8; MAX_CLIENTS],
     /// The TFFA id whose game currently runs in the **main slot** (D-006.11).
     /// A finished main game is replaced by the lowest-id still-played created
     /// match, whose members are runtime-assigned to main (`client_match = 0`)
@@ -623,6 +675,7 @@ impl Default for TffaState {
             }),
             client_match: [0; MAX_CLIENTS],
             home: [0; MAX_CLIENTS],
+            pass_ok: [0; MAX_CLIENTS],
             main_origin: crate::tffa::MAIN_MATCH,
             player_score: [0; MAX_CLIENTS],
             frame_stamp: 0,
@@ -853,7 +906,8 @@ fn ignores_after_reset(previous: Option<&ProxyState>, restart: bool) -> [u32; MA
 /// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
 /// of the round that just ended only for a `map_restart`: which created matches
 /// were open, which id each client belongs to (its `home`, which survives a
-/// promotion, D-006.11), and the rosters a finished game remembers (D-006.10).
+/// promotion, D-006.11), the rosters a finished game remembers (D-006.10), and
+/// each match's password with the clients that had given it (D-006.15).
 /// The runtime-only `main_origin` is not carried: after the restart the main
 /// slot hosts its own id (0) again.
 ///
@@ -881,9 +935,16 @@ fn tffa_after_reset(previous: Option<&TffaState>, restart: bool) -> TffaState {
             m.active = previous.matches[i].active;
         }
         m.remembered = previous.matches[i].remembered;
+        // The password belongs to the identity: a carried match keeps it (and
+        // the clients that had given it), so the group does not have to pass it
+        // around again after a `map_restart`. `reset_round_state` clears it for
+        // a slot that does not survive.
+        m.password = previous.matches[i].password;
+        m.password_len = previous.matches[i].password_len;
     }
     fresh.client_match = previous.client_match;
     fresh.home = previous.home;
+    fresh.pass_ok = previous.pass_ok;
     fresh
 }
 
@@ -1122,12 +1183,19 @@ mod tests {
         previous.restart_grace_frames = 3;
         previous.entity_instance[123] = 2;
         previous.cs_scores_sent[4] = (5, 3);
+        assert!(previous.matches[2].set_password(b"hunter2"));
+        previous.pass_ok[4] = 2;
 
         let carried = tffa_after_reset(Some(&previous), true);
         // Which matches were open and who was in them survives.
         assert!(carried.matches[2].active);
         assert!(carried.matches[5].active);
         assert_eq!(carried.client_match[4], 2);
+        // A protected match keeps its password and the authorisations given to
+        // it; a full map change drops both.
+        assert!(carried.matches[2].password_matches(b"hunter2"));
+        assert!(!carried.matches[5].has_password());
+        assert_eq!(carried.pass_ok[4], 2);
         // Main is always open; scores, per-player copies, cs caches and the
         // per-map clone tags are per round and start clean.
         assert!(carried.matches[crate::tffa::MAIN_MATCH as usize].active);

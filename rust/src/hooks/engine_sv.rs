@@ -1279,6 +1279,9 @@ pub unsafe extern "C" fn sv_execute_client_command(
 ) {
     if crate::diagnostics::verbose_enabled() {
         let bytes = cstr_bytes(command);
+        // A `tffa_*` password argument never reaches the log: the command
+        // shape is kept, the secret token is replaced.
+        let shown = crate::tffa::redact_client_command(bytes);
         crate::diagnostics::verbose(
             "clientcmd",
             format!(
@@ -1287,7 +1290,7 @@ pub unsafe extern "C" fn sv_execute_client_command(
                 unsafe { client_label(cl) },
                 client_ok,
                 bytes.len(),
-                crate::diagnostics::escape_bytes(bytes, 512)
+                crate::diagnostics::escape_bytes(&shown, 512)
             ),
         );
     }

@@ -1273,6 +1273,139 @@ the tab's outsider rows instead changes the unified scoreboard design.
 uses the client's own deferred-load path instead. *Entity drop and re-add* —
 still leaves the model deferred, so it cannot fix the skin.
 
+### D-006.15 — A password can protect a match's teams; spectating stays open
+
+*Status: landed (user directive, 2026-11-03). Automated tests only: the live
+two-client path (a player refused a team, then admitted by the password, while
+another client spectates without it) needs real clients, which the suite cannot
+drive.*
+
+**Requirement.** Players must be able to create and join password-protected TFFA
+instances, and **anyone** must be able to spectate one without knowing the
+password. "Join" therefore means two different things in this overlay, and the
+gate has to sit exactly on the boundary: travelling to an instance (which is how
+spectating another match works, D-006.1) is always allowed; joining RED/BLUE in
+it is what the password protects.
+
+**Commands.** `tffa_create [password]` and `tffa_join <id> [password]` take the
+password as an optional argument, and `tffa_password <password>` gives the
+password of the match the client is **already in** (no travel, no team change).
+The third form is what makes the promoted case (D-006.11) work: after a
+promotion the protected game plays in the main slot under its own identity, so
+there is no active slot id to `tffa_join`; `tffa_password` resolves the client's
+identity through `main_origin` and works there too.
+
+- Creating with a password joins the creator to their side as before and
+  authorises them; creating without one is an open match, exactly as before.
+- `tffa_join <id>` on a protected match moves the client to it as a
+  **spectator** and says the match is protected and how to play. With the
+  password it authorises the client and says they can `/team red|blue`. With a
+  wrong one it still lets them in to spectate and says so. No refusal is added
+  to the travel path, so a protected match behaves exactly like an open one
+  here.
+- `tffa_password` on an open match says there is nothing to unlock; a wrong
+  password leaves the client spectating; a too-long one is rejected without
+  being compared.
+
+Passwords are 1–32 bytes, case-sensitive, and one client-command argument
+(quoting allows spaces: `tffa_create "my pass"` is fine). A longer argument is
+refused at creation / never compared on join rather than truncated.
+`tffa_list` marks a protected match with `^3[password]^7`, including the main
+line while it hosts a promoted protected game.
+
+**Storage and enforcement.** `TffaMatch::password`/`password_len` hold the
+password of that match's **identity** (a 32-byte buffer and a length per slot),
+and `TffaState::pass_ok[client]` holds the identity whose password that client
+has given (`MAIN_MATCH` = none). Identity keying is what makes the rules survive
+the runtime-slot shuffles the overlay already has: a promoted game keeps its
+password in its own (now inactive) slot while it plays in main, and a
+`map_restart` carries both the passwords and the authorisations with the matches
+it carries.
+
+Enforcement is not a new hook. `SetTeam` is already detoured (the team-lock
+entry wrapper, always attached), so the password check runs there first:
+`teamlock::set_team` refuses a RED/BLUE request — explicit or the
+`PickTeam`/`team free` auto pick — for a client whose current identity is
+protected and whose `pass_ok` does not name it, with a message pointing at
+`tffa_password`. Spectator/follow/scoreboard requests and a no-op same-team
+request pass, so the game's own spectator moves (`ClientBegin`'s `SetTeam(ent,
+"s")`, forced spectator) are untouched. The pristine `SetTeam` body is not
+called on a refusal, so the client stays exactly where it was — the same
+mechanism team lock uses.
+
+Rationale for gating at `SetTeam` rather than at `tffa_join`: the overlay's own
+instance-switch paths (`travel_to_spectator`, `set_client_team`,
+`move_match_to_spectator`, the `map_restart` auto-join) call the pristine
+`SetTeam` **trampoline**, which bypasses the wrapper. That is deliberate: the
+creator's first join and a remembered roster's auto-join are already authorised
+by construction, and every explicit command-driven join (`/team red|blue`,
+`team free`, the siege class pick, `forceteam`) goes through the hooked body
+(the one connection-time exception is noted under caveats).
+
+**Lifecycle.** Authorisation and password are dropped where the match or its id
+disappears, so a reused slot can never inherit protection or an old group's
+access:
+
+- `close_instance_state` (a match that closed, was disabled, or could not be
+  rebuilt after `map_restart`) clears the identity's password and every client's
+  `pass_ok` naming it;
+- `tffa_create` on a slot clears any leftover authorisation to that id before
+  setting the new password (and authorises the creator);
+- `reset_round_state` keeps a surviving carried match's password and drops it,
+  with the slot, for a match above a lowered `proxy_tffa_maxMatches` or after a
+  full map change; a full map change also clears `pass_ok`;
+- a disconnect or a fresh client taking the slot clears `pass_ok`
+  (`forget_client_everywhere`), and disabling `proxy_tffa_enable` clears every
+  password with the rest of the overlay, so a later re-enable cannot resurrect a
+  protected match;
+- leaving a match does not forget its password: a client that knew it stays
+  authorised for that identity while the match lives.
+
+**No password in the log.** The verbose `proxy_sv_debugLog 2` client-command
+line logs every raw command (`SV_ExecuteClientCommand` entry wrapper). The
+password token of `tffa_create`/`tffa_join`/`tffa_password` is replaced by `***`
+before escaping (`tffa::redact_client_command`), all other bytes preserved.
+Tokenisation follows the engine's `Cmd_TokenizeString`, so a quoted password
+with spaces is redacted as a whole (`tffa_create "my pass"` → `tffa_create ***`);
+a `//` comment is left alone because the engine reads no password argument there
+either. A rejected attempt is logged at the suspicious level with the client
+number and match id, never the guess.
+
+**Caveats.** The password is a match-access gate, not a cryptographic secret on
+the wire: it travels as a normal client command (client console/history
+included) and is stored in proxy state. Failed attempts are not rate-limited
+beyond the engine's normal client-command handling — an admin who needs that can
+watch the suspicious log. An admin `forceteam` also goes through `SetTeam` and is
+refused for a protected instance; the players can use `tffa_password`, or the
+admin can ask them to. Bots never issue `tffa_*`, so they neither create nor
+join protected matches.
+
+One connect path bypasses `SetTeam`: with `g_teamAutoJoin 1`,
+`G_InitSessionData` (`g_session.c:187-228`, the auto-join at `:197-199`) assigns
+`sess.sessionTeam = PickTeam(-1)` directly for a first-time connect, then
+broadcasts it. A
+first-time connect always lands in main, so this is inert for created slots; it
+can only put one new client on a team without the password while main hosts a
+**promoted** protected game. Closing it would mean either writing the game's
+`g_teamAutoJoin` cvar struct (a new pinned offset) or undoing the assignment
+after the fact (no `ClientUserinfoChanged` trampoline), both larger than the
+corner warrants. With `g_teamAutoJoin` off (the default) there is no bypass: a
+connecting client starts as a spectator and every team join goes through the
+gate.
+
+**Tests.** `passwords_are_exact_and_case_sensitive` (storage, case, empty/open,
+too-long keeps the old password), `a_protected_match_refuses_play_until_its_password_is_given`
+(the gate over open/protected/auth-for-another-id/promoted-main cases),
+`tffa_list_marks_password_protected_matches` (created slot and promoted main
+line), `client_command_logging_redacts_password_arguments` (all three commands,
+no-argument passthrough, tab separators, non-UTF-8 bytes untouched),
+`a_map_restart_keeps_a_matches_password_and_a_dropped_match_loses_it` and the
+extended `state::tests::map_restart_carries_only_the_match_overlay` (password and
+`pass_ok` carried; full map change drops both), plus the closed-slot assertions
+in the disable test (password and authorisations die with the id). `cargo test`
+374/374, `clippy --all-targets -D warnings`, `fmt --check`, i686 release build
+and the engine smoke test (`rust/scripts/engine-test.sh`) are green.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
