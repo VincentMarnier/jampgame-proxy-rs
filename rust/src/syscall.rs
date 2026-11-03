@@ -317,8 +317,10 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 // Team chat (`say_team` → `tchat`/`ltchat`) stays inside the
                 // sender's instance: G_SayTo already limited it to the sender's
                 // team, and this drops the recipients of another match (blue in
-                // main no longer reaches blue in tffa1). Global `chat` stays
-                // server-wide. The sender is the acting scope the
+                // main no longer reaches blue in tffa1). A spectator's team
+                // chat is exempt (one `TEAM_SPECTATOR` team server-wide), so
+                // people watching different matches can talk. Global `chat`
+                // stays server-wide. The sender is the acting scope the
                 // `GAME_CLIENT_COMMAND` forward opened around the game's own
                 // `ClientCommand` (`Cmd_Say_f` → `G_Say`), which covers real
                 // clients and bots alike; with no scope open the message is

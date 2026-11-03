@@ -42,8 +42,11 @@
 //!   per-viewer `CS_PLAYERS` demotions re-pushed just before the scoreboard.
 //! - team chat: the same trap drops per-viewer `tchat`/`ltchat` commands whose
 //!   recipient is in another match (`team_chat_visible`), using the acting
-//!   scope the `GAME_CLIENT_COMMAND` forward opens for the sender. Global
-//!   `chat` stays server-wide, and `tell` stays private as in base JKA.
+//!   scope the `GAME_CLIENT_COMMAND` forward opens for the sender. Spectators
+//!   are one team server-wide, so a spectator's team chat crosses matches (how
+//!   people watching different games talk to each other) while a playing
+//!   sender's stays inside its match. Global `chat` stays server-wide, and
+//!   `tell` stays private as in base JKA.
 
 use core::ffi::{CStr, c_char, c_int};
 
@@ -152,20 +155,47 @@ pub fn is_team_chat(command: &[u8]) -> bool {
 /// may only reach a client in that same match. `SCOPE_NONE` (no attributable
 /// sender) and out-of-range recipients (a broadcast) are left alone, so chat
 /// generated outside a scoped client command keeps its old reach.
+///
+/// `sender_spectator` relaxes the split: every spectator is on the one
+/// `TEAM_SPECTATOR` team of the whole server (`g_cmds.c:1489-1491`'s
+/// `OnSameTeam`), and spectator chat is how people watching one match talk to
+/// people watching another. A playing sender stays confined to its match.
 pub fn team_chat_visible_in(
     sender_match: u8,
+    sender_spectator: bool,
     recipient: c_int,
     client_match: &[u8; MAX_CLIENTS],
 ) -> bool {
-    if sender_match == SCOPE_NONE || !(0..MAX_CLIENTS as c_int).contains(&recipient) {
+    if sender_match == SCOPE_NONE
+        || sender_spectator
+        || !(0..MAX_CLIENTS as c_int).contains(&recipient)
+    {
         return true;
     }
     client_match[recipient as usize] == sender_match
 }
 
-/// `team_chat_visible_in` against the live client table.
+/// `team_chat_visible_in` against the live client table, with the speaker's
+/// team read from game memory.
 pub fn team_chat_visible(sender_match: u8, recipient: c_int) -> bool {
-    state::with_state(|s| team_chat_visible_in(sender_match, recipient, &s.tffa.client_match))
+    let sender_spectator = sender_match != SCOPE_NONE && sender_is_spectator();
+    state::with_state(|s| {
+        team_chat_visible_in(
+            sender_match,
+            sender_spectator,
+            recipient,
+            &s.tffa.client_match,
+        )
+    })
+}
+
+/// Whether the client whose command is in flight (`GAME_CLIENT_COMMAND`, the
+/// forward that runs `ClientCommand` → `G_Say`) is on the spectator team.
+/// Unknown or absent (`-1`) is "not a spectator", so the fail-safe answer keeps
+/// the per-match split in force.
+fn sender_is_spectator() -> bool {
+    let sender = crate::ignore::acting_sender();
+    (0..MAX_CLIENTS as c_int).contains(&sender) && session_team_of(sender) == Some(TEAM_SPECTATOR)
 }
 
 /// What a viewer sees: their own match, else the followed player's match
@@ -5883,20 +5913,37 @@ mod tests {
         table[2] = 1;
         table[3] = 2;
         // Same match: delivered (the pristine G_SayTo already handles the team).
-        assert!(team_chat_visible_in(MAIN_MATCH, 0, &table));
-        assert!(team_chat_visible_in(MAIN_MATCH, 4, &table));
-        assert!(team_chat_visible_in(1, 1, &table));
-        assert!(team_chat_visible_in(1, 2, &table));
+        assert!(team_chat_visible_in(MAIN_MATCH, false, 0, &table));
+        assert!(team_chat_visible_in(MAIN_MATCH, false, 4, &table));
+        assert!(team_chat_visible_in(1, false, 1, &table));
+        assert!(team_chat_visible_in(1, false, 2, &table));
         // Cross-match: dropped, in both directions.
-        assert!(!team_chat_visible_in(MAIN_MATCH, 1, &table));
-        assert!(!team_chat_visible_in(1, 0, &table));
-        assert!(!team_chat_visible_in(1, 3, &table));
-        assert!(!team_chat_visible_in(2, 2, &table));
+        assert!(!team_chat_visible_in(MAIN_MATCH, false, 1, &table));
+        assert!(!team_chat_visible_in(1, false, 0, &table));
+        assert!(!team_chat_visible_in(1, false, 3, &table));
+        assert!(!team_chat_visible_in(2, false, 2, &table));
         // No attributable sender (no scope) and broadcast recipients: left
         // alone, so an unscoped game-generated team chat keeps its old reach.
-        assert!(team_chat_visible_in(SCOPE_NONE, 1, &table));
-        assert!(team_chat_visible_in(1, -1, &table));
-        assert!(team_chat_visible_in(1, MAX_CLIENTS as c_int, &table));
+        assert!(team_chat_visible_in(SCOPE_NONE, false, 1, &table));
+        assert!(team_chat_visible_in(1, false, -1, &table));
+        assert!(team_chat_visible_in(1, false, MAX_CLIENTS as c_int, &table));
+    }
+
+    #[test]
+    fn spectator_team_chat_crosses_matches() {
+        let mut table = [MAIN_MATCH; MAX_CLIENTS];
+        table[1] = 1;
+        table[2] = 2;
+        // A spectator's team chat is server-wide among spectators: the pristine
+        // OnSameTeam already limits the recipients to `TEAM_SPECTATOR`, so the
+        // match split must not cut a watcher off from another match's watchers.
+        assert!(team_chat_visible_in(MAIN_MATCH, true, 1, &table));
+        assert!(team_chat_visible_in(MAIN_MATCH, true, 2, &table));
+        assert!(team_chat_visible_in(1, true, 0, &table));
+        assert!(team_chat_visible_in(2, true, 0, &table));
+        // The same recipients from a playing sender keep the split.
+        assert!(!team_chat_visible_in(MAIN_MATCH, false, 1, &table));
+        assert!(!team_chat_visible_in(1, false, 2, &table));
     }
 
     #[test]

@@ -723,8 +723,10 @@ are hidden from snapshots, and the scoreboard lists all matches' players — so
 you can see who is where — with the other matches' players grouped as
 spectators and the red/blue header plus each player's score taken from the
 viewer's own match. Global chat is server-wide; team chat (`say_team`) stays
-inside its own match, so blue in main cannot talk to blue in a created match
-(spectators are split the same way). Every match shares the
+inside its own match, so blue in main cannot talk to blue in a created match.
+Spectator chat is the exception: every spectator is on the same team, so a
+spectator's `say_team` reaches the spectators of every match (how people
+watching different games talk to each other). Every match shares the
 server's own `fraglimit` independently (the global team scores are kept
 neutralised so the pristine win check never fires early); when a match hits
 it, the match keeps playing for one second with its damage void — the base

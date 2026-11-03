@@ -223,6 +223,14 @@ pub fn end_sender(previous: c_int) {
     ACTING_SENDER.store(previous, Ordering::Relaxed);
 }
 
+/// Client whose chat line the `G_SEND_SERVER_COMMAND` trap is currently
+/// forwarding, or `-1` when no client command is in flight. Shared by the chat
+/// gates that need the speaker (this module's `/ignore` rule and TFFA's
+/// per-instance team-chat rule).
+pub fn acting_sender() -> c_int {
+    ACTING_SENDER.load(Ordering::Relaxed)
+}
+
 /// Whether a server command emitted during a client-command scope must be
 /// dropped for `recipient`: the line is chat and the recipient ignores `sender`.
 ///

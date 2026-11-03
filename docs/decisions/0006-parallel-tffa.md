@@ -617,6 +617,33 @@ rewrite never sees non-ASCII bytes; and the pristine fraglimit `print` prune
 non-ASCII, which leaves one cosmetic chat line while the `LogExit` hook still
 owns the ending.
 
+**Correction (2026-11-03) — spectator team chat crosses matches.** The split
+above also cut the spectator channel in two, and the user reported it as a bug:
+*"When in TFFA 1, I cannot see spec messages from people in TFFA 0."*
+
+Source evidence: `G_SayTo` drops `SAY_TEAM` unless `OnSameTeam`
+(`g_cmds.c:1489`), and for `GT_TEAM` that is a session-team comparison
+(`g_team.c:186-224`), so every spectator on the server is on the one
+`TEAM_SPECTATOR` team, whichever match they watch. Spectator team chat is
+therefore the channel by which people watching one match talk to people
+watching another; the D-006.7 split was meant for the playing teams (blue in
+main must not reach blue in a created match), not for the watchers.
+
+Rule now: a `tchat`/`ltchat` whose **speaker** is on `TEAM_SPECTATOR` is not
+match-gated (it keeps the pristine `OnSameTeam` reach: the other spectators);
+a playing speaker's team chat stays inside its match. The speaker is the same
+acting client the `/ignore` chat gate already attributes
+(`ignore::acting_sender`, set around the `GAME_CLIENT_COMMAND` forward), and
+its team is read from game memory (`session_team_of`). An unattributable
+speaker or no game slot keeps the split (fail-safe), not the exemption.
+
+This is a proxy-side rule change, verified by unit tests only at this point:
+`tffa::tests::spectator_team_chat_crosses_matches` (spectator sender crosses
+both ways, playing sender still split) and the updated
+`team_chat_stays_inside_the_senders_instance` (playing sender unchanged). No
+runtime A/B with real clients has been run for this correction; the user's
+report is the runtime observation it fixes.
+
 ### D-006.8 — Matches survive `map_restart`, not a map change
 
 *Status: landed (user directive, 2026-10-21).*
@@ -2244,6 +2271,18 @@ that the trigger occurred and that the repair ran, not a symptom by itself.
   `non_utf8_team_chat_stays_inside_the_senders_instance`; `cargo test`
   164/164, `clippy -D warnings`, `fmt --check`, i686 release build and the
   runtime A/B green.
+
+- **Spectator team chat crosses matches (2026-11-03, user bug report "when in
+  TFFA 1, I cannot see spec messages from people in tffa 0"):**
+  `team_chat_visible_in` takes a `sender_spectator` flag that skips the
+  per-match split; `team_chat_visible` derives it from the speaking client's
+  `sess.sessionTeam` (the sender the `GAME_CLIENT_COMMAND` forward already
+  attributes for `/ignore`). Playing senders keep the split. Spectators are one
+  `TEAM_SPECTATOR` team server-wide and the pristine `OnSameTeam` already limits
+  the recipients to spectators. Tests:
+  `spectator_team_chat_crosses_matches` (both directions), existing
+  `team_chat_stays_inside_the_senders_instance` (playing sender unchanged). No
+  runtime A/B yet; see D-006.7 correction.
 
 - **Map-restart persistence (2026-10-21, user directive, D-006.8):**
   `GAME_INIT`'s restart flag now decides whether the parallel-TFFA overlay is
