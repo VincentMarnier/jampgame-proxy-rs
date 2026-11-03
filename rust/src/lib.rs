@@ -366,9 +366,6 @@ pub unsafe extern "C" fn vmMain(
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `vmMain(GAME_INIT, levelTime, randomSeed, restart)` — mirrors
-/// `Proxy_Main.cpp:88-126` (without the patch attach, which is a later
-/// milestone).
 /// `Z_TagFree(TAG_BSP_DISKIMAGE)` (S20): frees the sub-BSP disk images the
 /// engine's `CM_LoadMap_Actual` leaves behind on each map load.
 ///
@@ -382,6 +379,9 @@ unsafe fn free_bsp_disk_images() {
     unsafe { engine::z_tag_free(crate::sdk::TAG_BSP_DISKIMAGE) };
 }
 
+/// `vmMain(GAME_INIT, levelTime, randomSeed, restart)` — mirrors
+/// `Proxy_Main.cpp:88-126` (without the patch attach, which is a later
+/// milestone).
 fn game_init(args: &[c_int; 12]) -> c_int {
     eprintln!("========================================================================");
     eprintln!("----- proxy-rs {VERSION}: bootstrap core loaded");

@@ -1146,8 +1146,10 @@ existing D-006.12 deferral machinery.
 ### D-006.14 — Players keep their skin and animation after an instance switch
 
 *Status: landed (live report, 2026-11-03). The client half rests on the
-SDK/TaystJK cgame source; the runtime smoke test is blocked by the pre-existing
-sub-BSP startup regression (S20, `docs/ybeproxy-2026-delta.md`).*
+SDK/TaystJK cgame source. The pre-existing sub-BSP startup regression (S20,
+`docs/ybeproxy-2026-delta.md`) that blocked the runtime smoke test is fixed
+(D-018, 2026-11-03); server startup is green again, but the instance-switch
+render check still needs a live client.*
 
 Reported: "When you switch TFFA instance, if ingame players don't move, they
 are displayed T-posing." Follow-ups narrowed it down: running players first
