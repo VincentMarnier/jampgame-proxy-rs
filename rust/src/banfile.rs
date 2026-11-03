@@ -867,6 +867,33 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_ban_list_parses() {
+        // rust/proxy_bans.txt is the ready-made list the README points
+        // operators at; a stale or hand-broken copy must fail here, not at
+        // server start.
+        let parsed = parse_file(include_bytes!("../proxy_bans.txt"));
+        assert!(
+            parsed.errors.is_empty(),
+            "{} invalid line(s): {:?}",
+            parsed.errors.len(),
+            &parsed.errors[..parsed.errors.len().min(5)]
+        );
+        assert!(parsed.bans.len() > 10_000, "{} entries", parsed.bans.len());
+
+        let banned = |text: &str| parsed.bans.iter().any(|entry| entry.contains(ip(text)));
+        // One address from each cloud feed: AWS owns 3.0.0.0/8 permanently,
+        // Azure 20.0.0.0/8 and Google Cloud 34.0.0.0/8 (at least in part).
+        assert!(banned("3.1.2.3"), "AWS space is not banned");
+        assert!(banned("20.64.1.1"), "Azure space is not banned");
+        assert!(banned("34.128.1.1"), "Google Cloud space is not banned");
+
+        // Reserved space never belongs in the list (the generator strips it).
+        assert!(!banned("10.1.2.3"), "private space is banned");
+        assert!(!banned("127.0.0.1"), "loopback is banned");
+        assert!(!banned("192.168.1.1"), "private space is banned");
+    }
+
+    #[test]
     fn the_engines_ip_value_is_parsed_without_its_port() {
         assert_eq!(
             parse_userinfo_ip(b"172.30.0.1:29070"),

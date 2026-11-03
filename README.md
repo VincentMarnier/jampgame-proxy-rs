@@ -156,8 +156,16 @@ empty list, not an error.
 203.0.113.7
 ```
 
-A VPN blocklist can be dropped straight into this file: the proxy only
-enforces the ranges, it does not detect VPNs by itself.
+A ready-made cloud/hosting/VPN list ships at `rust/proxy_bans.txt` (tens of
+thousands of ranges). Copy it next to your server, point `proxy_sv_banFile` at
+it and enable `proxy_sv_enableBanFile`. It is a snapshot: regenerate it with
+`tools/update_banlist.py` (Python 3, standard library only), which re-fetches
+the AWS, Google Cloud, Azure, Oracle Cloud, DigitalOcean, Linode and Vultr
+feeds plus the [X4BNet](https://github.com/X4BNet/lists_vpn) VPN+datacenter
+aggregate, strips reserved space, merges adjacent ranges, and refuses to write
+a list that would cover a consumer ISP wholesale. The proxy only enforces the
+ranges, it does not detect VPNs by itself — so any other blocklist can be
+dropped into the file as well.
 
 Notes:
 

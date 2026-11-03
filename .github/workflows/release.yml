@@ -179,4 +179,8 @@ jobs:
           tag_name: v${{ steps.version.outputs.new }}
           name: v${{ steps.version.outputs.new }}
           body_path: release-notes.md
-          files: rust/jampgamei386.so
+          # The .so plus the ready-made ban list (D-020): both are runtime
+          # files an operator drops into a server directory.
+          files: |
+            rust/jampgamei386.so
+            rust/proxy_bans.txt

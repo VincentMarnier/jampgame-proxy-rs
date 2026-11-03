@@ -109,3 +109,8 @@
   range), enforced at connect, plus `rcon ban <client|name>`: IP through the
   active `addip`, GUID when enabled, then kick; `addguid`/`removeguid`/
   `listguid`; `reloadbans` reloads both registries.
+- `0020-shipped-banlist.md` — the ready-made cloud/hosting/VPN range list
+  (`rust/proxy_bans.txt`) and its generator (`tools/update_banlist.py`):
+  provider feeds plus the X4BNet datacenter aggregate, reserved space
+  stripped, adjacent ranges merged, a consumer-ISP guard that refuses a broken
+  source, and a parse test that fails if the shipped file stops loading.
