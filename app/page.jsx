@@ -138,7 +138,7 @@ export default function Home() {
       </header>
 
       <main id="main">
-        {/* ---------- hero ---------- */}
+        {/* ---------- hero — frozen: see docs/decisions/0015-hero-frozen.md ---------- */}
         <div className="hero" id="top">
           <div>
             <span className="status-pill"><span className="pulse" aria-hidden="true" />Anti-cheat &amp; security · QoL features · Saber combat untouched</span>
