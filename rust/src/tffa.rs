@@ -4809,14 +4809,6 @@ pub fn handle_client_command(client_num: c_int) -> bool {
         }
         return true;
     }
-    if name == b"tffa_password" {
-        cmd_password(client_num);
-        return true;
-    }
-    if name == b"tffa_leave" {
-        cmd_leave(client_num);
-        return true;
-    }
     if name == b"tffa_list" {
         cmd_list(client_num);
         return true;
@@ -4893,13 +4885,6 @@ fn cmd_arg_i32(n: c_int) -> Option<i32> {
 
 const JOIN_USAGE: &str = "print \"Usage: tffa_join <match> [password] (0 = main game, 1..N = created matches, see tffa_list). A password is only needed to play in a protected match; anyone may spectate one.\n\"";
 
-const PASSWORD_USAGE: &str = "print \"Usage: tffa_password <password> (gives the password of the match you are in, so you can join its teams).\n\"";
-
-/// `print` text for a team join refused because the match is protected. Names
-/// no id: a promoted match plays in the main slot and `tffa_password` works
-/// there too.
-const PASSWORD_REQUIRED: &str = "print \"This match is password protected: use tffa_password <password> to play in it. Anyone may spectate.\n\"";
-
 /// The TFFA identity whose game runs in a runtime slot: a created slot's own
 /// id, or the promoted game's id while it lives in the main slot (`main_origin`
 /// `0` = main's own game). Pure for the tests.
@@ -4932,7 +4917,7 @@ fn password_cleared(
     !m.has_password() || pass_ok.get(client_num).copied() == Some(identity)
 }
 
-/// What a `tffa_password` (or a password argument of `tffa_join`) did.
+/// What a password argument of `tffa_join` did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Auth {
     /// The client's match has no password: nothing to unlock.
@@ -4970,8 +4955,9 @@ fn authenticate_here(client_num: c_int, given: &[u8]) -> Auth {
     })
 }
 
-/// Tell the client the outcome of a password attempt made out of band (the
-/// `tffa_password` command); `tffa_join <id> <password>` reports its own.
+/// Tell the client the outcome of a password attempt made by
+/// `tffa_join <id> <password>`; the command's own paths report their own cases
+/// and fall back here for `Open`/`TooLong`.
 fn send_auth_outcome(client_num: c_int, auth: Auth) {
     match auth {
         Auth::Open => tell(
@@ -4993,37 +4979,6 @@ fn send_auth_outcome(client_num: c_int, auth: Auth) {
     }
 }
 
-/// `tffa_password <password>`: unlock team joins in the match the client is
-/// already in. It exists so a spectator of a **promoted** protected match
-/// (which plays in the main slot) can authenticate without naming an id, and
-/// so a spectator who joined with `tffa_join <id>` need not travel again.
-fn cmd_password(client_num: c_int) {
-    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
-        return;
-    }
-    let mut buf = [0u8; MAX_TFFA_PASSWORD + 64];
-    let n = cmd_arg(1, &mut buf);
-    if n == 0 {
-        tell(client_num, PASSWORD_USAGE);
-        return;
-    }
-    if !enabled() {
-        tell(
-            client_num,
-            "print \"TFFA matches are not enabled on this server (GT_TEAM only).\n\"",
-        );
-        return;
-    }
-    let auth = authenticate_here(client_num, &buf[..n]);
-    if auth == Auth::Wrong {
-        crate::diagnostics::suspicious(
-            "tffa",
-            format!("password rejected for client {client_num}"),
-        );
-    }
-    send_auth_outcome(client_num, auth);
-}
-
 /// Whether the `SetTeam` wrapper must refuse this client's team join for lack
 /// of the match password (the client's own instance only: main is normally
 /// open, and a promoted protected game is checked under its identity).
@@ -5043,9 +4998,23 @@ pub fn password_gate_blocks(client_num: c_int) -> bool {
     })
 }
 
-/// Tell a client why its team join was refused (the `SetTeam` wrapper).
+/// Tell a client why its team join was refused (the `SetTeam` wrapper). The
+/// match id is the client's own identity, so a promoted game is named by its
+/// own id even though it plays in the main slot.
 pub fn send_password_required(client_num: c_int) {
-    tell(client_num, PASSWORD_REQUIRED);
+    let id = state::with_state(|s| {
+        s.tffa
+            .client_match
+            .get(client_num as usize)
+            .map(|slot| slot_identity(s.tffa.main_origin, *slot))
+            .unwrap_or(MAIN_MATCH)
+    });
+    tell(
+        client_num,
+        &format!(
+            "print \"This match is password protected: use tffa_join {id} <password> to play in it. Anyone may spectate.\n\""
+        ),
+    );
 }
 
 /// Raw byte spans of the tokens the engine's `Cmd_TokenizeString` would parse
@@ -5104,9 +5073,9 @@ fn raw_token_spans(cmd: &[u8]) -> Vec<(usize, usize)> {
     }
 }
 
-/// Redact the password argument of `tffa_create`/`tffa_join`/`tffa_password`
-/// from a raw client command before it is written to the verbose diagnostics
-/// log (`proxy_debug.log`). Everything else is returned byte for byte, so a log
+/// Redact the password argument of `tffa_create`/`tffa_join` from a raw client
+/// command before it is written to the verbose diagnostics log
+/// (`proxy_debug.log`). Everything else is returned byte for byte, so a log
 /// line still shows the command shape. Pure for the tests.
 pub fn redact_client_command(cmd: &[u8]) -> Vec<u8> {
     let spans = raw_token_spans(cmd);
@@ -5123,7 +5092,6 @@ pub fn redact_client_command(cmd: &[u8]) -> Vec<u8> {
     let secret_index = match name {
         b"tffa_create" => 1,
         b"tffa_join" => 2,
-        b"tffa_password" => 1,
         _ => return cmd.to_vec(),
     };
     let Some(&(secret, secret_end)) = spans.get(secret_index) else {
@@ -5375,7 +5343,7 @@ fn cmd_create(client_num: c_int) {
     };
     // Travel last among the checks that can refuse: a playing client is
     // moved to spectator (which suicides them), so no refusal may come after
-    // it. `tffa_create` works ingame, exactly like `tffa_join`/`tffa_leave`.
+    // it. `tffa_create` works ingame, exactly like `tffa_join`.
     if !travel_to_spectator(client_num) {
         return;
     }
@@ -5482,9 +5450,10 @@ fn cmd_join(client_num: c_int, id: i32) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    // `tffa_join 0` returns to the main game: it is the same move as
-    // `tffa_leave`, and like it works even when the feature gate is off (a
-    // match can outlive the cvar/gametype that opened it).
+    // `tffa_join 0` returns to the main game and closes the match being left
+    // when nobody is left playing there. Like the other travel commands it
+    // works even when the feature gate is off (a match can outlive the
+    // cvar/gametype that opened it).
     if id == MAIN_MATCH as i32 {
         cmd_leave(client_num);
         return;
@@ -5509,8 +5478,8 @@ fn cmd_join(client_num: c_int, id: i32) {
     // Already in the game of `id`: its own runtime slot, or a promoted game
     // running in the main slot (identity `main_origin`, D-006.11). There is no
     // move, so do not put the client through the spectator step (a travel would
-    // kill a playing client for nothing). `tffa_join 0` / `tffa_leave` say the
-    // same through `cmd_leave`.
+    // kill a playing client for nothing). `tffa_join 0` says the same through
+    // `cmd_leave`.
     let runtime = client_match(client_num);
     let main_origin = state::with_state(|s| s.tffa.main_origin);
     if runtime == id || (runtime == MAIN_MATCH && main_origin == id) {
@@ -5532,12 +5501,12 @@ fn cmd_join(client_num: c_int, id: i32) {
             return;
         }
         // A spectator already in a protected match can unlock its teams
-        // without travelling: the same check `tffa_password` makes.
+        // without travelling: the same check a password argument makes.
         if given.is_empty() {
             tell(
                 client_num,
                 &format!(
-                    "print \"Match {id} is password protected: you are spectating. Use tffa_password <password> to play in it.\n\""
+                    "print \"Match {id} is password protected: you are spectating. Use tffa_join {id} <password> to play in it.\n\""
                 ),
             );
             return;
@@ -5574,7 +5543,7 @@ fn cmd_join(client_num: c_int, id: i32) {
             tell(
                 client_num,
                 &format!(
-                    "print \"The game of match {id} is running as the main game: use tffa_leave, then tffa_password <password> to play in it.\n\""
+                    "print \"The game of match {id} is running as the main game: use tffa_join 0, then tffa_join {id} <password> to play in it.\n\""
                 ),
             );
         } else {
@@ -5646,21 +5615,21 @@ fn cmd_join(client_num: c_int, id: i32) {
         tell(
             client_num,
             &format!(
-                "print \"Joined match {id} as a spectator. It is password protected: use tffa_password <password> to play in it.\n\""
+                "print \"Joined match {id} as a spectator. It is password protected: use tffa_join {id} <password> to play in it.\n\""
             ),
         );
     } else if given.len() > MAX_TFFA_PASSWORD {
         tell(
             client_num,
             &format!(
-                "print \"Joined match {id} as a spectator: password too long (max {MAX_TFFA_PASSWORD} characters). Use tffa_password <password> to play in it.\n\""
+                "print \"Joined match {id} as a spectator: password too long (max {MAX_TFFA_PASSWORD} characters). Use tffa_join {id} <password> to play in it.\n\""
             ),
         );
     } else {
         tell(
             client_num,
             &format!(
-                "print \"Joined match {id} as a spectator: wrong password. Use tffa_password <password> to play in it.\n\""
+                "print \"Joined match {id} as a spectator: wrong password. Use tffa_join {id} <password> to play in it.\n\""
             ),
         );
     }
@@ -5681,9 +5650,9 @@ fn cmd_leave(client_num: c_int) {
         tell(client_num, "print \"You are already in the main game.\n\"");
         return;
     }
-    // `tffa_leave` (and `tffa_join 0`) works ingame too: the playing client is
-    // moved to spectator first. A player whose game was promoted into main is
-    // already there at runtime; leaving only drops its id, so no suicide.
+    // `tffa_join 0` works ingame too: the playing client is moved to spectator
+    // first. A player whose game was promoted into main is already there at
+    // runtime; leaving only drops its id, so no suicide.
     if slot != MAIN_MATCH && !travel_to_spectator(client_num) {
         return;
     }
@@ -7603,10 +7572,6 @@ mod tests {
         assert_eq!(
             redact_client_command(b"tffa_join 3 hunter2"),
             &b"tffa_join 3 ***"[..]
-        );
-        assert_eq!(
-            redact_client_command(b"tffa_password hunter2"),
-            &b"tffa_password ***"[..]
         );
         // Tokenisation matches the engine's `Cmd_TokenizeString`: the original
         // separators survive in the log line, and a quoted password (which may

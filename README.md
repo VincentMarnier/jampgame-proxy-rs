@@ -45,7 +45,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeamsAfterXSecs`        | 0       | grace delay in seconds (`0` = off) before a TDM/CTF round's teams lock: teams stay open for that long; a join in an instance cancels its lock for the round, otherwise the even roster is capped at its size; with parallel TFFA every instance is handled per its own roster (see [Team lock](#team-lock)) |
 | `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeamsAfterXSecs` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
-| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_password`/`tffa_leave`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
+| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
@@ -714,16 +714,18 @@ sizes agree again.
 With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
 parallel matches on the same map: `tffa_create` opens a match, puts the
 creator on its smaller side (red when it is empty) and joins it,
-`tffa_join <id>` / `tffa_leave` switch matches (`tffa_join 0` returns to the
-main game, same as `tffa_leave`) and `tffa_list` shows them.
+`tffa_join <id>` switches matches (`tffa_join 0` returns to the main
+game) and `tffa_list` shows them.
 `tffa_create <password>` opens a **password-protected** match,
-`tffa_join <id> <password>` joins one to play, and `tffa_password <password>`
-gives the password of the match you are already in (this is also the way in
-after a match was promoted into the main game). A password only gates joining
-a team (`/team red|blue`, `team free`): **anyone can spectate a protected
-match without it** — `tffa_join <id>` with no password puts you in it as a
-spectator, and `tffa_list` marks it with `[password]`. Passwords are
-case-sensitive, up to 32 characters, and are never written to the proxy log.
+`tffa_join <id> <password>` joins one to play, and the same
+`tffa_join <id> <password>` unlocks the teams of a match you are already
+in — after a match was promoted into the main game, name its id from
+main (coming from another match, run `tffa_join 0` first). A password only
+gates joining a team (`/team red|blue`, `team free`): **anyone can
+spectate a protected match without it** — `tffa_join <id>` with no
+password puts you in it as a spectator, and `tffa_list` marks it with
+`[password]`. Passwords are case-sensitive, up to 32 characters, and are
+never written to the proxy log.
 These commands work while playing, not only from spectator: a travel command puts
 the player in the spectator team first (their character is killed), then
 switches the instance, so after `tffa_join` they re-pick a team with

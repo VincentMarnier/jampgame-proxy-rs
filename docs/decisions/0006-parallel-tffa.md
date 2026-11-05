@@ -32,10 +32,12 @@ There is no TFFA gametype in base JKA, and the engine/game own a single
 `fraglimit`, global end = pristine `timelimit` path untouched.
 `client_match[n]` (`0` = lobby) in `ProxyState.tffa`,
 fresh per map. Commands via `GAME_CLIENT_COMMAND`: `tffa_create |
-tffa_join <id> | tffa_leave | tffa_list | tffa`.
-`tffa_join 0` selects the always-active main match (id 0), i.e. it is an
-alias of `tffa_leave` (its `enabled()` gate is skipped the same way, so a
-match can be left after the cvar/gametype changed under it).
+tffa_join <id> | tffa_list | tffa`.
+`tffa_join 0` selects the always-active main match (id 0) and is the way
+back to the main game (its `enabled()` gate is skipped the same way, so a
+match can be left after the cvar/gametype changed under it). *Amended
+2026-11-05: the separate `tffa_leave` command was removed; `tffa_join 0`
+covers it.*
 
 ### D-006.2 — Damage gating in the existing wrappers
 
@@ -853,7 +855,7 @@ D-006.11) when they play again or make an explicit move:
   this (it already reads the pre-call team for `teamlock`; the read is now also
   done when parallel TFFA is on, not only during the grace window).
   Spectating/following is not a join and keeps the memory;
-- `tffa_create`/`tffa_join`/`tffa_leave` are explicit moves: they change the
+- `tffa_create`/`tffa_join` (including `tffa_join 0`) are explicit moves: they change the
   client's id (`home`, D-006.11) and clear the old roster;
 - a disconnect, or a fresh client taking a reused slot
   (`GAME_CLIENT_CONNECT(firstTime = qtrue)`), forgets them everywhere.
@@ -943,7 +945,7 @@ lost the original grouping:
 
 **Decision: a per-client identity.** `TffaState::home[client]` holds the TFFA id
 a client belongs to, next to the runtime `client_match`. It changes **only** on
-an explicit instance move (`tffa_create`/`tffa_join`/`tffa_leave`, a closed
+an explicit instance move (`tffa_create`/`tffa_join`, including `tffa_join 0`, a closed
 match returning its members to main, a disconnect/fresh connect) — never on a
 promotion, a finish's move to spectator, or a team join. A per-slot
 `TffaState::main_origin` records the id of the game currently running in the
@@ -1302,10 +1304,11 @@ still leaves the model deferred, so it cannot fix the skin.
 
 ### D-006.15 — A password can protect a match's teams; spectating stays open
 
-*Status: landed (user directive, 2026-11-03). Automated tests only: the live
-two-client path (a player refused a team, then admitted by the password, while
-another client spectates without it) needs real clients, which the suite cannot
-drive.*
+*Status: landed (user directive, 2026-11-03); the standalone `tffa_password`
+command was removed on 2026-11-05 (see the amendment below). Automated tests
+only: the live two-client path (a player refused a team, then admitted by the
+password, while another client spectates without it) needs real clients, which
+the suite cannot drive.*
 
 **Requirement.** Players must be able to create and join password-protected TFFA
 instances, and **anyone** must be able to spectate one without knowing the
@@ -1315,12 +1318,18 @@ spectating another match works, D-006.1) is always allowed; joining RED/BLUE in
 it is what the password protects.
 
 **Commands.** `tffa_create [password]` and `tffa_join <id> [password]` take the
-password as an optional argument, and `tffa_password <password>` gives the
-password of the match the client is **already in** (no travel, no team change).
-The third form is what makes the promoted case (D-006.11) work: after a
-promotion the protected game plays in the main slot under its own identity, so
-there is no active slot id to `tffa_join`; `tffa_password` resolves the client's
-identity through `main_origin` and works there too.
+password as an optional argument.
+
+*Amendment (2026-11-05, user directive):* the third form,
+`tffa_password <password>` (give the password of the match already joined,
+without travelling or changing team), was removed. The promoted case
+(D-006.11) still works: the protected game plays in the main slot under its own
+identity, so a client in main names the match with
+`tffa_join <id> <password>` (coming from another match, `tffa_join 0` first),
+which authorises in place because its runtime slot
+is main and `main_origin` names the match. Likewise, a spectator already in a
+protected match uses the same `tffa_join <id> <password>` form instead of
+travelling again, and the `SetTeam` refusal message now names that form.
 
 - Creating with a password joins the creator to their side as before and
   authorises them; creating without one is an open match, exactly as before.
@@ -1330,9 +1339,8 @@ identity through `main_origin` and works there too.
   wrong one it still lets them in to spectate and says so. No refusal is added
   to the travel path, so a protected match behaves exactly like an open one
   here.
-- `tffa_password` on an open match says there is nothing to unlock; a wrong
-  password leaves the client spectating; a too-long one is rejected without
-  being compared.
+- A wrong password on a match already joined through this command leaves the
+  client spectating; a too-long one is rejected without being compared.
 
 Passwords are 1–32 bytes, case-sensitive, and one client-command argument
 (quoting allows spaces: `tffa_create "my pass"` is fine). A longer argument is
@@ -1354,7 +1362,7 @@ entry wrapper, always attached), so the password check runs there first:
 `teamlock::set_team` refuses a RED/BLUE request — explicit or the
 `PickTeam`/`team free` auto pick — for a client whose current identity is
 protected and whose `pass_ok` does not name it, with a message pointing at
-`tffa_password`. Spectator/follow/scoreboard requests and a no-op same-team
+`tffa_join <id> <password>`. Spectator/follow/scoreboard requests and a no-op same-team
 request pass, so the game's own spectator moves (`ClientBegin`'s `SetTeam(ent,
 "s")`, forced spectator) are untouched. The pristine `SetTeam` body is not
 called on a refusal, so the client stays exactly where it was — the same
@@ -1390,7 +1398,7 @@ access:
 
 **No password in the log.** The verbose `proxy_sv_debugLog 2` client-command
 line logs every raw command (`SV_ExecuteClientCommand` entry wrapper). The
-password token of `tffa_create`/`tffa_join`/`tffa_password` is replaced by `***`
+password token of `tffa_create`/`tffa_join` is replaced by `***`
 before escaping (`tffa::redact_client_command`), all other bytes preserved.
 Tokenisation follows the engine's `Cmd_TokenizeString`, so a quoted password
 with spaces is redacted as a whole (`tffa_create "my pass"` → `tffa_create ***`);
@@ -1403,9 +1411,9 @@ the wire: it travels as a normal client command (client console/history
 included) and is stored in proxy state. Failed attempts are not rate-limited
 beyond the engine's normal client-command handling — an admin who needs that can
 watch the suspicious log. An admin `forceteam` also goes through `SetTeam` and is
-refused for a protected instance; the players can use `tffa_password`, or the
-admin can ask them to. Bots never issue `tffa_*`, so they neither create nor
-join protected matches.
+refused for a protected instance; the players can use
+`tffa_join <id> <password>`, or the admin can ask them to. Bots never issue
+`tffa_*`, so they neither create nor join protected matches.
 
 One connect path bypasses `SetTeam`: with `g_teamAutoJoin 1`,
 `G_InitSessionData` (`g_session.c:187-228`, the auto-join at `:197-199`) assigns
@@ -1559,8 +1567,8 @@ that the trigger occurred and that the repair ran, not a symptom by itself.
     playing outsiders as spectator with a `(TFFA N)` prefix (truncated to
     `MAX_NETNAME`), own match + real specs untouched. Base strings are stored
     proxy-side and re-pushed on match moves / begins.
-  - *Travel works ingame* (2026-10-19): `tffa_create`/`tffa_join`/`tffa_leave`
-    no longer refuse RED/BLUE. A playing client goes through the pristine
+  - *Travel works ingame* (2026-10-19): `tffa_create`/`tffa_join` no longer
+    refuse RED/BLUE. A playing client goes through the pristine
     `SetTeam` trampoline to spectator first (`set_client_spectator`, the same
     body `move_match_to_spectator` uses — the player suicides under
     `g_dontPenalizeTeam`, so no phantom team point), then the proxy moves their
@@ -1570,9 +1578,10 @@ that the trigger occurred and that the repair ran, not a symptom by itself.
     refuse (bad target, inactive/full match, no free slot) runs before the
     suicide, so a refused command never kills the player; a command naming the
     instance the player is already in (`tffa_join 0` in main, `tffa_join N` in
-    N, `tffa_leave` in main) is a no-op with a message and takes the same
-    shortcut, so it never kills them either. `tffa_join 0` and `tffa_leave`
-    share the same path. Moves refresh the mover's view and broadcast their
+    N) is a no-op with a message and takes the same
+    shortcut, so it never kills them either. (`tffa_leave` existed then and
+    shared `tffa_join 0`'s path; it was removed on 2026-11-05, leaving
+    `tffa_join 0` as the only way back.) Moves refresh the mover's view and broadcast their
     slot. `travel_move` (the team→move decision) is unit-tested (90/90 with
     `cargo test`); the forced-suicide path itself is *not* runtime-verified:
     bots never issue client commands, so it needs a live client, and
@@ -2197,8 +2206,8 @@ that the trigger occurred and that the repair ran, not a symptom by itself.
   spectating would have been swept shut on the next frame.
   "In game" is the `client_census` playing filter (connected and off the
   spectator team), not merely "assigned": a match whose last player goes
-  spectator (`/team spectator`), leaves (`tffa_leave` / `tffa_join`
-  elsewhere) or disconnects closes itself, returning any remaining
+  spectator (`/team spectator`), leaves (`tffa_join` elsewhere) or
+  disconnects closes itself, returning any remaining
   spectators to main. It is enforced twice: synchronously in
   `cmd_leave_silent` (`close_if_empty`, before a create/join can need the
   freed slot) and per frame in `on_run_frame_post`

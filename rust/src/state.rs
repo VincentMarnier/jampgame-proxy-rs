@@ -473,7 +473,7 @@ pub struct TffaState {
     pub client_match: [u8; MAX_CLIENTS],
     /// The TFFA id each client belongs to (`0` = main), independent of the slot
     /// their game currently runs in. It changes only on an explicit instance
-    /// move (`tffa_create`/`tffa_join`/`tffa_leave`, or a closed match returning
+    /// move (`tffa_create`/`tffa_join`/`tffa_join 0`, or a closed match returning
     /// them to main), never when a match is promoted into the main slot or when
     /// the client picks a team. A `map_restart` returns every client to this id
     /// (`tffa::reset_round_state`), so TFFA 0 stays TFFA 0 and TFFA 1 stays
