@@ -45,9 +45,14 @@
 //! 1. **rate** — the mean interval is shorter than a hand can sustain, in
 //!    commands for movement (the acceleration payoff is per command) and in
 //!    milliseconds for view/attack (the payoff is per second);
-//! 2. **spread** — the hold lengths, in commands, are confined to a narrow set.
-//!    That is what a config `wait` produces, at any rate and on any channel, and
-//!    small-range randomisation of the wait counts keeps the set narrow.
+//! 2. **spread** — the hold lengths, in milliseconds, are confined to a narrow
+//!    set. That is what a config `wait` produces, at any rate and on any
+//!    channel, and small-range randomisation of the wait counts keeps the set
+//!    narrow. The range is measured in time, not commands: `wait N` replays the
+//!    same frame count, so its duration is exact at any frame rate, while a
+//!    hand's jitter is a fixed number of milliseconds — which at the stock
+//!    `com_maxfps 85` is barely one command, so a command-count range would
+//!    call an ordinary rhythm machine-exact.
 //!
 //! Four reversals are enough: three intervals at a frame-exact 55 ms (200 fps)
 //! is 18 alternations per second, beyond any hand. After a channel has fired,
@@ -71,6 +76,13 @@
 //!
 //! The guard is inert unless a cvar asks for it, and it never prints to the
 //! player: `proxy_sv_antiMacroLog` writes to the server console only.
+//!
+//! **View freezing is opt-in** (`proxy_sv_antiMacroView`, default off). The
+//! view verdict is still computed and logged, but `yaw`/`pitch` are not
+//! rewritten unless it is on. A hand can wiggle a mouse faster and more
+//! regularly than it can mash turn keys, and the wire does not always tell the
+//! two apart; the default therefore keeps hand play untouched. The movement and
+//! attack channels are always enforced by `proxy_sv_antiMacro`.
 
 use crate::sdk::{MAX_CLIENTS, PITCH, Usercmd, YAW};
 
@@ -113,9 +125,13 @@ const RUN_MIN_REVERSALS: u16 = 4;
 /// Reversals needed for the hold-spread test (three holds).
 const SPREAD_MIN_REVERSALS: u16 = 4;
 
-/// A config `wait` gives a few distinct hold counts. A hand's timing spreads
-/// further: at 200 fps, ±10 ms is already ±2 commands per hold.
-const MAX_HOLD_SPREAD_COMMANDS: u32 = 2;
+/// A config `wait` gives hold durations that differ only by the client's frame
+/// quantisation: the same frame count is replayed every burst, so the time is
+/// exact at any frame rate. A hand's timing jitters by roughly ten
+/// milliseconds; at the stock 85 fps that is under one command, which is why
+/// the range is measured in time rather than in commands. Ten milliseconds is
+/// the same allowance the old 2-command range gave at 200 fps.
+const MAX_HOLD_SPREAD_MS: u32 = 10;
 
 /// After a channel has fired, the next burst is caught after this many
 /// reversals for [`WARY_MS`].
@@ -134,6 +150,21 @@ const AXIS_MAX_MEAN_COMMANDS: u32 = 3;
 /// ≈ 15 reversals/s; the reported script is 55 ms at 200 fps (18 % margin). A
 /// slower *exact* script is caught by the hold-spread test instead.
 const VIEW_MAX_MEAN_MS: i32 = 65;
+
+/// A view run must also look like a held turn **key**. A config macro can only
+/// press a key (`cl_input.cpp:1530-1531`), and a held key turns at full speed
+/// every command after the initial frame: its per-command `|delta|` is
+/// `cl_yawspeed * frame_msec`, near-constant at a capped frame rate. A mouse
+/// wiggle accelerates and decelerates, so its mean step is far below its peak
+/// (a sinusoid sits at ~64 %). Requiring 75 % keeps key bursts and rejects
+/// hand-driven mouse wiggles.
+const VIEW_STEP_MEAN_PERCENT: u64 = 75;
+
+/// A view run must also move the view by at least this much between reversals
+/// (`ANGLE2SHORT` units; 364 ≈ 2° peak-to-peak). Below it the step profile is
+/// dominated by the noise floor and the blade displacement is negligible; this
+/// closes the small-amplitude hole in the key-shape test.
+const VIEW_MIN_SWING: i32 = 364;
 
 /// Attack: toggling faster than this (~17/s) is not a human click rate.
 const ATTACK_MAX_MEAN_MS: i32 = 60;
@@ -179,8 +210,10 @@ enum Observation {
     Ignore,
     /// The channel is neutral (key released, walk-speed input): the run ends.
     Neutral,
-    /// A directional sample.
-    Sign { sign: i8 },
+    /// A directional sample. `step` is the per-command magnitude (view only):
+    /// a held turn key is full-speed every command, a mouse wiggle accelerates
+    /// and decelerates.
+    Sign { sign: i8, step: u32 },
 }
 
 /// One channel's run accounting.
@@ -196,13 +229,23 @@ struct ChannelState {
     flip_time: i32,
     /// Continuous (unwrapped) view angle, for the swing measure.
     unwrapped: i32,
-    /// Current run: reversals, its first sample, and the hold range in commands
+    /// Current run: reversals, its first sample, and the hold range
     /// (`min_hold_cmds == u32::MAX` while the run has fewer than two holds).
     run_count: u16,
     run_first_cmd: u32,
     run_first_time: i32,
     min_hold_cmds: u32,
     max_hold_cmds: u32,
+    /// The same hold range in milliseconds; this is what the spread test uses
+    /// (a `wait` is exact in time at any frame rate, a hand's jitter is not).
+    min_hold_ms: u32,
+    max_hold_ms: u32,
+    /// View step shape since the run started: sum/count/max of the per-command
+    /// `|delta|`. A held turn key is full-speed every command, so its mean is
+    /// close to its max; a mouse wiggle is not.
+    step_sum: u64,
+    step_count: u32,
+    step_max: u32,
     swing_min: i32,
     swing_max: i32,
     /// `serverTime` of the most recent reversal (the release deadline).
@@ -219,15 +262,22 @@ impl ChannelState {
     /// Feed one command. Returns `true` when the run is machine-like (the
     /// caller sets the lock and the wary deadline).
     fn observe(&mut self, kind: Kind, seq: u32, now: i32, observation: Observation) -> bool {
-        let sign = match observation {
+        let (sign, step) = match observation {
             Observation::Ignore => return false,
             Observation::Neutral => {
                 self.saw = false;
                 self.run_count = 0;
                 return false;
             }
-            Observation::Sign { sign } => sign,
+            Observation::Sign { sign, step } => (sign, step),
         };
+        // Every directional sample of a live run feeds the step-shape measure,
+        // including the same-direction commands the reversal logic ignores.
+        if self.run_count > 0 {
+            self.step_sum = self.step_sum.saturating_add(u64::from(step));
+            self.step_count = self.step_count.saturating_add(1);
+            self.step_max = self.step_max.max(step);
+        }
         if !self.saw {
             self.saw = true;
             self.sign = sign;
@@ -254,6 +304,11 @@ impl ChannelState {
             self.run_first_time = now;
             self.min_hold_cmds = u32::MAX;
             self.max_hold_cmds = 0;
+            self.min_hold_ms = u32::MAX;
+            self.max_hold_ms = 0;
+            self.step_sum = u64::from(step);
+            self.step_count = 1;
+            self.step_max = step;
             self.swing_min = self.unwrapped;
             self.swing_max = self.unwrapped;
             return false;
@@ -262,6 +317,9 @@ impl ChannelState {
         self.run_count = self.run_count.saturating_add(1);
         self.min_hold_cmds = self.min_hold_cmds.min(hold_cmds);
         self.max_hold_cmds = self.max_hold_cmds.max(hold_cmds);
+        let hold_ms_range = hold_ms.max(0) as u32;
+        self.min_hold_ms = self.min_hold_ms.min(hold_ms_range);
+        self.max_hold_ms = self.max_hold_ms.max(hold_ms_range);
         self.swing_min = self.swing_min.min(self.unwrapped);
         self.swing_max = self.swing_max.max(self.unwrapped);
 
@@ -274,10 +332,34 @@ impl ChannelState {
             Kind::Attack => mean_ms <= ATTACK_MAX_MEAN_MS,
         };
         let sustained = self.run_count >= RUN_MIN_REVERSALS && rate;
+        // Time-based, not command-based: `wait N` is exact in milliseconds at
+        // any frame rate, whereas a hand's jitter is a fixed span of time that
+        // a command-count range misreads as exactness at low fps.
         let spread = self.run_count >= SPREAD_MIN_REVERSALS
-            && self.max_hold_cmds - self.min_hold_cmds <= MAX_HOLD_SPREAD_COMMANDS;
+            && self.min_hold_ms != u32::MAX
+            && self.max_hold_ms - self.min_hold_ms <= MAX_HOLD_SPREAD_MS;
         let wary = now < self.wary_until && self.run_count >= WARY_MIN_REVERSALS && rate;
-        sustained || spread || wary
+        let verdict = sustained || spread || wary;
+        // A mouse can reverse the view faster and more regularly than a hand
+        // can mash two turn keys, so *every* view verdict — rate or spread —
+        // also needs the turn-key signature: a bang-bang step profile and a
+        // swing worth neutralising. Movement and attack are not gated.
+        if kind == Kind::View {
+            verdict && self.step_is_key_like() && self.swing_max - self.swing_min >= VIEW_MIN_SWING
+        } else {
+            verdict
+        }
+    }
+
+    /// Whether the run's per-command view steps look like a held turn key
+    /// (mean within [`VIEW_STEP_MEAN_PERCENT`] of the peak) rather than a
+    /// hand-driven mouse wiggle.
+    fn step_is_key_like(&self) -> bool {
+        if self.step_count == 0 || self.step_max == 0 {
+            return false;
+        }
+        self.step_sum * 100
+            >= u64::from(self.step_max) * VIEW_STEP_MEAN_PERCENT * u64::from(self.step_count)
     }
 
     /// Mean interval of the current run, milliseconds (0 with fewer than two
@@ -359,8 +441,16 @@ pub struct Stats {
     /// Shortest and longest hold in the run, commands (`0` with one reversal).
     pub min_hold_cmds: u32,
     pub max_hold_cmds: u32,
+    /// Shortest and longest hold in the run, milliseconds (`0` with one
+    /// reversal). The spread test compares this range.
+    pub min_hold_ms: u32,
+    pub max_hold_ms: u32,
     /// View swing over the run, `ANGLE2SHORT` units (0 for other channels).
     pub swing: i32,
+    /// View: mean and peak per-command `|delta|` over the run, `ANGLE2SHORT`
+    /// units (0 for other channels). The key-vs-mouse shape test reads these.
+    pub step_mean: u32,
+    pub step_max: u32,
     /// Whether the channel is currently frozen.
     pub locked: bool,
 }
@@ -389,6 +479,13 @@ impl Events {
     }
 }
 
+/// [`process_with_view`] with the view following `apply`. Used by the unit
+/// tests; the runtime calls [`process_with_view`] so the two can differ.
+#[cfg(test)]
+pub fn process(state: &mut MacroState, cmd: &mut Usercmd, apply: bool, log_level: i32) -> Events {
+    process_with_view(state, cmd, apply, apply, log_level)
+}
+
 /// Observe one raw command and, when `apply` is set, neutralise the channels
 /// currently locked.
 ///
@@ -397,7 +494,17 @@ impl Events {
 /// `log_level` is the `proxy_sv_antiMacroLog` level: `0`/`1` no statistics
 /// (`1` still logs transitions), `2` the figures for locked channels, `3` the
 /// figures for every channel with a run (diagnostic).
-pub fn process(state: &mut MacroState, cmd: &mut Usercmd, apply: bool, log_level: i32) -> Events {
+///
+/// `apply_view` decides whether a locked `yaw`/`pitch` is frozen, while `apply`
+/// still covers the movement and attack channels. Detection and logging are the
+/// same in either case.
+pub fn process_with_view(
+    state: &mut MacroState,
+    cmd: &mut Usercmd,
+    apply: bool,
+    apply_view: bool,
+    log_level: i32,
+) -> Events {
     let raw = *cmd;
     let now = raw.server_time;
     let mut events = Events::default();
@@ -445,7 +552,8 @@ pub fn process(state: &mut MacroState, cmd: &mut Usercmd, apply: bool, log_level
     }
 
     for (ch, channel) in state.channels.iter_mut().enumerate() {
-        if apply && channel.locked {
+        let freeze = apply && channel.locked && (apply_view || kind_of(ch) != Kind::View);
+        if freeze {
             write(ch, cmd, channel.applied);
         } else {
             // Remember what a lock starting on the next command must freeze at.
@@ -488,8 +596,24 @@ impl MacroState {
                     channel.min_hold_cmds
                 },
                 max_hold_cmds: channel.max_hold_cmds,
+                min_hold_ms: if channel.min_hold_ms == u32::MAX {
+                    0
+                } else {
+                    channel.min_hold_ms
+                },
+                max_hold_ms: channel.max_hold_ms,
                 swing: if kind_of(ch) == Kind::View {
                     channel.swing_max - channel.swing_min
+                } else {
+                    0
+                },
+                step_mean: if kind_of(ch) == Kind::View && channel.step_count > 0 {
+                    (channel.step_sum / u64::from(channel.step_count)) as u32
+                } else {
+                    0
+                },
+                step_max: if kind_of(ch) == Kind::View {
+                    channel.step_max
                 } else {
                     0
                 },
@@ -530,6 +654,7 @@ fn sample(ch: usize, raw: &Usercmd, prev: &Usercmd) -> Observation {
             let pressed = raw.buttons & ATTACK_BUTTONS != 0;
             Observation::Sign {
                 sign: if pressed { 1 } else { -1 },
+                step: 0,
             }
         }
         _ => Observation::Ignore,
@@ -544,6 +669,7 @@ fn axis_sample(value: i8) -> Observation {
     }
     Observation::Sign {
         sign: value.signum() as i8,
+        step: 0,
     }
 }
 
@@ -554,6 +680,7 @@ fn angle_sample(delta: i32) -> Observation {
     }
     Observation::Sign {
         sign: delta.signum() as i8,
+        step: delta.unsigned_abs(),
     }
 }
 
@@ -766,6 +893,145 @@ mod tests {
         let mut driver = YawDriver::new();
         let (locked, _) = driver.feed(&[31; 6], 5, 127, true);
         assert!(locked, "a slow but exact view burst must fire");
+    }
+
+    #[test]
+    fn a_frame_exact_burst_still_fires_at_a_low_frame_rate() {
+        // At the stock 85 fps a `wait 10` burst is ~168 ms per hold, well
+        // inside hand speed, so only the exactness gives it away.
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed(&[14; 6], 12, 127, true);
+        assert!(locked, "exact holds must fire whatever the frame rate");
+    }
+
+    #[test]
+    fn a_human_rhythm_at_the_stock_frame_rate_is_untouched() {
+        // 5-6 reversals/s with a few commands of jitter: at 83 fps that is a
+        // command range of 2, which the old command-count spread test read as
+        // a `wait` script. In time the same holds differ by 24 ms, which is a
+        // hand, not a frame counter.
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed(&[14, 15, 14, 16, 15], 12, 127, true);
+        assert!(!locked, "ordinary rhythm at a low frame rate must not fire");
+    }
+
+    #[test]
+    fn a_human_click_rhythm_at_the_stock_frame_rate_is_untouched() {
+        // The same jitter on the attack channel: a range of two commands at
+        // 83 fps is not a frame-exact bind.
+        let mut state = MacroState::default();
+        let holds = [14u32, 15, 14, 16, 15];
+        let mut time = 0;
+        let mut locked = false;
+        for (h, hold) in holds.iter().enumerate() {
+            let pressed = h % 2 == 0;
+            for _ in 0..*hold {
+                let mut c = Usercmd {
+                    server_time: time,
+                    ..Usercmd::default()
+                };
+                if pressed {
+                    c.buttons = ATTACK_BUTTONS;
+                }
+                locked |= process(&mut state, &mut c, true, 0).started[CH_ATTACK];
+                time += 12;
+            }
+        }
+        assert!(!locked, "a hand's click rhythm must not fire");
+    }
+
+    #[test]
+    fn a_mouse_wiggle_is_not_a_turn_key_burst() {
+        // A hand wiggling the mouse: each half-cycle accelerates and
+        // decelerates, so the per-command step is nothing like a held key. The
+        // reversal rate (~42 ms per hold) is well past the key-mashing limit
+        // the rate test was calibrated for.
+        let mut state = MacroState::default();
+        let holds: [&[u32]; 5] = [
+            &[50, 130, 180, 130, 50],
+            &[40, 80, 130, 180, 210, 210, 180, 130, 80],
+            &[60, 140, 200, 200, 140, 60],
+            &[40, 70, 110, 160, 200, 200, 160, 110, 70, 40],
+            &[50, 120, 180, 200, 180, 120, 50],
+        ];
+        let mut angle = 20_000i32;
+        let mut time = 0;
+        let mut locked = false;
+        for (h, steps) in holds.iter().enumerate() {
+            let sign = if h % 2 == 0 { -1 } else { 1 };
+            for step in steps.iter() {
+                angle = (angle + sign * *step as i32) & 0xFFFF;
+                let mut c = Usercmd {
+                    server_time: time,
+                    ..Usercmd::default()
+                };
+                c.angles[YAW] = angle;
+                locked |= process(&mut state, &mut c, true, 0).started[CH_YAW];
+                time += 5;
+            }
+        }
+        assert!(!locked, "a hand-driven mouse wiggle must not fire");
+    }
+
+    #[test]
+    fn a_steady_mouse_wiggle_with_exact_holds_is_untouched() {
+        // A rhythmic wiggle can have hold timings inside 10 ms, which is the
+        // spread signature. The view verdict must still require the key shape:
+        // these steps ramp up and down, so they are not a held key.
+        let mut state = MacroState::default();
+        let row = [40u32, 90, 140, 180, 140, 90, 40];
+        let mut angle = 20_000i32;
+        let mut time = 0;
+        let mut locked = false;
+        for h in 0..5 {
+            let sign = if h % 2 == 0 { -1 } else { 1 };
+            for step in row.iter() {
+                angle = (angle + sign * *step as i32) & 0xFFFF;
+                let mut c = Usercmd {
+                    server_time: time,
+                    ..Usercmd::default()
+                };
+                c.angles[YAW] = angle;
+                locked |= process(&mut state, &mut c, true, 0).started[CH_YAW];
+                time += 5;
+            }
+        }
+        assert!(!locked, "regular mouse timing alone must not fire");
+    }
+
+    #[test]
+    fn a_small_mouse_wiggle_is_untouched() {
+        // A bang-bang step profile at a small amplitude: the shape test alone
+        // would pass it (the noise floor hides the turnarounds), but the swing
+        // is under 2°, which is not the blade-wiggle payoff.
+        let mut state = MacroState::default();
+        let holds = [4u32, 7, 5, 8, 6];
+        let mut angle = 20_000i32;
+        let mut time = 0;
+        let mut locked = false;
+        for (h, hold) in holds.iter().enumerate() {
+            let sign = if h % 2 == 0 { -1 } else { 1 };
+            for _ in 0..*hold {
+                angle = (angle + sign * 40) & 0xFFFF;
+                let mut c = Usercmd {
+                    server_time: time,
+                    ..Usercmd::default()
+                };
+                c.angles[YAW] = angle;
+                locked |= process(&mut state, &mut c, true, 0).started[CH_YAW];
+                time += 5;
+            }
+        }
+        assert!(!locked, "a sub-2° wiggle is not the view-wiggle payoff");
+    }
+
+    #[test]
+    fn a_turn_key_burst_with_irregular_holds_is_detected() {
+        // The same irregular hold lengths driven by a key: every command is a
+        // full-speed step, which is the machine signature.
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed(&[5, 9, 6, 10, 7, 5], 5, 127, true);
+        assert!(locked, "a fast turn-key burst need not have exact holds");
     }
 
     #[test]
@@ -989,6 +1255,38 @@ mod tests {
     }
 
     #[test]
+    fn view_freezing_is_opt_in() {
+        // Detection still locks the view, but with `apply_view` off the raw
+        // angle is left alone (the default: a hand mouse wiggle is too close to
+        // a key-driven wiggle at the wire level).
+        let mut state = MacroState::default();
+        let mut angle = 20_000i32;
+        let mut time = 0;
+        let mut detected = false;
+        for h in 0..6 {
+            let sign = if h % 2 == 0 { -1 } else { 1 };
+            for _ in 0..11 {
+                angle = (angle + sign * 127) & 0xFFFF;
+                let mut c = Usercmd {
+                    server_time: time,
+                    ..Usercmd::default()
+                };
+                c.angles[YAW] = angle;
+                let raw = angle;
+                let e = process_with_view(&mut state, &mut c, true, false, 0);
+                detected |= e.started[CH_YAW];
+                assert_eq!(c.angles[YAW], raw, "a log-only view must not be frozen");
+                time += 5;
+            }
+        }
+        assert!(detected, "the observer must still run");
+        assert!(
+            state.channels[CH_YAW].locked,
+            "the verdict is still computed"
+        );
+    }
+
+    #[test]
     fn log_only_mode_reports_but_never_rewrites() {
         let mut driver = YawDriver::new();
         let (locked, _) = driver.feed(&REPORTED_BURST, 5, 127, false);
@@ -1019,6 +1317,10 @@ mod tests {
         assert!(debug.cmds > 100, "the command feed must be visible");
         let stats = debug.channels[CH_YAW].expect("yaw has a run");
         assert_eq!(stats.mean_ms, 55, "11 commands at 5 ms");
+        assert_eq!(stats.min_hold_ms, 55, "the spread test sees time");
+        assert_eq!(stats.max_hold_ms, 55, "the spread test sees time");
+        assert_eq!(stats.step_mean, 127, "a held turn key is full-speed");
+        assert_eq!(stats.step_max, 127, "a held turn key is full-speed");
         assert!(stats.reversals >= RUN_MIN_REVERSALS);
         assert!(stats.swing > 1_000 && stats.swing < 1_400, "≈6-8° swing");
     }

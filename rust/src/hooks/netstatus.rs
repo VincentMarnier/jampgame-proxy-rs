@@ -79,8 +79,9 @@ use crate::sdk::{
     SIZEOF_CLIENT_T, Usercmd,
 };
 use crate::state::{
-    self, CVAR_ANTI_MACRO, CVAR_ANTI_MACRO_LOG, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT,
-    CVAR_ENABLE_NET_STATUS, CVAR_VOID_TIME_NUDGE, CVAR_VOID_TIME_NUDGE_LOG,
+    self, CVAR_ANTI_MACRO, CVAR_ANTI_MACRO_LOG, CVAR_ANTI_MACRO_VIEW, CVAR_CLIENT_PPS_LOG,
+    CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS, CVAR_VOID_TIME_NUDGE,
+    CVAR_VOID_TIME_NUDGE_LOG,
 };
 use crate::syscall;
 use crate::timenudge;
@@ -384,13 +385,15 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
         // `proxy_sv_antiMacro` rewrites the command. The engine's duplicate
         // filter above this call site means each command is seen once.
         let anti_macro = s.cvars[CVAR_ANTI_MACRO].integer != 0;
+        let anti_macro_view = s.cvars[CVAR_ANTI_MACRO_VIEW].integer != 0;
         let log_level = s.cvars[CVAR_ANTI_MACRO_LOG].integer;
         let events = if anti_macro || log_level != 0 {
             // SAFETY: cmd is the engine's usercmd buffer for this call.
-            crate::macroguard::process(
+            crate::macroguard::process_with_view(
                 &mut s.clients[client_num].macro_guard,
                 unsafe { &mut *cmd },
                 anti_macro,
+                anti_macro_view,
                 log_level,
             )
         } else {
@@ -483,17 +486,24 @@ fn print_macro(label: &str, channel: &str, action: &str) {
     ));
 }
 
-/// `swing` is in `ANGLE2SHORT` units (360°/65536); `holds` are command counts.
+/// `swing` is in `ANGLE2SHORT` units (360°/65536); `holds` and `holdms` are the
+/// command and millisecond ranges of the holds; `step` is the per-command view
+/// step (mean..peak).
 fn print_macro_debug(label: &str, cmds: u32, channel: &str, stats: &crate::macroguard::Stats) {
     let swing_deg = stats.swing * 360 / 65536;
     print_macro_line(format!(
         "jampgame-proxy-rs: antiMacro debug {label} cmds={cmds} {channel} \
-         rev={} mean={}ms/{}cmd holds={}..{} swing={}deg locked={}\n",
+         rev={} mean={}ms/{}cmd holds={}..{} holdms={}..{} step={}..{} \
+         swing={}deg locked={}\n",
         stats.reversals,
         stats.mean_ms,
         stats.mean_cmds,
         stats.min_hold_cmds,
         stats.max_hold_cmds,
+        stats.min_hold_ms,
+        stats.max_hold_ms,
+        stats.step_mean,
+        stats.step_max,
         swing_deg,
         u8::from(stats.locked),
     ));

@@ -116,16 +116,21 @@
   stripped, adjacent ranges merged, a consumer-ISP guard that refuses a broken
   source, and a parse test that fails if the shipped file stops loading.
 - `0021-anti-macro.md` — opt-in anti-macro input guard (`proxy_sv_antiMacro` /
-  `proxy_sv_antiMacroLog`): the server cannot see opposing key states
+  `proxy_sv_antiMacroLog` / `proxy_sv_antiMacroView`): the server cannot see
+  opposing key states
   (`CL_CreateCmd` sums and clamps them), so the guard watches sign reversal of
   `forwardmove`/`rightmove`/`upmove`, the `yaw`/`pitch` deltas and the attack
   bits, and freezes a channel when a **run** of reversals (chained within 200 ms)
-  is beyond a hand — four reversals at ≤3 commands (movement) or ≤65 ms (view),
-  or frame-exact `wait` holds (spread ≤2) — plus a 3 s *wary* period that catches
+  is beyond a hand — four reversals at ≤3 commands (movement) or ≤65 ms (view,
+  which must also look like a held key rather than a mouse wiggle and clear a
+  2° swing floor), or frame-exact `wait` holds (time spread ≤10 ms) — plus a
+  3 s *wary* period that catches
   the next burst sooner; run-based because a bind is a short burst, and rate-based
   because randomised wait counts keep the mean. Includes the
-  `proxy_sv_antiMacroLog` transition/statistics levels, a never-notify rule, and
-  thresholds to be checked with the log-only mode first.
+  `proxy_sv_antiMacroLog` transition/statistics levels, a never-notify rule,
+  opt-in view freezing (`proxy_sv_antiMacroView`, default off: hand mouse play
+  is not reliably separable from a key wiggle), and thresholds to be checked
+  with the log-only mode first.
 - `0022-fov-cap.md` — opt-in `proxy_sv_maxFov` visibility cap: stock clients
   never report `cg_fov`, so the proxy caps the entity stream instead — players
   outside a `maxFov`-degree cone around the viewer are hidden per viewer with

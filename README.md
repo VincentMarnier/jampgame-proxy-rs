@@ -56,6 +56,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
 | `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
 | `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
+| `proxy_sv_antiMacroView`              | 0       | `0` observe/log the view verdict but never freeze `yaw`/`pitch` (hand mouse play is too close to a key wiggle at the wire level); non-zero freezes a locked view |
 | `proxy_sv_maxFov`                     | 0       | maximum `cg_fov` value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing; `0` = off (see [FOV cap](#fov-cap)) |
 | `proxy_sv_maxFovAspect`               | 1.7777778 | screen aspect used to turn `proxy_sv_maxFov` into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's `cg_fovAspectAdjust 1`; use `1.3333334` for 4:3/stock clients or higher for ultrawide) |
 | `proxy_sv_maxFovCameraRange`          | 100     | third-person camera setback (world units) assumed by the frustum test; `100` matches the stock `cg_thirdPersonRange`, `0` tests from the player's eye (first-person-strict) |
@@ -529,17 +530,34 @@ Within a run, two independent tests are used:
   **commands** for a movement axis (the acceleration payoff is per command), 65
   **ms** for the view (≈15 reversals/s) or 60 ms for the attack button. Four
   reversals are enough: three frame-exact intervals is already far beyond a hand,
-  and randomising the wait counts changes neither the mean nor the payoff.
-- **spread** — after four reversals, the hold lengths in commands are confined
-  to a range of at most 2. That is what a config `wait` produces at *any* rate
-  and on any channel; a hand's timing spreads over several commands per hold.
+  and randomising the wait counts changes neither the mean nor the payoff. A
+  mouse can be wiggled faster than two turn keys can be mashed, so the view rate
+  test also requires the run to look like a **held key**: the mean per-command
+  step must reach 75 % of the peak (a held key is full-speed every command, a
+  mouse wiggle accelerates and decelerates), and the run must swing at least 2°
+  between reversals.
+- **spread** — after four reversals, the hold durations are confined to a range
+  of at most 10 **ms**. That is what a config `wait` produces at *any* rate and
+  on any channel (it replays an exact frame count, so its hold time is exact); a
+  hand's timing jitters by more than that. The range is measured in time rather
+  than commands, because at the stock 85 fps a hand's jitter is under one
+  command.
 
 Once a channel has fired it stays **wary** for 3 s: the next burst fires after
 only three reversals, so repeated presses are neutralised earlier and earlier.
 
-Amplitude is not a signal: at 200 fps the stock `cl_yawspeed 140` turns 0.7°
-per command for a hand and a macro alike, and a movement axis is `±127` (run) or
-`46` (walk) either way.
+Amplitude alone is not a verdict: at 200 fps the stock `cl_yawspeed 140` turns
+0.7° per command for a hand and a macro alike, and a movement axis is `±127`
+(run) or `46` (walk) either way. The view test does use a **2° swing floor**
+(below it the oscillation is negligible and dominated by the 0.2° noise floor)
+and the **shape** of the step over the run (the held-key bang-bang profile
+above), but never the size as a positive signal.
+
+The view verdict is **report-only by default**: `yaw`/`pitch` are observed and
+logged but not frozen unless `proxy_sv_antiMacroView 1`. A hand can wiggle a
+mouse faster and more regularly than it can mash turn keys, and the wire cannot
+always separate that from a scripted key wiggle, so the default leaves the view
+alone. Movement and attack are still frozen by `proxy_sv_antiMacro`.
 
 Frozen means *held*, not zeroed: the command keeps the value of the last
 command before the run, so the player keeps moving in the direction they already
@@ -555,12 +573,15 @@ diagnostic mode:
 
 ```text
 jampgame-proxy-rs: antiMacro client=2 name="..." adr="..." yaw locked
-jampgame-proxy-rs: antiMacro debug client=2 name="..." adr="..." cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 swing=6deg locked=1
+jampgame-proxy-rs: antiMacro debug client=2 name="..." adr="..." cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 holdms=55..55 step=127..127 swing=6deg locked=1
 ```
 
 `cmds` proves the command feed is alive, `rev` counts reversals in the run,
-`mean` is the mean interval, `holds` the shortest/longest hold in commands and
-`swing` the view swing in degrees.
+`mean` is the mean interval, `holds` the shortest/longest hold in commands,
+`holdms` the same range in milliseconds (the spread test runs on this), `step`
+the mean/peak per-command view step (the key-shape test runs on this) and
+`swing` the view swing in degrees. A `locked` transition is the verdict; with
+`proxy_sv_antiMacroView 0` a view lock means "would freeze", not "froze".
 
 Not covered: a single aim snap (one large angle jump is not a reversal), attack
 timing that stays inside the game's own `weaponTime` gate, and a script that both

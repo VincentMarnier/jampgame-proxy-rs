@@ -98,7 +98,9 @@ follows in the default colour. Both surfaces use the same
 
 `proxy_sv_antiMacro` (default `0`, off) with `proxy_sv_antiMacroLog` (default
 `0`; `1` transitions, `2` also the statistics of locked channels, `3` every
-channel with a run) is a Rust-only, D-021 feature. The server never sees opposing
+channel with a run) and `proxy_sv_antiMacroView` (default `0`: compute and log
+the view verdict but do not freeze `yaw`/`pitch`, because hand mouse play is not
+reliably separable) is a Rust-only, D-021 feature. The server never sees opposing
 key states — `CL_CreateCmd` sums the movement keys before sending
 (`cl_input.cpp:1637-1666`) — so the guard watches the thing that is observable:
 a channel's sign reversing between consecutive commands, on `forwardmove`,
@@ -108,17 +110,22 @@ burst of reversals chained while the gap between them is at most 200 ms, so the
 five reversals of a six-hold bind are measured as a burst instead of being
 averaged with the gap until the next key press. Two tests, either firing: **rate**
 (a movement axis with a mean interval of at most 3 commands — the
-`PM_Accelerate` payoff is per command; the view at most 65 ms ≈15/s; attack at
-most 60 ms) and **spread** (after 4 reversals the hold lengths in commands lie
-within a 2-command range — what a config `wait` produces at any rate and on any
-channel). Four reversals suffice, and after a fire the channel stays *wary* for
+`PM_Accelerate` payoff is per command; the view at most 65 ms ≈15/s, and must
+also look like a held turn key with a ≥2° swing rather than a mouse wiggle;
+attack at most 60 ms) and **spread** (after 4 reversals the hold durations lie
+within a
+10 ms range — what a config `wait` produces at any rate and on any channel,
+since it replays an exact frame count; measured in time, not commands, so a
+hand's jitter is not mistaken for exactness at low frame rates). Four reversals
+suffice, and after a fire the channel stays *wary* for
 3 s so the next burst is caught after three. Regularity is
 deliberately *not* used: `wait N` is an exact frame count
 (`cmd_common.cpp:36-53,292-299`, one usercmd per frame,
 `cl_input.cpp:2266-2313`), but a script can rotate wait counts and keep the
-effect. Rate is the payoff axis, so randomising the waits changes nothing. A
-locked channel is held at its last unlocked value and released 400 ms after the
-last reversal; the player is never notified. This catches the reported
+effect. Rate is the payoff axis, so randomising the waits changes nothing. An
+enforced locked channel (movement, attack, and the view only when
+`proxy_sv_antiMacroView` is on) is held at its last unlocked value and released
+400 ms after the last reversal; the player is never notified. This catches the reported
 `bind W "+right;wait 10;…"` burst at 200 fps (six holds of 11 commands, five
 reversals, 0.7° per command) on its fourth reversal — window- and
 regularity-based attempts diluted the burst with the gap before the next press

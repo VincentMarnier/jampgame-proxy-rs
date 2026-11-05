@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 31] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 32] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -48,6 +48,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 31] = [
     (c"proxy_sv_guidBanFile", c"proxy_guid_bans.txt"),
     (c"proxy_sv_antiMacro", c"0"),
     (c"proxy_sv_antiMacroLog", c"0"),
+    (c"proxy_sv_antiMacroView", c"0"),
     (c"proxy_sv_maxFov", c"0"),
     (c"proxy_sv_maxFovAspect", c"1.7777778"),
     (c"proxy_sv_maxFovCameraRange", c"100"),
@@ -129,26 +130,32 @@ pub const CVAR_ANTI_MACRO: usize = 25;
 /// statistics of every channel with a reversal (diagnostic). Works without
 /// `proxy_sv_antiMacro` (reports what would be frozen).
 pub const CVAR_ANTI_MACRO_LOG: usize = 26;
+/// `proxy_sv_antiMacroView`: `0` (default) observe and log the view channels but
+/// never freeze them; non-zero freezes a locked `yaw`/`pitch`. Hand mouse play is
+/// too close to a key-driven view wiggle at the wire level, so enforcement is
+/// opt-in; the movement and attack channels are always covered by
+/// [`CVAR_ANTI_MACRO`].
+pub const CVAR_ANTI_MACRO_VIEW: usize = 27;
 /// `proxy_sv_maxFov`: maximum `cg_fov` value whose rendered wedge is sent to a
 /// viewer (`0` = off). Players outside the wedge are hidden for that viewer by
 /// `crate::fov` (mind-trick bit + 1% model scale + a hidden blade), so a
 /// client-side `cg_fov` wider than the cap shows no extra players.
-pub const CVAR_MAX_FOV: usize = 27;
+pub const CVAR_MAX_FOV: usize = 28;
 /// `proxy_sv_maxFovAspect`: reference aspect ratio used to turn the `cg_fov`
 /// cap into a rendered horizontal wedge. Modern clients (`cg_fovAspectAdjust`
 /// default 1 in OpenJK/TaystJK) widen the horizontal FOV on widescreen; the
 /// default `1.7777778` is 16:9 (use `1.3333334` for 4:3/stock behaviour, more
 /// for ultrawide).
-pub const CVAR_MAX_FOV_ASPECT: usize = 28;
+pub const CVAR_MAX_FOV_ASPECT: usize = 29;
 /// `proxy_sv_maxFovCameraRange`: third-person camera setback, in world units,
 /// used when testing the wedge. Default `100` matches `cg_thirdPersonRange`;
 /// `0` means test from the player's eye (first-person-strict).
-pub const CVAR_MAX_FOV_CAMERA_RANGE: usize = 29;
+pub const CVAR_MAX_FOV_CAMERA_RANGE: usize = 30;
 /// `proxy_sv_maxFovMargin`: world-unit margin added to every side of the FOV
 /// visibility volume. A player whose body or drawn saber comes within this many
 /// world units of the frustum stays visible, so border contacts do not pop in
 /// and out. `0` means the exact frustum (previous behaviour).
-pub const CVAR_MAX_FOV_MARGIN: usize = 30;
+pub const CVAR_MAX_FOV_MARGIN: usize = 31;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -1082,6 +1089,7 @@ mod tests {
         );
         assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO_LOG].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO_VIEW].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_ASPECT].1.to_bytes(), b"1.7777778");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_CAMERA_RANGE].1.to_bytes(), b"100");
