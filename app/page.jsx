@@ -40,6 +40,7 @@ const cvars = [
   ["proxy_sv_maxFov", "0", "Maximum cg_fov value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing (0 = off)", "fov"],
   ["proxy_sv_maxFovAspect", "1.7777778", "Screen aspect used to turn proxy_sv_maxFov into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's cg_fovAspectAdjust 1; 1.3333334 for 4:3/stock clients, higher for ultrawide)", "fov"],
   ["proxy_sv_maxFovCameraRange", "100", "Third-person camera setback (world units) assumed by the frustum test; 100 matches the stock cg_thirdPersonRange, 0 tests from the player's eye (first-person-strict)", "fov"],
+  ["proxy_sv_maxFovMargin", "0", "World-unit margin added to every side of the FOV test volume: a player whose body or drawn saber comes within that distance of the frustum stays visible, so edge contacts do not pop in/out (0 = exact frustum)", "fov"],
 ];
 
 const hardening = [
@@ -54,8 +55,7 @@ const hardening = [
 const playerCommands = [
   "tffa_create [password]",
   "tffa_join <id> [password]",
-  "tffa_password <password>",
-  "tffa_leave",
+  "tffa_join 0",
   "tffa_list",
   "netStatus",
   "showNet",
@@ -143,7 +143,7 @@ export default function Home() {
               <a className="btn ghost" href={REPO}>Source</a>
             </div>
             <div className="stat-row" aria-label="Project facts">
-              <div className="stat"><b>31</b><span>server cvars</span></div>
+              <div className="stat"><b>32</b><span>server cvars</span></div>
               <div className="stat"><b>6</b><span>hardening guards</span></div>
               <div className="stat"><b>8</b><span>parallel TFFA max</span></div>
             </div>
@@ -238,7 +238,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">31 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">32 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -722,6 +722,21 @@ export default function Home() {
               edge targets visible; <code>0</code> tests from the player&apos;s eye.
             </p>
             <p>
+              The test is not based on the player&apos;s feet alone: it samples the
+              whole body box from the game&apos;s own bounds (
+              <code>{"{-15,-15,-24}"}</code> to <code>{"{15,15,40}"}</code>), so a
+              player whose feet are just off screen but whose head or side is still
+              visible stays visible. A drawn, non-thrown saber also contributes its
+              blade from hilt to tip using the server-side blade position, so a
+              saber reaching into the screen comes into view with the player; a
+              corpse and a thrown saber are tested on the body only.{" "}
+              <code>proxy_sv_maxFovMargin</code> (default <code>0</code>, off)
+              enlarges the visible volume by that many world units on every side, so
+              a body or saber just outside the cap still stays visible near the
+              border. It is a distance, not an angle: <code>32</code> is roughly one
+              player width.
+            </p>
+            <p>
               Hiding is instant: the player entity is marked <code>EF_NODRAW</code>{" "}
               for that viewer, with a per-viewer mind-trick bit and a 1% model scale
               as extra layers. The entity stays in the snapshot, so its{" "}
@@ -744,11 +759,12 @@ export default function Home() {
           </div>
           <Code
             title="server.cfg"
-            text={"seta proxy_sv_maxFov 100\nseta proxy_sv_maxFovAspect 1.7777778\nseta proxy_sv_maxFovCameraRange 100"}
+            text={"seta proxy_sv_maxFov 100\nseta proxy_sv_maxFovAspect 1.7777778\nseta proxy_sv_maxFovCameraRange 100\nseta proxy_sv_maxFovMargin 32"}
           >
             seta proxy_sv_maxFov 100{"\n"}
             seta proxy_sv_maxFovAspect 1.7777778{"\n"}
-            seta proxy_sv_maxFovCameraRange 100
+            seta proxy_sv_maxFovCameraRange 100{"\n"}
+            seta proxy_sv_maxFovMargin 32
           </Code>
 
           <h3 className="sub" id="debuglog">Crash diagnostics <span className="count">opt-in</span></h3>
@@ -793,7 +809,7 @@ export default function Home() {
           <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players self-organize into parallel matches on one map — each with its own teams, world, chat and scores. Matches can be password-protected without closing spectating. No extra servers needed." />
           <div className="lifecycle" aria-label="TFFA match lifecycle">
             <div><b><i>1</i>Create</b><code>tffa_create [password]</code> opens a match and joins its smaller side (red when empty); a password protects its teams, not its spectating.</div>
-            <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt; [password]</code> switches matches mid-game — without the password a protected match lets you spectate only; <code>tffa_password</code> gives the password of the match you are already in. <code>tffa_leave</code> or <code>tffa_join 0</code> returns to main.</div>
+            <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt; [password]</code> switches matches mid-game — without the password a protected match lets you spectate only, and naming a match you are already in with its password unlocks its teams in place. <code>tffa_join 0</code> returns to main.</div>
             <div><b><i>3</i>Fight</b>Damage, snapshots, shields, saber clashes, force sounds, kill feed and items are isolated per match; spawn points are picked without counting another match&apos;s players, so no spawn kills across matches. Global chat stays server-wide; team chat stays in its match, except spectator chat, which reaches the spectators of every match.</div>
             <div><b><i>4</i>End</b>Each match shares the server fraglimit: a finished match plays on for one second with damage void before its players go to spectator. Tied matches at the global timelimit play sudden death; when none is tied, the map ends and every player keeps their own match&apos;s final scoreboard.</div>
           </div>
@@ -809,8 +825,8 @@ export default function Home() {
             ))}
           </div>
           <ul className="tight">
-            <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_leave</code> / <code>tffa_list</code> — create, join, leave, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
-            <li><b>Password-protected matches:</b> a password only gates joining a team (<code>/team red|blue</code>, <code>team free</code>) — <b>anyone can spectate a protected match without it</b>. <code>tffa_join &lt;id&gt;</code> with no password puts you in it as a spectator, <code>tffa_list</code> marks it with <code>[password]</code>, and <code>tffa_password &lt;password&gt;</code> gives the password of the match you are already in (also the way in after a match was promoted to the main slot). Passwords are case-sensitive, up to 32 characters, may contain spaces when quoted, and are redacted from the proxy log. A wrong or too-long password still lets you spectate but not play.</li>
+            <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_join 0</code> / <code>tffa_list</code> — create, join (or re-authorise in place), return to the main game, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
+            <li><b>Password-protected matches:</b> a password only gates joining a team (<code>/team red|blue</code>, <code>team free</code>) — <b>anyone can spectate a protected match without it</b>. <code>tffa_join &lt;id&gt;</code> with no password puts you in it as a spectator, <code>tffa_list</code> marks it with <code>[password]</code>, and <code>tffa_join &lt;id&gt; &lt;password&gt;</code> unlocks the teams of a match you are already in — also the way in after a match was promoted to the main slot (name its id from main; coming from another match, run <code>tffa_join 0</code> first). Passwords are case-sensitive, up to 32 characters, may contain spaces when quoted, and are redacted from the proxy log. A wrong or too-long password still lets you spectate but not play.</li>
             <li><code>netStatus</code> / <code>showNet</code> — print the per-player net status table: ping, rtt, jitter, fps, pps, timeNudge, snaps, rate and name (see <a href="#netstatus">Net status</a>; requires <code>proxy_sv_enableNetStatus 1</code>).</li>
             <li>Auto team picks (<code>team free</code>, the client auto-join, <code>g_teamAutoJoin</code>) balance the match being joined. <code>proxy_sv_lockTeamsAfterXSecs</code> locks each match against its own roster once the grace delay expires (a join in it cancels its lock; a match created mid-round stays unlocked until the next round), and <code>proxy_sv_teamSizeRules</code> uses per-match sizes — one rule applies when every populated match is the same <code>N vs N</code>.</li>
             <li>A match that reaches the fraglimit keeps playing for one second with its damage void, then its players move to spectator. It remembers who played and for which team, so the next <code>map_restart</code> brings the match back with them — while a full map change drops it.</li>
