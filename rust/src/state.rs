@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 30] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 31] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -51,6 +51,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 30] = [
     (c"proxy_sv_maxFov", c"0"),
     (c"proxy_sv_maxFovAspect", c"1.7777778"),
     (c"proxy_sv_maxFovCameraRange", c"100"),
+    (c"proxy_sv_maxFovMargin", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -143,6 +144,11 @@ pub const CVAR_MAX_FOV_ASPECT: usize = 28;
 /// used when testing the wedge. Default `100` matches `cg_thirdPersonRange`;
 /// `0` means test from the player's eye (first-person-strict).
 pub const CVAR_MAX_FOV_CAMERA_RANGE: usize = 29;
+/// `proxy_sv_maxFovMargin`: world-unit margin added to every side of the FOV
+/// visibility volume. A player whose body or drawn saber comes within this many
+/// world units of the frustum stays visible, so border contacts do not pop in
+/// and out. `0` means the exact frustum (previous behaviour).
+pub const CVAR_MAX_FOV_MARGIN: usize = 30;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -1078,6 +1084,8 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_ANTI_MACRO_LOG].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_ASPECT].1.to_bytes(), b"1.7777778");
+        assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_CAMERA_RANGE].1.to_bytes(), b"100");
+        assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_MARGIN].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

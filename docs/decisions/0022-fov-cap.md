@@ -55,6 +55,32 @@ vertical half-angles from `proxy_sv_maxFov`/`proxy_sv_maxFovAspect`, around
 `ps.viewangles`, from a point `proxy_sv_maxFovCameraRange` behind the engine's
 eye/camera origin.
 
+The test does not use the entity's feet coordinate (`s.pos.trBase`) alone.
+A player is visible when any sample point is inside the frustum:
+
+- eight corners and the centre of the body box, taken from
+  `gentity_t.r.mins/maxs` (the game sets `playerMins`/`playerMaxs`,
+  `{-15,-15,-24}` .. `{15,15,40}`, `g_client.c`), around `s.pos.trBase`;
+- for a player holding a drawn, non-thrown saber (`weapon == WP_SABER`,
+  `saberInFlight == 0`, `saberHolstered < 2`), the hilt, middle and tip of every
+  active blade from `gclient_t.saber[i].blade[j]`: `muzzlePoint` plus
+  `muzzleDir * length`, the server-side blade position
+  `WP_SaberPositionUpdate` (`w_saber.c:7655`, run from `g_main.c:4051`)
+  computes from the hand bolt.
+
+A corpse (`EF_DEAD`) and a thrown saber use the body box only: the corpse has no
+live held blade, and a thrown saber is a separate entity with its own
+visibility. This removes the "player appears at the screen border" artefact
+caused by hiding a body whose feet were out of view while its head, side or
+saber was already on screen.
+
+`proxy_sv_maxFovMargin` (default `0`) is a world-unit distance, not an angle. It
+offsets every frustum plane outward by that many units (right/left, top/bottom
+and the near plane), so a point within that distance of the true frustum counts
+as visible. The visible volume is therefore enlarged by that many world units on
+every axis: `32` is roughly one player width. `0` is the exact frustum and the
+cheapest setting.
+
 `cg_fov` is not the rendered horizontal angle on modern clients: OpenJK and
 TaystJK default to `cg_fovAspectAdjust 1`, which applies
 `fov_x = 2*atan(tan(cg_fov/2) * 0.75 * aspect)`. The proxy converts the cap
@@ -165,12 +191,20 @@ entity origins (`Proxy_sv_snapshot.cpp`); only the fields differ.
 horizontal and vertical frustum edges, a screen corner, behind the view
 plane, the third-person camera correction (a close 70° target outside the eye
 frustum but on screen from a camera 100 units back, while a far 70° target
-stays capped), the steep-pitch pause, the spectator-viewer gate, the 16-client
-bit mapping, the synthetic apply/restore
+stays capped), the margin enlarging the horizontal, vertical and near
+boundaries while a far-outside point stays hidden, the steep-pitch pause, the
+spectator-viewer gate, the 16-client bit mapping, the synthetic apply/restore
 pass (body scale, trick bit, drawn saber hidden with the hilt hum, thrown saber
-untouched, all fields restored). `rust/src/sdk.rs` pins the new offsets
+untouched, all fields restored). The synthetic pass also covers the new sample
+points: a player whose feet are outside the 50° half-angle but whose body-box
+corner is inside stays visible; a drawn blade crossing into the view keeps the
+player visible while the same body without a blade is hidden; a corpse with a
+stale active blade is still hidden; and an 8-unit margin keeps a point about
+5 units outside the side plane visible. `rust/src/sdk.rs` pins the new offsets
 (`iModelScale` 332, `trickedentindex*` 152/156/160/164, `pos.trBase` 28,
-`clientSnapshot_t.ps.viewangles` 220) against the compiled SDK layout.
+`clientSnapshot_t.ps.viewangles` 220, `r.mins`/`r.maxs` 580/592,
+`saberInfo_t.numBlades` 212 / `blade` 216, `bladeInfo_t` 204 with `active` 0,
+`length` 12, `muzzlePoint` 28, `muzzleDir` 52) against the compiled SDK layout.
 
 Runtime verification (to be run with the engine stack): set
 `proxy_sv_maxFov 100` with the default 16:9 aspect and a client at
@@ -182,7 +216,11 @@ a saber still shows/plays the thrown saber. On a non-16:9 screen, set
 `proxy_sv_maxFovAspect` to the actual aspect and re-check the edge. In third
 person, keep `proxy_sv_maxFovCameraRange` at the stock `100` (or match the
 player's `cg_thirdPersonRange`) and confirm a close target at the screen edge
-stays visible; `0` is the first-person-strict test.
+stays visible; `0` is the first-person-strict test. Walk a target across the
+screen border: the body (including head/feet) and a drawn saber must come into
+view together rather than popping in when the feet coordinate crosses the
+boundary. Set `proxy_sv_maxFovMargin 32` (or `16`/`64`) and confirm the border
+contact becomes softer while a player well outside the view stays hidden.
 
 ## References
 

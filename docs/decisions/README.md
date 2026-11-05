@@ -131,6 +131,8 @@
   outside a `maxFov`-degree cone around the viewer are hidden per viewer with
   the client's mind-trick bit plus a 1 % `iModelScale` (dead ones with
   `EF_NODRAW`), keeping footsteps, swings and the saber hum at the true
-  position; the shared entity state is restored right after
+  position; the test samples the whole body box and a drawn saber's blade, and
+  `proxy_sv_maxFovMargin` enlarges the volume by world units to soften border
+  contacts. The shared entity state is restored right after
   `SV_SendClientSnapshot` copies the snapshot. Thrown sabers stay as-is; Force
   Sight and a custom client that strips both fields are documented limits.

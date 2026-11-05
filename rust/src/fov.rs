@@ -8,7 +8,11 @@
 //! corresponding to `cg_fov N` is hidden for that viewer. Raising `cg_fov` above `N` therefore shows no extra players.
 //! Modern clients widen `cg_fov` for the screen aspect (`cg_fovAspectAdjust`);
 //! `proxy_sv_maxFovAspect` (default 16:9) is the reference used for that
-//! conversion.
+//! conversion. A player is visible when any sampled point is inside the view:
+//! the body box's corners and centre, plus the hilt/middle/tip of a drawn
+//! (non-thrown) saber blade, so bodies and sabers at the screen border do not
+//! pop in on the feet coordinate alone. `proxy_sv_maxFovMargin` expands the
+//! volume outward by that many world units on every side.
 //!
 //! The hide is per viewer and instant: `EF_NODRAW` makes cgame's `CG_Player`
 //! return at the top (no mind-trick fade). The entity stays in the snapshot, so
@@ -30,14 +34,17 @@ use core::ffi::c_int;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::sdk::{
-    EF_DEAD, EF_NODRAW, MAX_CLIENTS, MAX_SNAPSHOT_ENTITIES, OFFSET_GCLIENT_SABER,
-    OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
+    EF_DEAD, EF_NODRAW, MAX_BLADES, MAX_CLIENTS, MAX_SABERS, MAX_SNAPSHOT_ENTITIES,
+    OFFSET_BLADE_ACTIVE, OFFSET_BLADE_LENGTH, OFFSET_BLADE_MUZZLE_DIR, OFFSET_BLADE_MUZZLE_POINT,
+    OFFSET_GCLIENT_SABER, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_R_MAXS,
+    OFFSET_GENTITY_R_MINS, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
     OFFSET_GENTITY_S_IMODEL_SCALE, OFFSET_GENTITY_S_LOOP_SOUND, OFFSET_GENTITY_S_POS_TRBASE,
     OFFSET_GENTITY_S_SABER_HOLSTERED, OFFSET_GENTITY_S_SABER_IN_FLIGHT, OFFSET_GENTITY_S_TRICKED_1,
     OFFSET_GENTITY_S_TRICKED_2, OFFSET_GENTITY_S_TRICKED_3, OFFSET_GENTITY_S_TRICKED_4,
-    OFFSET_GENTITY_S_WEAPON, OFFSET_SABER_SOUND_LOOP, OFFSET_SESS_SESSION_TEAM,
-    OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES,
-    SIZEOF_GENTITY, SIZEOF_SABER_INFO, TEAM_SPECTATOR, WP_SABER,
+    OFFSET_GENTITY_S_WEAPON, OFFSET_SABER_BLADE, OFFSET_SABER_NUM_BLADES, OFFSET_SABER_SOUND_LOOP,
+    OFFSET_SESS_SESSION_TEAM, OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST,
+    OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES, SIZEOF_BLADE_INFO, SIZEOF_GENTITY, SIZEOF_SABER_INFO,
+    TEAM_SPECTATOR, WP_SABER,
 };
 use crate::state;
 
@@ -148,47 +155,131 @@ pub fn view_vectors(angles: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     (forward, right, up)
 }
 
-/// Whether `target` lies inside the camera frustum with horizontal/vertical
-/// half-angles `h_half`/`v_half` around `angles`, from a camera placed
-/// `camera_range` units behind the eye (`origin`).
+/// A camera view frustum precomputed for one viewer snapshot.
 ///
-/// The camera setback matters in third person: the client renders from a point
-/// up to `cg_thirdPersonRange` (default 100) behind the player, so a close
-/// target near the screen edge has a smaller bearing from the camera than from
-/// the eye (`proxy_sv_maxFovCameraRange`; `0` = first-person/eye). A target at
-/// (or essentially at) the camera counts as visible so a degenerate direction
-/// never hides a player. A target behind the view plane is never on screen.
-pub fn visible_in_view_frustum(
-    origin: [f32; 3],
-    angles: [f32; 3],
-    target: [f32; 3],
-    h_half: f32,
-    v_half: f32,
-    camera_range: f32,
-) -> bool {
-    let (forward, right, up) = view_vectors(angles);
-    let range = if camera_range.is_finite() {
-        camera_range.max(0.0)
-    } else {
-        0.0
-    };
-    let cam = [
-        origin[0] - forward[0] * range,
-        origin[1] - forward[1] * range,
-        origin[2] - forward[2] * range,
-    ];
-    let d = [target[0] - cam[0], target[1] - cam[1], target[2] - cam[2]];
-    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    if len2 <= 1.0 {
-        return true;
+/// The half-angles are stored as plane normals (`forward*sin - axis*cos`)
+/// rather than tangents, so a 90° half-angle (the vertical margin can reach it)
+/// stays finite. `margin` offsets every plane outward by that many world units,
+/// which enlarges the visible volume on every axis: a point within `margin` of
+/// the true frustum counts as inside.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewFrustum {
+    cam: [f32; 3],
+    /// Inward unit normals of the right, left, top, bottom and near planes.
+    planes: [[f32; 3]; 5],
+    margin: f32,
+}
+
+impl ViewFrustum {
+    /// Build the frustum for a camera placed `camera_range` units behind the
+    /// eye (`origin`).
+    ///
+    /// The camera setback matters in third person: the client renders from a
+    /// point up to `cg_thirdPersonRange` (default 100) behind the player, so a
+    /// close target near the screen edge has a smaller bearing from the camera
+    /// than from the eye (`proxy_sv_maxFovCameraRange`; `0` = first-person/eye).
+    pub fn new(
+        origin: [f32; 3],
+        angles: [f32; 3],
+        h_half: f32,
+        v_half: f32,
+        camera_range: f32,
+        margin: f32,
+    ) -> ViewFrustum {
+        let (forward, right, up) = view_vectors(angles);
+        let range = if camera_range.is_finite() {
+            camera_range.max(0.0)
+        } else {
+            0.0
+        };
+        let cam = [
+            origin[0] - forward[0] * range,
+            origin[1] - forward[1] * range,
+            origin[2] - forward[2] * range,
+        ];
+        // A half-angle beyond 90° would flip a plane normal and make the
+        // "inside" test wrong; clamp to the valid range (a 90° half-angle is a
+        // half-space on that axis, which `sin`/`cos` handle exactly).
+        let half = |a: f32| {
+            if a.is_finite() {
+                a.clamp(0.0, core::f32::consts::FRAC_PI_2)
+            } else {
+                0.0
+            }
+        };
+        let (sh, ch) = half(h_half).sin_cos();
+        let (sv, cv) = half(v_half).sin_cos();
+        // Side plane through the camera: inside when the point is on the
+        // forward side of the plane, i.e. `dot(d, forward)*sin >= dot(d, axis)*cos`.
+        let plane = |axis: [f32; 3], sin: f32, cos: f32| {
+            [
+                forward[0] * sin - axis[0] * cos,
+                forward[1] * sin - axis[1] * cos,
+                forward[2] * sin - axis[2] * cos,
+            ]
+        };
+        let planes = [
+            plane(right, sh, ch),
+            // Left/top planes are the same construction with the axis flipped.
+            [
+                forward[0] * sh + right[0] * ch,
+                forward[1] * sh + right[1] * ch,
+                forward[2] * sh + right[2] * ch,
+            ],
+            plane(up, sv, cv),
+            [
+                forward[0] * sv + up[0] * cv,
+                forward[1] * sv + up[1] * cv,
+                forward[2] * sv + up[2] * cv,
+            ],
+            forward,
+        ];
+        let margin = if margin.is_finite() {
+            margin.max(0.0)
+        } else {
+            0.0
+        };
+        ViewFrustum {
+            cam,
+            planes,
+            margin,
+        }
     }
-    let f = d[0] * forward[0] + d[1] * forward[1] + d[2] * forward[2];
-    if f <= 0.0 {
-        return false;
+
+    /// Whether `target` lies inside the frustum or within `margin` world units
+    /// of it. A target at (or essentially at) the camera counts as visible so a
+    /// degenerate direction never hides a player; a target behind the view
+    /// plane is only visible within the margin.
+    pub fn contains(&self, target: [f32; 3]) -> bool {
+        let d = [
+            target[0] - self.cam[0],
+            target[1] - self.cam[1],
+            target[2] - self.cam[2],
+        ];
+        // A corrupt/NaN position must not read as "inside" (NaN comparisons are
+        // always false, which would otherwise pass every plane test).
+        if !d.iter().all(|c| c.is_finite()) {
+            return false;
+        }
+        let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if len2 <= 1.0 {
+            return true;
+        }
+        for n in &self.planes {
+            // Each normal is unit length, so the dot product is the signed
+            // distance to that plane. The margin expands every plane outward.
+            if d[0] * n[0] + d[1] * n[1] + d[2] * n[2] < -self.margin {
+                return false;
+            }
+        }
+        true
     }
-    let r = d[0] * right[0] + d[1] * right[1] + d[2] * right[2];
-    let u = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
-    r.abs() <= f * h_half.tan() && u.abs() <= f * v_half.tan()
+}
+
+/// Whether any sample point is inside the view, i.e. some visible part of the
+/// player (body or saber) is on screen.
+pub fn any_point_visible(frustum: &ViewFrustum, points: &[[f32; 3]]) -> bool {
+    points.iter().any(|point| frustum.contains(*point))
 }
 
 /// `(trickedentindex* field, bit)` for a client number: clients 0-15 use
@@ -199,6 +290,95 @@ pub fn trick_mask(viewer: i32) -> (usize, i32) {
     let field = field.min(3);
     let bit = 1i32 << (viewer.max(0) % 16);
     (field, bit)
+}
+
+/// Whether any visible part of a player is inside the view: the eight corners
+/// and centre of the body's bounding box, plus the hilt, middle and tip of
+/// every active blade of a drawn, non-thrown saber.
+///
+/// The body box comes from `gentity_t.r.mins/maxs`, which the game sets to
+/// `playerMins`/`playerMaxs` (`{-15,-15,-24}` .. `{15,15,40}`, `g_client.c`).
+/// The saber blade positions are the server-side values
+/// `WP_SaberPositionUpdate` (`w_saber.c:7655`, run from `g_main.c:4051`)
+/// computes from the hand bolt, so the test follows the part of the player that
+/// protrudes furthest into the view.
+///
+/// # Safety
+///
+/// `ent` must be a live `gentity_t` slot and `client` its live `gclient_t*`.
+unsafe fn player_visible(
+    frustum: &ViewFrustum,
+    ent: usize,
+    client: usize,
+    origin: [f32; 3],
+) -> bool {
+    // SAFETY: ent is a live gentity; r.mins/r.maxs are vec3_t.
+    let mins = unsafe { read_vec3(ent + OFFSET_GENTITY_R_MINS) };
+    let maxs = unsafe { read_vec3(ent + OFFSET_GENTITY_R_MAXS) };
+    let mut body = [[0.0f32; 3]; 9];
+    let mut n = 0;
+    for x in [mins[0], maxs[0]] {
+        for y in [mins[1], maxs[1]] {
+            for z in [mins[2], maxs[2]] {
+                body[n] = [origin[0] + x, origin[1] + y, origin[2] + z];
+                n += 1;
+            }
+        }
+    }
+    body[8] = [
+        origin[0] + (mins[0] + maxs[0]) * 0.5,
+        origin[1] + (mins[1] + maxs[1]) * 0.5,
+        origin[2] + (mins[2] + maxs[2]) * 0.5,
+    ];
+    if any_point_visible(frustum, &body) {
+        return true;
+    }
+    // A corpse has no live held saber; a thrown saber is a separate entity with
+    // its own visibility; a holstered one is not rendered.
+    // SAFETY: the fields below are plain ints/bytes in the live gentity.
+    let e_flags = unsafe { read_i32(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_EFLAGS) };
+    let weapon = unsafe { read_u8(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_WEAPON) };
+    let saber_in_flight =
+        unsafe { read_u8(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_SABER_IN_FLIGHT) } != 0;
+    let saber_holstered =
+        unsafe { read_u8(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_SABER_HOLSTERED) };
+    if e_flags & EF_DEAD != 0 || weapon != WP_SABER || saber_in_flight || saber_holstered >= 2 {
+        return false;
+    }
+    for saber in 0..MAX_SABERS {
+        let saber_info = client + OFFSET_GCLIENT_SABER + saber * SIZEOF_SABER_INFO;
+        // SAFETY: the gclient_t holds MAX_SABERS saberInfo_t entries.
+        let num_blades = unsafe { read_i32(saber_info + OFFSET_SABER_NUM_BLADES) };
+        let num_blades = num_blades.clamp(0, MAX_BLADES as c_int) as usize;
+        for blade in 0..num_blades {
+            let info = saber_info + OFFSET_SABER_BLADE + blade * SIZEOF_BLADE_INFO;
+            // SAFETY: blade < MAX_BLADES, so info is inside this saberInfo_t.
+            if unsafe { read_i32(info + OFFSET_BLADE_ACTIVE) } == 0 {
+                continue;
+            }
+            // SAFETY: the blade's fields are plain scalars/vec3_t.
+            let length = unsafe { read_f32(info + OFFSET_BLADE_LENGTH) };
+            let base = unsafe { read_vec3(info + OFFSET_BLADE_MUZZLE_POINT) };
+            let dir = unsafe { read_vec3(info + OFFSET_BLADE_MUZZLE_DIR) };
+            if !length.is_finite() || length <= 0.0 {
+                continue;
+            }
+            let tip = [
+                base[0] + dir[0] * length,
+                base[1] + dir[1] * length,
+                base[2] + dir[2] * length,
+            ];
+            let mid = [
+                base[0] + dir[0] * length * 0.5,
+                base[1] + dir[1] * length * 0.5,
+                base[2] + dir[2] * length * 0.5,
+            ];
+            if any_point_visible(frustum, &[base, mid, tip]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Apply the FOV cap to every player entity in `e_nums` that falls outside the
@@ -233,11 +413,12 @@ pub unsafe fn apply(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    let (max_fov, aspect, camera_range, requested_viewer) = state::with_state(|s| {
+    let (max_fov, aspect, camera_range, margin, requested_viewer) = state::with_state(|s| {
         (
             s.cvars[state::CVAR_MAX_FOV].integer,
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value,
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value,
+            s.cvars[state::CVAR_MAX_FOV_MARGIN].value,
             s.fov.viewer_client,
         )
     });
@@ -271,6 +452,7 @@ pub unsafe fn apply(
     let angles = [pitch, yaw, roll];
     // SAFETY: `origin` is the engine's vec3_t viewpoint argument.
     let viewpoint = unsafe { read_vec3(origin) };
+    let frustum = ViewFrustum::new(viewpoint, angles, h_half, v_half, camera_range, margin);
     // SAFETY: `e_nums` is a valid snapshotEntityNumbers_t.
     let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
     if count <= 0 {
@@ -301,8 +483,11 @@ pub unsafe fn apply(
             continue;
         }
         // SAFETY: `ent` is a live gentity slot; pos.trBase is a vec3_t.
-        let target = unsafe { read_vec3(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_POS_TRBASE) };
-        if visible_in_view_frustum(viewpoint, angles, target, h_half, v_half, camera_range) {
+        let origin = unsafe { read_vec3(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_POS_TRBASE) };
+        // SAFETY: `ent` and `client` are live game structures; the gentity
+        // bounds and the server-side saber blade positions are maintained by
+        // the game module.
+        if unsafe { player_visible(&frustum, ent, client, origin) } {
             continue;
         }
         if saved_count >= MAX_CLIENTS {
@@ -593,78 +778,75 @@ mod tests {
         assert!(f[0].abs() < 1e-6 && (f[1] - 1.0).abs() < 1e-6);
     }
 
+    fn view(
+        origin: [f32; 3],
+        angles: [f32; 3],
+        h_half: f32,
+        v_half: f32,
+        camera_range: f32,
+        margin: f32,
+    ) -> ViewFrustum {
+        ViewFrustum::new(origin, angles, h_half, v_half, camera_range, margin)
+    }
+
     #[test]
     fn frustum_keeps_front_and_drops_outside() {
         let o = [0.0, 0.0, 0.0];
         let a = [0.0, 0.0, 0.0];
         let h = 50.0f32.to_radians();
         let v = 40.0f32.to_radians();
+        let f = view(o, a, h, v, 0.0, 0.0);
         // Straight ahead.
-        assert!(visible_in_view_frustum(o, a, [100.0, 0.0, 0.0], h, v, 0.0));
+        assert!(f.contains([100.0, 0.0, 0.0]));
         // Horizontal 40 (inside) and 60 (outside).
         let d = 40.0f32.to_radians();
-        assert!(visible_in_view_frustum(
-            o,
-            a,
-            [d.cos() * 100.0, d.sin() * 100.0, 0.0],
-            h,
-            v,
-            0.0
-        ));
+        assert!(f.contains([d.cos() * 100.0, d.sin() * 100.0, 0.0]));
         let d = 60.0f32.to_radians();
-        assert!(!visible_in_view_frustum(
-            o,
-            a,
-            [d.cos() * 100.0, d.sin() * 100.0, 0.0],
-            h,
-            v,
-            0.0
-        ));
+        assert!(!f.contains([d.cos() * 100.0, d.sin() * 100.0, 0.0]));
         // Vertical 30 (inside) and 50 (outside); JKA negative pitch looks up.
         let d = 30.0f32.to_radians();
-        assert!(visible_in_view_frustum(
-            o,
-            a,
-            [d.cos() * 100.0, 0.0, -d.sin() * 100.0],
-            h,
-            v,
-            0.0
-        ));
+        assert!(f.contains([d.cos() * 100.0, 0.0, -d.sin() * 100.0]));
         let d = 50.0f32.to_radians();
-        assert!(!visible_in_view_frustum(
-            o,
-            a,
-            [d.cos() * 100.0, 0.0, -d.sin() * 100.0],
-            h,
-            v,
-            0.0
-        ));
+        assert!(!f.contains([d.cos() * 100.0, 0.0, -d.sin() * 100.0]));
         // A screen corner (horizontal 40, vertical 30) is inside.
         let hd = 40.0f32.to_radians();
         let vd = 30.0f32.to_radians();
-        assert!(visible_in_view_frustum(
-            o,
-            a,
-            [
-                hd.cos() * vd.cos() * 100.0,
-                hd.sin() * vd.cos() * 100.0,
-                -vd.sin() * 100.0
-            ],
-            h,
-            v,
-            0.0
-        ));
+        assert!(f.contains([
+            hd.cos() * vd.cos() * 100.0,
+            hd.sin() * vd.cos() * 100.0,
+            -vd.sin() * 100.0
+        ]));
         // Behind the view plane.
-        assert!(!visible_in_view_frustum(
-            o,
-            a,
-            [-100.0, 0.0, 0.0],
-            h,
-            v,
-            0.0
-        ));
+        assert!(!f.contains([-100.0, 0.0, 0.0]));
         // At the camera never hides.
-        assert!(visible_in_view_frustum(o, a, o, h, v, 0.0));
+        assert!(f.contains(o));
+    }
+
+    #[test]
+    fn margin_expands_the_volume_on_every_axis() {
+        let o = [0.0, 0.0, 0.0];
+        let a = [0.0, 0.0, 0.0];
+        let h = 50.0f32.to_radians();
+        let v = 40.0f32.to_radians();
+        let exact = view(o, a, h, v, 0.0, 0.0);
+        let expanded = view(o, a, h, v, 0.0, 8.0);
+        // 100 units ahead, the horizontal edge sits at 100*tan(50) = 119.18.
+        // A point 3 units beyond it is outside the exact frustum but inside the
+        // volume enlarged by 8 world units.
+        let edge = 100.0 * h.tan();
+        let just_out = [100.0, edge + 3.0, 0.0];
+        assert!(!exact.contains(just_out));
+        assert!(expanded.contains(just_out));
+        // Same on the vertical axis (the edge is `100*tan(40)` there).
+        let edge = 100.0 * v.tan();
+        let just_out = [100.0, 0.0, -(edge + 3.0)];
+        assert!(!exact.contains(just_out));
+        assert!(expanded.contains(just_out));
+        // And behind the camera: the near plane also moves back by the margin.
+        assert!(!exact.contains([-3.0, 0.0, 0.0]));
+        assert!(expanded.contains([-3.0, 0.0, 0.0]));
+        // A point far outside is still hidden.
+        assert!(!expanded.contains([0.0, 1000.0, 0.0]));
     }
 
     #[test]
@@ -677,13 +859,13 @@ mod tests {
         // eye frustum...
         let d = 70.0f32.to_radians();
         let target = [d.cos() * 100.0, d.sin() * 100.0, 0.0];
-        assert!(!visible_in_view_frustum(o, a, target, h, v, 0.0));
+        assert!(!view(o, a, h, v, 0.0, 0.0).contains(target));
         // ...but the client renders it from a camera 100 units behind the
         // player, where its bearing is about 35 degrees: on screen.
-        assert!(visible_in_view_frustum(o, a, target, h, v, 100.0));
+        assert!(view(o, a, h, v, 100.0, 0.0).contains(target));
         // A far target at the same eye bearing is still capped.
         let far = [d.cos() * 2000.0, d.sin() * 2000.0, 0.0];
-        assert!(!visible_in_view_frustum(o, a, far, h, v, 100.0));
+        assert!(!view(o, a, h, v, 100.0, 0.0).contains(far));
     }
 
     #[test]
@@ -705,17 +887,88 @@ mod tests {
         loop_sound: u8,
     }
 
+    /// Write a `vec3_t` into a byte buffer standing in for game memory.
+    fn write_vec3(buf: &mut [u8], v: [f32; 3]) {
+        for (i, c) in v.iter().enumerate() {
+            buf[i * 4..(i + 1) * 4].copy_from_slice(&c.to_ne_bytes());
+        }
+    }
+
+    /// Configure one blade of the fake `gclient_t.saber[]`.
+    fn set_blade(
+        gclient: &mut [u8],
+        saber: usize,
+        blade: usize,
+        active: bool,
+        length: f32,
+        base: [f32; 3],
+        dir: [f32; 3],
+    ) {
+        let client = gclient.as_mut_ptr() as usize;
+        let info = client + OFFSET_GCLIENT_SABER + saber * SIZEOF_SABER_INFO;
+        // SAFETY: the buffer holds SIZEOF_GCLIENT bytes; `saber`/`blade` are
+        // inside MAX_SABERS/MAX_BLADES and every field offset is pinned.
+        unsafe {
+            core::ptr::write_unaligned(
+                (info + OFFSET_SABER_NUM_BLADES) as *mut i32,
+                (blade + 1) as i32,
+            );
+            let b = info + OFFSET_SABER_BLADE + blade * SIZEOF_BLADE_INFO;
+            core::ptr::write_unaligned(
+                (b + OFFSET_BLADE_ACTIVE) as *mut i32,
+                if active { 1 } else { 0 },
+            );
+            core::ptr::write_unaligned((b + OFFSET_BLADE_LENGTH) as *mut f32, length);
+            for (i, c) in base.iter().enumerate() {
+                core::ptr::write_unaligned((b + OFFSET_BLADE_MUZZLE_POINT + i * 4) as *mut f32, *c);
+            }
+            for (i, c) in dir.iter().enumerate() {
+                core::ptr::write_unaligned((b + OFFSET_BLADE_MUZZLE_DIR + i * 4) as *mut f32, *c);
+            }
+        }
+    }
+
     /// Synthesise the engine buffers the hook receives and run the real
     /// apply/restore pass over them. `saber` arms the player with a drawn
     /// saber using a fake `gclient_t` whose `saber[0].soundLoop` is 42.
+    #[allow(clippy::too_many_arguments)]
     fn run_hide(
         place: [f32; 3],
         max_fov: i32,
         aspect: f32,
         camera_range: f32,
+        margin: f32,
         pitch: f32,
         saber: bool,
         viewer_spectator: bool,
+    ) -> Hidden {
+        run_hide_with(
+            place,
+            max_fov,
+            aspect,
+            camera_range,
+            margin,
+            pitch,
+            saber,
+            viewer_spectator,
+            |_, _, _| {},
+        )
+    }
+
+    /// [`run_hide`] plus a hook to fill extra game fields (body bounds, saber
+    /// blades) before the pass runs. `setup(entities, gclient, base)` receives
+    /// the player slot's entity byte offset.
+    #[allow(clippy::too_many_arguments)]
+    fn run_hide_with<F: FnOnce(&mut [u8], &mut [u8], usize)>(
+        place: [f32; 3],
+        max_fov: i32,
+        aspect: f32,
+        camera_range: f32,
+        margin: f32,
+        pitch: f32,
+        saber: bool,
+        viewer_spectator: bool,
+        setup: F,
     ) -> Hidden {
         let _guard = state::TEST_STATE_LOCK
             .lock()
@@ -754,6 +1007,7 @@ mod tests {
                 ..base + OFFSET_GENTITY_S + OFFSET_GENTITY_S_POS_TRBASE + (i + 1) * 4]
                 .copy_from_slice(&v.to_ne_bytes());
         }
+        setup(&mut entities, &mut gclient, base);
         // Viewer 0: viewangles = [pitch, yaw, roll], yaw 0.
         let mut frame = vec![0u8; 512];
         frame[208..212].copy_from_slice(&0i32.to_ne_bytes());
@@ -773,6 +1027,7 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV].integer = max_fov;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = aspect;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = camera_range;
+            s.cvars[state::CVAR_MAX_FOV_MARGIN].value = margin;
             s.fov.viewer_client = 0;
             s.located_game_data.g_entities = entities.as_mut_ptr() as usize;
         });
@@ -811,6 +1066,7 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV].integer = 0;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = 0.0;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = 0.0;
+            s.cvars[state::CVAR_MAX_FOV_MARGIN].value = 0.0;
         });
         hidden
     }
@@ -818,7 +1074,16 @@ mod tests {
     #[test]
     fn an_outside_player_is_mind_tricked_scaled_and_restored() {
         // Behind the viewer: hidden.
-        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
+        let hidden = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        );
         assert_eq!(hidden.trick, 1, "viewer 0's mind-trick bit must be set");
         assert_eq!(hidden.scale, 1, "the hidden player is scaled to 1%");
         assert_ne!(
@@ -843,7 +1108,16 @@ mod tests {
 
     #[test]
     fn an_inside_player_is_untouched() {
-        let hidden = run_hide([100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
+        let hidden = run_hide(
+            [100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        );
         assert_eq!(hidden.trick, 0);
         assert_eq!(hidden.scale, 0);
         assert_eq!(hidden.e_flags & EF_NODRAW, 0);
@@ -852,8 +1126,120 @@ mod tests {
     }
 
     #[test]
+    fn a_body_box_edge_on_screen_keeps_the_player_visible() {
+        let a = 53.0f32.to_radians();
+        let place = [a.cos() * 100.0, a.sin() * 100.0, 0.0];
+        // The feet origin alone is outside the 50° horizontal half-angle...
+        let origin_only = run_hide(place, 100, 4.0 / 3.0, 0.0, 0.0, 0.0, false, false);
+        assert_eq!(origin_only.trick, 1);
+        // ...but the front-inner corner of the body box (still on screen) keeps
+        // the whole player visible.
+        let bounded = run_hide_with(
+            place,
+            100,
+            4.0 / 3.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            |entities, _, base| {
+                write_vec3(
+                    &mut entities[base + OFFSET_GENTITY_R_MINS..base + OFFSET_GENTITY_R_MINS + 12],
+                    [-15.0, -15.0, -24.0],
+                );
+                write_vec3(
+                    &mut entities[base + OFFSET_GENTITY_R_MAXS..base + OFFSET_GENTITY_R_MAXS + 12],
+                    [15.0, 15.0, 40.0],
+                );
+            },
+        );
+        assert_eq!(bounded.trick, 0);
+    }
+
+    #[test]
+    fn a_drawn_saber_tip_on_screen_keeps_the_player_visible() {
+        // Body origin at 60° from the view axis: hidden without a blade.
+        let a = 60.0f32.to_radians();
+        let place = [a.cos() * 100.0, a.sin() * 100.0, 0.0];
+        let no_blade = run_hide(place, 100, 4.0 / 3.0, 0.0, 0.0, 0.0, true, false);
+        assert_eq!(no_blade.trick, 1);
+        // A drawn blade running from the hand back across the view puts its
+        // middle/tip inside the 50° half-angle, so the player is visible.
+        let hand = [place[0], place[1], 26.0];
+        let tip = [75.0f32, 60.0, 26.0];
+        let dx = tip[0] - hand[0];
+        let dy = tip[1] - hand[1];
+        let length = (dx * dx + dy * dy).sqrt();
+        let dir = [dx / length, dy / length, 0.0];
+        let with_blade = run_hide_with(
+            place,
+            100,
+            4.0 / 3.0,
+            0.0,
+            0.0,
+            0.0,
+            true,
+            false,
+            |_, gclient, _| set_blade(gclient, 0, 0, true, length, hand, dir),
+        );
+        assert_eq!(with_blade.trick, 0);
+        assert_eq!(with_blade.saber_holstered, 0, "the blade is not hidden");
+    }
+
+    #[test]
+    fn a_corpse_does_not_use_a_stale_saber_blade() {
+        let a = 60.0f32.to_radians();
+        let place = [a.cos() * 100.0, a.sin() * 100.0, 0.0];
+        let hand = [place[0], place[1], 26.0];
+        let tip = [75.0f32, 60.0, 26.0];
+        let dx = tip[0] - hand[0];
+        let dy = tip[1] - hand[1];
+        let length = (dx * dx + dy * dy).sqrt();
+        let dir = [dx / length, dy / length, 0.0];
+        let hidden = run_hide_with(
+            place,
+            100,
+            4.0 / 3.0,
+            0.0,
+            0.0,
+            0.0,
+            true,
+            false,
+            |entities, gclient, base| {
+                entities[base + OFFSET_GENTITY_S + OFFSET_GENTITY_S_EFLAGS
+                    ..base + OFFSET_GENTITY_S + OFFSET_GENTITY_S_EFLAGS + 4]
+                    .copy_from_slice(&EF_DEAD.to_ne_bytes());
+                set_blade(gclient, 0, 0, true, length, hand, dir);
+            },
+        );
+        assert_eq!(hidden.trick, 1, "a corpse keeps the body-only test");
+    }
+
+    #[test]
+    fn a_margin_keeps_a_near_edge_player_visible() {
+        let a = 53.0f32.to_radians();
+        let place = [a.cos() * 100.0, a.sin() * 100.0, 0.0];
+        let exact = run_hide(place, 100, 4.0 / 3.0, 0.0, 0.0, 0.0, false, false);
+        assert_eq!(exact.trick, 1);
+        // The point is ~5 world units outside the side plane; an 8-unit
+        // margin covers it.
+        let expanded = run_hide(place, 100, 4.0 / 3.0, 0.0, 8.0, 0.0, false, false);
+        assert_eq!(expanded.trick, 0);
+    }
+
+    #[test]
     fn a_hidden_drawn_saber_loses_its_blade_but_keeps_its_hum() {
-        let hidden = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, true, false);
+        let hidden = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            true,
+            false,
+        );
         assert_eq!(hidden.trick, 1);
         assert_eq!(hidden.scale, 1);
         assert_eq!(hidden.e_flags & EF_NODRAW, EF_NODRAW);
@@ -952,24 +1338,60 @@ mod tests {
     fn a_spectator_viewer_is_not_affected() {
         // Same hidden target behind the viewer, but the actual client (slot 0)
         // is on the spectator team: the cap must not apply.
-        let spectator = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, true);
+        let spectator = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            true,
+        );
         assert_eq!(spectator.trick, 0);
         assert_eq!(spectator.scale, 0);
         assert_eq!(spectator.e_flags & EF_NODRAW, 0);
         // A playing viewer in the same setup is capped.
-        let playing = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
+        let playing = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        );
         assert_eq!(playing.trick, 1);
     }
 
     #[test]
     fn a_steep_view_pauses_the_cap() {
         // Behind the viewer at a normal pitch: hidden.
-        let level = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 0.0, false, false);
+        let level = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        );
         assert_eq!(level.trick, 1);
         // The same target while looking steeply down/up stays visible: the
         // client's third-person camera pitch diverges from `ps.viewangles`
         // there, so the server frustum is not trustworthy.
-        let steep = run_hide([-100.0, 0.0, 0.0], 100, 16.0 / 9.0, 0.0, 80.0, false, false);
+        let steep = run_hide(
+            [-100.0, 0.0, 0.0],
+            100,
+            16.0 / 9.0,
+            0.0,
+            0.0,
+            80.0,
+            false,
+            false,
+        );
         assert_eq!(steep.trick, 0);
         assert_eq!(steep.scale, 0);
     }

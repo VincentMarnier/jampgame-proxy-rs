@@ -1492,10 +1492,10 @@ pub unsafe extern "C" fn sv_netchan_process(cl: usize, msg: usize) -> c_int {
 /// within the viewer's match (lobby `None` sees lobby).
 ///
 /// After the pristine and TFFA passes, the main-view call also applies the
-/// `proxy_sv_maxFov` cap (`crate::fov`): players outside the viewer's horizontal
-/// wedge get the viewer's mind-trick bit and a 1 % model scale for this
-/// snapshot, and `SV_SendClientSnapshot` restores the shared entity state once
-/// it has been copied.
+/// `proxy_sv_maxFov` cap (`crate::fov`): players whose body and drawn saber are
+/// outside the viewer's frustum get the viewer's mind-trick bit and a 1 % model
+/// scale for this snapshot, and `SV_SendClientSnapshot` restores the shared
+/// entity state once it has been copied.
 ///
 /// # Safety
 ///

@@ -59,6 +59,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_maxFov`                     | 0       | maximum `cg_fov` value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing; `0` = off (see [FOV cap](#fov-cap)) |
 | `proxy_sv_maxFovAspect`               | 1.7777778 | screen aspect used to turn `proxy_sv_maxFov` into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's `cg_fovAspectAdjust 1`; use `1.3333334` for 4:3/stock clients or higher for ultrawide) |
 | `proxy_sv_maxFovCameraRange`          | 100     | third-person camera setback (world units) assumed by the frustum test; `100` matches the stock `cg_thirdPersonRange`, `0` tests from the player's eye (first-person-strict) |
+| `proxy_sv_maxFovMargin`               | 0       | world-unit margin added to every side of the FOV test volume: a player whose body or drawn saber comes within that distance of the frustum stays visible, so edge contacts do not pop in/out; `0` = exact frustum (see [FOV cap](#fov-cap)) |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
@@ -600,6 +601,20 @@ and the frustum test uses the camera's pitch as well as its yaw;
 set it to `0` for a first-person-strict server, or raise it if your players use
 a larger `cg_thirdPersonRange`.
 
+The test is not based on the player's feet coordinate alone. It samples the
+whole body box from the game's own bounds (`{-15,-15,-24}` to `{15,15,40}`), so
+a player whose feet are just off screen but whose head or side is still visible
+stays visible. For a drawn, non-thrown saber it also samples the blade from hilt
+to tip, using the server-side blade position: a saber reaching into the screen
+comes into view with the player instead of popping in later. A corpse and a
+thrown saber are tested on the body only.
+
+`proxy_sv_maxFovMargin` (default `0`, off) enlarges the visible volume by that
+many world units on every side, so a player whose body or saber is just outside
+the cap still stays visible near the border. It is a distance, not an angle:
+`32` means roughly one player width. The exact frustum (no margin) is the
+cheapest and strictest setting; raise it if edge contacts still feel abrupt.
+
 Hiding is instant: the player entity is marked `EF_NODRAW` for that viewer, so
 cgame's `CG_Player` returns at the top instead of fading. The entity stays in
 the snapshot, so its server events (footsteps, weapon/force sounds) still fire
@@ -637,6 +652,7 @@ Set it at startup or at runtime:
 
 ```text
 seta proxy_sv_maxFov 100
+seta proxy_sv_maxFovMargin 32
 ```
 
 or `rcon proxy_sv_maxFov 100`. Like every proxy feature it needs

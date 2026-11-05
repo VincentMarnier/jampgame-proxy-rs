@@ -282,6 +282,29 @@ pub const OFFSET_GCLIENT_SABER: usize = 1952;
 pub const SIZEOF_SABER_INFO: usize = 2156;
 /// `offsetof(saberInfo_t, soundLoop)` — game sound index of the hum.
 pub const OFFSET_SABER_SOUND_LOOP: usize = 204;
+/// `offsetof(saberInfo_t, numBlades)` — blades actually configured for this
+/// saber (0-8).
+pub const OFFSET_SABER_NUM_BLADES: usize = 212;
+/// `offsetof(saberInfo_t, blade)` — `bladeInfo_t blade[MAX_BLADES]`.
+pub const OFFSET_SABER_BLADE: usize = 216;
+/// `sizeof(bladeInfo_t)` — stride between `saber.blade[i]` entries.
+pub const SIZEOF_BLADE_INFO: usize = 204;
+/// `offsetof(bladeInfo_t, active)` (`qboolean`) — the blade is switched on.
+pub const OFFSET_BLADE_ACTIVE: usize = 0;
+/// `offsetof(bladeInfo_t, length)` — rendered/active blade length, in world
+/// units (`0` when the blade is off).
+pub const OFFSET_BLADE_LENGTH: usize = 12;
+/// `offsetof(bladeInfo_t, muzzlePoint)` — world position of the blade base
+/// (the hilt), updated server-side by `WP_SaberPositionUpdate`
+/// (`w_saber.c:7655`, run from `g_main.c:4051`).
+pub const OFFSET_BLADE_MUZZLE_POINT: usize = 28;
+/// `offsetof(bladeInfo_t, muzzleDir)` — unit direction from the hilt toward the
+/// blade tip.
+pub const OFFSET_BLADE_MUZZLE_DIR: usize = 52;
+/// `MAX_BLADES` (`q_shared.h`) — maximum blades in one `saberInfo_t`.
+pub const MAX_BLADES: usize = 8;
+/// `MAX_SABERS` (`q_shared.h`) — `gclient_t.saber` entries (right/left hand).
+pub const MAX_SABERS: usize = 2;
 
 /// `sizeof(gclient_t) == 7232`, `offsetof(gclient_t, pers) == 1552`,
 /// `offsetof(clientPersistant_t, netname) == 48` (SDK `g_local.h:440,535`).
@@ -315,6 +338,13 @@ pub const OFFSET_GENTITY_S_OWNER: usize = 280;
 /// maxs 32, contents 44, absmin 48, absmax 60, currentOrigin 72,
 /// currentAngles 84, mIsRoffing 96, ownerNum 100).
 pub const OFFSET_GENTITY_R_OWNER: usize = 660;
+/// `entityShared_t.mins` (`r` at 560 + `mins` 20) — local bounding-box minimum
+/// relative to `currentOrigin`. For a player the game sets this to
+/// `playerMins = {-15,-15,-24}` (`g_client.c`).
+pub const OFFSET_GENTITY_R_MINS: usize = 580;
+/// `entityShared_t.maxs` (`r` at 560 + `maxs` 32) — local bounding-box maximum.
+/// For a player: `playerMaxs = {15,15,40}` (`g_client.c`).
+pub const OFFSET_GENTITY_R_MAXS: usize = 592;
 /// `entityShared_t.contents` (`r` at 560 + `contents` 44). The parallel-TFFA
 /// trace isolation zeroes this field for cross-match entities for the
 /// duration of a single `SV_Trace`.
@@ -1066,6 +1096,15 @@ mod tests {
         assert_eq!(OFFSET_GCLIENT_SABER, 1952);
         assert_eq!(SIZEOF_SABER_INFO, 2156);
         assert_eq!(OFFSET_SABER_SOUND_LOOP, 204);
+        assert_eq!(OFFSET_SABER_NUM_BLADES, 212);
+        assert_eq!(OFFSET_SABER_BLADE, 216);
+        assert_eq!(SIZEOF_BLADE_INFO, 204);
+        assert_eq!(OFFSET_BLADE_ACTIVE, 0);
+        assert_eq!(OFFSET_BLADE_LENGTH, 12);
+        assert_eq!(OFFSET_BLADE_MUZZLE_POINT, 28);
+        assert_eq!(OFFSET_BLADE_MUZZLE_DIR, 52);
+        assert_eq!(MAX_BLADES, 8);
+        assert_eq!(MAX_SABERS, 2);
         assert_eq!(WP_SABER, 1);
         assert_eq!(OFFSET_GENTITY_S_POS_TRBASE, 28);
         assert_eq!(OFFSET_GENTITY_S_TRICKED_1, 152);
@@ -1075,6 +1114,8 @@ mod tests {
         assert_eq!(EF_DEAD, 0x02);
         assert_eq!(EF_NODRAW, 0x100);
         assert_eq!(OFFSET_GENTITY_R_OWNER, 660);
+        assert_eq!(OFFSET_GENTITY_R_MINS, 580);
+        assert_eq!(OFFSET_GENTITY_R_MAXS, 592);
         assert_eq!(OFFSET_GENTITY_R_CONTENTS, 604);
         assert_eq!(OFFSET_GENTITY_R_LINKED, 560);
         assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, 208);
