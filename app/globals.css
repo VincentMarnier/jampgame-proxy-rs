@@ -553,6 +553,7 @@ ol.steps p { margin: 0.2rem 0 0; font-size: 0.92rem; color: var(--muted); }
 .cards li p { margin: 0; font-size: 0.86rem; color: var(--muted); }
 .cards.danger li { border-top-color: var(--sith); }
 .cards.danger li b svg { color: var(--sith); }
+.cards.hardening { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 /* ---- cvar explorer ---- */
 
@@ -748,6 +749,7 @@ footer.site { border-top: 1px solid var(--border); padding: 1rem 1.25rem 2.5rem;
   .site-nav a { padding: 0.6rem 0.5rem; font-size: 0.7rem; }
   main { padding: 0 0.9rem 4rem; }
   .lifecycle { grid-template-columns: 1fr; }
+  .cards.hardening { grid-template-columns: 1fr; }
   .foot-grid { grid-template-columns: 1fr; gap: 1.2rem; }
   .stat-row { gap: 1.1rem; }
   .aurebesh { gap: 3px; }
