@@ -37,6 +37,9 @@ const cvars = [
   ["proxy_sv_voidTimeNudgeLog", "0", "Log cl_timeNudge non-zero / back-to-zero transitions; works on its own (reports the shift without applying it)", "network"],
   ["proxy_sv_antiMacro", "0", "Freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact wait holds); hand play is untouched and the player is never told", "hardening"],
   ["proxy_sv_antiMacroLog", "0", "1 logs anti-macro lock/release transitions, 2 adds the statistics of locked channels, 3 the statistics of every channel with a reversal; works on its own", "diagnostics"],
+  ["proxy_sv_maxFov", "0", "Maximum cg_fov value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing (0 = off)", "fov"],
+  ["proxy_sv_maxFovAspect", "1.7777778", "Screen aspect used to turn proxy_sv_maxFov into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's cg_fovAspectAdjust 1; 1.3333334 for 4:3/stock clients, higher for ultrawide)", "fov"],
+  ["proxy_sv_maxFovCameraRange", "100", "Third-person camera setback (world units) assumed by the frustum test; 100 matches the stock cg_thirdPersonRange, 0 tests from the player's eye (first-person-strict)", "fov"],
 ];
 
 const hardening = [
@@ -49,8 +52,9 @@ const hardening = [
 ];
 
 const playerCommands = [
-  "tffa_create",
-  "tffa_join <id>",
+  "tffa_create [password]",
+  "tffa_join <id> [password]",
+  "tffa_password <password>",
   "tffa_leave",
   "tffa_list",
   "netStatus",
@@ -123,15 +127,15 @@ export default function Home() {
         {/* ---------- hero ---------- */}
         <div className="hero" id="top">
           <div>
-            <span className="status-pill"><span className="pulse" aria-hidden="true" />Exploit protection · Ban lists · Parallel matches</span>
+            <span className="status-pill"><span className="pulse" aria-hidden="true" />Exploit protection · Ban lists · FOV cap · Parallel matches</span>
             <h1>Safer servers.<br />More matches.</h1>
             <p className="tagline">
               <strong>jampgame-proxy-rs</strong> protects your Jedi Academy server
               from exploits and cheats, adds file-backed IP and GUID bans, an
-              anti-macro guard, team controls, RCON mute and player ignore,
-              spectator HP overlays and live K/D on TaystJK scoreboards, and lets
-              more players fight at once — server-side only, no downloads for
-              players.
+              anti-macro guard, a server-side FOV cap, team controls, RCON mute
+              and player ignore, spectator HP overlays and live K/D on TaystJK
+              scoreboards, and lets more players fight at once — server-side
+              only, no downloads for players.
             </p>
             <div className="cta-row">
               <a className="btn" href={RELEASES}>Download release</a>
@@ -139,7 +143,7 @@ export default function Home() {
               <a className="btn ghost" href={REPO}>Source</a>
             </div>
             <div className="stat-row" aria-label="Project facts">
-              <div className="stat"><b>28</b><span>server cvars</span></div>
+              <div className="stat"><b>31</b><span>server cvars</span></div>
               <div className="stat"><b>6</b><span>hardening guards</span></div>
               <div className="stat"><b>8</b><span>parallel TFFA max</span></div>
             </div>
@@ -234,7 +238,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">28 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">31 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -687,6 +691,66 @@ export default function Home() {
             jampgame-proxy-rs: antiMacro debug client=2 name=&quot;...&quot; adr=&quot;...&quot; cmds=6041 yaw rev=4 mean=55ms/11cmd holds=11..11 swing=6deg locked=1
           </Code>
 
+          <h3 className="sub" id="fovcap">FOV cap <span className="count">opt-in</span></h3>
+          <div className="prose">
+            <p>
+              <code>proxy_sv_maxFov</code> (default <code>0</code>, off) caps the{" "}
+              <code>cg_fov</code> value a client can <em>benefit from</em>. Stock
+              Jedi Academy never sends <code>cg_fov</code> to the server — it is a
+              cgame-only cvar — so the proxy cannot see who raised it. Instead it
+              caps what every viewer receives: a player outside the view frustum
+              that corresponds to the cap is hidden for that viewer, so a client
+              running a larger <code>cg_fov</code> sees empty space in the extra
+              field. Legitimate values below the cap are unaffected, the viewer&apos;s
+              own entity is never touched, and only players actually in the game
+              are capped — free and following spectators see the normal stream,
+              and spectator entities are never hidden.
+            </p>
+            <p>
+              The frustum test uses both the horizontal and vertical FOV, so
+              looking up or down does not hide players that are still on screen;
+              above 45° of pitch the cap pauses entirely, because the third-person
+              camera pitch then diverges too far from the server&apos;s aim.{" "}
+              <code>proxy_sv_maxFovAspect</code> (default <code>1.7777778</code>,
+              16:9) converts the configured number into the rendered frustum, so{" "}
+              <code>proxy_sv_maxFov 100</code> still covers <code>cg_fov 97</code>{" "}
+              on a 16:9 screen (about 113° rendered). Set it to{" "}
+              <code>1.3333334</code> for 4:3/stock clients or to the actual aspect
+              for ultrawide (e.g. <code>2.3333334</code> for 21:9).{" "}
+              <code>proxy_sv_maxFovCameraRange</code> (default <code>100</code>)
+              shifts the test point back for the third-person camera, keeping close
+              edge targets visible; <code>0</code> tests from the player&apos;s eye.
+            </p>
+            <p>
+              Hiding is instant: the player entity is marked <code>EF_NODRAW</code>{" "}
+              for that viewer, with a per-viewer mind-trick bit and a 1% model scale
+              as extra layers. The entity stays in the snapshot, so its{" "}
+              <b>footsteps, weapon and force sounds still play</b> at the true
+              position. A drawn saber is hidden and its hum replaced by the
+              hilt&apos;s own loop sound; a <b>thrown saber stays visible and
+              audible</b>. The per-viewer changes are reverted immediately after the
+              engine copies that viewer&apos;s snapshot, so shared game state is
+              never left modified.
+            </p>
+            <p>
+              Limits worth knowing: a spectator with <b>Force Sight</b> bypasses the
+              stock mind-trick check (the entity is still <code>EF_NODRAW</code>), a
+              determined custom client can strip the layers and normalise the model
+              scale, and a stock 1.01 cgame skips loop sounds on <code>NODRAW</code>{" "}
+              (so it loses the replaced saber hum). The cap applies to every viewer
+              equally — it removes the benefit instead of detecting who raised{" "}
+              <code>cg_fov</code>.
+            </p>
+          </div>
+          <Code
+            title="server.cfg"
+            text={"seta proxy_sv_maxFov 100\nseta proxy_sv_maxFovAspect 1.7777778\nseta proxy_sv_maxFovCameraRange 100"}
+          >
+            seta proxy_sv_maxFov 100{"\n"}
+            seta proxy_sv_maxFovAspect 1.7777778{"\n"}
+            seta proxy_sv_maxFovCameraRange 100
+          </Code>
+
           <h3 className="sub" id="debuglog">Crash diagnostics <span className="count">opt-in</span></h3>
           <div className="prose">
             <p>
@@ -726,16 +790,16 @@ export default function Home() {
 
         {/* ---------- TFFA ---------- */}
         <section className="block" id="tffa" aria-labelledby="tffa-title">
-          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players self-organize into parallel matches on one map — each with its own teams, world, chat and scores. No extra servers needed." />
+          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players self-organize into parallel matches on one map — each with its own teams, world, chat and scores. Matches can be password-protected without closing spectating. No extra servers needed." />
           <div className="lifecycle" aria-label="TFFA match lifecycle">
-            <div><b><i>1</i>Create</b><code>tffa_create</code> opens a match and joins its smaller side (red when empty).</div>
-            <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt;</code> switches matches mid-game; <code>tffa_leave</code> or <code>tffa_join 0</code> returns to main.</div>
-            <div><b><i>3</i>Fight</b>Damage, snapshots, shields, saber clashes, force sounds, kill feed and items are isolated per match; spawn points are picked without counting another match&apos;s players, so no spawn kills across matches. Global chat stays server-wide; team chat stays in its match.</div>
+            <div><b><i>1</i>Create</b><code>tffa_create [password]</code> opens a match and joins its smaller side (red when empty); a password protects its teams, not its spectating.</div>
+            <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt; [password]</code> switches matches mid-game — without the password a protected match lets you spectate only; <code>tffa_password</code> gives the password of the match you are already in. <code>tffa_leave</code> or <code>tffa_join 0</code> returns to main.</div>
+            <div><b><i>3</i>Fight</b>Damage, snapshots, shields, saber clashes, force sounds, kill feed and items are isolated per match; spawn points are picked without counting another match&apos;s players, so no spawn kills across matches. Global chat stays server-wide; team chat stays in its match, except spectator chat, which reaches the spectators of every match.</div>
             <div><b><i>4</i>End</b>Each match shares the server fraglimit: a finished match plays on for one second with damage void before its players go to spectator. Tied matches at the global timelimit play sudden death; when none is tied, the map ends and every player keeps their own match&apos;s final scoreboard.</div>
           </div>
           <div className="hook-grid">
             <div className="hook-card"><b>Own world per match</b><p>Doors, plats, elevators, buttons, triggers and map items are duplicated, and runtime spawns belong to the match that created them. Maps with NPC or vehicle actors take no parallel matches; <code>tffa_create</code> is refused when the entity slots cannot hold another set.</p></div>
-            <div className="hook-card"><b>Survives map_restart</b><p>Every player returns to their own match id and team — including a finished match, recreated from its remembered group — with that match&apos;s doors and triggers rebuilt and the scores from zero. The reconnect burst is deferred and spread over frames, so a populated server restarts with every client retained. A full map change starts everyone in main.</p></div>
+            <div className="hook-card"><b>Survives map_restart</b><p>Every player returns to their own match id and team — including a finished match, recreated from its remembered group — with that match&apos;s doors and triggers rebuilt and the scores from zero. Passwords and authorisations travel with their match. The reconnect burst is deferred and spread over frames, so a populated server restarts with every client retained. A full map change starts everyone in main.</p></div>
             <div className="hook-card"><b>Closes cleanly</b><p>An emptied created match closes itself. <code>proxy_tffa_enable 0</code> moves created-match players to spectator with a message; everyone keeps playing in main.</p></div>
           </div>
           <h3 className="sub">Player commands <span className="count">tap to copy</span></h3>
@@ -745,10 +809,12 @@ export default function Home() {
             ))}
           </div>
           <ul className="tight">
-            <li><code>tffa_create</code> / <code>tffa_join &lt;id&gt;</code> / <code>tffa_leave</code> / <code>tffa_list</code> — create, join, leave, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
+            <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_leave</code> / <code>tffa_list</code> — create, join, leave, and list parallel TFFA matches (requires <code>proxy_tffa_enable 1</code>). They work while playing, not only from spectator: the travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>.</li>
+            <li><b>Password-protected matches:</b> a password only gates joining a team (<code>/team red|blue</code>, <code>team free</code>) — <b>anyone can spectate a protected match without it</b>. <code>tffa_join &lt;id&gt;</code> with no password puts you in it as a spectator, <code>tffa_list</code> marks it with <code>[password]</code>, and <code>tffa_password &lt;password&gt;</code> gives the password of the match you are already in (also the way in after a match was promoted to the main slot). Passwords are case-sensitive, up to 32 characters, may contain spaces when quoted, and are redacted from the proxy log. A wrong or too-long password still lets you spectate but not play.</li>
             <li><code>netStatus</code> / <code>showNet</code> — print the per-player net status table: ping, rtt, jitter, fps, pps, timeNudge, snaps, rate and name (see <a href="#netstatus">Net status</a>; requires <code>proxy_sv_enableNetStatus 1</code>).</li>
             <li>Auto team picks (<code>team free</code>, the client auto-join, <code>g_teamAutoJoin</code>) balance the match being joined. <code>proxy_sv_lockTeamsAfterXSecs</code> locks each match against its own roster once the grace delay expires (a join in it cancels its lock; a match created mid-round stays unlocked until the next round), and <code>proxy_sv_teamSizeRules</code> uses per-match sizes — one rule applies when every populated match is the same <code>N vs N</code>.</li>
             <li>A match that reaches the fraglimit keeps playing for one second with its damage void, then its players move to spectator. It remembers who played and for which team, so the next <code>map_restart</code> brings the match back with them — while a full map change drops it.</li>
+            <li>Global chat is server-wide, and a playing player&apos;s team chat stays inside their match. Spectator chat is the exception: every spectator is on the same team, so a spectator&apos;s <code>say_team</code> reaches the spectators of every match — the way people watching different games talk to each other.</li>
             <li>At the global timelimit, tied matches keep playing sudden death. When no tied match with players remains, the whole map ends with every match intact: each player reads their own instance&apos;s final scoreboard instead of being sent to main, and the next <code>map_restart</code> resumes the same games.</li>
             <li>Spawn points stay shared coordinates, but their occupancy is judged per match: a match only skips spots its own players stand on, so it never drops players onto another match&apos;s bodies and runs out of spawns.</li>
             <li>Switching instance no longer leaves other players T-posing: the proxy tells the client to load its deferred player models immediately (the same path opening the scoreboard uses), so in-game players keep their skin and animation, and a following spectator gets the animation restart too.</li>
