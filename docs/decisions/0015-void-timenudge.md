@@ -91,6 +91,16 @@ Two details matter:
 |---|---|---|
 | `proxy_sv_voidTimeNudge` | 0 | apply the rewrite |
 | `proxy_sv_voidTimeNudgeLog` | 0 | log transitions |
+| `proxy_sv_timeNudgeMargin` | 2 | margin, in ms, added to the estimate's confidence range |
+
+The estimator's non-statistical bias floor (D-007's fixed 2 ms) became the
+`proxy_sv_timeNudgeMargin` cvar. It widens the reported range, so it is the
+knob that trades sensitivity for false positives: a larger value leaves small
+settings "consistent with 0" (no rewrite, white cell), a smaller value lets the
+verdict act on a smaller reading and on more estimator noise. `0` reports the
+statistical interval alone; values are clamped to `0..=100` ms. The margin
+feeds both the neutralisation verdict and the netStatus `timeNudge` cell, which
+render the same range and therefore cannot disagree.
 
 The log has the `proxy_sv_clientPpsLog` shape: it keeps the estimator feed and
 the verdict running on its own, prints one line when a client's confirmed range

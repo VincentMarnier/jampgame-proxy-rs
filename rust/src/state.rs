@@ -20,7 +20,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
 /// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
 /// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 32] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 42] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -53,6 +53,16 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 32] = [
     (c"proxy_sv_maxFovAspect", c"1.7777778"),
     (c"proxy_sv_maxFovCameraRange", c"100"),
     (c"proxy_sv_maxFovMargin", c"0"),
+    (c"proxy_sv_clientPpsFpsMargin", c"2"),
+    (c"proxy_sv_timeNudgeMargin", c"2"),
+    (c"proxy_sv_antiMacroMinReversals", c"4"),
+    (c"proxy_sv_antiMacroAxisMaxMeanCmds", c"3"),
+    (c"proxy_sv_antiMacroViewMaxMeanMs", c"65"),
+    (c"proxy_sv_antiMacroAttackMaxMeanMs", c"60"),
+    (c"proxy_sv_antiMacroMaxHoldSpreadMs", c"10"),
+    (c"proxy_sv_antiMacroViewStepPercent", c"75"),
+    (c"proxy_sv_antiMacroViewMinSwing", c"364"),
+    (c"proxy_sv_clientPpsTolerance", c"1"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -156,6 +166,57 @@ pub const CVAR_MAX_FOV_CAMERA_RANGE: usize = 30;
 /// world units of the frustum stays visible, so border contacts do not pop in
 /// and out. `0` means the exact frustum (previous behaviour).
 pub const CVAR_MAX_FOV_MARGIN: usize = 31;
+/// `proxy_sv_clientPpsFpsMargin`: half-width, in FPS, of the uncertainty band
+/// around the client's measured FPS used to derive the packet-rate limit
+/// (`crate::pps`). The limit is the highest value the downscale formula
+/// produces over `fps - margin ..= fps + margin`, so the band can only raise
+/// the limit. Default `2` (the historical fixed value); `0` uses the measured
+/// FPS alone.
+pub const CVAR_CLIENT_PPS_FPS_MARGIN: usize = 32;
+/// `proxy_sv_timeNudgeMargin`: bias floor, in milliseconds, added to the
+/// `cl_timeNudge` estimator's confidence interval (`crate::netstatus_est`,
+/// D-007/D-015). A larger margin widens the reported range, so a client's
+/// range must clear 0 by more before `proxy_sv_voidTimeNudge` acts and before
+/// the netStatus `timeNudge` cell reports a confident non-zero setting.
+/// Default `2.0` (the historical fixed value); `0` reports the statistical
+/// interval alone.
+pub const CVAR_TIME_NUDGE_MARGIN: usize = 33;
+/// `proxy_sv_antiMacroMinReversals`: reversals in a run needed for the rate
+/// test to fire (`crate::macroguard`). Raising it is the main false-positive
+/// brake; the wary shortcut still needs [`WARY_MIN_REVERSALS`].
+///
+/// [`WARY_MIN_REVERSALS`]: crate::macroguard::WARY_MIN_REVERSALS
+pub const CVAR_ANTI_MACRO_MIN_REVERSALS: usize = 34;
+/// `proxy_sv_antiMacroAxisMaxMeanCmds`: movement channels fire when the run's
+/// mean interval is at most this many commands (the acceleration payoff is per
+/// command).
+pub const CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS: usize = 35;
+/// `proxy_sv_antiMacroViewMaxMeanMs`: `yaw`/`pitch` fire when the run's mean
+/// interval is at most this many milliseconds (the wiggle payoff is per
+/// second).
+pub const CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS: usize = 36;
+/// `proxy_sv_antiMacroAttackMaxMeanMs`: the attack channel fires when the run's
+/// mean interval is at most this many milliseconds.
+pub const CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS: usize = 37;
+/// `proxy_sv_antiMacroMaxHoldSpreadMs`: the `wait`-exactness test: a run fires
+/// when its shortest and longest hold differ by at most this many
+/// milliseconds. Lower is stricter.
+pub const CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS: usize = 38;
+/// `proxy_sv_antiMacroViewStepPercent`: key-vs-mouse shape test for the view:
+/// the mean per-command step must be at least this percentage of the peak
+/// (a held turn key is near 100 %, a mouse wiggle accelerates and decelerates).
+pub const CVAR_ANTI_MACRO_VIEW_STEP_PERCENT: usize = 39;
+/// `proxy_sv_antiMacroViewMinSwing`: minimum view swing over a run, in
+/// `ANGLE2SHORT` units (`364` ≈ 2° peak-to-peak), for a view verdict. `0`
+/// removes the floor.
+pub const CVAR_ANTI_MACRO_VIEW_MIN_SWING: usize = 40;
+/// `proxy_sv_clientPpsTolerance`: packets per second of slack added to the
+/// derived packet-rate limit **after** the FPS band and the global ceiling
+/// (`crate::pps`). It absorbs the small difference between a client's real
+/// send rate and the server's per-second measurement: with the default `1`, a
+/// client sending `101` packets/s is accepted when the derived limit is `100`.
+/// `0` restores the exact limit.
+pub const CVAR_CLIENT_PPS_TOLERANCE: usize = 41;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -1094,6 +1155,37 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_ASPECT].1.to_bytes(), b"1.7777778");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_CAMERA_RANGE].1.to_bytes(), b"100");
         assert_eq!(PROXY_CVARS[CVAR_MAX_FOV_MARGIN].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_FPS_MARGIN].1.to_bytes(), b"2");
+        assert_eq!(PROXY_CVARS[CVAR_TIME_NUDGE_MARGIN].1.to_bytes(), b"2");
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_MIN_REVERSALS].1.to_bytes(),
+            b"4"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS].1.to_bytes(),
+            b"3"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS].1.to_bytes(),
+            b"65"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS].1.to_bytes(),
+            b"60"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS].1.to_bytes(),
+            b"10"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_VIEW_STEP_PERCENT].1.to_bytes(),
+            b"75"
+        );
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_MACRO_VIEW_MIN_SWING].1.to_bytes(),
+            b"364"
+        );
+        assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_TOLERANCE].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

@@ -64,7 +64,8 @@ clock_gap = I_msg + 5 - I_cmd                (CL_AdjustTimeDelta steady state,
 
 Derivation: R-026. Reported as the **robust mean** of `tn_hat_k` over a ~5 s
 window (10% trimmed mean), with the range = the 95% CI of the mean widened by
-a **fixed bias floor** (±2 ms, settable from the ground-truth runs).
+a bias floor (2 ms default, now operator-settable through
+`proxy_sv_timeNudgeMargin`; D-015).
 
 ### D-007.3 — Correction terms (user decisions, 2026-10-26)
 

@@ -42,6 +42,11 @@
 //!   window after a connect can hold startup artifacts), so it starts well
 //!   after a player connects and lags a `cl_timeNudge` change by the window's
 //!   step detection. A range that contains 0 disengages at once.
+//! * The range includes the estimator's bias floor
+//!   (`proxy_sv_timeNudgeMargin`, default 2 ms), so small settings sit inside
+//!   the range and are left alone; raising the margin makes the verdict more
+//!   conservative, lowering it makes it more sensitive to small nudges (and
+//!   to estimator noise).
 //!
 //! ## Logging
 //!
@@ -186,9 +191,9 @@ pub fn clear_offsets() {
 ///
 /// The offset is the point estimate rounded to the integer `cl_timeNudge`
 /// value the client holds, clamped to ±[`MAX_SHIFT_MS`]. The estimator's
-/// ±2 ms bias floor means an excluding range implies `|tn| > 2`, so rounding
-/// cannot produce 0; the explicit ±1 fallback only guards a future floor
-/// change.
+/// configured bias floor (`proxy_sv_timeNudgeMargin`, default 2 ms) widens the
+/// range, so an excluding range normally implies `|tn|` beyond that margin;
+/// the explicit ±1 fallback only guards a zero-width floor.
 pub fn offset_for(tn: f32, lo: f32, hi: f32) -> Option<i32> {
     if !tn.is_finite() || !lo.is_finite() || !hi.is_finite() {
         return None;

@@ -136,10 +136,12 @@ pub const MIN_WINDOW_MS: i32 = 1000;
 /// Minimum packet samples before a value is shown.
 pub const MIN_SAMPLES: usize = 8;
 
-/// Fixed bias floor added to the CI (decision 11). The unobservable residual
-/// (`E` drift, `δ_s`, network jitter) is not statistical, so the range is the
-/// CI of the mean widened by this constant. Set from the ground-truth runs.
-pub const BIAS_FLOOR_MS: f32 = 2.0;
+/// Default fixed bias floor added to the CI (decision 11), in milliseconds. The
+/// unobservable residual (`E` drift, `δ_s`, network jitter) is not statistical,
+/// so the range is the CI of the mean widened by this constant. Set from the
+/// ground-truth runs. `proxy_sv_timeNudgeMargin` overrides it per server; `0`
+/// reports the statistical interval alone.
+pub const DEFAULT_BIAS_FLOOR_MS: f32 = 2.0;
 
 /// fps/pps window (decision 13): cmds/packets per second over the last 1 s of
 /// cmd `serverTime` (the same clock the original proxy used).
@@ -279,7 +281,9 @@ pub fn fps_pps(records: &[PacketRecord]) -> (i32, i32) {
 ///
 /// `now` is the current `svs.time`; `frame_msec` is `1000/sv_fps` (only used
 /// for the logged `frame_msec/2` variant); `msg_interval` is the message
-/// spacing measured from `cl->frames[]` (`None` → derived from the window).
+/// spacing measured from `cl->frames[]` (`None` → derived from the window);
+/// `bias_floor` is the non-statistical widening of the reported range in
+/// milliseconds (`proxy_sv_timeNudgeMargin`).
 ///
 /// Returns `None` when the window is stale or still filling (the cell shows
 /// `-`).
@@ -288,6 +292,7 @@ pub fn estimate(
     now: i32,
     frame_msec: f32,
     msg_interval: Option<f32>,
+    bias_floor: f32,
 ) -> Option<Estimate> {
     // live window: committed packets seen within WINDOW_MS of `now`
     let live: Vec<&PacketRecord> = records
@@ -403,7 +408,7 @@ pub fn estimate(
     // one sample per acked message: the sample count is already the number of
     // independent ack-delay draws
     let se = stddev(&tn_samples, tn) / (messages as f32).sqrt();
-    let half = t95(messages.saturating_sub(1)) * se + BIAS_FLOOR_MS;
+    let half = t95(messages.saturating_sub(1)) * se + bias_floor;
 
     // step change: older half vs newer half of the window (arrival order)
     let mut older: Vec<f32> = Vec::new();
@@ -508,7 +513,8 @@ mod tests {
         ] {
             let records = ideal_window(tn, cmd_interval, n, i_msg, 120);
             let now = records.iter().map(|r| r.arrival).max().unwrap();
-            let est = estimate(&records, now, 50.0, Some(i_msg)).expect("window");
+            let est =
+                estimate(&records, now, 50.0, Some(i_msg), DEFAULT_BIAS_FLOOR_MS).expect("window");
             assert!(
                 (est.tn - tn).abs() <= 1.0,
                 "tn = {} want {} (raw {}, lag {}, ackdelay {}, I_cmd {})",
@@ -529,7 +535,8 @@ mod tests {
         // the refined estimate (logged as tn_plan, never displayed)
         let records = ideal_window(0.0, 1000.0 / 60.0, 2, 100.0, 120);
         let now = records.iter().map(|r| r.arrival).max().unwrap();
-        let est = estimate(&records, now, 50.0, Some(100.0)).expect("window");
+        let est =
+            estimate(&records, now, 50.0, Some(100.0), DEFAULT_BIAS_FLOOR_MS).expect("window");
         assert!((est.tn - 0.0).abs() <= 1.0, "refined {}", est.tn);
         assert!(
             (est.tn_plan - est.tn).abs() > 5.0,
@@ -544,20 +551,57 @@ mod tests {
         let records = ideal_window(0.0, 1000.0 / 60.0, 2, 50.0, 120);
         let now = records.iter().map(|r| r.arrival).max().unwrap();
         // stale: `now` far beyond the window
-        assert!(estimate(&records, now + 10_000, 50.0, Some(50.0)).is_none());
+        assert!(
+            estimate(
+                &records,
+                now + 10_000,
+                50.0,
+                Some(50.0),
+                DEFAULT_BIAS_FLOOR_MS
+            )
+            .is_none()
+        );
         // filling: only a few samples
-        assert!(estimate(&records[..6], now, 50.0, Some(50.0)).is_none());
+        assert!(estimate(&records[..6], now, 50.0, Some(50.0), DEFAULT_BIAS_FLOOR_MS).is_none());
     }
 
     #[test]
     fn range_is_ci_plus_bias_floor() {
         let records = ideal_window(5.0, 1000.0 / 60.0, 2, 50.0, 120);
         let now = records.iter().map(|r| r.arrival).max().unwrap();
-        let est = estimate(&records, now, 50.0, Some(50.0)).expect("window");
+        let est = estimate(&records, now, 50.0, Some(50.0), DEFAULT_BIAS_FLOOR_MS).expect("window");
         let half = est.hi - est.tn;
-        assert!(half >= BIAS_FLOOR_MS - 1e-3);
-        assert!(half <= BIAS_FLOOR_MS + t95(est.samples - 1) * est.se + 1e-3);
+        assert!(half >= DEFAULT_BIAS_FLOOR_MS - 1e-3);
+        assert!(half <= DEFAULT_BIAS_FLOOR_MS + t95(est.samples - 1) * est.se + 1e-3);
         assert!(est.lo <= est.tn && est.tn <= est.hi);
+    }
+
+    #[test]
+    fn the_bias_floor_is_configurable() {
+        let records = ideal_window(5.0, 1000.0 / 60.0, 2, 50.0, 120);
+        let now = records.iter().map(|r| r.arrival).max().unwrap();
+        let narrow = estimate(&records, now, 50.0, Some(50.0), 0.0).expect("window");
+        let wide = estimate(&records, now, 50.0, Some(50.0), 10.0).expect("window");
+        // Only the reported range moves: the point estimate is unchanged.
+        assert!((wide.tn - narrow.tn).abs() < 1e-4);
+        assert!((wide.hi - wide.tn) - ((narrow.hi - narrow.tn) + 10.0) < 1e-3);
+        assert!((wide.tn - wide.lo) - ((narrow.tn - narrow.lo) + 10.0) < 1e-3);
+
+        // The margin is what the netStatus cell colours and the void verdict
+        // reads: a small non-zero reading is confidently excluded at floor 0
+        // and becomes "consistent with 0" once the margin covers it.
+        let small = ideal_window(1.0, 1000.0 / 60.0, 2, 50.0, 120);
+        let now = small.iter().map(|r| r.arrival).max().unwrap();
+        let excluded = estimate(&small, now, 50.0, Some(50.0), 0.0).expect("window");
+        let included = estimate(&small, now, 50.0, Some(50.0), 2.0).expect("window");
+        assert!(
+            excluded.lo > 0.0,
+            "floor 0 must exclude 0 for a +1 ms reading"
+        );
+        assert!(
+            included.lo < 0.0 && included.hi > 0.0,
+            "a 2 ms margin must include 0 for the same reading"
+        );
     }
 
     #[test]
@@ -576,7 +620,7 @@ mod tests {
         }
         records.append(&mut late);
         let now = records.iter().map(|r| r.arrival).max().unwrap();
-        let est = estimate(&records, now, 50.0, Some(50.0)).expect("window");
+        let est = estimate(&records, now, 50.0, Some(50.0), DEFAULT_BIAS_FLOOR_MS).expect("window");
         assert!(est.step, "expected a step detection (tn {})", est.tn);
     }
 
@@ -609,7 +653,7 @@ mod tests {
             }
         }
         let now = out.iter().map(|r| r.arrival).max().unwrap();
-        let est = estimate(&out, now, 50.0, Some(i_msg)).expect("window");
+        let est = estimate(&out, now, 50.0, Some(i_msg), DEFAULT_BIAS_FLOOR_MS).expect("window");
         assert!(
             (est.tn - 3.0).abs() <= 1.0,
             "tn = {} (samples {}, messages {})",
@@ -626,7 +670,14 @@ mod tests {
         // of following I_msg
         let records = ideal_window(0.0, 1000.0 / 60.0, 2, 145.0, 120);
         let now = records.iter().map(|r| r.arrival).max().unwrap();
-        let est = estimate(&records, now, 1000.0 / 30.0, Some(145.0)).expect("window");
+        let est = estimate(
+            &records,
+            now,
+            1000.0 / 30.0,
+            Some(145.0),
+            DEFAULT_BIAS_FLOOR_MS,
+        )
+        .expect("window");
         assert!((est.clock_gap - FAST_ADJUST_MEAN_MS).abs() < 1e-3);
     }
 

@@ -79,9 +79,11 @@ use crate::sdk::{
     SIZEOF_CLIENT_T, Usercmd,
 };
 use crate::state::{
-    self, CVAR_ANTI_MACRO, CVAR_ANTI_MACRO_LOG, CVAR_ANTI_MACRO_VIEW, CVAR_CLIENT_PPS_LOG,
-    CVAR_ENABLE_CLIENT_PPS_LIMIT, CVAR_ENABLE_NET_STATUS, CVAR_VOID_TIME_NUDGE,
-    CVAR_VOID_TIME_NUDGE_LOG,
+    self, CVAR_ANTI_MACRO, CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS, CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS,
+    CVAR_ANTI_MACRO_LOG, CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS, CVAR_ANTI_MACRO_MIN_REVERSALS,
+    CVAR_ANTI_MACRO_VIEW, CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS, CVAR_ANTI_MACRO_VIEW_MIN_SWING,
+    CVAR_ANTI_MACRO_VIEW_STEP_PERCENT, CVAR_CLIENT_PPS_LOG, CVAR_ENABLE_CLIENT_PPS_LIMIT,
+    CVAR_ENABLE_NET_STATUS, CVAR_TIME_NUDGE_MARGIN, CVAR_VOID_TIME_NUDGE, CVAR_VOID_TIME_NUDGE_LOG,
 };
 use crate::syscall;
 use crate::timenudge;
@@ -388,6 +390,15 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
         let anti_macro_view = s.cvars[CVAR_ANTI_MACRO_VIEW].integer != 0;
         let log_level = s.cvars[CVAR_ANTI_MACRO_LOG].integer;
         let events = if anti_macro || log_level != 0 {
+            let thresholds = crate::macroguard::Thresholds::from_cvars(
+                s.cvars[CVAR_ANTI_MACRO_MIN_REVERSALS].integer,
+                s.cvars[CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS].integer,
+                s.cvars[CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS].integer,
+                s.cvars[CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS].integer,
+                s.cvars[CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS].integer,
+                s.cvars[CVAR_ANTI_MACRO_VIEW_STEP_PERCENT].integer,
+                s.cvars[CVAR_ANTI_MACRO_VIEW_MIN_SWING].integer,
+            );
             // SAFETY: cmd is the engine's usercmd buffer for this call.
             crate::macroguard::process_with_view(
                 &mut s.clients[client_num].macro_guard,
@@ -395,6 +406,7 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
                 anti_macro,
                 anti_macro_view,
                 log_level,
+                &thresholds,
             )
         } else {
             // Inert while off; drop any state a previous enable left behind.
@@ -534,6 +546,18 @@ fn compute(client_num: usize, now: i32, msg_interval: f32) -> Option<Estimate> {
         if fps > 0 { 1000.0 / fps as f32 } else { 0.0 }
     };
     state::with_state(|s| {
+        // The estimator's non-statistical margin is operator-tunable
+        // (`proxy_sv_timeNudgeMargin`, D-015). A malformed value (NaN, or a
+        // negative reading from a hand-edited config) falls back to the
+        // historical floor instead of poisoning every range with NaN.
+        let bias_floor = {
+            let v = s.cvars[CVAR_TIME_NUDGE_MARGIN].value;
+            if v.is_finite() {
+                v.clamp(0.0, 100.0)
+            } else {
+                netstatus_est::DEFAULT_BIAS_FLOOR_MS
+            }
+        };
         let ns = &mut s.clients[client_num].netstatus;
         let records: Vec<_> = ns.records().copied().collect();
         let est = netstatus_est::estimate(
@@ -541,6 +565,7 @@ fn compute(client_num: usize, now: i32, msg_interval: f32) -> Option<Estimate> {
             now,
             frame_msec,
             Some(msg_interval).filter(|v| *v > 0.0),
+            bias_floor,
         )?;
         if est.step {
             // keep the post-step half so the new value shows within ~2 s
@@ -847,6 +872,36 @@ mod tests {
             pps_cell(Some(sample(200_000, 100_000, 0)), 0, false),
             "^1200000^7/100000"
         );
+    }
+
+    #[test]
+    fn the_configured_tolerance_reaches_the_packets_cell() {
+        // fps 98 -> the ±2 band lifts the limit to the 100 ceiling, and the
+        // tolerance of 1 makes it 101: a client sending exactly 101 packets/s
+        // must stay white. This pins that the cell colours on the same limit
+        // `refresh_fps` derives, not on the bare FPS.
+        let run = |tolerance: i32| {
+            let mut s = crate::pps::PpsState::default();
+            s.refresh_fps(0, 98, 100, 2, tolerance);
+            let limit = s.limit();
+            // Two seconds at exactly 101 pps (integer packet times).
+            for i in 0..=202 {
+                s.on_packet(i * 1000 / 101, limit, true);
+            }
+            let status = s.status(2000).expect("a window completed");
+            (limit, status, pps_cell(Some(status), 0, true))
+        };
+
+        let (limit, status, cell) = run(1);
+        assert_eq!(limit, 101);
+        assert_eq!(status.rate, 101);
+        assert_eq!(cell, "      101", "the tolerance must keep 101 white");
+
+        // With the tolerance off the same traffic is over the limit and red.
+        let (limit, status, cell) = run(0);
+        assert_eq!(limit, 100);
+        assert_eq!(status.rate, 101);
+        assert_eq!(cell, "^1      100^7", "without slack the cell is red");
     }
 
     fn estimate(lo: f32, hi: f32) -> Estimate {

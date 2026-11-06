@@ -173,7 +173,9 @@ Channels and observations:
 | `yaw`, `pitch` | signed 16-bit delta of the raw angle, `>= 36` units (≈0.2°) | the angle keeps its last unlocked value |
 | `attack` | `BUTTON_ATTACK`/`BUTTON_ALT_ATTACK` mask toggling | the mask keeps its last unlocked state |
 
-Constants (inferred, see below):
+Constants (inferred, see below). Seven of them — the rate, hold-spread and
+view-shape thresholds — are also cvars whose defaults reproduce these values
+(see [Cvars](#cvars)); the rest are fixed:
 
 | constant | value | why |
 |---|---|---|
@@ -307,10 +309,26 @@ Known limits:
 | `proxy_sv_antiMacro` | 0 | freeze locked channels; detection runs while this or the log cvar is on |
 | `proxy_sv_antiMacroLog` | 0 | `1` lock/release transitions, `2` plus the statistics of locked channels, `3` plus every channel with a reversal (diagnostic); works alone (reports, does not apply) |
 | `proxy_sv_antiMacroView` | 0 | `0` compute and log the view verdict but never freeze `yaw`/`pitch`; non-zero freezes a locked view. Opt-in because a hand mouse wiggle is not reliably separable from a key-driven view wiggle at the wire level |
+| `proxy_sv_antiMacroMinReversals` | 4 | reversals in a run needed for the rate test; raising it is the documented first response to false positives |
+| `proxy_sv_antiMacroAxisMaxMeanCmds` | 3 | movement channels: maximum mean interval, in commands, for a rate verdict |
+| `proxy_sv_antiMacroViewMaxMeanMs` | 65 | view channels: maximum mean interval, in milliseconds, for a rate verdict |
+| `proxy_sv_antiMacroAttackMaxMeanMs` | 60 | attack channel: maximum mean interval, in milliseconds, for a rate verdict |
+| `proxy_sv_antiMacroMaxHoldSpreadMs` | 10 | maximum shortest-to-longest hold spread, in milliseconds, for the `wait`-exactness test; lower is stricter |
+| `proxy_sv_antiMacroViewStepPercent` | 75 | minimum mean/peak per-command view step percentage for the held-key shape test; `0` disables it |
+| `proxy_sv_antiMacroViewMinSwing` | 364 | minimum view swing in `ANGLE2SHORT` units (≈2°) for a view verdict; `0` removes the floor |
+
+The seven threshold cvars are clamped on read
+(`macroguard::Thresholds::from_cvars`) into ranges where the corresponding
+test keeps its meaning; the defaults reproduce the calibration in the constants
+table above exactly, so an untouched configuration behaves as recorded. Only the
+rate, spread and view-shape tests are tunable: the run structure
+(`RUN_MAX_GAP_MS`, `STALE_GAP_MS`), the wary shortcut, the hold-count floors
+and the noise floors stay fixed because changing them would move what a "run"
+means rather than how sensitive the verdict is.
 
 ## Tests
 
-`rust/src/macroguard.rs` unit tests (30):
+`rust/src/macroguard.rs` unit tests (35):
 
 - the operator's exact bind (six holds → five reversals) fires on its fourth
   reversal, and a second press fires on its third while the channel is wary;
@@ -339,6 +357,10 @@ Known limits:
 - release after the reversing stops (and not before `RELEASE_MS`), wrapped yaw
   measured shortest-path, log-only mode never rewrites, clock rewind, forward
   and up independent;
+- the threshold cvars: defaults reproduce the calibration, out-of-range values
+  are clamped, raising `min_reversals` leaves a five-reversal burst alone,
+  widening the hold spread fires on a hand rhythm, and the per-channel rate
+  thresholds gate the view and movement tests independently;
 - plus the `PROXY_CVARS` default/name tests in `state.rs`.
 
 `cargo test --lib` (390), `cargo clippy --all-targets`, `cargo fmt --check` and

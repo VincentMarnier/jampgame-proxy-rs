@@ -49,14 +49,24 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
-| `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± 2, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
+| `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± `proxy_sv_clientPpsFpsMargin`, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_globalMaxPps`               | 100     | global hard ceiling on accepted packets per second per client (`0` = no ceiling); the per-client FPS-derived limit is capped to it |
+| `proxy_sv_clientPpsFpsMargin`         | 2       | half-width, in FPS, of the uncertainty band around the measured FPS used to derive the packet-rate limit: the highest limit over `FPS - margin ..= FPS + margin` wins, so the band can only raise it; `0` uses the measured FPS alone (see [Client packet rate](#client-packet-rate)) |
+| `proxy_sv_clientPpsTolerance`         | 1       | packets/second of slack added **after** the FPS band and the global ceiling: with `1`, a client sending 101 packets/s is accepted when the derived limit is 100; `0` enforces the exact limit (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_clientPpsLog`               | 0       | log client packet-rate limit transitions (starts using too many packets / back under the limit); works on its own without the limiter |
 | `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
+| `proxy_sv_timeNudgeMargin`            | 2       | margin, in milliseconds, added to the `cl_timeNudge` estimate's confidence range: a larger value makes the range wider, so a small nudge stays "consistent with 0" (more conservative); `0` reports the statistical interval alone (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
 | `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
 | `proxy_sv_antiMacroView`              | 0       | `0` observe/log the view verdict but never freeze `yaw`/`pitch` (hand mouse play is too close to a key wiggle at the wire level); non-zero freezes a locked view |
+| `proxy_sv_antiMacroMinReversals`      | 4       | reversals in a run needed for the rate test; raising it is the main false-positive brake (see [Anti-macro guard](#anti-macro-guard)) |
+| `proxy_sv_antiMacroAxisMaxMeanCmds`   | 3       | movement channels: maximum mean interval, in commands, for a rate verdict |
+| `proxy_sv_antiMacroViewMaxMeanMs`     | 65      | view channels: maximum mean interval, in milliseconds, for a rate verdict |
+| `proxy_sv_antiMacroAttackMaxMeanMs`   | 60      | attack channel: maximum mean interval, in milliseconds, for a rate verdict |
+| `proxy_sv_antiMacroMaxHoldSpreadMs`   | 10      | hold-spread test: maximum difference, in milliseconds, between a run's shortest and longest hold (the `wait`-exactness signature); lower is stricter |
+| `proxy_sv_antiMacroViewStepPercent`   | 75      | view key-shape test: minimum mean/peak per-command step percentage; `0` disables the shape gate |
+| `proxy_sv_antiMacroViewMinSwing`      | 364     | view key-shape test: minimum swing between reversals in `ANGLE2SHORT` units (`364` ≈ 2°); `0` removes the floor |
 | `proxy_sv_maxFov`                     | 0       | maximum `cg_fov` value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing; `0` = off (see [FOV cap](#fov-cap)) |
 | `proxy_sv_maxFovAspect`               | 1.7777778 | screen aspect used to turn `proxy_sv_maxFov` into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's `cg_fovAspectAdjust 1`; use `1.3333334` for 4:3/stock clients or higher for ultrawide) |
 | `proxy_sv_maxFovCameraRange`          | 100     | third-person camera setback (world units) assumed by the frustum test; `100` matches the stock `cg_thirdPersonRange`, `0` tests from the player's eye (first-person-strict) |
@@ -393,6 +403,13 @@ Details worth knowing:
   second), because the first window after a connect can still contain startup
   artifacts, and it needs the ~5 s estimation window to settle. A range that
   contains 0 disengages immediately.
+- The range includes a configurable margin, `proxy_sv_timeNudgeMargin`
+  (default `2` ms, the historical bias floor). It absorbs the estimator's
+  unobservable residual and network noise: a small setting stays inside the
+  range and is left alone. Raising the margin makes the decision more
+  conservative (a nudge must be larger to be acted on); `0` reports the
+  statistical interval alone, which is the most sensitive and the most exposed
+  to a bad reading.
 - The applied shift moves by 1 ms per command in either direction, so engaging
   or disengaging never drops a move (a 30 ms jump would fail the game's
   `msec < 1` guard) or creates one oversized movement frame. The player's
@@ -427,28 +444,39 @@ limiter. The maximum allowed pps is computed per client from their **estimated
 FPS** and the global ceiling:
 
 ```text
-limit = max over f in FPS-2 ..= FPS+2 of
+limit = max over f in FPS-margin ..= FPS+margin of
             min(f / ceil(f / proxy_sv_globalMaxPps), proxy_sv_globalMaxPps)
+        + tolerance
 ```
 
-The FPS estimate is uncertain by ±2, so the formula is evaluated for all five
-values and the **highest** result is used; the uncertainty can only raise the
-limit, never lower it. This makes the accepted rate an exact `1/K` fraction of
-the client's rate (`K = ceil(f / globalMaxPps)`), so the eviction pattern is a
-clean "drop one out of every K packets":
+The FPS estimate is uncertain, so the formula is evaluated over a band and the
+**highest** result is used; the uncertainty can only raise the limit, never
+lower it. The half-width of that band is `proxy_sv_clientPpsFpsMargin`
+(default `2` FPS, the historical fixed value; `0` uses the measured FPS
+alone). `proxy_sv_clientPpsTolerance` (default `1`) is then added **after** the
+ceiling: it is the slack between the derived limit and what a legitimate client
+actually sends. With the defaults, a derived limit of `100` accepts `101`
+packets/s, and a client whose FPS is measured at `98` is accepted at `101` too
+(the ±2 band lifts `98` to the `100` ceiling, the tolerance covers the last
+packet). Set it to `0` to enforce the exact limit. This makes the accepted rate
+an exact `1/K` fraction of the client's rate (`K = ceil(f / globalMaxPps)`) plus
+the fixed slack, so the eviction pattern is a clean "drop one out of every K
+packets":
 
 | FPS | global max | samples | limit |
 |---|---|---|---|
-| 60 | 100 | 58..62 → 58..62 | 62 |
-| 100 | 100 | 98..102 → 98,99,100,50,51 | 100 |
-| 144 | 100 | 142..146 → 71,71,72,72,73 | 73 |
-| 250 | 100 | 248..252 → 82,83,83,83,84 | 84 |
+| 60 | 100 | 58..62 → 58..62 | 63 |
+| 100 | 100 | 98..102 → 98,99,100,50,51 | 101 |
+| 144 | 100 | 142..146 → 71,71,72,72,73 | 74 |
+| 250 | 100 | 248..252 → 82,83,83,83,84 | 85 |
 
 The FPS is computed by the same function as the netStatus table
 (`netstatus_est::fps_pps`), so both agree. `proxy_sv_globalMaxPps 0` removes
-the ceiling and the highest sample (`FPS + 2`) is used; if the FPS is not yet
-trustworthy, only the global ceiling is enforced (and `0` there means fail
-open).
+the ceiling and the highest sample (`FPS + margin`) is used; if the FPS is not
+yet trustworthy, only the global ceiling plus the tolerance is enforced (and
+`0` there means fail open). Raising `proxy_sv_clientPpsFpsMargin` makes the
+limiter more tolerant of
+a bad FPS reading (a higher limit); lowering it tightens the limit.
 
 The netStatus table renders the same verdict: its `packets/s` cell comes from
 this counter (all incoming packets, not only packets carrying moves) and an
@@ -545,6 +573,29 @@ Within a run, two independent tests are used:
 
 Once a channel has fired it stays **wary** for 3 s: the next burst fires after
 only three reversals, so repeated presses are neutralised earlier and earlier.
+
+The rate, spread and view-shape thresholds are configurable; their defaults are
+the calibration above, so an untouched config behaves exactly as described:
+
+| cvar | default | controls |
+|---|---|---|
+| `proxy_sv_antiMacroMinReversals` | 4 | reversals needed for a rate verdict (the main false-positive brake) |
+| `proxy_sv_antiMacroAxisMaxMeanCmds` | 3 | movement: maximum mean interval in commands |
+| `proxy_sv_antiMacroViewMaxMeanMs` | 65 | view: maximum mean interval in milliseconds |
+| `proxy_sv_antiMacroAttackMaxMeanMs` | 60 | attack: maximum mean interval in milliseconds |
+| `proxy_sv_antiMacroMaxHoldSpreadMs` | 10 | maximum hold spread in milliseconds (the `wait` signature) |
+| `proxy_sv_antiMacroViewStepPercent` | 75 | minimum mean/peak step percentage (held-key shape) |
+| `proxy_sv_antiMacroViewMinSwing` | 364 | minimum swing in `ANGLE2SHORT` units (≈2°) |
+
+For the maximum-interval and spread thresholds, lowering the value makes the
+guard stricter and raising it more tolerant; `proxy_sv_antiMacroMinReversals`
+works the other way round (higher is stricter).
+`proxy_sv_antiMacroViewStepPercent 0` and `proxy_sv_antiMacroViewMinSwing 0`
+disable their respective view-shape gate. Values are clamped to ranges where the
+tests still have a defined meaning (for example,
+`proxy_sv_antiMacroMinReversals` is at least 1). The run structure (200 ms
+chaining gap, 400 ms release), the wary shortcut, the hold count floors and the
+noise floors are fixed.
 
 Amplitude alone is not a verdict: at 200 fps the stock `cl_yawspeed 140` turns
 0.7° per command for a hand and a macro alike, and a movement axis is `±127`

@@ -65,25 +65,42 @@ steal, already in the verified engine address table
 - `proxy_sv_globalMaxPps` (default `100`): hard global ceiling per client
   (`0` = no ceiling).
 - `proxy_sv_clientPpsLog` (default `0`): over-limit logging.
+- `proxy_sv_clientPpsFpsMargin` (default `2`): half-width, in FPS, of the
+  uncertainty band around the measured FPS (the fixed `2` of the original
+  design, now operator-tunable).
+- `proxy_sv_clientPpsTolerance` (default `1`): packets/second of slack added
+  after the FPS band and the global ceiling, so a legitimate client that sends
+  one packet more than the derived limit is not filtered.
 
 For each client the effective limit is an integer downscale of the FPS,
-evaluated over the estimate's `±2` uncertainty with the **highest** result
-winning:
+evaluated over the estimate's `±margin` uncertainty with the **highest** result
+winning, plus the tolerance:
 
 ```text
-limit = max over f in estimated_fps-2 ..= estimated_fps+2 of
+limit = max over f in estimated_fps-margin ..= estimated_fps+margin of
             min(f / ceil(f / globalMaxPps), globalMaxPps)
+        + tolerance
 ```
 
 The accepted rate is therefore an exact `1/K` fraction of the client's rate
-(`K = ceil(f / globalMaxPps)`), so the eviction pattern is a clean "drop one
-out of every K packets", and the uncertainty can only raise the limit. With
-`144 fps` and a ceiling of `100`, the samples `142..146` produce
-`71, 71, 72, 72, 73`, so the limit is `73` (the highest). Below the ceiling
-`K = 1` and the highest sample is `fps + 2`. `globalMaxPps = 0` means no
-ceiling (limit = `fps + 2`). If the FPS cannot be trusted yet, the global
-ceiling alone is enforced (with `0` there, the limiter fails open and accepts
-everything).
+(`K = ceil(f / globalMaxPps)`) plus a fixed slack, so the eviction pattern is a
+clean "drop one out of every K packets", and neither the uncertainty nor the
+slack can lower the limit. With `144 fps`, a ceiling of `100` and the defaults,
+the samples `142..146` produce `71, 71, 72, 72, 73`, so the limit is `74`
+(highest + tolerance). Below the ceiling `K = 1` and the highest sample is
+`fps + margin` (plus tolerance). `globalMaxPps = 0` means no ceiling
+(limit = `fps + margin + tolerance`). A margin of `0` uses the measured FPS
+alone: the tightest limit, and the most exposed to a single bad reading; the
+value is clamped to `0..=60`, and the tolerance to `0..=1000`. If the FPS
+cannot be trusted yet, the global ceiling plus the tolerance is enforced (with
+`0` there, the limiter fails open and accepts everything, because `0` is the
+fail-open sentinel and is never raised by the tolerance).
+
+The tolerance is what makes a `101`-packet/s client acceptable against the
+default ceiling of `100`, and it also covers the case where the FPS is
+*measured* a little low: at `98` measured fps the `±2` band already lifts the
+limit to `100`, and the tolerance accepts `101`. Set it to `0` to enforce the
+exact derived limit.
 
 ### D-014.2 — FPS comes from the shared usercmd record feed
 

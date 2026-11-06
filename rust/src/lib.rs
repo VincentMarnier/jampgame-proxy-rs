@@ -589,6 +589,8 @@ fn update_proxy_cvars() {
                 measure,
                 s.cvars[state::CVAR_GLOBAL_MAX_PPS].integer,
                 s.cvars[state::CVAR_CLIENT_PPS_LOG].integer,
+                s.cvars[state::CVAR_CLIENT_PPS_FPS_MARGIN].integer,
+                s.cvars[state::CVAR_CLIENT_PPS_TOLERANCE].integer,
             );
             // The ban file path is a string cvar; copied out while the state is
             // locked, then used (file I/O) after it is released.

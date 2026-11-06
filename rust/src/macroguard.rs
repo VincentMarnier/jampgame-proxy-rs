@@ -83,6 +83,12 @@
 //! regularly than it can mash turn keys, and the wire does not always tell the
 //! two apart; the default therefore keeps hand play untouched. The movement and
 //! attack channels are always enforced by `proxy_sv_antiMacro`.
+//!
+//! The rate, hold-spread and view-shape thresholds are mirrored from the
+//! `proxy_sv_antiMacro*` cvars once per command (see [`Thresholds`]); their
+//! defaults are the calibration described below, so a server that never touches
+//! them behaves exactly as before. The run structure, the wary shortcut and the
+//! noise floors are fixed constants.
 
 use crate::sdk::{MAX_CLIENTS, PITCH, Usercmd, YAW};
 
@@ -119,7 +125,8 @@ const ATTACK_BUTTONS: i32 = 1 | 128;
 const RUN_MAX_GAP_MS: i32 = 200;
 
 /// Reversals that make a run "sustained" for the rate test. Three intervals at
-/// a frame-exact pace is already far beyond a hand.
+/// a frame-exact pace is already far beyond a hand. The default of the
+/// `proxy_sv_antiMacroMinReversals` cvar.
 const RUN_MIN_REVERSALS: u16 = 4;
 
 /// Reversals needed for the hold-spread test (three holds).
@@ -130,7 +137,8 @@ const SPREAD_MIN_REVERSALS: u16 = 4;
 /// exact at any frame rate. A hand's timing jitters by roughly ten
 /// milliseconds; at the stock 85 fps that is under one command, which is why
 /// the range is measured in time rather than in commands. Ten milliseconds is
-/// the same allowance the old 2-command range gave at 200 fps.
+/// the same allowance the old 2-command range gave at 200 fps. The default of
+/// the `proxy_sv_antiMacroMaxHoldSpreadMs` cvar.
 const MAX_HOLD_SPREAD_MS: u32 = 10;
 
 /// After a channel has fired, the next burst is caught after this many
@@ -143,12 +151,13 @@ const WARY_MS: i32 = 3_000;
 /// Movement: the acceleration payoff is per command, so the interval is counted
 /// in commands. Reversing every 1-3 commands is far beyond a hand; a human
 /// half-strafe sits at 5+ commands even at 200 fps. Randomised wait counts do
-/// not change the mean.
+/// not change the mean. The default of `proxy_sv_antiMacroAxisMaxMeanCmds`.
 const AXIS_MAX_MEAN_COMMANDS: u32 = 3;
 
 /// View: milliseconds, not commands — the wiggle's payoff is per second. 65 ms
 /// ≈ 15 reversals/s; the reported script is 55 ms at 200 fps (18 % margin). A
-/// slower *exact* script is caught by the hold-spread test instead.
+/// slower *exact* script is caught by the hold-spread test instead. The default
+/// of `proxy_sv_antiMacroViewMaxMeanMs`.
 const VIEW_MAX_MEAN_MS: i32 = 65;
 
 /// A view run must also look like a held turn **key**. A config macro can only
@@ -157,16 +166,19 @@ const VIEW_MAX_MEAN_MS: i32 = 65;
 /// `cl_yawspeed * frame_msec`, near-constant at a capped frame rate. A mouse
 /// wiggle accelerates and decelerates, so its mean step is far below its peak
 /// (a sinusoid sits at ~64 %). Requiring 75 % keeps key bursts and rejects
-/// hand-driven mouse wiggles.
+/// hand-driven mouse wiggles. The default of
+/// `proxy_sv_antiMacroViewStepPercent`.
 const VIEW_STEP_MEAN_PERCENT: u64 = 75;
 
 /// A view run must also move the view by at least this much between reversals
 /// (`ANGLE2SHORT` units; 364 ≈ 2° peak-to-peak). Below it the step profile is
 /// dominated by the noise floor and the blade displacement is negligible; this
-/// closes the small-amplitude hole in the key-shape test.
+/// closes the small-amplitude hole in the key-shape test. The default of
+/// `proxy_sv_antiMacroViewMinSwing`.
 const VIEW_MIN_SWING: i32 = 364;
 
-/// Attack: toggling faster than this (~17/s) is not a human click rate.
+/// Attack: toggling faster than this (~17/s) is not a human click rate. The
+/// default of `proxy_sv_antiMacroAttackMaxMeanMs`.
 const ATTACK_MAX_MEAN_MS: i32 = 60;
 
 // --- structure -------------------------------------------------------------
@@ -193,6 +205,85 @@ const ANGLE_MIN_STEP: i32 = 36;
 /// With `proxy_sv_antiMacroLog 2`, a locked channel's figures print once per
 /// second; level `3` prints every channel with a run (diagnostic).
 const DEBUG_PERIOD_MS: i32 = 1_000;
+
+// --- operator-tunable thresholds -------------------------------------------
+
+/// Detection thresholds mirrored from the `proxy_sv_antiMacro*` cvars once per
+/// command. [`Default`] is the historical calibration (the defaults registered
+/// in [`crate::state::PROXY_CVARS`]), so a configuration that never touches the
+/// cvars behaves exactly as before.
+///
+/// Only the *rate*, *spread* and *view-shape* tests are tunable. The run
+/// structure (`RUN_MAX_GAP_MS`, `STALE_GAP_MS`), the confirmation shortcut
+/// (`WARY_*`), the hold-count floors (`SPREAD_MIN_REVERSALS`) and the noise
+/// floors (`AXIS_MIN`, `ANGLE_MIN_STEP`) stay fixed: changing them moves the
+/// meaning of a run rather than its sensitivity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// Reversals needed for the rate test (`proxy_sv_antiMacroMinReversals`).
+    pub min_reversals: u16,
+    /// Movement: maximum mean interval in commands
+    /// (`proxy_sv_antiMacroAxisMaxMeanCmds`).
+    pub axis_max_mean_cmds: u32,
+    /// View: maximum mean interval in milliseconds
+    /// (`proxy_sv_antiMacroViewMaxMeanMs`).
+    pub view_max_mean_ms: i32,
+    /// Attack: maximum mean interval in milliseconds
+    /// (`proxy_sv_antiMacroAttackMaxMeanMs`).
+    pub attack_max_mean_ms: i32,
+    /// Hold-spread test: maximum spread in milliseconds
+    /// (`proxy_sv_antiMacroMaxHoldSpreadMs`).
+    pub max_hold_spread_ms: u32,
+    /// View key-shape test: minimum mean/peak step percentage
+    /// (`proxy_sv_antiMacroViewStepPercent`).
+    pub view_step_percent: u64,
+    /// View key-shape test: minimum swing in `ANGLE2SHORT` units
+    /// (`proxy_sv_antiMacroViewMinSwing`).
+    pub view_min_swing: i32,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Thresholds {
+            min_reversals: RUN_MIN_REVERSALS,
+            axis_max_mean_cmds: AXIS_MAX_MEAN_COMMANDS,
+            view_max_mean_ms: VIEW_MAX_MEAN_MS,
+            attack_max_mean_ms: ATTACK_MAX_MEAN_MS,
+            max_hold_spread_ms: MAX_HOLD_SPREAD_MS,
+            view_step_percent: VIEW_STEP_MEAN_PERCENT,
+            view_min_swing: VIEW_MIN_SWING,
+        }
+    }
+}
+
+impl Thresholds {
+    /// Build from the raw cvar integers, clamping each into the range where the
+    /// corresponding test still has a defined meaning.
+    ///
+    /// The floors keep a mistyped `0` from turning the guard into "fire on
+    /// every reversal" (`min_reversals`), and the ceilings are wide enough that
+    /// any deliberate setting is honoured. The two view-shape knobs use `0` as
+    /// an explicit "disable this test" value.
+    pub fn from_cvars(
+        min_reversals: i32,
+        axis_max_mean_cmds: i32,
+        view_max_mean_ms: i32,
+        attack_max_mean_ms: i32,
+        max_hold_spread_ms: i32,
+        view_step_percent: i32,
+        view_min_swing: i32,
+    ) -> Self {
+        Thresholds {
+            min_reversals: min_reversals.clamp(1, 32) as u16,
+            axis_max_mean_cmds: axis_max_mean_cmds.clamp(1, 64) as u32,
+            view_max_mean_ms: view_max_mean_ms.clamp(1, 1_000),
+            attack_max_mean_ms: attack_max_mean_ms.clamp(1, 1_000),
+            max_hold_spread_ms: max_hold_spread_ms.clamp(0, 10_000) as u32,
+            view_step_percent: view_step_percent.clamp(0, 100) as u64,
+            view_min_swing: view_min_swing.clamp(0, i16::MAX as i32),
+        }
+    }
+}
 
 /// Which payoff a channel feeds, selecting the rate test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,7 +352,14 @@ struct ChannelState {
 impl ChannelState {
     /// Feed one command. Returns `true` when the run is machine-like (the
     /// caller sets the lock and the wary deadline).
-    fn observe(&mut self, kind: Kind, seq: u32, now: i32, observation: Observation) -> bool {
+    fn observe(
+        &mut self,
+        kind: Kind,
+        seq: u32,
+        now: i32,
+        observation: Observation,
+        t: &Thresholds,
+    ) -> bool {
         let (sign, step) = match observation {
             Observation::Ignore => return false,
             Observation::Neutral => {
@@ -327,17 +425,17 @@ impl ChannelState {
         let mean_ms = now.wrapping_sub(self.run_first_time) / intervals;
         let mean_cmds = seq.wrapping_sub(self.run_first_cmd) / intervals as u32;
         let rate = match kind {
-            Kind::Axis => mean_cmds <= AXIS_MAX_MEAN_COMMANDS,
-            Kind::View => mean_ms <= VIEW_MAX_MEAN_MS,
-            Kind::Attack => mean_ms <= ATTACK_MAX_MEAN_MS,
+            Kind::Axis => mean_cmds <= t.axis_max_mean_cmds,
+            Kind::View => mean_ms <= t.view_max_mean_ms,
+            Kind::Attack => mean_ms <= t.attack_max_mean_ms,
         };
-        let sustained = self.run_count >= RUN_MIN_REVERSALS && rate;
+        let sustained = self.run_count >= t.min_reversals && rate;
         // Time-based, not command-based: `wait N` is exact in milliseconds at
         // any frame rate, whereas a hand's jitter is a fixed span of time that
         // a command-count range misreads as exactness at low fps.
         let spread = self.run_count >= SPREAD_MIN_REVERSALS
             && self.min_hold_ms != u32::MAX
-            && self.max_hold_ms - self.min_hold_ms <= MAX_HOLD_SPREAD_MS;
+            && self.max_hold_ms - self.min_hold_ms <= t.max_hold_spread_ms;
         let wary = now < self.wary_until && self.run_count >= WARY_MIN_REVERSALS && rate;
         let verdict = sustained || spread || wary;
         // A mouse can reverse the view faster and more regularly than a hand
@@ -345,21 +443,22 @@ impl ChannelState {
         // also needs the turn-key signature: a bang-bang step profile and a
         // swing worth neutralising. Movement and attack are not gated.
         if kind == Kind::View {
-            verdict && self.step_is_key_like() && self.swing_max - self.swing_min >= VIEW_MIN_SWING
+            verdict
+                && self.step_is_key_like(t.view_step_percent)
+                && self.swing_max - self.swing_min >= t.view_min_swing
         } else {
             verdict
         }
     }
 
     /// Whether the run's per-command view steps look like a held turn key
-    /// (mean within [`VIEW_STEP_MEAN_PERCENT`] of the peak) rather than a
-    /// hand-driven mouse wiggle.
-    fn step_is_key_like(&self) -> bool {
+    /// (mean at least `percent` of the peak) rather than a hand-driven mouse
+    /// wiggle.
+    fn step_is_key_like(&self, percent: u64) -> bool {
         if self.step_count == 0 || self.step_max == 0 {
             return false;
         }
-        self.step_sum * 100
-            >= u64::from(self.step_max) * VIEW_STEP_MEAN_PERCENT * u64::from(self.step_count)
+        self.step_sum * 100 >= u64::from(self.step_max) * percent * u64::from(self.step_count)
     }
 
     /// Mean interval of the current run, milliseconds (0 with fewer than two
@@ -483,7 +582,7 @@ impl Events {
 /// tests; the runtime calls [`process_with_view`] so the two can differ.
 #[cfg(test)]
 pub fn process(state: &mut MacroState, cmd: &mut Usercmd, apply: bool, log_level: i32) -> Events {
-    process_with_view(state, cmd, apply, apply, log_level)
+    process_with_view(state, cmd, apply, apply, log_level, &Thresholds::default())
 }
 
 /// Observe one raw command and, when `apply` is set, neutralise the channels
@@ -493,7 +592,8 @@ pub fn process(state: &mut MacroState, cmd: &mut Usercmd, apply: bool, log_level
 /// guard *would* do); `apply` only decides whether the command is rewritten.
 /// `log_level` is the `proxy_sv_antiMacroLog` level: `0`/`1` no statistics
 /// (`1` still logs transitions), `2` the figures for locked channels, `3` the
-/// figures for every channel with a run (diagnostic).
+/// figures for every channel with a run (diagnostic). `thresholds` carries the
+/// operator-tunable `proxy_sv_antiMacro*` values (see [`Thresholds`]).
 ///
 /// `apply_view` decides whether a locked `yaw`/`pitch` is frozen, while `apply`
 /// still covers the movement and attack channels. Detection and logging are the
@@ -504,6 +604,7 @@ pub fn process_with_view(
     apply: bool,
     apply_view: bool,
     log_level: i32,
+    thresholds: &Thresholds,
 ) -> Events {
     let raw = *cmd;
     let now = raw.server_time;
@@ -538,7 +639,7 @@ pub fn process_with_view(
             channel.unwrapped = channel.unwrapped.wrapping_add(view_delta(&raw, &prev, ch));
         }
         let observation = sample(ch, &raw, &prev);
-        if channel.observe(kind, seq, now, observation) {
+        if channel.observe(kind, seq, now, observation, thresholds) {
             channel.wary_until = now.wrapping_add(WARY_MS);
             if !channel.locked {
                 channel.locked = true;
@@ -749,6 +850,20 @@ mod tests {
             delta: i32,
             apply: bool,
         ) -> (bool, Option<usize>) {
+            self.feed_with(holds, frame_ms, delta, apply, &Thresholds::default())
+        }
+
+        /// [`feed`] with explicit detection thresholds.
+        ///
+        /// [`feed`]: Self::feed
+        fn feed_with(
+            &mut self,
+            holds: &[u32],
+            frame_ms: i32,
+            delta: i32,
+            apply: bool,
+            thresholds: &Thresholds,
+        ) -> (bool, Option<usize>) {
             let start = self.index;
             let mut locked = false;
             let mut lock_at = None;
@@ -761,7 +876,7 @@ mod tests {
                         ..Usercmd::default()
                     };
                     c.angles[YAW] = self.angle;
-                    let e = process(&mut self.state, &mut c, apply, 0);
+                    let e = process_with_view(&mut self.state, &mut c, apply, apply, 0, thresholds);
                     if e.started[CH_YAW] && !locked {
                         locked = true;
                         lock_at = Some(self.index - start);
@@ -801,6 +916,17 @@ mod tests {
         frame_ms: i32,
         value: i8,
     ) -> (bool, Option<usize>) {
+        feed_axis_holds_with(state, holds, frame_ms, value, &Thresholds::default())
+    }
+
+    /// [`feed_axis_holds`] with explicit detection thresholds.
+    fn feed_axis_holds_with(
+        state: &mut MacroState,
+        holds: &[u32],
+        frame_ms: i32,
+        value: i8,
+        thresholds: &Thresholds,
+    ) -> (bool, Option<usize>) {
         let mut time = 0;
         let mut index = 0usize;
         let mut locked = false;
@@ -813,7 +939,7 @@ mod tests {
                     rightmove: sign * value,
                     ..Usercmd::default()
                 };
-                let e = process(state, &mut c, true, 0);
+                let e = process_with_view(state, &mut c, true, true, 0, thresholds);
                 if e.started[CH_RIGHT] && !locked {
                     locked = true;
                     lock_at = Some(index);
@@ -1032,6 +1158,106 @@ mod tests {
         let mut driver = YawDriver::new();
         let (locked, _) = driver.feed(&[5, 9, 6, 10, 7, 5], 5, 127, true);
         assert!(locked, "a fast turn-key burst need not have exact holds");
+    }
+
+    #[test]
+    fn the_thresholds_default_to_the_historical_calibration() {
+        assert_eq!(Thresholds::default().min_reversals, RUN_MIN_REVERSALS);
+        assert_eq!(
+            Thresholds::default().axis_max_mean_cmds,
+            AXIS_MAX_MEAN_COMMANDS
+        );
+        assert_eq!(Thresholds::default().view_max_mean_ms, VIEW_MAX_MEAN_MS);
+        assert_eq!(Thresholds::default().attack_max_mean_ms, ATTACK_MAX_MEAN_MS);
+        assert_eq!(Thresholds::default().max_hold_spread_ms, MAX_HOLD_SPREAD_MS);
+        assert_eq!(
+            Thresholds::default().view_step_percent,
+            VIEW_STEP_MEAN_PERCENT
+        );
+        assert_eq!(Thresholds::default().view_min_swing, VIEW_MIN_SWING);
+        // The cvar defaults produce exactly the same thresholds.
+        assert_eq!(
+            Thresholds::from_cvars(4, 3, 65, 60, 10, 75, 364),
+            Thresholds::default()
+        );
+    }
+
+    #[test]
+    fn the_threshold_cvars_are_clamped_to_meaningful_ranges() {
+        // A mistyped 0 must not turn every reversal into a verdict, and the
+        // view-shape knobs keep 0 as an explicit "disable" value.
+        let t = Thresholds::from_cvars(0, 0, 0, 0, -5, 500, 99_999);
+        assert_eq!(t.min_reversals, 1);
+        assert_eq!(t.axis_max_mean_cmds, 1);
+        assert_eq!(t.view_max_mean_ms, 1);
+        assert_eq!(t.attack_max_mean_ms, 1);
+        assert_eq!(t.max_hold_spread_ms, 0);
+        assert_eq!(t.view_step_percent, 100);
+        assert_eq!(t.view_min_swing, i16::MAX as i32);
+        let wide = Thresholds::from_cvars(999, 999, 5_000, 5_000, 999_999, 75, 364);
+        assert_eq!(wide.min_reversals, 32);
+        assert_eq!(wide.axis_max_mean_cmds, 64);
+        assert_eq!(wide.view_max_mean_ms, 1_000);
+        assert_eq!(wide.attack_max_mean_ms, 1_000);
+        assert_eq!(wide.max_hold_spread_ms, 10_000);
+    }
+
+    #[test]
+    fn raising_min_reversals_requires_a_longer_burst() {
+        // The irregular turn-key burst is a rate verdict after four reversals
+        // (the default). Requiring eight leaves this five-reversal burst alone.
+        let strict = Thresholds {
+            min_reversals: 8,
+            ..Thresholds::default()
+        };
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed_with(&[5, 9, 6, 10, 7, 5], 5, 127, true, &strict);
+        assert!(!locked, "min_reversals must raise the bar");
+    }
+
+    #[test]
+    fn loosening_the_hold_spread_catches_a_hand_rhythm() {
+        // The same holds the default calibration leaves alone become a spread
+        // verdict once the allowed spread covers the hand's 24 ms jitter.
+        let loose = Thresholds {
+            max_hold_spread_ms: 100,
+            ..Thresholds::default()
+        };
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed_with(&[14, 15, 14, 16, 15], 12, 127, true, &loose);
+        assert!(locked, "a wider spread must fire on the same rhythm");
+    }
+
+    #[test]
+    fn the_rate_thresholds_are_per_channel() {
+        // A fast, *irregular* turn-key burst (mean ~37 ms) is a view rate
+        // verdict by default. Lowering the view rate threshold below its mean
+        // leaves the view alone; its holds are irregular, so the spread test
+        // cannot fire instead.
+        let strict_view = Thresholds {
+            view_max_mean_ms: 20,
+            ..Thresholds::default()
+        };
+        let mut driver = YawDriver::new();
+        let (locked, _) = driver.feed_with(&[5, 9, 6, 10, 7, 5], 5, 127, true, &strict_view);
+        assert!(!locked, "the view rate threshold must gate the view test");
+
+        // The movement channel reads the same idea in commands. Randomised
+        // 1..3-command holds average ~2 commands: a rate verdict at the default
+        // of 3, no longer one at 1 (and their 10-30 ms spread is too wide for
+        // the spread test to take over).
+        let holds = pseudo_random_holds(11, 20, 1, 3);
+        let strict_axis = Thresholds {
+            axis_max_mean_cmds: 1,
+            ..Thresholds::default()
+        };
+        let mut default_state = MacroState::default();
+        let (locked, _) =
+            feed_axis_holds_with(&mut default_state, &holds, 10, 127, &Thresholds::default());
+        assert!(locked, "the default axis threshold catches the strafe");
+        let mut strict_state = MacroState::default();
+        let (locked, _) = feed_axis_holds_with(&mut strict_state, &holds, 10, 127, &strict_axis);
+        assert!(!locked, "axis_max_mean_cmds must gate the axis test");
     }
 
     #[test]
@@ -1273,7 +1499,8 @@ mod tests {
                 };
                 c.angles[YAW] = angle;
                 let raw = angle;
-                let e = process_with_view(&mut state, &mut c, true, false, 0);
+                let e =
+                    process_with_view(&mut state, &mut c, true, false, 0, &Thresholds::default());
                 detected |= e.started[CH_YAW];
                 assert_eq!(c.angles[YAW], raw, "a log-only view must not be frozen");
                 time += 5;

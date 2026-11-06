@@ -24,18 +24,29 @@
 //! integer downscale:
 //!
 //! ```text
-//! limit = max over f in fps-2 ..= fps+2 of
+//! limit = max over f in fps-margin ..= fps+margin of
 //!             min(f / ceil(f / globalMaxPps), globalMaxPps)
+//!         + tolerance
 //! ```
 //!
-//! so the accepted rate is always an exact `1/K` fraction of the client's
-//! rate (`K = ceil(f / globalMaxPps)`), and the FPS estimate's `±2` window
-//! never lowers the limit: the highest value the formula produces over the
-//! five samples wins. `144 fps` with a cap of `100` evaluates `142..=146`
-//! (`71, 71, 72, 72, 73`) and enforces `73`. If the FPS cannot be trusted
-//! yet, the global ceiling alone is enforced (and `0` there means fail open);
-//! a global ceiling of `0` means "no ceiling" and the highest sample
-//! (`fps + 2`) is used.
+//! where `margin` is `proxy_sv_clientPpsFpsMargin` (default `2`, the historical
+//! fixed value) and `tolerance` is `proxy_sv_clientPpsTolerance` (default `1`).
+//! The tolerance is added **after** the global ceiling, so it is the slack
+//! between the derived limit and what a legitimate client actually sends: a
+//! derived limit of `100` accepts `101` packets/s, and a client whose FPS is
+//! measured at `98` is accepted at `101` too (the `±2` band lifts `98` to the
+//! `100` ceiling, then the tolerance covers the last packet).
+//!
+//! So the accepted rate is always an exact `1/K` fraction of the client's rate
+//! (`K = ceil(f / globalMaxPps)`) plus the fixed tolerance, and the FPS
+//! estimate's uncertainty band never lowers the limit: the highest value the
+//! formula produces over the samples wins. `144 fps` with a cap of `100`
+//! evaluates `142..=146` (`71, 71, 72, 72, 73`) and enforces `74` with the
+//! default tolerance. If the FPS cannot be trusted yet, the global ceiling plus
+//! the tolerance is enforced (and `0` there means fail open); a global ceiling
+//! of `0` means "no ceiling" and the highest sample (`fps + margin`) is used. A
+//! margin of `0` uses the measured FPS alone, which is the strictest setting and
+//! the most exposed to a single bad reading.
 //!
 //! This targets the interesting cheat shape: a modified client that sends more
 //! packets than it produces commands (duplicated/empty packets). Packets that
@@ -116,10 +127,25 @@ const IDLE_RESET_MS: i32 = 2 * WINDOW_MS;
 /// is not used for the limit.
 const FPS_MIN_SPAN_MS: i32 = 900;
 
-/// The FPS estimate is uncertain by ±2 fps. The allowed pps is the **highest**
-/// value the formula produces over `fps-2 ..= fps+2`, so the uncertainty never
-/// causes a below-legitimate limit.
-const FPS_ESTIMATE_MARGIN: i32 = 2;
+/// The FPS estimate is uncertain by `proxy_sv_clientPpsFpsMargin` fps (default
+/// ±2). The allowed pps is the **highest** value the formula produces over
+/// `fps - margin ..= fps + margin`, so the uncertainty never causes a
+/// below-legitimate limit.
+const DEFAULT_FPS_ESTIMATE_MARGIN: i32 = 2;
+
+/// Upper bound accepted for `proxy_sv_clientPpsFpsMargin`: wider bands cannot
+/// be meaningful for a per-second command count and would turn the limiter
+/// into a no-op.
+const MAX_FPS_ESTIMATE_MARGIN: i32 = 60;
+
+/// Default slack in packets/second added after the derived limit
+/// (`proxy_sv_clientPpsTolerance`): one packet of measurement/jitter slack, so
+/// a client sending `101` packets/s against a `100` limit is not filtered.
+const DEFAULT_TOLERANCE: i32 = 1;
+
+/// Upper bound accepted for `proxy_sv_clientPpsTolerance`: beyond this the
+/// limiter would allow a meaningful flood above the configured ceiling.
+const MAX_TOLERANCE: i32 = 1_000;
 
 /// The FPS estimate (and therefore the allowed pps) is refreshed once a second.
 const FPS_REFRESH_MS: i32 = 1000;
@@ -134,6 +160,11 @@ static ENABLED: AtomicI32 = AtomicI32::new(0);
 /// [`ENABLED`].
 static MEASURE: AtomicI32 = AtomicI32::new(0);
 static GLOBAL_MAX_PPS: AtomicI32 = AtomicI32::new(100);
+/// Half-width of the FPS uncertainty band (`proxy_sv_clientPpsFpsMargin`).
+static FPS_ESTIMATE_MARGIN: AtomicI32 = AtomicI32::new(DEFAULT_FPS_ESTIMATE_MARGIN);
+/// Packets/second of slack added after the derived limit
+/// (`proxy_sv_clientPpsTolerance`).
+static TOLERANCE: AtomicI32 = AtomicI32::new(DEFAULT_TOLERANCE);
 static LOG: AtomicI32 = AtomicI32::new(0);
 
 /// Set when accounting was seen off, so the next measured packet starts from
@@ -148,10 +179,22 @@ static ENFORCE_WAS_OFF: AtomicBool = AtomicBool::new(true);
 /// Mirror the cvars into lock-free atomics so a fully idle feature costs one
 /// packet-path check. `measure` is `enableClientPpsLimit ||
 /// enableNetStatus`. Values are clamped here, not at the call site.
-pub fn set_config(enabled: i32, measure: i32, global_max_pps: i32, log: i32) {
+pub fn set_config(
+    enabled: i32,
+    measure: i32,
+    global_max_pps: i32,
+    log: i32,
+    fps_margin: i32,
+    tolerance: i32,
+) {
     ENABLED.store(i32::from(enabled != 0), Ordering::Relaxed);
     MEASURE.store(i32::from(measure != 0), Ordering::Relaxed);
     GLOBAL_MAX_PPS.store(global_max_pps.clamp(0, 100_000), Ordering::Relaxed);
+    FPS_ESTIMATE_MARGIN.store(
+        fps_margin.clamp(0, MAX_FPS_ESTIMATE_MARGIN),
+        Ordering::Relaxed,
+    );
+    TOLERANCE.store(tolerance.clamp(0, MAX_TOLERANCE), Ordering::Relaxed);
     LOG.store(i32::from(log != 0), Ordering::Relaxed);
 }
 
@@ -223,12 +266,13 @@ fn allowed_pps_at(fps: i32, global_max_pps: i32) -> i32 {
     (fps / divisor).min(global)
 }
 
-/// The allowed pps over the FPS estimate's `±2` uncertainty: the highest value
-/// the formula produces for `fps-2 ..= fps+2`.
-fn allowed_pps(fps: i32, global_max_pps: i32) -> i32 {
+/// The allowed pps over the FPS estimate's `±margin` uncertainty: the highest
+/// value the formula produces for `fps-margin ..= fps+margin`.
+fn allowed_pps(fps: i32, global_max_pps: i32, margin: i32) -> i32 {
     let center = fps.max(1);
-    let low = center.saturating_sub(FPS_ESTIMATE_MARGIN).max(1);
-    let high = center.saturating_add(FPS_ESTIMATE_MARGIN);
+    let margin = margin.clamp(0, MAX_FPS_ESTIMATE_MARGIN);
+    let low = center.saturating_sub(margin).max(1);
+    let high = center.saturating_add(margin);
     (low..=high)
         .map(|sample| allowed_pps_at(sample, global_max_pps))
         .max()
@@ -318,24 +362,43 @@ impl PpsState {
     /// Store a fresh FPS estimate and derive the allowed pps from it.
     ///
     /// The enforced limit is the **highest** value the integer-downscale
-    /// formula produces over the estimate's `±2` uncertainty:
+    /// formula produces over the estimate's `±margin` uncertainty
+    /// (`margin` = `proxy_sv_clientPpsFpsMargin`, default 2), plus
+    /// `tolerance` (`proxy_sv_clientPpsTolerance`, default 1):
     ///
     /// ```text
-    /// limit = max over f in fps-2 ..= fps+2 of
+    /// limit = max over f in fps-margin ..= fps+margin of
     ///             min(f / ceil(f / globalMaxPps), globalMaxPps)
+    ///         + tolerance
     /// ```
     ///
-    /// so the accepted rate is always `f / K` for an integer `K`, and the
-    /// estimate uncertainty never lowers the limit. `fps == 0` means "not
-    /// measured": only the global ceiling applies (`0` there means fail open).
-    /// A global ceiling of `0` means "no ceiling"; the highest sample
-    /// (`fps + 2`) is then used.
-    pub fn refresh_fps(&mut self, now_ms: i32, fps: i32, global_max_pps: i32) {
+    /// so the accepted rate is `f / K` for an integer `K` plus a fixed slack,
+    /// and neither the estimate uncertainty nor the slack ever lowers the
+    /// limit. `fps == 0` means "not measured": only the global ceiling (plus
+    /// the tolerance) applies, and `0` there means fail open. A global ceiling
+    /// of `0` means "no ceiling"; the highest sample (`fps + margin`) is then
+    /// used.
+    pub fn refresh_fps(
+        &mut self,
+        now_ms: i32,
+        fps: i32,
+        global_max_pps: i32,
+        margin: i32,
+        tolerance: i32,
+    ) {
+        let tolerance = tolerance.clamp(0, MAX_TOLERANCE);
         self.fps = fps.max(0);
         self.limit = if self.fps == 0 {
-            global_max_pps.max(0)
+            let global = global_max_pps.max(0);
+            // `0` is the fail-open sentinel: adding the tolerance to it would
+            // turn "no limit" into a one-packet limit.
+            if global == 0 {
+                0
+            } else {
+                global.saturating_add(tolerance)
+            }
         } else {
-            allowed_pps(self.fps, global_max_pps)
+            allowed_pps(self.fps, global_max_pps, margin).saturating_add(tolerance)
         };
         self.fps_ms = now_ms;
         self.fps_valid = true;
@@ -558,6 +621,8 @@ pub unsafe fn on_incoming_packet(cl: usize) -> bool {
     }
 
     let global_max_pps = GLOBAL_MAX_PPS.load(Ordering::Relaxed);
+    let fps_margin = FPS_ESTIMATE_MARGIN.load(Ordering::Relaxed);
+    let tolerance = TOLERANCE.load(Ordering::Relaxed);
     let log = LOG.load(Ordering::Relaxed) != 0;
     // SAFETY: engine memory layer initialised (hooks run after GAME_INIT).
     let now = unsafe { svs_time() };
@@ -570,7 +635,9 @@ pub unsafe fn on_incoming_packet(cl: usize) -> bool {
         }
         if client.pps.fps_due(now) {
             let fps = trusted_fps(&client.netstatus, now);
-            client.pps.refresh_fps(now, fps, global_max_pps);
+            client
+                .pps
+                .refresh_fps(now, fps, global_max_pps, fps_margin, tolerance);
         }
         let was_over = client.pps.over();
         let limit = client.pps.limit();
@@ -708,37 +775,97 @@ mod tests {
         assert_eq!(allowed_pps_at(200, 100), 100);
         assert_eq!(allowed_pps_at(201, 100), 67);
 
-        // ±2 window: every sample 142..=146, highest wins (146 -> 73).
-        assert_eq!(allowed_pps(144, 100), 73);
+        // Default ±2 window: every sample 142..=146, highest wins (146 -> 73).
+        assert_eq!(allowed_pps(144, 100, 2), 73);
         // 58..=62 all use K = 1, so the highest sample (62) wins.
-        assert_eq!(allowed_pps(60, 100), 62);
+        assert_eq!(allowed_pps(60, 100, 2), 62);
         // The window 98..=102 includes 100, whose K = 1 gives 100.
-        assert_eq!(allowed_pps(100, 100), 100);
+        assert_eq!(allowed_pps(100, 100, 2), 100);
         // 99..=103 includes 100 as well.
-        assert_eq!(allowed_pps(101, 100), 100);
+        assert_eq!(allowed_pps(101, 100, 2), 100);
         // 248..=252: K = 3 for all; 252 / 3 = 84 is the highest.
-        assert_eq!(allowed_pps(250, 100), 84);
-        // No ceiling: the highest sample (fps + 2) wins.
-        assert_eq!(allowed_pps(200, 0), 202);
-        assert_eq!(allowed_pps(1, 0), 3);
+        assert_eq!(allowed_pps(250, 100, 2), 84);
+        // No ceiling: the highest sample (fps + margin) wins.
+        assert_eq!(allowed_pps(200, 0, 2), 202);
+        assert_eq!(allowed_pps(1, 0, 2), 3);
+    }
+
+    #[test]
+    fn the_fps_margin_is_configurable() {
+        // A margin of 0 enforces exactly the measured rate's formula.
+        assert_eq!(allowed_pps(144, 100, 0), 72);
+        assert_eq!(allowed_pps(200, 0, 0), 200);
+        // A wider margin can only raise the limit.
+        assert_eq!(allowed_pps(144, 100, 10), 77);
+        assert_eq!(allowed_pps(144, 100, 20), 82);
+        // It is clamped to a sane upper bound; negative values behave as 0.
+        assert_eq!(allowed_pps(144, 100, -5), allowed_pps(144, 100, 0));
+        assert_eq!(
+            allowed_pps(144, 100, 10_000),
+            allowed_pps(144, 100, MAX_FPS_ESTIMATE_MARGIN)
+        );
     }
 
     #[test]
     fn refresh_fps_handles_unknown_fps_and_the_ceiling() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 144, 100);
+        s.refresh_fps(0, 144, 100, 2, 0);
         assert_eq!(s.limit(), 73);
-        s.refresh_fps(0, 0, 100);
+        s.refresh_fps(0, 144, 100, 0, 0);
+        assert_eq!(s.limit(), 72);
+        s.refresh_fps(0, 0, 100, 2, 0);
         assert_eq!(s.limit(), 100);
-        s.refresh_fps(0, 0, 0);
+        s.refresh_fps(0, 0, 0, 2, 0);
         assert_eq!(s.limit(), 0);
+    }
+
+    #[test]
+    fn the_tolerance_adds_slack_after_the_ceiling() {
+        let mut s = PpsState::default();
+        // The reported case: FPS measured at 98, ceiling 100, default margin 2
+        // and tolerance 1 -> the 98 is lifted to 100 by the band, and the
+        // tolerance accepts one more packet (101).
+        s.refresh_fps(0, 98, 100, 2, 1);
+        assert_eq!(s.limit(), 101);
+        // The same slack applies above the ceiling (144 fps -> 73 + 1).
+        s.refresh_fps(0, 144, 100, 2, 1);
+        assert_eq!(s.limit(), 74);
+        // ... and while the FPS is not measured yet (ceiling + slack).
+        s.refresh_fps(0, 0, 100, 2, 1);
+        assert_eq!(s.limit(), 101);
+        // `0` means "no ceiling": the fail-open sentinel stays 0, the tolerance
+        // must not turn it into a one-packet limit.
+        s.refresh_fps(0, 0, 0, 2, 1);
+        assert_eq!(s.limit(), 0);
+        // A negative value behaves as 0; a huge one is clamped.
+        s.refresh_fps(0, 200, 100, 2, -5);
+        assert_eq!(s.limit(), 100);
+        s.refresh_fps(0, 200, 100, 2, i32::MAX);
+        assert_eq!(s.limit(), 100 + MAX_TOLERANCE);
+    }
+
+    #[test]
+    fn one_packet_over_the_ceiling_is_accepted() {
+        let mut s = PpsState::default();
+        s.refresh_fps(0, 98, 100, 2, 1);
+        assert_eq!(s.limit(), 101);
+        // Exactly 101 packets per second (integer times), for two seconds: the
+        // first window is measurement-only, the second is at the limit.
+        let limit = s.limit();
+        let accepted: Vec<bool> = (0..=202)
+            .map(|i| s.on_packet(i * 1000 / 101, limit, true).0)
+            .collect();
+        assert!(
+            accepted[101..].iter().all(|&a| a),
+            "101 pps must pass a limit of 101"
+        );
     }
 
     #[test]
     fn fps_refreshes_once_a_second() {
         let mut s = PpsState::default();
         assert!(s.fps_due(0));
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         assert!(!s.fps_due(999));
         assert!(s.fps_due(1000));
     }
@@ -791,7 +918,7 @@ mod tests {
     #[test]
     fn sample_reports_when_a_client_is_over_its_limit() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         let mut sample = None;
         // 100 packets over the first second, then the packet that rolls the
@@ -812,7 +939,7 @@ mod tests {
     #[test]
     fn a_client_inside_its_limit_is_silent() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         let mut sample = None;
         // 60 packets over ~1 s (17 ms apart), then the rolling packet.
@@ -850,7 +977,7 @@ mod tests {
     #[test]
     fn measurement_without_enforcement_never_drops_but_status_flags_the_excess() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         // 100 pps over a second, enforcement off: every packet passes ...
         let accepted = feed_with(&mut s, 0, 101, 10, limit, false);
@@ -867,7 +994,7 @@ mod tests {
     #[test]
     fn inside_the_limit_status_does_not_flag() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         feed_with(&mut s, 0, 60, 17, limit, false);
         let status = s.status(1003).expect("a window completed");
@@ -891,7 +1018,7 @@ mod tests {
     #[test]
     fn status_is_none_while_filling_and_expires_when_idle() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         // First window still filling: no completed sample yet.
         feed_with(&mut s, 0, 50, 10, limit, false);
@@ -906,7 +1033,7 @@ mod tests {
     #[test]
     fn an_idle_reset_clears_the_shared_status() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         feed_with(&mut s, 0, 101, 10, limit, false);
         assert!(s.status(1000).is_some());
@@ -919,7 +1046,7 @@ mod tests {
     #[test]
     fn the_log_edge_state_follows_over_then_under_then_over() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         // First over-limit window: starts the log edge.
         feed_with(&mut s, 0, 101, 10, limit, false);
@@ -938,7 +1065,7 @@ mod tests {
     #[test]
     fn clearing_the_edge_does_not_touch_the_measurement_windows() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         feed_with(&mut s, 0, 101, 10, limit, false);
         assert!(s.over());
@@ -952,7 +1079,7 @@ mod tests {
     #[test]
     fn an_idle_gap_keeps_the_log_edge_state() {
         let mut s = PpsState::default();
-        s.refresh_fps(0, 60, 100);
+        s.refresh_fps(0, 60, 100, 2, 0);
         let limit = s.limit();
         feed_with(&mut s, 0, 101, 10, limit, false);
         assert!(s.over());
