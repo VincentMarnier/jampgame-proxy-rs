@@ -41,10 +41,13 @@
 //!   refreshes whose range excludes 0 (one reading is not trusted: the first
 //!   window after a connect can hold startup artifacts), so it starts well
 //!   after a player connects and lags a `cl_timeNudge` change by the window's
-//!   step detection. A range that contains 0 disengages at once.
+//!   step detection. A range that does not clear 0 by the margin disengages at
+//!   once.
 //! * The range includes the estimator's bias floor
-//!   (`proxy_sv_timeNudgeMargin`, default 2 ms), so small settings sit inside
-//!   the range and are left alone; raising the margin makes the verdict more
+//!   (`proxy_sv_timeNudgeMargin`, default 2 ms). The margin is also applied to
+//!   the end of the range facing 0: a range must clear 0 by the full margin
+//!   before it counts as a confident non-zero setting, so `[0.3..6.1]` with a
+//!   2 ms margin is left alone. Raising the margin makes the verdict more
 //!   conservative, lowering it makes it more sensitive to small nudges (and
 //!   to estimator noise).
 //!
@@ -187,19 +190,35 @@ pub fn clear_offsets() {
 // ---------------------------------------------------------------------------
 
 /// The correction for one estimator range: `Some(offset)` only when the range
-/// excludes 0, `None` when 0 is inside it (or the range is unusable).
+/// clears 0 by more than the configured margin, `None` when 0 is inside it or
+/// within the margin of it (or the range is unusable).
+///
+/// The margin is the estimator's bias floor (`proxy_sv_timeNudgeMargin`,
+/// default 2 ms). It widens the reported range, and the verdict additionally
+/// applies it to the end facing 0 — the minimum for a positive range, the
+/// maximum for a negative one: `[0.3..6.1]` with a 2 ms margin is still
+/// "consistent with 0" and yields no correction. A range must therefore clear
+/// 0 by the full margin (and by the CI it already includes) before the shift
+/// is applied, which is what keeps a small setting or a noisy reading from
+/// being acted on.
 ///
 /// The offset is the point estimate rounded to the integer `cl_timeNudge`
-/// value the client holds, clamped to ±[`MAX_SHIFT_MS`]. The estimator's
-/// configured bias floor (`proxy_sv_timeNudgeMargin`, default 2 ms) widens the
-/// range, so an excluding range normally implies `|tn|` beyond that margin;
-/// the explicit ±1 fallback only guards a zero-width floor.
-pub fn offset_for(tn: f32, lo: f32, hi: f32) -> Option<i32> {
+/// value the client holds, clamped to ±[`MAX_SHIFT_MS`]. The explicit ±1
+/// fallback only guards a range that clears the margin but whose point
+/// estimate rounds to 0.
+pub fn offset_for(tn: f32, lo: f32, hi: f32, margin: f32) -> Option<i32> {
     if !tn.is_finite() || !lo.is_finite() || !hi.is_finite() {
         return None;
     }
-    // 0 is in [lo, hi]: the reading is consistent with the default setting.
-    if lo <= 0.0 && hi >= 0.0 {
+    let margin = if margin.is_finite() {
+        margin.clamp(0.0, crate::netstatus_est::MAX_BIAS_FLOOR_MS)
+    } else {
+        crate::netstatus_est::DEFAULT_BIAS_FLOOR_MS
+    };
+    // 0 in [lo - margin, hi + margin]: the reading is consistent with the
+    // default setting. For a positive range this only tests the minimum, for a
+    // negative one only the maximum.
+    if lo - margin <= 0.0 && hi + margin >= 0.0 {
         return None;
     }
     let rounded = tn.round() as i32;
@@ -227,17 +246,19 @@ pub struct Transition {
 /// Store the fresh verdict for one client and return the log transition, if
 /// the log is on and the verdict changed.
 ///
-/// `enforce` follows `proxy_sv_voidTimeNudge`: when false the verdict is still
-/// computed (the log reports the shift it *would* apply) but the applied
-/// correction is ramped back to 0.
+/// `margin` is `proxy_sv_timeNudgeMargin`, applied to the range's zero-facing
+/// end (see [`offset_for`]). `enforce` follows `proxy_sv_voidTimeNudge`: when
+/// false the verdict is still computed (the log reports the shift it *would*
+/// apply) but the applied correction is ramped back to 0.
 pub fn update(
     client_num: usize,
     now: i32,
     est: Option<&Estimate>,
+    margin: f32,
     enforce: bool,
     log: bool,
 ) -> Option<Transition> {
-    let verdict = est.and_then(|e| offset_for(e.tn, e.lo, e.hi));
+    let verdict = est.and_then(|e| offset_for(e.tn, e.lo, e.hi, margin));
     state::with_state(|s| {
         let v = &mut s.clients[client_num].nudge_void;
         v.last_check_ms = now;
@@ -309,34 +330,62 @@ mod tests {
 
     #[test]
     fn a_range_containing_zero_needs_no_correction() {
-        assert_eq!(offset_for(1.2, -2.0, 4.4), None);
-        assert_eq!(offset_for(0.0, -2.0, 2.0), None);
-        assert_eq!(offset_for(-2.9, -4.9, 0.9), None);
-        assert_eq!(offset_for(2.9, -0.9, 4.9), None);
+        assert_eq!(offset_for(1.2, -2.0, 4.4, 2.0), None);
+        assert_eq!(offset_for(0.0, -2.0, 2.0, 2.0), None);
+        assert_eq!(offset_for(-2.9, -4.9, 0.9, 2.0), None);
+        assert_eq!(offset_for(2.9, -0.9, 4.9, 2.0), None);
     }
 
     #[test]
     fn an_excluding_range_yields_the_rounded_setting() {
-        assert_eq!(offset_for(-14.2, -17.9, -10.5), Some(-14));
-        assert_eq!(offset_for(16.1, 12.6, 19.6), Some(16));
+        assert_eq!(offset_for(-14.2, -17.9, -10.5, 2.0), Some(-14));
+        assert_eq!(offset_for(16.1, 12.6, 19.6, 2.0), Some(16));
         // 0 is outside a very narrow range, but the point estimate rounds to
-        // 0: the sign still forces a correction.
-        assert_eq!(offset_for(-0.4, -2.4, -0.1), Some(-1));
-        assert_eq!(offset_for(0.4, 0.1, 2.4), Some(1));
+        // 0: the sign still forces a correction. (A zero margin keeps the
+        // plain "0 in the range" rule for these two.)
+        assert_eq!(offset_for(-0.4, -2.4, -0.1, 0.0), Some(-1));
+        assert_eq!(offset_for(0.4, 0.1, 2.4, 0.0), Some(1));
+    }
+
+    #[test]
+    fn the_margin_is_applied_to_the_end_facing_zero() {
+        // The reported reading: [0.3..6.1] is within the default margin, so it
+        // is a near-zero estimate, not a +3 setting.
+        assert_eq!(offset_for(3.2, 0.3, 6.1, 2.0), None);
+        // Positive range: only the minimum has to clear the margin.
+        assert_eq!(offset_for(5.0, 3.0, 7.0, 2.0), Some(5));
+        assert_eq!(offset_for(5.0, 2.1, 7.9, 2.0), Some(5));
+        assert_eq!(
+            offset_for(5.0, 2.0, 8.0, 2.0),
+            None,
+            "the boundary is inside the margin"
+        );
+        // Negative range: only the maximum has to clear it.
+        assert_eq!(offset_for(-5.0, -7.0, -3.0, 2.0), Some(-5));
+        assert_eq!(offset_for(-5.0, -7.9, -2.1, 2.0), Some(-5));
+        assert_eq!(offset_for(-5.0, -8.0, -2.0, 2.0), None);
+        // A zero margin is the plain "range excludes 0" rule.
+        assert_eq!(offset_for(0.4, 0.1, 2.4, 0.0), Some(1));
+        // A negative margin cannot make the verdict more sensitive than 0.
+        assert_eq!(offset_for(0.4, 0.1, 2.4, -10.0), Some(1));
     }
 
     #[test]
     fn the_shift_is_clamped_to_the_release_client_range() {
-        assert_eq!(offset_for(-240.0, -243.0, -237.0), Some(-MAX_SHIFT_MS));
-        assert_eq!(offset_for(500.0, 497.0, 503.0), Some(MAX_SHIFT_MS));
-        assert_eq!(offset_for(-30.2, -33.2, -27.2), Some(-30));
+        assert_eq!(offset_for(-240.0, -243.0, -237.0, 2.0), Some(-MAX_SHIFT_MS));
+        assert_eq!(offset_for(500.0, 497.0, 503.0, 2.0), Some(MAX_SHIFT_MS));
+        assert_eq!(offset_for(-30.2, -33.2, -27.2, 2.0), Some(-30));
     }
 
     #[test]
     fn non_finite_readings_are_ignored() {
-        assert_eq!(offset_for(f32::NAN, -2.0, 2.0), None);
-        assert_eq!(offset_for(1.0, f32::NAN, 2.0), None);
-        assert_eq!(offset_for(1.0, -2.0, f32::INFINITY), None);
+        assert_eq!(offset_for(f32::NAN, -2.0, 2.0, 2.0), None);
+        assert_eq!(offset_for(1.0, f32::NAN, 2.0, 2.0), None);
+        assert_eq!(offset_for(1.0, -2.0, f32::INFINITY, 2.0), None);
+        // A malformed margin falls back to the default floor instead of
+        // poisoning the verdict.
+        assert_eq!(offset_for(16.1, 12.6, 19.6, f32::NAN), Some(16));
+        assert_eq!(offset_for(16.1, 12.6, 19.6, f32::INFINITY), Some(16));
     }
 
     #[test]

@@ -175,9 +175,10 @@ pub const CVAR_MAX_FOV_MARGIN: usize = 31;
 pub const CVAR_CLIENT_PPS_FPS_MARGIN: usize = 32;
 /// `proxy_sv_timeNudgeMargin`: bias floor, in milliseconds, added to the
 /// `cl_timeNudge` estimator's confidence interval (`crate::netstatus_est`,
-/// D-007/D-015). A larger margin widens the reported range, so a client's
-/// range must clear 0 by more before `proxy_sv_voidTimeNudge` acts and before
-/// the netStatus `timeNudge` cell reports a confident non-zero setting.
+/// D-007/D-015). It also guards the verdict: the range must clear 0 by the
+/// margin (the minimum for a positive reading, the maximum for a negative
+/// one) before `proxy_sv_voidTimeNudge` acts and before the netStatus
+/// `timeNudge` cell reports a confident non-zero setting.
 /// Default `2.0` (the historical fixed value); `0` reports the statistical
 /// interval alone.
 pub const CVAR_TIME_NUDGE_MARGIN: usize = 33;

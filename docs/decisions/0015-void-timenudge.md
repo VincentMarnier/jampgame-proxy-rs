@@ -18,15 +18,17 @@ cl->serverTime = cls.realtime + cl->serverTimeDelta - tn      (cl_cgame.cpp:2088
 cmd->serverTime = cl->serverTime                              (cl_input.cpp:2144)
 ```
 
-The netStatus estimator (D-007) recovers `tn` as a range. A range that excludes
-0 is a confident reading of a non-zero setting; the user asked to be able to
-neutralise that setting on the server instead of only reporting it.
+The netStatus estimator (D-007) recovers `tn` as a range. A range that clears
+0 by the configured margin is a confident reading of a non-zero setting; the
+user asked to be able to neutralise that setting on the server instead of only
+reporting it (D-015.6 tightened the margin rule at the user's request).
 
 ## Decisions
 
 ### D-015.1 — The correction
 
-When the estimated range excludes 0, rewrite the cmd's `serverTime` by
+When the estimated range clears 0 by the configured margin (D-015.6), rewrite
+the cmd's `serverTime` by
 `+tn_hat` before the game sees it: `raw = neutral - tn`, so `raw + tn = neutral`
 is the clock a `cl_timeNudge 0` client would have stamped. The client's own
 setting is untouched; the server simply stops processing its moves on the
@@ -69,12 +71,13 @@ Two details matter:
 * The verdict is refreshed at most every 500 ms per client (the netStatus
   table's own rate limit; the window is ~5 s, so faster recomputation would
   read the same data).
-* **Two consecutive refreshes must exclude 0** before the correction is
-  applied or logged. The ground-truth harness showed a spurious
+* **Two consecutive refreshes must clear 0 by the margin** before the
+  correction is applied or logged. The ground-truth harness showed a spurious
   `[-76.4..-60.6]` reading in the first window after a connect (before the
   window settled); acting on it would have shifted the player by the ±30 clamp
   for about a second. A real setting stays outside the range on every refresh.
-  A range that contains 0 disengages at once.
+  A range that contains 0, or stays within the margin of it, disengages at
+  once.
 * The applied offset moves **1 ms per usercmd** toward the target. A jump of up
   to ±30 ms either fails the game's `msec < 1` guard for several commands
   (`g_active.c:2089-2095`, dropping inputs) or produces one oversized `msec`
@@ -91,23 +94,25 @@ Two details matter:
 |---|---|---|
 | `proxy_sv_voidTimeNudge` | 0 | apply the rewrite |
 | `proxy_sv_voidTimeNudgeLog` | 0 | log transitions |
-| `proxy_sv_timeNudgeMargin` | 2 | margin, in ms, added to the estimate's confidence range |
+| `proxy_sv_timeNudgeMargin` | 2 | margin, in ms, added to the estimate's confidence range and required between the range and 0 (D-015.6) |
 
 The estimator's non-statistical bias floor (D-007's fixed 2 ms) became the
-`proxy_sv_timeNudgeMargin` cvar. It widens the reported range, so it is the
-knob that trades sensitivity for false positives: a larger value leaves small
-settings "consistent with 0" (no rewrite, white cell), a smaller value lets the
-verdict act on a smaller reading and on more estimator noise. `0` reports the
+`proxy_sv_timeNudgeMargin` cvar. It widens the reported range, and D-015.6
+additionally applies it to the range's end facing 0, so it is the knob that
+trades sensitivity for false positives: a larger value leaves small settings
+"consistent with 0" (no rewrite, white cell), a smaller value lets the verdict
+act on a smaller reading and on more estimator noise. `0` reports the
 statistical interval alone; values are clamped to `0..=100` ms. The margin
 feeds both the neutralisation verdict and the netStatus `timeNudge` cell, which
-render the same range and therefore cannot disagree.
+use the same `timenudge::offset_for` predicate and therefore cannot disagree.
 
 The log has the `proxy_sv_clientPpsLog` shape: it keeps the estimator feed and
 the verdict running on its own, prints one line when a client's confirmed range
-starts excluding 0 (with the shift the feature applies *or would apply*), one
-when it goes back to zero, and one when the reading is lost (stale/filling
-window). A client on the same side of zero is silent. While the log cvar is 0
-no edge state is kept, so enabling it reports the next non-zero reading.
+starts clearing 0 by the margin (with the shift the feature applies *or would
+apply*), one when it goes back to zero, and one when the reading is lost
+(stale/filling window). A client on the same side of zero is silent. While the
+log cvar is 0 no edge state is kept, so enabling it reports the next non-zero
+reading.
 
 ```text
 ----- proxy-rs: timeNudge non-zero: estimate=[-17.0..-11.1] shift=-14 client=0 name="client0" adr="127.0.0.1:50052"
@@ -126,26 +131,64 @@ cell:
 
 * **red** when the whole range is outside the release client's clamp
   (`hi < -30` or `lo > 30`);
-* **yellow** when 0 is outside the range but the range is not entirely
-  outside the clamp (a confidently non-zero setting);
-* **white** when 0 is in the range (consistent with the default setting).
+* **yellow** when the range clears 0 by the configured margin but is not
+  entirely outside the clamp (a confidently non-zero setting);
+* **white** when 0 is in the range **or within the margin of it** (consistent
+  with the default setting, even if the printed range excludes 0 — e.g.
+  `[0.3..6.1]` with the default 2 ms margin).
 
 With `proxy_sv_voidTimeNudge` active the column instead reports the value the
-server enforces: `0` for every client, **red** on the clients whose range
-excludes 0 (the timenudges being voided) and white on the rest. A stale/filling
-window keeps the `-` placeholder (white). Colour codes are not counted in the
-column width, so the cells stay aligned; `^7` restores the default colour for
-the following columns.
+server enforces: `0` for every client, **red** on the clients whose range clears
+0 by the margin (the timenudges being voided) and white on the rest. A
+stale/filling window keeps the `-` placeholder (white). Colour codes are not
+counted in the column width, so the cells stay aligned; `^7` restores the
+default colour for the following columns.
 
 Turning the feature off at runtime stops the rewrite at once (the next command
 is raw again); the 1 ms ramp covers verdict changes while the feature stays on,
 not an operator disabling it. The estimator keeps its raw feed throughout.
 
+### D-015.6 — The margin also guards the zero-facing end (2026-11-06)
+
+User report: with `proxy_sv_timeNudgeMargin 2` the log emitted
+`timeNudge non-zero: estimate=[0.3..6.1] shift=3`. The margin was already in
+the range (the CI was widened by it), but the verdict only tested
+`0 ∈ [lo, hi]`, so any range that excluded 0 acted. The user wants the margin
+applied to the range's minimum or maximum: `[0.3..6.1]` is within 2 ms of 0 on
+its lower end and must count as "consistent with 0".
+
+The policy is now:
+
+```text
+consistent with 0  ⇔  0 ∈ [lo - margin, hi + margin]
+```
+
+For a positive range this tests only the minimum (`lo - margin <= 0`), for a
+negative range only the maximum (`hi + margin >= 0`), so the margin is applied
+to the end facing 0 as requested. The printed range is unchanged (and still
+includes the margin), which means a range must clear the printed lower/upper
+bound by the margin: the effective threshold for a zero-width CI is `2 ×
+margin` from the point estimate. That is deliberate — the user asked for the
+printed `[0.3..6.1]` to be accepted with `2` — and `proxy_sv_timeNudgeMargin 0`
+restores the old plain `0 ∈ [lo, hi]` rule.
+
+`timenudge::offset_for` takes the margin, `timenudge::update` receives it from
+`hooks::netstatus::compute`, and `tn_cell` colours on the same predicate, so the
+verdict, the log and the table cannot disagree. Unit tests pin the reported
+case, the boundary (`lo == margin` is inside), both signs, a zero margin, and a
+malformed/negative margin. This supersedes the D-015.4 wording that the margin
+only widens the range.
+
 ## Validation
 
 **Unit tests** (`rust/src/timenudge.rs`): range-includes-0, rounded/clamped
-offset, non-finite guards, refresh cadence and clock jumps, the 1 ms ramp in
-both directions, confirmation, stop-keeps-edge, and the three log lines.
+offset, non-finite guards, the margin guard on the zero-facing end (the reported
+`[0.3..6.1]` case, both signs, boundary, zero/negative/malformed margin),
+refresh cadence and clock jumps, the 1 ms ramp in both directions,
+confirmation, stop-keeps-edge, and the three log lines.
+**Unit tests** (`rust/src/hooks/netstatus.rs`): the `timeNudge` cell colours on
+the same verdict (the reported range stays white with the default margin and
+turns yellow with `0`).
 
 **Runtime (2026-11-02, the a2 synthetic-client harness in the i386 container,
 `--mode single --tn -15 --lan`, proxy built from this change):**

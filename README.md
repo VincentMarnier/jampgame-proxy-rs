@@ -54,9 +54,9 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_clientPpsFpsMargin`         | 2       | half-width, in FPS, of the uncertainty band around the measured FPS used to derive the packet-rate limit: the highest limit over `FPS - margin ..= FPS + margin` wins, so the band can only raise it; `0` uses the measured FPS alone (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_clientPpsTolerance`         | 1       | packets/second of slack added **after** the FPS band and the global ceiling: with `1`, a client sending 101 packets/s is accepted when the derived limit is 100; `0` enforces the exact limit (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_clientPpsLog`               | 0       | log client packet-rate limit transitions (starts using too many packets / back under the limit); works on its own without the limiter |
-| `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
+| `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range clears 0 by the configured margin, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
-| `proxy_sv_timeNudgeMargin`            | 2       | margin, in milliseconds, added to the `cl_timeNudge` estimate's confidence range: a larger value makes the range wider, so a small nudge stays "consistent with 0" (more conservative); `0` reports the statistical interval alone (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
+| `proxy_sv_timeNudgeMargin`            | 2       | margin, in milliseconds, added to the `cl_timeNudge` estimate's confidence range and required between that range and 0: a range must clear 0 by the margin (its minimum for a positive reading, its maximum for a negative one) before it counts as a non-zero setting, so `[0.3..6.1]` with `2` stays "consistent with 0"; `0` reports the statistical interval alone (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
 | `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
 | `proxy_sv_antiMacroView`              | 0       | `0` observe/log the view verdict but never freeze `yaw`/`pitch` (hand mouse play is too close to a key wiggle at the wire level); non-zero freezes a locked view |
@@ -364,9 +364,10 @@ ping    rtt   jit  fps packets/s     timeNudge snaps   rate name
   `-` means there is not enough data yet. Values are never clamped to ±30:
   a reading outside that range is evidence of a modified client. The value is
   coloured:
-  - **white** when 0 is inside the range (consistent with the default
-    setting);
-  - **yellow** when 0 is outside the range but the range is not entirely
+  - **white** when 0 is inside the range or within the configured margin of it
+    (consistent with the default setting, even when the printed range excludes
+    0);
+  - **yellow** when the range clears 0 by the margin but is not entirely
     outside the legal clamp (the player is confidently using a non-zero
     setting);
   - **red** when the whole range is outside the client's ±30 clamp
@@ -375,7 +376,7 @@ ping    rtt   jit  fps packets/s     timeNudge snaps   rate name
 
   With `proxy_sv_voidTimeNudge` active, the column instead shows the value the
   server enforces: `0` for every player, in **red** on the players whose range
-  excludes 0 (their timenudge is being voided), white on the rest.
+  clears 0 by the margin (their timenudge is being voided), white on the rest.
 * **snaps** — how many times per second the server sends this player a view of
   the game (their `snaps` setting, capped by the server's `sv_fps`).
 * **rate** — the player's bandwidth setting (bytes per second the game is
@@ -388,28 +389,32 @@ ping    rtt   jit  fps packets/s     timeNudge snaps   rate name
 stamps into its moves: a negative value makes the client run "ahead" of the
 server. It is never transmitted, but the [net status](#net-status) estimator
 recovers it. With `proxy_sv_voidTimeNudge 1`, the proxy uses that estimate to
-put the game back on the neutral clock: when the reported range **excludes 0**
-(so the player is confidently using a non-zero setting) every usercmd's
-`serverTime` is shifted by the estimated setting before the game processes it.
-The client keeps its own setting; the server stops accepting the timing
-advantage.
+put the game back on the neutral clock: when the reported range **excludes 0 by
+more than the configured margin** (so the player is confidently using a non-zero
+setting) every usercmd's `serverTime` is shifted by the estimated setting before
+the game processes it. The client keeps its own setting; the server stops
+accepting the timing advantage.
 
 Details worth knowing:
 
 - The shift is the rounded estimate, clamped to ±30 ms — the 2003 release
   client's own `cl_timeNudge` clamp. A reading beyond that is left uncorrected
   rather than amplified.
-- It engages only after two consecutive refreshed ranges exclude 0 (about one
-  second), because the first window after a connect can still contain startup
-  artifacts, and it needs the ~5 s estimation window to settle. A range that
-  contains 0 disengages immediately.
+- It engages only after two consecutive refreshed ranges clear 0 by the margin
+  (about one second), because the first window after a connect can still contain
+  startup artifacts, and it needs the ~5 s estimation window to settle. A range
+  that contains 0, or stays within the margin of it, disengages immediately.
 - The range includes a configurable margin, `proxy_sv_timeNudgeMargin`
   (default `2` ms, the historical bias floor). It absorbs the estimator's
-  unobservable residual and network noise: a small setting stays inside the
-  range and is left alone. Raising the margin makes the decision more
-  conservative (a nudge must be larger to be acted on); `0` reports the
-  statistical interval alone, which is the most sensitive and the most exposed
-  to a bad reading.
+  unobservable residual and network noise, and it is also applied to the end of
+  the range facing 0: the range must clear 0 by the full margin (its minimum for
+  a positive reading, its maximum for a negative one) before the setting is
+  acted on or marked in the table. With the default `2`, a reading printed as
+  `[0.3..6.1]` is still treated as zero, while `[-17.9..-10.5]` is acted on.
+  Raising the margin makes the decision more conservative (a nudge must be
+  larger to be acted on); `0` removes the zero guard and reports the statistical
+  interval alone, which is the most sensitive and the most exposed to a bad
+  reading.
 - The applied shift moves by 1 ms per command in either direction, so engaging
   or disengaging never drops a move (a 30 ms jump would fail the game's
   `msec < 1` guard) or creates one oversized movement frame. The player's
@@ -419,9 +424,9 @@ Details worth knowing:
   moves on it.
 - While the feature is active the netStatus table's `timeNudge` column shows
   what the server enforces: `0` for every player, **red** on the players being
-  voided (their estimated range excludes 0) and white on the rest (a player
-  with no settled estimate keeps `-`). The estimator itself still reads the raw
-  command stamps, so the red marks and the log follow the player's real
+  voided (their estimated range clears 0 by the margin) and white on the rest (a
+  player with no settled estimate keeps `-`). The estimator itself still reads
+  the raw command stamps, so the red marks and the log follow the player's real
   setting.
 - It needs `proxy_sv_enable 1` like every feature, but not
   `proxy_sv_enableNetStatus`.

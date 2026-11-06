@@ -143,6 +143,11 @@ pub const MIN_SAMPLES: usize = 8;
 /// reports the statistical interval alone.
 pub const DEFAULT_BIAS_FLOOR_MS: f32 = 2.0;
 
+/// Upper clamp for `proxy_sv_timeNudgeMargin`, in milliseconds. A hand-edited
+/// config cannot widen the reported range (or the zero guard in
+/// `crate::timenudge::offset_for`) beyond this.
+pub const MAX_BIAS_FLOOR_MS: f32 = 100.0;
+
 /// fps/pps window (decision 13): cmds/packets per second over the last 1 s of
 /// cmd `serverTime` (the same clock the original proxy used).
 pub const FPS_WINDOW_MS: i32 = 1000;

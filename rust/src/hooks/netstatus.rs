@@ -306,10 +306,18 @@ pub unsafe fn mark_packet_start(cl: usize, message_acknowledge: i32) {
     if due {
         // SAFETY: cl is a valid client_t.
         let msg_interval = unsafe { frames_msg_interval(cl, now) };
-        let est = compute(client_num, now, msg_interval);
-        if let Some(transition) =
-            timenudge::update(client_num, now, est.as_ref(), void_enabled, void_log)
-        {
+        // The margin widens the estimator's range and is applied to the
+        // range's zero-facing end by the verdict (`timenudge::offset_for`).
+        let margin = time_nudge_margin();
+        let est = compute(client_num, now, msg_interval, margin);
+        if let Some(transition) = timenudge::update(
+            client_num,
+            now,
+            est.as_ref(),
+            margin,
+            void_enabled,
+            void_log,
+        ) {
             // SAFETY: cl is a valid client_t.
             unsafe { timenudge::print_transition(cl, transition) };
         }
@@ -537,27 +545,33 @@ fn print_macro_line(line: String) {
 // Estimator computation (D-007 step 3)
 // ---------------------------------------------------------------------------
 
+/// `proxy_sv_timeNudgeMargin` sanitised for the estimator and the verdict: a
+/// malformed value (NaN, or a negative reading from a hand-edited config)
+/// falls back to the historical floor instead of poisoning every range with
+/// NaN.
+fn time_nudge_margin() -> f32 {
+    state::with_state(|s| margin_in(s))
+}
+
+fn margin_in(s: &state::ProxyState) -> f32 {
+    let v = s.cvars[CVAR_TIME_NUDGE_MARGIN].value;
+    if v.is_finite() {
+        v.clamp(0.0, netstatus_est::MAX_BIAS_FLOOR_MS)
+    } else {
+        netstatus_est::DEFAULT_BIAS_FLOOR_MS
+    }
+}
+
 /// Compute the estimate for one client over its window, applying a detected
 /// step reset. `msg_interval` is the `cl->frames[]`-derived message spacing
-/// (0 = derive it from the window instead).
-fn compute(client_num: usize, now: i32, msg_interval: f32) -> Option<Estimate> {
+/// (0 = derive it from the window instead); `bias_floor` is the margin
+/// `proxy_sv_timeNudgeMargin` that widens the reported range.
+fn compute(client_num: usize, now: i32, msg_interval: f32, bias_floor: f32) -> Option<Estimate> {
     let frame_msec = {
         let fps = sv_fps();
         if fps > 0 { 1000.0 / fps as f32 } else { 0.0 }
     };
     state::with_state(|s| {
-        // The estimator's non-statistical margin is operator-tunable
-        // (`proxy_sv_timeNudgeMargin`, D-015). A malformed value (NaN, or a
-        // negative reading from a hand-edited config) falls back to the
-        // historical floor instead of poisoning every range with NaN.
-        let bias_floor = {
-            let v = s.cvars[CVAR_TIME_NUDGE_MARGIN].value;
-            if v.is_finite() {
-                v.clamp(0.0, 100.0)
-            } else {
-                netstatus_est::DEFAULT_BIAS_FLOOR_MS
-            }
-        };
         let ns = &mut s.clients[client_num].netstatus;
         let records: Vec<_> = ns.records().copied().collect();
         let est = netstatus_est::estimate(
@@ -636,25 +650,29 @@ const TN_COL_WIDTH: usize = 13;
 /// * red (`^1`) when the whole range is outside the release client's legal
 ///   `[-30, 30]` — `hi < -30` or `lo > 30`: the player is outside the range the
 ///   engine's own clamp can produce;
-/// * yellow (`^3`) when 0 is not in the range but the range is not entirely
-///   outside the legal clamp: the player is confidently using a non-zero
-///   setting;
-/// * white when 0 is in the range (consistent with the default setting).
+/// * yellow (`^3`) when the range clears 0 by the configured margin
+///   (`proxy_sv_timeNudgeMargin`, applied to the end facing 0 by
+///   [`timenudge::offset_for`]) but the range is not entirely outside the legal
+///   clamp: the player is confidently using a non-zero setting;
+/// * white when 0 is in the range **or within the margin of it**: consistent
+///   with the default setting (a range printed as `[0.3..6.1]` with a 2 ms
+///   margin is still white).
 ///
 /// With the feature active the column reports the value the server enforces:
-/// `0` for every client, red on the clients whose range excludes 0 (the
+/// `0` for every client, red on the clients whose range clears the margin (the
 /// timenudges being voided). A stale/filling window has no estimate, so it
 /// keeps the `-` placeholder (white).
 ///
 /// Colour codes are not counted in [`TN_COL_WIDTH`], so the coloured cells stay
 /// aligned; `^7` restores the default colour for the following columns.
-fn tn_cell(est: Option<Estimate>, voiding: bool) -> String {
+fn tn_cell(est: Option<Estimate>, voiding: bool, margin: f32) -> String {
     let Some(est) = est else {
         return format!("{:>TN_COL_WIDTH$}", "-");
     };
+    let non_zero = timenudge::offset_for(est.tn, est.lo, est.hi, margin).is_some();
     if voiding {
         let zero = "0";
-        if est.lo > 0.0 || est.hi < 0.0 {
+        if non_zero {
             return format!("^1{zero:>TN_COL_WIDTH$}^7");
         }
         return format!("{zero:>TN_COL_WIDTH$}");
@@ -663,7 +681,7 @@ fn tn_cell(est: Option<Estimate>, voiding: bool) -> String {
     let legal = timenudge::MAX_SHIFT_MS as f32;
     if est.hi < -legal || est.lo > legal {
         format!("^1{range:>TN_COL_WIDTH$}^7")
-    } else if est.lo > 0.0 || est.hi < 0.0 {
+    } else if non_zero {
         format!("^3{range:>TN_COL_WIDTH$}^7")
     } else {
         format!("{range:>TN_COL_WIDTH$}")
@@ -698,6 +716,8 @@ pub fn client_command_net_status(client_num: c_int) {
     // The `timeNudge` column reports the enforced value while D-015 is active;
     // latch it once so one table cannot mix both renditions.
     let voiding = timenudge::enabled();
+    // One margin for the whole table so every cell colours on the same rule.
+    let tn_margin = time_nudge_margin();
     // SAFETY: engine memory layer initialised.
     let clients = unsafe { clients_base() };
 
@@ -739,7 +759,7 @@ pub fn client_command_net_status(client_num: c_int) {
 
         // SAFETY: cl is a valid client_t.
         let msg_interval = unsafe { frames_msg_interval(cl, svs_time) };
-        let est = compute(i as usize, svs_time, msg_interval);
+        let est = compute(i as usize, svs_time, msg_interval, tn_margin);
         let (fps, pps) = fps_pps_of(i as usize);
         // The limiter's own accounting, shared with the `clientPpsLog` line:
         // it sees every sequenced packet (empty/duplicate ones included), unlike
@@ -751,11 +771,15 @@ pub fn client_command_net_status(client_num: c_int) {
         );
         let (tn, rtt, jit) = match est {
             Some(est) => (
-                tn_cell(Some(est), voiding),
+                tn_cell(Some(est), voiding, tn_margin),
                 format!("{:.1}", est.rtt_mean),
                 format!("{:.1}", est.rtt_dev),
             ),
-            None => (tn_cell(None, voiding), "-".to_string(), "-".to_string()),
+            None => (
+                tn_cell(None, voiding, tn_margin),
+                "-".to_string(),
+                "-".to_string(),
+            ),
         };
 
         // SAFETY: cl is a valid client_t.
@@ -926,21 +950,55 @@ mod tests {
 
     #[test]
     fn tn_cell_is_white_when_zero_is_in_the_range() {
-        assert_eq!(tn_cell(Some(estimate(-2.0, 3.0)), false), "  [-2.0..3.0]");
+        assert_eq!(
+            tn_cell(Some(estimate(-2.0, 3.0)), false, 2.0),
+            "  [-2.0..3.0]"
+        );
         // A range that exceeds the legal clamp on both sides still contains 0:
         // the client could be at the default setting, so it stays white.
-        assert_eq!(tn_cell(Some(estimate(-40.0, 40.0)), false), "[-40.0..40.0]");
+        assert_eq!(
+            tn_cell(Some(estimate(-40.0, 40.0)), false, 2.0),
+            "[-40.0..40.0]"
+        );
+    }
+
+    #[test]
+    fn tn_cell_is_white_when_the_range_is_within_the_margin() {
+        // `[0.3..6.1]` with the default 2 ms margin is a near-zero reading
+        // (the margin applies to the end facing 0), so it must not be yellow.
+        assert_eq!(
+            tn_cell(Some(estimate(0.3, 6.1)), false, 2.0),
+            "   [0.3..6.1]"
+        );
+        assert_eq!(
+            tn_cell(Some(estimate(-6.1, -0.3)), false, 2.0),
+            " [-6.1..-0.3]"
+        );
+        // A zero margin keeps the plain "0 outside the range" colouring ...
+        assert_eq!(
+            tn_cell(Some(estimate(0.3, 6.1)), false, 0.0),
+            "^3   [0.3..6.1]^7"
+        );
+        // ... and the voiding rendering follows the same verdict.
+        assert_eq!(
+            tn_cell(Some(estimate(0.3, 6.1)), true, 2.0),
+            "            0"
+        );
+        assert_eq!(
+            tn_cell(Some(estimate(0.3, 6.1)), true, 0.0),
+            "^1            0^7"
+        );
     }
 
     #[test]
     fn tn_cell_is_yellow_when_zero_is_outside_a_legal_range() {
         assert_eq!(
-            tn_cell(Some(estimate(-17.9, -10.5)), false),
+            tn_cell(Some(estimate(-17.9, -10.5)), false, 2.0),
             "^3[-17.9..-10.5]^7"
         );
         // On the clamp boundary the reading is still legal (`hi == -30`).
         assert_eq!(
-            tn_cell(Some(estimate(-30.0, -25.0)), false),
+            tn_cell(Some(estimate(-30.0, -25.0)), false, 2.0),
             "^3[-30.0..-25.0]^7"
         );
     }
@@ -948,16 +1006,16 @@ mod tests {
     #[test]
     fn tn_cell_is_red_when_the_whole_range_is_outside_the_clamp() {
         assert_eq!(
-            tn_cell(Some(estimate(-40.0, -33.0)), false),
+            tn_cell(Some(estimate(-40.0, -33.0)), false, 2.0),
             "^1[-40.0..-33.0]^7"
         );
         assert_eq!(
-            tn_cell(Some(estimate(33.0, 40.0)), false),
+            tn_cell(Some(estimate(33.0, 40.0)), false, 2.0),
             "^1 [33.0..40.0]^7"
         );
         // `hi < -30` / `lo > 30` are strict: -30 itself is not red.
         assert_eq!(
-            tn_cell(Some(estimate(-40.0, -30.0)), false),
+            tn_cell(Some(estimate(-40.0, -30.0)), false, 2.0),
             "^3[-40.0..-30.0]^7"
         );
     }
@@ -965,23 +1023,26 @@ mod tests {
     #[test]
     fn tn_cell_reports_zero_while_the_feature_voids() {
         // 0 is in the range: the neutral setting, nothing to void.
-        assert_eq!(tn_cell(Some(estimate(-2.0, 3.0)), true), "            0");
-        // The range excludes 0: this timenudge is being voided (red).
         assert_eq!(
-            tn_cell(Some(estimate(-17.9, -10.5)), true),
+            tn_cell(Some(estimate(-2.0, 3.0)), true, 2.0),
+            "            0"
+        );
+        // The range clears the margin: this timenudge is being voided (red).
+        assert_eq!(
+            tn_cell(Some(estimate(-17.9, -10.5)), true, 2.0),
             "^1            0^7"
         );
         // Even a range entirely outside the clamp is reported as a red 0.
         assert_eq!(
-            tn_cell(Some(estimate(-40.0, -33.0)), true),
+            tn_cell(Some(estimate(-40.0, -33.0)), true, 2.0),
             "^1            0^7"
         );
     }
 
     #[test]
     fn tn_cell_keeps_the_placeholder_without_an_estimate() {
-        assert_eq!(tn_cell(None, false), "            -");
+        assert_eq!(tn_cell(None, false, 2.0), "            -");
         // The feature cannot void without a reading; it stays unknown.
-        assert_eq!(tn_cell(None, true), "            -");
+        assert_eq!(tn_cell(None, true, 2.0), "            -");
     }
 }

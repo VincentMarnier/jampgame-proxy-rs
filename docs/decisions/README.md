@@ -79,11 +79,12 @@
   default limit colour) with it off — see D-014.6.
 - `0015-void-timenudge.md` — opt-in server-side `cl_timeNudge`
   neutralisation (D-015): `proxy_sv_voidTimeNudge` rewrites each usercmd's
-  `serverTime` by the estimator's setting when the reported range excludes 0
-  (clamped to ±30, 1 ms per command ramp, two-reading confirmation), and
-  `proxy_sv_voidTimeNudgeLog` reports the non-zero / back-to-zero transitions
-  without applying the shift; the engine's duplicate filtering keeps the raw
-  stamps (`lastUsercmd.serverTime` restored after `SV_ClientThink`).
+  `serverTime` by the estimator's setting when the reported range clears 0 by
+  the `proxy_sv_timeNudgeMargin` margin (clamped to ±30, 1 ms per command ramp,
+  two-reading confirmation), and `proxy_sv_voidTimeNudgeLog` reports the
+  non-zero / back-to-zero transitions without applying the shift; the engine's
+  duplicate filtering keeps the raw stamps (`lastUsercmd.serverTime` restored
+  after `SV_ClientThink`).
 - `0016-player-ignore.md` — player `/ignore`/`/unignore` client commands: the
   same target shape as `rcon mute` (shared `player_target` resolver), a
   per-client slot mask on `ClientEntry::ignored`, cleared on disconnect in both
