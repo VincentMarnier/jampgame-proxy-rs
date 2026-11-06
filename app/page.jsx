@@ -30,13 +30,24 @@ const cvars = [
   ["proxy_tffa_maxMatches", "8", "Maximum parallel TFFA matches", "tffa"],
   ["proxy_tffa_maxGroupSize", "12", "Maximum players per TFFA match (both teams combined)", "tffa"],
   ["proxy_sv_spectatorTeamOverlay", "1", "Send the team overlay's HP/armor roster to spectators following a player (TaystJK cg_drawTeamOverlay and the stock team info HUD)", "observability"],
-  ["proxy_sv_enableClientPpsLimit", "0", "Per-client packet-rate limiter: the limit is an integer downscale of the client's measured FPS ± 2, capped by proxy_sv_globalMaxPps; excess packets are dropped evenly through the next second", "network"],
+  ["proxy_sv_enableClientPpsLimit", "0", "Per-client packet-rate limiter: the limit is an integer downscale of the client's measured FPS ± proxy_sv_clientPpsFpsMargin, capped by proxy_sv_globalMaxPps; excess packets are dropped evenly through the next second", "network"],
   ["proxy_sv_globalMaxPps", "100", "Global hard ceiling on accepted packets per second per client (0 = no ceiling); the FPS-derived per-client limit is capped to it", "network"],
+  ["proxy_sv_clientPpsFpsMargin", "2", "Uncertainty band around the measured FPS used to derive the packet-rate limit: the highest limit over FPS ± margin wins, so the band can only raise it (0 = measured FPS alone)", "network"],
+  ["proxy_sv_clientPpsTolerance", "1", "Packets/second of slack added after the FPS band and the global ceiling: 1 accepts 101 packets/s when the derived limit is 100; 0 enforces the exact limit", "network"],
   ["proxy_sv_clientPpsLog", "0", "Log client packet-rate limit transitions (starts using too many packets / back under the limit); works without the limiter", "network"],
   ["proxy_sv_voidTimeNudge", "0", "Neutralise a player's non-zero cl_timeNudge on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting", "network"],
   ["proxy_sv_voidTimeNudgeLog", "0", "Log cl_timeNudge non-zero / back-to-zero transitions; works on its own (reports the shift without applying it)", "network"],
-  ["proxy_sv_antiMacro", "0", "Freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact wait holds); hand play is untouched and the player is never told", "hardening"],
+  ["proxy_sv_timeNudgeMargin", "2", "Margin (ms) added to the cl_timeNudge estimate's confidence range: a wider range keeps a small nudge consistent with 0 (more conservative); 0 reports the statistical interval alone", "network"],
+  ["proxy_sv_antiMacro", "0", "Freeze a movement or attack channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands or frame-exact wait holds); the view verdict is report-only unless proxy_sv_antiMacroView is on, and the player is never told", "hardening"],
   ["proxy_sv_antiMacroLog", "0", "1 logs anti-macro lock/release transitions, 2 adds the statistics of locked channels, 3 the statistics of every channel with a reversal; works on its own", "diagnostics"],
+  ["proxy_sv_antiMacroView", "0", "0 computes and logs the view verdict but never freezes yaw/pitch (hand mouse wiggles are not reliably separable at the wire level); non-zero freezes a locked view", "hardening"],
+  ["proxy_sv_antiMacroMinReversals", "4", "Reversals in a run needed for the rate test; raising it is the main false-positive brake", "hardening"],
+  ["proxy_sv_antiMacroAxisMaxMeanCmds", "3", "Movement channels: maximum mean interval, in commands, for a rate verdict", "hardening"],
+  ["proxy_sv_antiMacroViewMaxMeanMs", "65", "View channels: maximum mean interval, in milliseconds, for a rate verdict", "hardening"],
+  ["proxy_sv_antiMacroAttackMaxMeanMs", "60", "Attack channel: maximum mean interval, in milliseconds, for a rate verdict", "hardening"],
+  ["proxy_sv_antiMacroMaxHoldSpreadMs", "10", "Hold-spread test: maximum difference in milliseconds between a run's shortest and longest hold (the wait-exactness signature); lower is stricter", "hardening"],
+  ["proxy_sv_antiMacroViewStepPercent", "75", "View key-shape test: minimum mean/peak per-command step percentage; 0 disables the shape gate", "hardening"],
+  ["proxy_sv_antiMacroViewMinSwing", "364", "View key-shape test: minimum swing between reversals in ANGLE2SHORT units (364 ≈ 2°); 0 removes the floor", "hardening"],
   ["proxy_sv_maxFov", "0", "Maximum cg_fov value a viewer can benefit from: players outside the corresponding view frustum are hidden for that viewer while their footsteps, swings and saber hum keep playing (0 = off)", "fov"],
   ["proxy_sv_maxFovAspect", "1.7777778", "Screen aspect used to turn proxy_sv_maxFov into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's cg_fovAspectAdjust 1; 1.3333334 for 4:3/stock clients, higher for ultrawide)", "fov"],
   ["proxy_sv_maxFovCameraRange", "100", "Third-person camera setback (world units) assumed by the frustum test; 100 matches the stock cg_thirdPersonRange, 0 tests from the player's eye (first-person-strict)", "fov"],
@@ -250,7 +261,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">32 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">43 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -295,15 +306,18 @@ export default function Home() {
                 <code>netStatus</code> prints ping, RTT, jitter, FPS, packets/s,
                 estimated <code>cl_timeNudge</code>, snaps and rate. Optional: a
                 per-client packet-rate limiter and neutralising a non-zero{" "}
-                <code>cl_timeNudge</code>.
+                <code>cl_timeNudge</code>, both with a tunable FPS margin,
+                packet tolerance and time-nudge margin.
               </p>
             </li>
             <li>
               <b>Anti-macro guard</b>
               <p>
-                <code>proxy_sv_antiMacro</code> freezes a movement, view or attack
-                channel when its reversals run faster than a hand can; the last
-                input is held, not zeroed, and the player is never told.
+                <code>proxy_sv_antiMacro</code> freezes a movement or attack
+                channel when its reversals run faster than a hand can; the view
+                verdict is report-only unless <code>proxy_sv_antiMacroView 1</code>.
+                Per-channel rate, spread and shape thresholds are configurable,
+                the last input is held, not zeroed, and the player is never told.
               </p>
             </li>
             <li>
