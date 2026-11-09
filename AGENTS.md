@@ -7,8 +7,7 @@ The Rust proxy lives on `main` and is never built or modified from here.
 
 - `main` (`origin/main`): Rust proxy source of truth. Do not merge it
   into this branch, do not copy `rust/`, `original/`, or `tools/` here.
-- `website` (this branch, currently unborn/no commits): Next.js static site,
-  deployed to GitHub Pages.
+- `website` (this branch): Next.js static site, deployed to GitHub Pages.
 - Remote: `git@github.com:VincentMarnier/jampgame-proxy-rs.git` → Pages URL is
   the project-page form `https://vincentmarnier.github.io/jampgame-proxy-rs/`
   (no custom domain configured). All asset/route paths must work under that
@@ -25,8 +24,11 @@ git show origin/main:docs/decisions/0006-parallel-tffa.md
 ```
 
 Trust `README.md` + `docs/` over memory. Notably the Rust port deliberately
-drops `proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
+drops `proxy_sv_pingFix`, `proxy_sv_sabersFps` and
 `proxy_sv_disableKillCmd` — never document those as available.
+`proxy_sv_antiWallHack` was dropped too, but `main` re-added it in v0.15.0
+(`docs/decisions/0023-anti-wallhack.md`) with a new implementation on the FOV
+cap's hide path, so it is a supported feature on the current site.
 
 ## Pages constraints (non-negotiable)
 
@@ -64,10 +66,9 @@ different path.
 
 ## Current workdir hygiene
 
-- This checkout has no scaffold yet: no root `package.json`, no `next.config`.
-  Local agent-tooling directories (skill installs, plugins, caches),
-  `tests/` is empty, `rust/target/` is leftover Rust build output — none of
-  these get committed to this branch.
+- The root `package.json`, `next.config.mjs` and `app/` scaffold are part of
+  this branch. Local agent-tooling directories (skill installs, plugins,
+  caches) and `rust/target/` build output must never be committed here.
 - Website `.gitignore` must cover `node_modules/`, `.next/`, `out/`,
   `rust/target/`, plus local agent-skills directories (currently
   `.opencode/node_modules/`, `.opencode/skills/` — extend for other tools).

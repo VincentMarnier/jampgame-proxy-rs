@@ -35,9 +35,9 @@ const cvars = [
   ["proxy_sv_clientPpsFpsMargin", "2", "Uncertainty band around the measured FPS used to derive the packet-rate limit: the highest limit over FPS ± margin wins, so the band can only raise it (0 = measured FPS alone)", "network"],
   ["proxy_sv_clientPpsTolerance", "1", "Packets/second of slack added after the FPS band and the global ceiling: 1 accepts 101 packets/s when the derived limit is 100; 0 enforces the exact limit", "network"],
   ["proxy_sv_clientPpsLog", "0", "Log client packet-rate limit transitions (starts using too many packets / back under the limit); works without the limiter", "network"],
-  ["proxy_sv_voidTimeNudge", "0", "Neutralise a player's non-zero cl_timeNudge on the server: when the estimated range excludes 0, shift their usercmds' clock by the estimated setting", "network"],
+  ["proxy_sv_voidTimeNudge", "0", "Neutralise a player's non-zero cl_timeNudge on the server: when the estimated range clears 0 by the configured margin, shift their usercmds' clock by the estimated setting", "network"],
   ["proxy_sv_voidTimeNudgeLog", "0", "Log cl_timeNudge non-zero / back-to-zero transitions; works on its own (reports the shift without applying it)", "network"],
-  ["proxy_sv_timeNudgeMargin", "2", "Margin (ms) added to the cl_timeNudge estimate's confidence range: a wider range keeps a small nudge consistent with 0 (more conservative); 0 reports the statistical interval alone", "network"],
+  ["proxy_sv_timeNudgeMargin", "2", "Margin (ms) added to the cl_timeNudge estimate's confidence range and required between that range and 0: a range must clear 0 by the margin to count as non-zero, so [0.3..6.1] with 2 stays consistent with 0; 0 reports the statistical interval alone", "network"],
   ["proxy_sv_antiMacro", "0", "Freeze a movement or attack channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands or frame-exact wait holds); the view verdict is report-only unless proxy_sv_antiMacroView is on, and the player is never told", "hardening"],
   ["proxy_sv_antiMacroLog", "0", "1 logs anti-macro lock/release transitions, 2 adds the statistics of locked channels, 3 the statistics of every channel with a reversal; works on its own", "diagnostics"],
   ["proxy_sv_antiMacroView", "0", "0 computes and logs the view verdict but never freezes yaw/pitch (hand mouse wiggles are not reliably separable at the wire level); non-zero freezes a locked view", "hardening"],
@@ -52,6 +52,9 @@ const cvars = [
   ["proxy_sv_maxFovAspect", "1.7777778", "Screen aspect used to turn proxy_sv_maxFov into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's cg_fovAspectAdjust 1; 1.3333334 for 4:3/stock clients, higher for ultrawide)", "fov"],
   ["proxy_sv_maxFovCameraRange", "100", "Third-person camera setback (world units) assumed by the frustum test; 100 matches the stock cg_thirdPersonRange, 0 tests from the player's eye (first-person-strict)", "fov"],
   ["proxy_sv_maxFovMargin", "0", "World-unit margin added to every side of the FOV test volume: a player whose body or drawn saber comes within that distance of the frustum stays visible, so edge contacts do not pop in/out (0 = exact frustum)", "fov"],
+  ["proxy_sv_antiWallHack", "0", "Hide a player from a viewer when no line of sight reaches their body or drawn saber; uses the FOV cap's hide path, so footsteps, swings and saber hum keep playing (0 = off)", "fov"],
+  ["proxy_sv_antiWallHackMargin", "0", "World-unit margin around the sampled body box for the line-of-sight test: a silhouette within that distance of a clear line stays visible, so cover-edge contacts do not pop in/out (0 = exact body box)", "fov"],
+  ["proxy_sv_antiWallHackCameraRange", "100", "Maximum third-person camera setback (world units) used as the start of the line-of-sight traces; a wall behind the viewer pulls it in like the client's camera collision (100 matches the stock cg_thirdPersonRange, 0 traces from the eye)", "fov"],
 ];
 
 const hardening = [
@@ -261,12 +264,15 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">43 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">46 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
-            <code>proxy_sv_antiWallHack</code>, <code>proxy_sv_sabersFps</code> and{" "}
-            <code>proxy_sv_disableKillCmd</code> from the original C++ proxy.
+            <code>proxy_sv_sabersFps</code> and{" "}
+            <code>proxy_sv_disableKillCmd</code> from the original C++ proxy.{" "}
+            <code>proxy_sv_antiWallHack</code> is supported again, but by a new
+            implementation on the FOV cap&apos;s hide path, not the original
+            origin-moving one.
           </p>
 
           <h3 className="sub">Feature highlights</h3>
@@ -327,6 +333,17 @@ export default function Home() {
                 viewer, sampling the whole body and a drawn saber.{" "}
                 <code>proxy_sv_maxFovMargin</code> softens the screen border;
                 spectators are exempt and sounds keep playing.
+              </p>
+            </li>
+            <li>
+              <b>Anti-wallhack</b>
+              <p>
+                <code>proxy_sv_antiWallHack</code> hides a player from a viewer
+                when no line of sight reaches their body or drawn saber,
+                reusing the FOV cap&apos;s hide path so footsteps and saber
+                sounds still play. It composes with the cap;{" "}
+                <code>proxy_sv_antiWallHackMargin</code> softens cover edges,
+                and Force Sight, bots and spectators are exempt.
               </p>
             </li>
             <li>
