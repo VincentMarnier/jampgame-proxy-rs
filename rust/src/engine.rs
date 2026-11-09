@@ -478,6 +478,69 @@ pub unsafe fn sv_client_think(cl: usize, ucmd: usize) {
     unsafe { f(cl, ucmd) };
 }
 
+/// `void SV_Trace(trace_t *results, const vec3_t start, const vec3_t mins,
+/// const vec3_t maxs, const vec3_t end, int passEntityNum, int contentmask,
+/// int capsule, int traceFlags, int useLod)` (0x805a4c4) — the server's
+/// world+entity trace (`sv_world.cpp:792`). The anti-wallhack uses a point box
+/// for line of sight and the client's ±`CAMERA_SIZE` box for the camera
+/// collision estimate.
+///
+/// # Safety
+///
+/// `results` must point at a writable `trace_t`; engine memory layer and game
+/// module must be live.
+pub unsafe fn sv_trace(
+    results: &mut crate::sdk::Trace,
+    start: [f32; 3],
+    mins: [f32; 3],
+    maxs: [f32; 3],
+    end: [f32; 3],
+    pass_entity_num: c_int,
+    contentmask: c_int,
+) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(
+        *mut crate::sdk::Trace,
+        *const f32,
+        *const f32,
+        *const f32,
+        *const f32,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+    ) = engine_fn!(
+        unsafe extern "C" fn(
+            *mut crate::sdk::Trace,
+            *const f32,
+            *const f32,
+            *const f32,
+            *const f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+        ),
+        functions::SV_TRACE
+    );
+    unsafe {
+        f(
+            results,
+            start.as_ptr(),
+            mins.as_ptr(),
+            maxs.as_ptr(),
+            end.as_ptr(),
+            pass_entity_num,
+            contentmask,
+            0,
+            0,
+            0,
+        )
+    };
+}
+
 /// `void MSG_Bitstream(msg_t*)` (0x80775d4) — switch a message to bitstream
 /// reading (sets `oob = qfalse`; does not reset readcount/bit).
 ///

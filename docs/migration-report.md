@@ -72,7 +72,8 @@ consistent. Status as of R-022 / D-003.
 
 ## Deliberately dropped (not "missing")
 
-- `proxy_sv_antiWallHack` (whole `sv_snapshot` family)
+- `proxy_sv_antiWallHack` (original `sv_snapshot` origin-moving family; D-023
+  re-adds the feature on the D-022 hide path)
 - `proxy_sv_pingFix` (whole-function rewrites of `SV_CalcPings` /
   `SV_SendMessageToClient` / `SV_UserMove`)
 - `proxy_sv_sabersFps`

@@ -239,7 +239,7 @@ the reason D-001.2 deferred this to the hook milestone.
 
 | feature | cvar | original implementation | address |
 |---|---|---|---|
-| anti wallhack | `proxy_sv_antiWallHack` | `Proxy_sv_snapshot.cpp` (`SV_SendClientSnapshot` `0x8058e04`, `SV_AddEntitiesVisibleFromPoint` `0x08058404`, `SV_CanSee`/`SV_MoveEntityBehindCamera` helpers, `SV_MoveEntityBehindCamera` state) + call retarget `Proxy_Call_To_SV_AddEntToSnapshot_For_Players` @ `0x0805882d` | drop all |
+| anti wallhack (original implementation) | `proxy_sv_antiWallHack` | `Proxy_sv_snapshot.cpp` (`SV_SendClientSnapshot` `0x8058e04`, `SV_AddEntitiesVisibleFromPoint` `0x08058404`, `SV_CanSee`/`SV_MoveEntityBehindCamera` helpers, `SV_MoveEntityBehindCamera` state) + call retarget `Proxy_Call_To_SV_AddEntToSnapshot_For_Players` @ `0x0805882d` | original machinery dropped; **feature re-added by D-023** on the D-022 hide path (line-of-sight traces, no origin move/relink) |
 | disable kill command | `proxy_sv_disableKillCmd` | `Proxy_SharedAPI.cpp:131-134` | drop (already ported arm in `shared_api.rs:198-202` — remove) |
 | saber FPS | `proxy_sv_sabersFps` | `Proxy_WP_SaberPositionUpdate` `Proxy_g_local.cpp:69-96`, game `+0x00194c24` | drop |
 | ping fix | `proxy_sv_pingFix` | `SV_CalcPings` `0x8057204`, `SV_SendMessageToClient` `0x8058c84`, `SV_UserMove` `messageAcked` | drop all three (two are whole-function rewrites) |

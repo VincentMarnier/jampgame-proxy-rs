@@ -17,10 +17,12 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 
 /// The `proxy.cvars` mirror table (D-002 keep list): each entry is
 /// `(field-name, default string)`; `CVAR_ARCHIVE` is the flag for all of them.
-/// The four dropped cvars (`pingFix`, `antiWallHack`, `disableKillCmd`,
-/// `sabersFps`) are gone with their features. `proxy_sv_enableRconCmdCooldown`
-/// was removed with the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 42] = [
+/// The four dropped cvars (`pingFix`, `disableKillCmd`, `sabersFps`, and the
+/// original `antiWallHack` implementation) are gone with their features.
+/// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
+/// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
+/// the 2026 rcon rate-limit policy (10-25 F6, S11).
+pub const PROXY_CVARS: [(&CStr, &CStr); 45] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -63,6 +65,9 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 42] = [
     (c"proxy_sv_antiMacroViewStepPercent", c"75"),
     (c"proxy_sv_antiMacroViewMinSwing", c"364"),
     (c"proxy_sv_clientPpsTolerance", c"1"),
+    (c"proxy_sv_antiWallHack", c"0"),
+    (c"proxy_sv_antiWallHackMargin", c"0"),
+    (c"proxy_sv_antiWallHackCameraRange", c"100"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -218,6 +223,23 @@ pub const CVAR_ANTI_MACRO_VIEW_MIN_SWING: usize = 40;
 /// client sending `101` packets/s is accepted when the derived limit is `100`.
 /// `0` restores the exact limit.
 pub const CVAR_CLIENT_PPS_TOLERANCE: usize = 41;
+/// `proxy_sv_antiWallHack`: hide a player from a viewer when no line of sight
+/// from that viewer's camera reaches any part of the player's body or drawn
+/// saber (`0` = off). Uses the same per-viewer hide as [`CVAR_MAX_FOV`]
+/// (`EF_NODRAW` + mind-trick bit + 1% model scale + hidden blade), so the
+/// player's footsteps, swings and saber hum keep playing. See `crate::fov`
+/// and D-023.
+pub const CVAR_ANTI_WALLHACK: usize = 42;
+/// `proxy_sv_antiWallHackMargin`: world-unit margin added around the player's
+/// sampled body box for the line-of-sight test. A player whose invisible
+/// silhouette is within this many world units of a clear line stays visible,
+/// so cover-edge contacts do not pop in and out. `0` is the exact body box.
+pub const CVAR_ANTI_WALLHACK_MARGIN: usize = 43;
+/// `proxy_sv_antiWallHackCameraRange`: third-person camera setback, in world
+/// units, used as the start of the line-of-sight traces. Default `100` matches
+/// the stock `cg_thirdPersonRange`; `0` traces from the player's eye
+/// (first-person-strict).
+pub const CVAR_ANTI_WALLHACK_CAMERA_RANGE: usize = 44;
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -899,9 +921,10 @@ pub struct ProxyState {
     /// waiting for the next periodic tick.
     pub spec_overlay_scope: [i32; MAX_CLIENTS],
     pub tffa: TffaState,
-    /// Per-viewer FOV-cap snapshot mutations (`crate::fov`): the entity fields
-    /// changed for the snapshot currently being built, restored as soon as the
-    /// engine has copied them.
+    /// Per-viewer visibility-filter snapshot mutations (`crate::fov`): the FOV
+    /// cap and the anti-wallhack. Holds the entity fields changed for the
+    /// snapshot currently being built, restored as soon as the engine has
+    /// copied them.
     pub fov: crate::fov::FovState,
 }
 
@@ -1187,17 +1210,24 @@ mod tests {
             b"364"
         );
         assert_eq!(PROXY_CVARS[CVAR_CLIENT_PPS_TOLERANCE].1.to_bytes(), b"1");
+        assert_eq!(PROXY_CVARS[CVAR_ANTI_WALLHACK].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_ANTI_WALLHACK_MARGIN].1.to_bytes(), b"0");
+        assert_eq!(
+            PROXY_CVARS[CVAR_ANTI_WALLHACK_CAMERA_RANGE].1.to_bytes(),
+            b"100"
+        );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
     #[test]
     fn dropped_cvars_are_gone() {
         // D-002: the not-wanted features are dropped entirely, cvars included.
+        // `proxy_sv_antiWallHack` is no longer in this list: D-023 re-adds it
+        // with a new implementation (the original one remains dropped).
         for (name, _) in PROXY_CVARS {
             let n = name.to_bytes();
             assert!(
                 !n.starts_with(b"proxy_sv_pingFix")
-                    && !n.starts_with(b"proxy_sv_antiWallHack")
                     && !n.starts_with(b"proxy_sv_disableKillCmd")
                     && !n.starts_with(b"proxy_sv_sabersFps"),
                 "dropped cvar still registered: {}",

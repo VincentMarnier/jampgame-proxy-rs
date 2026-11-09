@@ -547,6 +547,65 @@ pub const CONTENTS_TRIGGER: i32 = 0x0000_0400;
 /// whose contents do not intersect the trace's `contentmask` is already skipped
 /// by the engine (`sv_world.cpp:637`), so it needs no flip.
 pub const CONTENTS_SOLID: i32 = 0x0000_0001;
+/// `CONTENTS_LAVA` (`surfaceflags.h:11`).
+pub const CONTENTS_LAVA: i32 = 0x0000_0002;
+/// `CONTENTS_TERRAIN` (`surfaceflags.h:22`).
+pub const CONTENTS_TERRAIN: i32 = 0x0000_1000;
+/// `CONTENTS_SLIME` (`surfaceflags.h:30`).
+pub const CONTENTS_SLIME: i32 = 0x0002_0000;
+/// `MASK_OPAQUE` (`bg_public.h:1174`): what blocks a line of sight. Solid
+/// geometry, opaque liquids and terrain; water and other non-opaque contents do
+/// not. The anti-wallhack trace uses it as its `contentmask`.
+pub const MASK_OPAQUE: i32 = CONTENTS_SOLID | CONTENTS_SLIME | CONTENTS_LAVA | CONTENTS_TERRAIN;
+
+/// `CONTENTS_PLAYERCLIP` (`surfaceflags.h:14`) — invisible movement blockers.
+/// The client's third-person camera collision includes them (`MASK_CAMERACLIP`,
+/// `cg_view.c:13`), so the server's camera estimate must too.
+pub const CONTENTS_PLAYERCLIP: i32 = 0x0000_0010;
+/// `MASK_CAMERACLIP` (`cg_view.c:13`): `MASK_SOLID|CONTENTS_PLAYERCLIP`.
+/// Used to pull the estimated third-person camera in when a wall is behind the
+/// viewer, matching the client's own camera traces.
+pub const MASK_CAMERACLIP: i32 = CONTENTS_SOLID | CONTENTS_TERRAIN | CONTENTS_PLAYERCLIP;
+
+/// `forcedata_t` / `playerState_t` layouts used by the anti-wallhack's Force
+/// Sight exemption.
+///
+/// `offsetof(playerState_t, fd)` 804 + `offsetof(forcedata_t,
+/// forcePowersActive)` 76, with `clientSnapshot_t.ps` starting at 36
+/// (`areabytes` 4 + `areabits[32]`); the SDK oracle printed 880 and
+/// `ps.viewangles` 184, matching the pinned `OFFSET_SNAPSHOT_FRAME_PS_*` base.
+pub const OFFSET_SNAPSHOT_FRAME_PS_FORCE_POWERS_ACTIVE: usize = 916;
+/// `FP_SEE` (`q_shared.h:607`, `forcePowers_t`): stock Force Sight, which
+/// intentionally shows players through walls. The anti-wallhack pauses for a
+/// viewer using it.
+pub const FP_SEE: u8 = 14;
+
+/// `trace_t` (`q_shared.h:1793-1817`) on i386: `allsolid` 0, `startsolid` 1,
+/// `entityNum` 2, `fraction` 4, `endpos` 8, `plane` 20 (`cplane_t`: normal 0,
+/// dist 12, type 16, signbits 17, pad 18), `surfaceFlags` 40, `contents` 44;
+/// 48 bytes. The anti-wallhack reads `fraction`/`startsolid`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CPlane {
+    pub normal: [f32; 3],
+    pub dist: f32,
+    pub kind: u8,
+    pub signbits: u8,
+    pub pad: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Trace {
+    pub allsolid: u8,
+    pub startsolid: u8,
+    pub entity_num: i16,
+    pub fraction: f32,
+    pub endpos: [f32; 3],
+    pub plane: CPlane,
+    pub surface_flags: i32,
+    pub contents: i32,
+}
 
 /// Event numbers (`bg_public.h` `entity_event_t`, oracle-counted 2026-09-15;
 /// the sound set re-counted 2026-10-18 and the owner-attributed set re-counted
@@ -1129,6 +1188,20 @@ mod tests {
         assert_eq!(ET_MOVER, 6);
         assert_eq!(CONTENTS_TRIGGER, 0x400);
         assert_eq!(CONTENTS_SOLID, 1);
+        assert_eq!(CONTENTS_LAVA, 0x2);
+        assert_eq!(CONTENTS_TERRAIN, 0x1000);
+        assert_eq!(CONTENTS_SLIME, 0x2_0000);
+        assert_eq!(MASK_OPAQUE, 0x2_1003);
+        assert_eq!(CONTENTS_PLAYERCLIP, 0x10);
+        assert_eq!(MASK_CAMERACLIP, 0x1011);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_FORCE_POWERS_ACTIVE, 916);
+        assert_eq!(FP_SEE, 14);
+        assert_eq!(core::mem::size_of::<Trace>(), 48);
+        assert_eq!(core::mem::offset_of!(Trace, startsolid), 1);
+        assert_eq!(core::mem::offset_of!(Trace, fraction), 4);
+        assert_eq!(core::mem::offset_of!(Trace, endpos), 8);
+        assert_eq!(core::mem::offset_of!(Trace, plane), 20);
+        assert_eq!(core::mem::offset_of!(Trace, contents), 44);
         assert_eq!(OFFSET_MSG_OOB, 8);
         assert_eq!(OFFSET_MSG_DATA, 12);
         assert_eq!(OFFSET_MSG_CURSIZE, 20);

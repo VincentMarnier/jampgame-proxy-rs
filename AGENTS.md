@@ -26,7 +26,9 @@ README.md is for humans: what the proxy is, its features and cvars, and how to u
 docs/ holds the reverse-engineering evidence, the architecture notes and the decisions taken during the port. Decisions behind features described in README.md:
 
 - docs/decisions/0001-bootstrap-core.md — bootstrap core, the i386 4-byte stack alignment finding and the `-mstackrealign` / SSE-off workaround.
-- docs/decisions/0002-scope.md — port scope; records the cvars deliberately dropped from the original C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`, `proxy_sv_disableKillCmd`).
+- docs/decisions/0002-scope.md — port scope; records the cvars deliberately dropped from the original C++ proxy (`proxy_sv_pingFix`, `proxy_sv_sabersFps`, `proxy_sv_disableKillCmd`) and the original anti-wallhack implementation (the cvar is re-added by D-023).
+- docs/decisions/0022-fov-cap.md — per-viewer FOV cap (`proxy_sv_maxFov*`) and the shared hide/restore path.
+- docs/decisions/0023-anti-wallhack.md — anti-wallhack (`proxy_sv_antiWallHack*`) built on the FOV cap's hide path and sample points (line-of-sight traces).
 - docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeamsAfterXSecs`.
 - docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM).
 - docs/decisions/README.md — index of the decision records.

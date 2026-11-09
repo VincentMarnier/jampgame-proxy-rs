@@ -71,10 +71,15 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_maxFovAspect`               | 1.7777778 | screen aspect used to turn `proxy_sv_maxFov` into the rendered view frustum (16:9 default, matching OpenJK/TaystJK's `cg_fovAspectAdjust 1`; use `1.3333334` for 4:3/stock clients or higher for ultrawide) |
 | `proxy_sv_maxFovCameraRange`          | 100     | third-person camera setback (world units) assumed by the frustum test; `100` matches the stock `cg_thirdPersonRange`, `0` tests from the player's eye (first-person-strict) |
 | `proxy_sv_maxFovMargin`               | 0       | world-unit margin added to every side of the FOV test volume: a player whose body or drawn saber comes within that distance of the frustum stays visible, so edge contacts do not pop in/out; `0` = exact frustum (see [FOV cap](#fov-cap)) |
+| `proxy_sv_antiWallHack`               | 0       | hide a player from a viewer when no line of sight reaches any part of their body or drawn saber; uses the same hide as the FOV cap, so footsteps, swings and saber hum keep playing; `0` = off (see [Anti-wallhack](#anti-wallhack)) |
+| `proxy_sv_antiWallHackMargin`         | 0       | world-unit margin added around the sampled body box for the line-of-sight test: a player whose silhouette is within that distance of a clear line stays visible, so cover-edge contacts do not pop in/out; `0` = exact body box (see [Anti-wallhack](#anti-wallhack)) |
+| `proxy_sv_antiWallHackCameraRange`    | 100     | maximum third-person camera setback (world units) used as the start of the line-of-sight traces; a wall behind the viewer pulls it in exactly like the client's camera collision does; `100` matches the stock `cg_thirdPersonRange`, `0` traces from the player's eye (first-person-strict) |
 
 Note: this Rust version deliberately drops some cvars present in the original
-C++ proxy (`proxy_sv_pingFix`, `proxy_sv_antiWallHack`, `proxy_sv_sabersFps`,
-`proxy_sv_disableKillCmd`).
+C++ proxy (`proxy_sv_pingFix`, `proxy_sv_sabersFps`,
+`proxy_sv_disableKillCmd`). `proxy_sv_antiWallHack` is supported again, but by a
+new implementation that reuses the FOV cap's hide path (D-023), not the
+original origin-moving one.
 
 ### Player mute
 
@@ -733,6 +738,70 @@ seta proxy_sv_maxFovMargin 32
 ```
 
 or `rcon proxy_sv_maxFov 100`. Like every proxy feature it needs
+`proxy_sv_enable 1`.
+
+### Anti-wallhack
+
+`proxy_sv_antiWallHack` (default `0`, off) hides a player from a viewer when
+nothing of that player can be seen: the proxy traces a line from the viewer's
+camera to every sample point of the player's body box and drawn saber, and if
+all of them meet solid geometry the player is hidden for that snapshot. The
+stock client never reports a wallhack, so — like the FOV cap — the proxy
+removes what the cheat would read rather than trying to detect it. A wallhack
+therefore shows empty space behind walls; a normal player sees no change.
+
+The test uses the same sample points as the FOV cap: the centre and eight
+corners of the game's body box (`{-15,-15,-24}` to `{15,15,40}`), plus hilt,
+middle and tip of every active blade of a drawn, non-thrown saber. A player
+whose head, side or blade is still visible therefore stays visible even when
+their feet coordinate is behind cover. The trace uses `MASK_OPAQUE`, so solid
+geometry (including brush movers such as doors), opaque liquids and terrain
+block the view while water and non-opaque contents do not. It ignores the
+viewer's own body.
+
+The two visibility features compose. With only `proxy_sv_antiWallHack`, a
+player behind a wall is hidden wherever they are; with both features on, a
+player must be **inside the FOV cap and in line of sight** to be sent. A
+viewer using Force Sight (`FP_SEE`, a stock power that intentionally shows
+players through walls) is left alone, and so are bots and spectators.
+
+`proxy_sv_antiWallHackMargin` (default `0`, off) grows the sampled body box by
+that many world units on every side, so a player whose silhouette is partly
+past the cover edge stays visible. It is a distance, not an angle; `8`–`16`
+softens most edge contacts, `0` is the cheapest and strictest setting.
+
+`proxy_sv_antiWallHackCameraRange` (default `100`) is the **maximum**
+third-person camera setback, exactly like `proxy_sv_maxFovCameraRange`: the
+client renders from up to `cg_thirdPersonRange` behind the player, so a trace
+from the eye alone would hide players around a corner the client can still
+see. When something is behind the player, the client does not keep the full
+range: it traces its `±4`-unit camera box from the eye to the ideal location
+and stops at the first hit (`cg_view.c:393-405`). The proxy performs the same
+camera-collision trace with `MASK_CAMERACLIP` and uses its hit point, so a
+camera that would sit inside a wall is pulled in to where the client's camera
+really is. Set the cvar to `0` for a first-person-strict server, or raise it if
+your players use a larger `cg_thirdPersonRange`. A camera trace that starts
+inside solid geometry falls back to the eye rather than blanking the stream.
+
+Hiding uses the FOV cap's path: `EF_NODRAW` (instant), the viewer's mind-trick
+bit, a 1 % model scale and a hidden drawn blade, with the hum moved to
+`s.loopSound`. The player entity stays in the snapshot, so footsteps, swings,
+hits and the saber hum still play at the true position, and the shared game
+state is restored immediately after the engine copies that viewer's snapshot.
+A **thrown** saber is left visible and audible as-is. The same documented
+limits as the FOV cap apply: a custom client that strips `EF_NODRAW` and
+normalises the scale can still draw the entity, and the stock 1.01 cgame skips
+entity loop sounds on `EF_NODRAW`.
+
+Set it at startup or at runtime:
+
+```text
+seta proxy_sv_antiWallHack 1
+seta proxy_sv_antiWallHackMargin 8
+seta proxy_sv_antiWallHackCameraRange 100
+```
+
+or `rcon proxy_sv_antiWallHack 1`. Like every proxy feature it needs
 `proxy_sv_enable 1`.
 
 ### Team lock

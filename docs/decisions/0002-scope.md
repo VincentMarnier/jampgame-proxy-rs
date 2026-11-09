@@ -8,6 +8,11 @@ commit `687997412ea6e5ead93f5c7b25db552590a2eeb1`); hook tables in
 `RuntimePatch/Engine/Proxy_Engine_Patch.cpp`; full per-feature map in
 `../inventory.md`. Source authority: AGENTS.md.
 
+> Superseding note (2026-11-09): the **feature** `proxy_sv_antiWallHack` is
+> wanted again by D-023. The original implementation listed below remains
+> dropped: D-023 uses the D-022 FOV-cap hide path and line-of-sight traces, not
+> the original origin-moving/relink machinery. The rest of this record stands.
+
 ## Context
 
 The original proxy attaches 22 engine detours + 8 game detours + 1 call-site

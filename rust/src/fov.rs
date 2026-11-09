@@ -1,9 +1,10 @@
-//! FOV cap (`proxy_sv_maxFov`): hide players outside a viewer's allowed
-//! horizontal FOV while keeping their sounds.
+//! Per-viewer visibility filter: the FOV cap (`proxy_sv_maxFov`) and the
+//! anti-wallhack (`proxy_sv_antiWallHack`) hide players while keeping their
+//! sounds.
 //!
 //! A stock JKA client never tells the server its `cg_fov` (the cvar is
-//! registered by cgame only, `cg_main.c:887`), so the server cannot know a
-//! client's real FOV. Instead, the proxy caps what any client can *receive*:
+//! registered by cgame only, `cg_main.c:887`), and the server cannot see a
+//! wallhack either. Instead, the proxy caps what any client can *receive*:
 //! when `proxy_sv_maxFov` is `N`, a player outside the rendered view frustum
 //! corresponding to `cg_fov N` is hidden for that viewer. Raising `cg_fov` above `N` therefore shows no extra players.
 //! Modern clients widen `cg_fov` for the screen aspect (`cg_fovAspectAdjust`);
@@ -13,6 +14,14 @@
 //! (non-thrown) saber blade, so bodies and sabers at the screen border do not
 //! pop in on the feet coordinate alone. `proxy_sv_maxFovMargin` expands the
 //! volume outward by that many world units on every side.
+//!
+//! The anti-wallhack applies the same idea to occlusion instead of angles:
+//! `proxy_sv_antiWallHack` traces from the viewer's camera to the same player
+//! sample points and hides the player when no line reaches any of them.
+//! `proxy_sv_antiWallHackMargin` grows the sampled body box by that many world
+//! units, and `proxy_sv_antiWallHackCameraRange` places the trace start behind
+//! the eye for third person. The two features compose: when both are on, a
+//! player must be inside the frustum **and** in line of sight to stay visible.
 //!
 //! The hide is per viewer and instant: `EF_NODRAW` makes cgame's `CG_Player`
 //! return at the top (no mind-trick fade). The entity stays in the snapshot, so
@@ -28,23 +37,24 @@
 //! The mutations live on the shared `g_entities` state for exactly the time
 //! the engine needs to copy the entity states into the viewer's snapshot:
 //! applied at the end of `SV_AddEntitiesVisibleFromPoint` and restored right
-//! after `SV_SendClientSnapshot` returns (D-022).
+//! after `SV_SendClientSnapshot` returns (D-022, D-023).
 
 use core::ffi::c_int;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::sdk::{
-    EF_DEAD, EF_NODRAW, MAX_BLADES, MAX_CLIENTS, MAX_SABERS, MAX_SNAPSHOT_ENTITIES,
-    OFFSET_BLADE_ACTIVE, OFFSET_BLADE_LENGTH, OFFSET_BLADE_MUZZLE_DIR, OFFSET_BLADE_MUZZLE_POINT,
-    OFFSET_GCLIENT_SABER, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_R_MAXS,
-    OFFSET_GENTITY_R_MINS, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
+    EF_DEAD, EF_NODRAW, FP_SEE, MASK_CAMERACLIP, MASK_OPAQUE, MAX_BLADES, MAX_CLIENTS, MAX_SABERS,
+    MAX_SNAPSHOT_ENTITIES, OFFSET_BLADE_ACTIVE, OFFSET_BLADE_LENGTH, OFFSET_BLADE_MUZZLE_DIR,
+    OFFSET_BLADE_MUZZLE_POINT, OFFSET_GCLIENT_SABER, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT,
+    OFFSET_GENTITY_R_MAXS, OFFSET_GENTITY_R_MINS, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS,
     OFFSET_GENTITY_S_IMODEL_SCALE, OFFSET_GENTITY_S_LOOP_SOUND, OFFSET_GENTITY_S_POS_TRBASE,
     OFFSET_GENTITY_S_SABER_HOLSTERED, OFFSET_GENTITY_S_SABER_IN_FLIGHT, OFFSET_GENTITY_S_TRICKED_1,
     OFFSET_GENTITY_S_TRICKED_2, OFFSET_GENTITY_S_TRICKED_3, OFFSET_GENTITY_S_TRICKED_4,
     OFFSET_GENTITY_S_WEAPON, OFFSET_SABER_BLADE, OFFSET_SABER_NUM_BLADES, OFFSET_SABER_SOUND_LOOP,
-    OFFSET_SESS_SESSION_TEAM, OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST,
+    OFFSET_SESS_SESSION_TEAM, OFFSET_SHARED_SVFLAGS, OFFSET_SNAPSHOT_ENUMS_COUNT,
+    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_FORCE_POWERS_ACTIVE,
     OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES, SIZEOF_BLADE_INFO, SIZEOF_GENTITY, SIZEOF_SABER_INFO,
-    TEAM_SPECTATOR, WP_SABER,
+    SVF_BOT, TEAM_SPECTATOR, Trace, WP_SABER,
 };
 use crate::state;
 
@@ -292,9 +302,43 @@ pub fn trick_mask(viewer: i32) -> (usize, i32) {
     (field, bit)
 }
 
-/// Whether any visible part of a player is inside the view: the eight corners
-/// and centre of the body's bounding box, plus the hilt, middle and tip of
-/// every active blade of a drawn, non-thrown saber.
+/// Maximum sample points for one player: the body box (centre + eight corners)
+/// plus `MAX_SABERS * MAX_BLADES` blades at three points each.
+pub const MAX_PLAYER_POINTS: usize = 9 + MAX_SABERS * MAX_BLADES * 3;
+
+/// Nine body sample points: the centre first, then the eight corners of the
+/// `mins..maxs` box around `origin`, enlarged by `margin` world units on every
+/// side. Centre-first matters for the anti-wallhack: a visible player usually
+/// clears on the first trace.
+pub fn body_points(origin: [f32; 3], mins: [f32; 3], maxs: [f32; 3], margin: f32) -> [[f32; 3]; 9] {
+    let margin = if margin.is_finite() {
+        margin.max(0.0)
+    } else {
+        0.0
+    };
+    let lo = [mins[0] - margin, mins[1] - margin, mins[2] - margin];
+    let hi = [maxs[0] + margin, maxs[1] + margin, maxs[2] + margin];
+    let mut body = [[0.0f32; 3]; 9];
+    body[0] = [
+        origin[0] + (lo[0] + hi[0]) * 0.5,
+        origin[1] + (lo[1] + hi[1]) * 0.5,
+        origin[2] + (lo[2] + hi[2]) * 0.5,
+    ];
+    let mut n = 1;
+    for x in [lo[0], hi[0]] {
+        for y in [lo[1], hi[1]] {
+            for z in [lo[2], hi[2]] {
+                body[n] = [origin[0] + x, origin[1] + y, origin[2] + z];
+                n += 1;
+            }
+        }
+    }
+    body
+}
+
+/// Fill `out` with the points used to decide whether a player is visible: the
+/// body box (centre + eight corners, expanded by `margin`) plus the hilt,
+/// middle and tip of every active blade of a drawn, non-thrown saber.
 ///
 /// The body box comes from `gentity_t.r.mins/maxs`, which the game sets to
 /// `playerMins`/`playerMaxs` (`{-15,-15,-24}` .. `{15,15,40}`, `g_client.c`).
@@ -306,32 +350,21 @@ pub fn trick_mask(viewer: i32) -> (usize, i32) {
 /// # Safety
 ///
 /// `ent` must be a live `gentity_t` slot and `client` its live `gclient_t*`.
-unsafe fn player_visible(
-    frustum: &ViewFrustum,
+unsafe fn player_sample_points(
     ent: usize,
     client: usize,
     origin: [f32; 3],
-) -> bool {
+    margin: f32,
+    out: &mut [[f32; 3]; MAX_PLAYER_POINTS],
+) -> usize {
     // SAFETY: ent is a live gentity; r.mins/r.maxs are vec3_t.
     let mins = unsafe { read_vec3(ent + OFFSET_GENTITY_R_MINS) };
     let maxs = unsafe { read_vec3(ent + OFFSET_GENTITY_R_MAXS) };
-    let mut body = [[0.0f32; 3]; 9];
-    let mut n = 0;
-    for x in [mins[0], maxs[0]] {
-        for y in [mins[1], maxs[1]] {
-            for z in [mins[2], maxs[2]] {
-                body[n] = [origin[0] + x, origin[1] + y, origin[2] + z];
-                n += 1;
-            }
-        }
-    }
-    body[8] = [
-        origin[0] + (mins[0] + maxs[0]) * 0.5,
-        origin[1] + (mins[1] + maxs[1]) * 0.5,
-        origin[2] + (mins[2] + maxs[2]) * 0.5,
-    ];
-    if any_point_visible(frustum, &body) {
-        return true;
+    let body = body_points(origin, mins, maxs, margin);
+    out[..9].copy_from_slice(&body);
+    let mut n = 9;
+    if client == 0 {
+        return n;
     }
     // A corpse has no live held saber; a thrown saber is a separate entity with
     // its own visibility; a holstered one is not rendered.
@@ -343,7 +376,7 @@ unsafe fn player_visible(
     let saber_holstered =
         unsafe { read_u8(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_SABER_HOLSTERED) };
     if e_flags & EF_DEAD != 0 || weapon != WP_SABER || saber_in_flight || saber_holstered >= 2 {
-        return false;
+        return n;
     }
     for saber in 0..MAX_SABERS {
         let saber_info = client + OFFSET_GCLIENT_SABER + saber * SIZEOF_SABER_INFO;
@@ -363,27 +396,166 @@ unsafe fn player_visible(
             if !length.is_finite() || length <= 0.0 {
                 continue;
             }
-            let tip = [
-                base[0] + dir[0] * length,
-                base[1] + dir[1] * length,
-                base[2] + dir[2] * length,
-            ];
-            let mid = [
+            out[n] = base;
+            out[n + 1] = [
                 base[0] + dir[0] * length * 0.5,
                 base[1] + dir[1] * length * 0.5,
                 base[2] + dir[2] * length * 0.5,
             ];
-            if any_point_visible(frustum, &[base, mid, tip]) {
-                return true;
-            }
+            out[n + 2] = [
+                base[0] + dir[0] * length,
+                base[1] + dir[1] * length,
+                base[2] + dir[2] * length,
+            ];
+            n += 3;
         }
     }
-    false
+    n
 }
 
-/// Apply the FOV cap to every player entity in `e_nums` that falls outside the
-/// viewer's view frustum. Called after the pristine (and parallel-TFFA)
-/// snapshot pass, for the main view only (`portal == false`).
+/// Whether any visible part of a player is inside the view.
+///
+/// # Safety
+///
+/// See [`player_sample_points`].
+unsafe fn player_visible(
+    frustum: &ViewFrustum,
+    ent: usize,
+    client: usize,
+    origin: [f32; 3],
+) -> bool {
+    let mut points = [[0.0f32; 3]; MAX_PLAYER_POINTS];
+    // SAFETY: ent/client are live game structures.
+    let n = unsafe { player_sample_points(ent, client, origin, 0.0, &mut points) };
+    any_point_visible(frustum, &points[..n])
+}
+
+/// Whether any part of a player has a clear line of sight from the viewer.
+/// `clear` decides one ray endpoint; the body box is enlarged by `margin`.
+///
+/// # Safety
+///
+/// See [`player_sample_points`].
+unsafe fn player_in_line_of_sight<F: FnMut([f32; 3]) -> bool>(
+    ent: usize,
+    client: usize,
+    origin: [f32; 3],
+    margin: f32,
+    mut clear: F,
+) -> bool {
+    let mut points = [[0.0f32; 3]; MAX_PLAYER_POINTS];
+    // SAFETY: ent/client are live game structures.
+    let n = unsafe { player_sample_points(ent, client, origin, margin, &mut points) };
+    points[..n].iter().any(|point| clear(*point))
+}
+
+/// Whether the engine's `SV_Trace` finds no opaque geometry between `start` and
+/// `end`. `pass_entity` is the viewer's entity number, so its own body does not
+/// block the ray. A trace that starts inside solid returns `true`: a camera
+/// point on a wall surface or a degenerate viewpoint must not blank the whole
+/// stream.
+///
+/// # Safety
+///
+/// Engine memory layer and game module must be live; called from the
+/// `SV_AddEntitiesVisibleFromPoint` wrapper.
+unsafe fn line_clear(start: [f32; 3], end: [f32; 3], pass_entity: c_int) -> bool {
+    let mut trace = Trace::default();
+    // SAFETY: the engine's SV_Trace writes the whole trace_t; start/end are
+    // stack vec3_t values and a zero box is the point trace.
+    unsafe {
+        crate::engine::sv_trace(
+            &mut trace,
+            start,
+            [0.0; 3],
+            [0.0; 3],
+            end,
+            pass_entity,
+            MASK_OPAQUE,
+        )
+    };
+    trace.startsolid != 0 || trace.fraction >= 1.0
+}
+
+/// `CAMERA_SIZE` (`cg_view.c:14`): the client's third-person camera collision
+/// box is `±CAMERA_SIZE` on every axis.
+pub const CAMERA_SIZE: f32 = 4.0;
+
+/// Pick the camera position from the desired full setback and the engine's
+/// camera-collision trace. The client traces its camera box from the eye to the
+/// ideal third-person location and uses the hit point (`cg_view.c:393-405`), so
+/// when a wall is behind the player the real camera is much closer than
+/// `range`. `start_solid` falls back to the eye: no trustworthy camera point.
+pub fn clamp_camera(
+    eye: [f32; 3],
+    desired: [f32; 3],
+    start_solid: bool,
+    blocked: bool,
+    endpos: [f32; 3],
+) -> [f32; 3] {
+    if start_solid {
+        eye
+    } else if blocked {
+        endpos
+    } else {
+        desired
+    }
+}
+
+/// The camera position used by the anti-wallhack: the full third-person setback
+/// from [`camera_origin`], clamped in by the client's own camera collision
+/// (a `±CAMERA_SIZE` box trace with `MASK_CAMERACLIP`).
+///
+/// # Safety
+///
+/// Engine memory layer and game module must be live; called from the
+/// `SV_AddEntitiesVisibleFromPoint` wrapper.
+unsafe fn wallhack_camera(eye: [f32; 3], angles: [f32; 3], range: f32, viewer: c_int) -> [f32; 3] {
+    let desired = camera_origin(eye, angles, range);
+    let mut trace = Trace::default();
+    // SAFETY: engine trace against the live world; the viewer is passed so its
+    // own body cannot push the camera forward.
+    unsafe {
+        crate::engine::sv_trace(
+            &mut trace,
+            eye,
+            [-CAMERA_SIZE; 3],
+            [CAMERA_SIZE; 3],
+            desired,
+            viewer,
+            MASK_CAMERACLIP,
+        )
+    };
+    clamp_camera(
+        eye,
+        desired,
+        trace.startsolid != 0,
+        trace.fraction < 1.0,
+        trace.endpos,
+    )
+}
+
+/// The trace start: the eye `origin` moved `camera_range` world units backwards
+/// along the view direction (the third-person camera).
+pub fn camera_origin(origin: [f32; 3], angles: [f32; 3], camera_range: f32) -> [f32; 3] {
+    let (forward, _, _) = view_vectors(angles);
+    let range = if camera_range.is_finite() {
+        camera_range.max(0.0)
+    } else {
+        0.0
+    };
+    [
+        origin[0] - forward[0] * range,
+        origin[1] - forward[1] * range,
+        origin[2] - forward[2] * range,
+    ]
+}
+
+/// Apply the per-viewer visibility filter to every player entity in `e_nums`:
+/// hide it when the FOV cap (`proxy_sv_maxFov`) says it is outside the view or
+/// the anti-wallhack (`proxy_sv_antiWallHack`) finds no line of sight. Called
+/// after the pristine (and parallel-TFFA) snapshot pass, for the main view only
+/// (`portal == false`).
 ///
 /// # Safety
 ///
@@ -413,12 +585,24 @@ pub unsafe fn apply(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    let (max_fov, aspect, camera_range, margin, requested_viewer) = state::with_state(|s| {
+    let (
+        max_fov,
+        aspect,
+        fov_camera_range,
+        fov_margin,
+        anti_wallhack,
+        wallhack_margin,
+        wallhack_camera_range,
+        requested_viewer,
+    ) = state::with_state(|s| {
         (
             s.cvars[state::CVAR_MAX_FOV].integer,
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value,
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value,
             s.cvars[state::CVAR_MAX_FOV_MARGIN].value,
+            s.cvars[state::CVAR_ANTI_WALLHACK].integer,
+            s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value,
+            s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value,
             s.fov.viewer_client,
         )
     });
@@ -434,31 +618,87 @@ pub unsafe fn apply(
     if unsafe { is_spectator(g_entities, viewer_client) } {
         return;
     }
-    let Some((h_half, v_half)) = view_half_angles(max_fov, aspect) else {
+    let fov_angles = view_half_angles(max_fov, aspect);
+    // Bots' snapshots are not rendered and their AI has its own perception, so
+    // the original anti-wallhack skipped them too; hiding entities from a bot
+    // packet buys nothing.
+    // SAFETY: g_entities is the located game array.
+    let wallhack_on = anti_wallhack != 0 && !unsafe { is_bot(g_entities, viewer_client) };
+    if fov_angles.is_none() && !wallhack_on {
         return;
-    };
+    }
     // SAFETY: `frame` is a valid clientSnapshot_t; viewangles is a vec3_t.
     let pitch = unsafe { read_f32(frame + OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES) };
     let yaw = unsafe { read_f32(frame + OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES + 4) };
     let roll = unsafe { read_f32(frame + OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES + 8) };
-    if !pitch.is_finite() || pitch.abs() > MAX_PITCH {
+    if !pitch.is_finite() || !yaw.is_finite() || !roll.is_finite() {
         return;
     }
-    // The stock third-person camera pitches toward its focus point, so its
-    // vertical view can sit a few degrees off `ps.viewangles` even below the
-    // pause threshold. A small vertical margin keeps on-screen players visible;
-    // the horizontal bound (the FOV cheat's axis) stays exact.
-    let v_half = (v_half + 10.0f32.to_radians()).min(core::f32::consts::FRAC_PI_2);
     let angles = [pitch, yaw, roll];
     // SAFETY: `origin` is the engine's vec3_t viewpoint argument.
     let viewpoint = unsafe { read_vec3(origin) };
-    let frustum = ViewFrustum::new(viewpoint, angles, h_half, v_half, camera_range, margin);
+    // The FOV cap pauses at steep pitch (D-022.1); the anti-wallhack does not
+    // depend on the aim's pitch, only on the camera position and occlusion.
+    let frustum = match fov_angles {
+        Some((h_half, v_half)) if pitch.abs() <= MAX_PITCH => {
+            // The stock third-person camera pitches toward its focus point, so
+            // its vertical view can sit a few degrees off `ps.viewangles` even
+            // below the pause threshold. A small vertical margin keeps
+            // on-screen players visible; the horizontal bound (the FOV cheat's
+            // axis) stays exact.
+            let v_half = (v_half + 10.0f32.to_radians()).min(core::f32::consts::FRAC_PI_2);
+            Some(ViewFrustum::new(
+                viewpoint,
+                angles,
+                h_half,
+                v_half,
+                fov_camera_range,
+                fov_margin,
+            ))
+        }
+        _ => None,
+    };
+    // Force Sight intentionally shows players through walls; a viewer using it
+    // is not wallhacking. The original anti-wallhack had the same exemption.
+    // SAFETY: frame is a valid clientSnapshot_t.
+    let force_see = wallhack_on
+        && (unsafe { read_i32(frame + OFFSET_SNAPSHOT_FRAME_PS_FORCE_POWERS_ACTIVE) }
+            & (1 << FP_SEE))
+            != 0;
+    let wall_cam = if wallhack_on && !force_see {
+        // The client's third-person camera stops at the wall behind the player
+        // instead of staying at the full `cg_thirdPersonRange`. A camera
+        // estimate that ignored that would sit behind the wall and hide a
+        // player standing clearly in front.
+        // SAFETY: engine memory layer and game module are live here.
+        Some(unsafe { wallhack_camera(viewpoint, angles, wallhack_camera_range, viewer_client) })
+    } else {
+        None
+    };
+    if frustum.is_none() && wall_cam.is_none() {
+        return;
+    }
     // SAFETY: `e_nums` is a valid snapshotEntityNumbers_t.
     let count = unsafe { read_i32(e_nums + OFFSET_SNAPSHOT_ENUMS_COUNT) };
     if count <= 0 {
         return;
     }
     let count = (count as usize).min(MAX_SNAPSHOT_ENTITIES);
+    // In parallel TFFA the world is per instance. The game-side trace gate
+    // (`crate::syscall`) zeroes foreign instances' contents around each game
+    // trap; this pass runs outside a game call, so it owns one window for the
+    // whole snapshot. Without it, an invisible foreign door could block a
+    // viewer's line of sight and hide a player who is visible in their own
+    // instance.
+    let mut wall_flips = state::with_state(|s| core::mem::take(&mut s.tffa.flip_buf));
+    let wall_flips_n = if wall_cam.is_some() && crate::tffa::enabled() {
+        crate::tffa::trace_flips(viewer_client, MASK_OPAQUE, &mut wall_flips)
+    } else {
+        0
+    };
+    if wall_flips_n > 0 {
+        crate::tffa::flip_apply(&wall_flips[..wall_flips_n]);
+    }
     let (trick_field, trick_bit) = trick_mask(viewer);
     let mut local = [SavedEntity::default(); MAX_CLIENTS];
     let mut saved_count = 0usize;
@@ -484,10 +724,29 @@ pub unsafe fn apply(
         }
         // SAFETY: `ent` is a live gentity slot; pos.trBase is a vec3_t.
         let origin = unsafe { read_vec3(ent + OFFSET_GENTITY_S + OFFSET_GENTITY_S_POS_TRBASE) };
-        // SAFETY: `ent` and `client` are live game structures; the gentity
-        // bounds and the server-side saber blade positions are maintained by
-        // the game module.
-        if unsafe { player_visible(&frustum, ent, client, origin) } {
+        let mut visible = true;
+        if let Some(frustum) = frustum.as_ref() {
+            // SAFETY: `ent` and `client` are live game structures; the gentity
+            // bounds and the server-side saber blade positions are maintained by
+            // the game module.
+            if !unsafe { player_visible(frustum, ent, client, origin) } {
+                visible = false;
+            }
+        }
+        if visible {
+            if let Some(cam) = wall_cam {
+                // SAFETY: `ent` and `client` are live game structures; the
+                // engine trace runs against the live world.
+                if !unsafe {
+                    player_in_line_of_sight(ent, client, origin, wallhack_margin, |point| {
+                        line_clear(cam, point, viewer_client)
+                    })
+                } {
+                    visible = false;
+                }
+            }
+        }
+        if visible {
             continue;
         }
         if saved_count >= MAX_CLIENTS {
@@ -561,7 +820,12 @@ pub unsafe fn apply(
             }
         }
     }
+    if wall_flips_n > 0 {
+        crate::tffa::flip_restore(&wall_flips[..wall_flips_n]);
+    }
     state::with_state(|s| {
+        wall_flips.clear();
+        s.tffa.flip_buf = wall_flips;
         s.fov.saved = local;
         s.fov.count = saved_count;
     });
@@ -653,6 +917,21 @@ unsafe fn is_spectator(g_entities: usize, slot: i32) -> bool {
     // SAFETY: slot is inside the g_entities array; client is a pointer.
     let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
     client != 0 && unsafe { is_spectator_client(client) }
+}
+
+/// Whether the player in `slot` is a bot (`r.svFlags & SVF_BOT`, the engine's
+/// own discriminator).
+///
+/// # Safety
+///
+/// `g_entities` must be the located game array and `slot` in `0..MAX_CLIENTS`.
+unsafe fn is_bot(g_entities: usize, slot: i32) -> bool {
+    if g_entities == 0 || !(0..MAX_CLIENTS as i32).contains(&slot) {
+        return false;
+    }
+    let ent = g_entities + slot as usize * SIZEOF_GENTITY;
+    // SAFETY: slot is inside the g_entities array; svFlags is an int field.
+    unsafe { read_i32(ent + OFFSET_SHARED_SVFLAGS) & SVF_BOT as i32 != 0 }
 }
 
 /// Read an `f32` engine/game struct field.
@@ -1028,6 +1307,11 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = aspect;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = camera_range;
             s.cvars[state::CVAR_MAX_FOV_MARGIN].value = margin;
+            // The wallhack test drives the pure sampler; `apply` must stay off
+            // the engine path in unit tests.
+            s.cvars[state::CVAR_ANTI_WALLHACK].integer = 0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value = 0.0;
             s.fov.viewer_client = 0;
             s.located_game_data.g_entities = entities.as_mut_ptr() as usize;
         });
@@ -1067,6 +1351,9 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = 0.0;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = 0.0;
             s.cvars[state::CVAR_MAX_FOV_MARGIN].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK].integer = 0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value = 0.0;
         });
         hidden
     }
@@ -1293,6 +1580,9 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV].integer = 100;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = 16.0 / 9.0;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK].integer = 0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value = 0.0;
             s.located_game_data.g_entities = entities.as_mut_ptr() as usize;
         });
         unsafe {
@@ -1331,6 +1621,9 @@ mod tests {
             s.cvars[state::CVAR_MAX_FOV].integer = 0;
             s.cvars[state::CVAR_MAX_FOV_ASPECT].value = 0.0;
             s.cvars[state::CVAR_MAX_FOV_CAMERA_RANGE].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK].integer = 0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value = 0.0;
+            s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value = 0.0;
         });
     }
 
@@ -1394,5 +1687,97 @@ mod tests {
         );
         assert_eq!(steep.trick, 0);
         assert_eq!(steep.scale, 0);
+    }
+
+    #[test]
+    fn the_wallhack_margin_expands_the_body_box_on_every_axis() {
+        let mins = [-15.0, -15.0, -24.0];
+        let maxs = [15.0, 15.0, 40.0];
+        let exact = body_points([0.0, 0.0, 0.0], mins, maxs, 0.0);
+        // Centre first, then the eight corners.
+        assert_eq!(exact[0], [0.0, 0.0, 8.0]);
+        assert_eq!(exact[1], [mins[0], mins[1], mins[2]]);
+        assert_eq!(exact[8], [maxs[0], maxs[1], maxs[2]]);
+        let expanded = body_points([0.0, 0.0, 0.0], mins, maxs, 8.0);
+        assert_eq!(
+            expanded[0], exact[0],
+            "the centre does not move with a symmetric expansion"
+        );
+        assert_eq!(expanded[1], [mins[0] - 8.0, mins[1] - 8.0, mins[2] - 8.0]);
+        assert_eq!(expanded[8], [maxs[0] + 8.0, maxs[1] + 8.0, maxs[2] + 8.0]);
+        // A negative/NaN margin never shrinks the box.
+        assert_eq!(body_points([0.0; 3], mins, maxs, -5.0), exact);
+        assert_eq!(body_points([0.0; 3], mins, maxs, f32::NAN), exact);
+    }
+
+    #[test]
+    fn the_wallhack_keeps_a_player_with_any_body_point_in_line_of_sight() {
+        let mut entities = vec![0u8; MAX_CLIENTS * SIZEOF_GENTITY];
+        let base = SIZEOF_GENTITY;
+        write_vec3(
+            &mut entities[base + OFFSET_GENTITY_R_MINS..base + OFFSET_GENTITY_R_MINS + 12],
+            [-15.0, -15.0, -24.0],
+        );
+        write_vec3(
+            &mut entities[base + OFFSET_GENTITY_R_MAXS..base + OFFSET_GENTITY_R_MAXS + 12],
+            [15.0, 15.0, 40.0],
+        );
+        let ent = entities.as_mut_ptr() as usize + base;
+        // The target's body spans x 45..75; a clear ray is one whose endpoint
+        // is before x = 40.
+        let clear_before_40 = |point: [f32; 3]| point[0] < 40.0;
+        // SAFETY: the fake entity carries the pinned body-box fields and the
+        // closure supplies the trace verdict.
+        let exact =
+            unsafe { player_in_line_of_sight(ent, 0, [60.0, 0.0, 0.0], 0.0, clear_before_40) };
+        assert!(!exact, "every body point is behind the wall");
+        // An 8-unit margin moves the near corner to x = 37, in line of sight.
+        // SAFETY: as above.
+        let expanded =
+            unsafe { player_in_line_of_sight(ent, 0, [60.0, 0.0, 0.0], 8.0, clear_before_40) };
+        assert!(expanded, "the margin lets the near corner clear the wall");
+    }
+
+    #[test]
+    fn the_wallhack_camera_sits_behind_the_eye() {
+        // Looking down +X, a 100-unit setback lands 100 units behind the eye.
+        assert_eq!(
+            camera_origin([100.0, 0.0, 0.0], [0.0, 0.0, 0.0], 100.0),
+            [0.0, 0.0, 0.0]
+        );
+        // Looking straight down, the third-person camera is above the eye.
+        let cam = camera_origin([0.0, 0.0, 0.0], [90.0, 0.0, 0.0], 100.0);
+        assert!((cam[2] - 100.0).abs() < 1e-4);
+        // First person and a negative/NaN range both stay at the eye.
+        assert_eq!(
+            camera_origin([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], 0.0),
+            [1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            camera_origin([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], f32::NAN),
+            [1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn the_wallhack_camera_pulls_in_to_the_client_camera_collision_hit() {
+        let eye = [100.0, 0.0, 0.0];
+        let desired = [0.0, 0.0, 0.0];
+        // Nothing behind the player: keep the full setback.
+        assert_eq!(
+            clamp_camera(eye, desired, false, false, [50.0, 0.0, 0.0]),
+            desired
+        );
+        // A wall behind: the client camera stops at the trace hit, not at the
+        // ideal location behind the wall.
+        assert_eq!(
+            clamp_camera(eye, desired, false, true, [40.0, 0.0, 0.0]),
+            [40.0, 0.0, 0.0]
+        );
+        // The eye itself is in solid: no trustworthy camera estimate.
+        assert_eq!(
+            clamp_camera(eye, desired, true, true, [40.0, 0.0, 0.0]),
+            eye
+        );
     }
 }

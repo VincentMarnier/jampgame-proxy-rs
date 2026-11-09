@@ -142,3 +142,10 @@
   contacts. The shared entity state is restored right after
   `SV_SendClientSnapshot` copies the snapshot. Thrown sabers stay as-is; Force
   Sight and a custom client that strips both fields are documented limits.
+- `0023-anti-wallhack.md` — anti-wallhack (`proxy_sv_antiWallHack`) that reuses
+  D-022's hide path instead of the original C++ origin-moving approach: line of
+  sight from the third-person camera
+  (`proxy_sv_antiWallHackCameraRange`, clamped by the client's camera-collision
+  trace), a world-unit body margin (`proxy_sv_antiWallHackMargin`),
+  `MASK_OPAQUE` traces, spectator/bot/Force-Sight exemptions, the shared
+  apply/restore point, and per-instance TFFA trace filtering.

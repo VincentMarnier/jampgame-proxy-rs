@@ -689,16 +689,17 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 
 /// All engine detours, in attach order (mirrors `hookEntries` in
 /// `Proxy_Engine_Patch.cpp:29-52`), minus the dropped features (D-002):
-/// anti-wallhack `SV_SendClientSnapshot` (still dropped),
 /// ping-fix (`SV_CalcPings`, `SV_SendMessageToClient`), the
 /// `SV_ExecuteClientMessage` rewrite (hack guards already in the shipped
 /// binary — see `docs/`), `SV_PacketEvent` (pristine `SV_ReadPackets` already
 /// has both fixes) and the `Cmd_TokenizeString` hook (proxy-local helper
 /// instead). `Com_Printf` is not detoured either: its hardening is the
 /// `vsprintf`→`vsnprintf` call-site retarget (`CALL_VSPRINTF`).
-/// `SV_AddEntitiesVisibleFromPoint` is re-added as a Rust-only parallel-TFFA
-/// post-filter (invisibility); it runs the pristine body then drops
-/// cross-match entities from the snapshot list.
+/// `SV_AddEntitiesVisibleFromPoint` is a Rust-only post-filter (parallel-TFFA
+/// invisibility and the per-viewer FOV cap / anti-wallhack); it runs the
+/// pristine body then filters the snapshot list.
+/// `SV_SendClientSnapshot` is re-added by D-022 as the restore point for the
+/// per-viewer entity-field mutations.
 /// `SV_Netchan_Process` is a Rust-only entry wrapper for the per-client packet
 /// rate limiter (`crate::pps`): it accounts one incoming packet and may return
 /// `qfalse` (drop) before the pristine body decodes it.
