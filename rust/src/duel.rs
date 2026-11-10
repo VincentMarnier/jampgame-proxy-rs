@@ -792,6 +792,11 @@ fn adopt_game_bots() {
         }
     }
     state::with_state(|s| {
+        // During the `map_restart` settle frames the game's entity array is
+        // not repopulated yet, so an absent bot is not a leaver: its carried
+        // court spawn must survive until it reconnects.
+        let preserve = s.tffa.restart_burst
+            || (s.duel.phase == DuelPhase::Playing && !s.duel.round_clock_started);
         for (i, &is_present) in present.iter().enumerate() {
             if is_present {
                 s.clients[i].is_bot = true;
@@ -801,8 +806,10 @@ fn adopt_game_bots() {
                 // Bot removed by the game (bot_minplayers, `kick`): drop it.
                 s.clients[i].is_connected = false;
                 s.duel.willing[i] = false;
-                s.duel.spawn_pending.retain(|&c| c as usize != i);
-                s.duel.queue.retain(|&c| c as usize != i);
+                if !preserve {
+                    s.duel.spawn_pending.retain(|&c| c as usize != i);
+                    s.duel.queue.retain(|&c| c as usize != i);
+                }
             }
         }
     });
@@ -1262,6 +1269,28 @@ fn take_over_stock_duel() {
     }
 }
 
+/// Keep every non-court client out of the arena: the base game can restore
+/// up to two `TEAM_FREE` players from session data across a restart (and a
+/// bot's own connect path joins before the ladder drafts it), which would let
+/// an undrafted player fight court 1. Court players are left alone.
+fn park_non_court_players() {
+    if !ladder_on() {
+        return;
+    }
+    let non_court: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|&cn| {
+                s.clients[cn as usize].is_connected && court_of_locked(s, cn as u8).is_none()
+            })
+            .collect()
+    });
+    for cn in non_court {
+        if session_team(cn) != Some(TEAM_SPECTATOR) {
+            crate::tffa::set_client_spectator(cn);
+        }
+    }
+}
+
 /// `GAME_RUN_FRAME` pre-pass.
 pub fn on_frame_start() {
     if !mode_on() {
@@ -1365,6 +1394,7 @@ pub fn on_frame_start() {
     // already sees the court's bodies (and the resolver cannot mistake a
     // just-formed court for a double walkover).
     drain_spawns();
+    park_non_court_players();
 }
 
 fn issue_restart() {
