@@ -43,8 +43,9 @@ use crate::state;
 pub const MAIN_MATCH: u8 = 0;
 
 /// Maximum instance slots (ids `1..=MAX_MATCHES`). Raised from 8 to 16 by
-/// D-025: the duel ladder may host up to 16 courts, while `proxy_tffa_maxMatches`
-/// keeps its documented 8-match ceiling (`tffa::TFFA_MATCH_CAP`).
+/// D-025: the duel ladder may host up to 16 courts, while
+/// `proxy_parallel_tffas_maxMatches` keeps its documented 8-match ceiling
+/// (`tffa::TFFA_MATCH_CAP`).
 pub const MAX_MATCHES: usize = 16;
 
 /// Backing array size: main slot + created slots.
@@ -1225,8 +1226,8 @@ pub(crate) fn is_duplicable_entity(g_entities: usize, ent_num: c_int) -> bool {
 /// `g_entities` located). The interactive entities are tagged as belonging to
 /// main (`MAIN_MATCH`), which is inert while every viewer is in main and makes
 /// the set the clone pass reads. Called lazily from `cmd_create` too, so a
-/// server that enables `proxy_tffa_enable` mid-map is still measured before
-/// its first instance.
+/// server that enables `proxy_parallel_tffas_enable` mid-map is still measured
+/// before its first instance.
 pub fn scan_world_entities() {
     let g_entities = state::with_state(|s| s.located_game_data.g_entities);
     let sources = interactive_sources(g_entities);

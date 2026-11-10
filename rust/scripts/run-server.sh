@@ -120,7 +120,7 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
     +set g_friendlySaber 1 \
     +set proxy_sv_teamSizeRules "2:1:0:0,3:0:1:0" \
     +set proxy_sv_enableNetStatus 1 \
-    +set proxy_tffa_enable 1 \
+    +set proxy_parallel_tffas_enable 1 \
     +set proxy_sv_enableIgnore 1 \
     +set proxy_sv_muteMode 2 \
     +set proxy_sv_enableBanFile 1 \

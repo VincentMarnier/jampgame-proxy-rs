@@ -87,9 +87,9 @@ for `< GT_SIEGE`, `capturelimit` for `>= GT_CTF`).
 
 *Status: landed (user directive, 2026-10-26).*
 
-While `proxy_tffa_enable` runs parallel matches on the same GT_TEAM map, the
-three limits are still one set of server-wide cvars, so only one rule can be in
-effect. The roster the rules read is therefore the per-match playing-client
+While `proxy_parallel_tffas_enable` runs parallel matches on the same GT_TEAM
+map, the three limits are still one set of server-wide cvars, so only one rule
+can be in effect. The roster the rules read is therefore the per-match playing-client
 census (`tffa::match_team_counts`: connected clients on RED/BLUE grouped by
 `client_match`), not the sum of all matches:
 

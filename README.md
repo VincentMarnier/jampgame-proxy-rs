@@ -45,9 +45,9 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeamsAfterXSecs`        | 0       | grace delay in seconds (`0` = off) before a TDM/CTF round's teams lock: teams stay open for that long; a join in an instance cancels its lock for the round, otherwise the even roster is capped at its size; with parallel TFFA every instance is handled per its own roster (see [Team lock](#team-lock)) |
 | `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeamsAfterXSecs` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
-| `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
-| `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
-| `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
+| `proxy_parallel_tffas_enable`         | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below); the pre-rename `proxy_tffa_enable` still works as an alias |
+| `proxy_parallel_tffas_maxMatches`     | 8       | maximum parallel TFFA matches (alias `proxy_tffa_maxMatches`) |
+| `proxy_parallel_tffas_maxGroupSize`   | 12      | maximum players per TFFA match, both teams combined (alias `proxy_tffa_maxGroupSize`) |
 | `proxy_parallel_duels_enable`         | 0       | run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners move up and losers down between rounds, first to `duel_fraglimit` wins (see [Parallel duels](#parallel-duels)) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
 | `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± `proxy_sv_clientPpsFpsMargin`, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
@@ -832,8 +832,8 @@ open for the same team. A join to a full, locked team is refused with a message
 `0` disables the feature entirely. This cvar replaces the former
 `proxy_sv_lockTeams` minimum-team-size setting; old configs need the new name.
 
-With `proxy_tffa_enable 1` the lock runs **per instance**: only the matches that
-existed at the round start are eligible, each is snapshotted against its own
+With `proxy_parallel_tffas_enable 1` the lock runs **per instance**: only the
+matches that existed at the round start are eligible, each is snapshotted against its own
 roster, and a join in one match cancels only that match's lock; a join is
 checked against the caps of the match the player belongs to. A match created
 after the round started has no round-start roster and stays unlocked until the
@@ -870,7 +870,7 @@ sizes agree again.
 
 ### Parallel TFFA matches
 
-With `proxy_tffa_enable 1` (GT_TEAM only), players self-organize into
+With `proxy_parallel_tffas_enable 1` (GT_TEAM only), players self-organize into
 parallel matches on the same map: `tffa_create` opens a match, puts the
 creator on its smaller side (red when it is empty) and joins it,
 `tffa_join <id>` switches matches (`tffa_join 0` returns to the main
@@ -934,8 +934,8 @@ is evaluated against its own roster and a join cancels only its own lock (see
 keeps working: each match's own team size is used, and a rule applies when all
 matches being played have the same size (see [Per-team-size rules](#per-team-size-rules)).
 HUD team scores stay
-global (per-match HUD would need a client mod). Setting `proxy_tffa_enable`
-back to `0` closes every created match: its players are moved to spectator
+global (per-match HUD would need a client mod). Setting
+`proxy_parallel_tffas_enable` back to `0` closes every created match: its players are moved to spectator
 with a message explaining why, the map's per-match copies go away, and
 everyone keeps playing in the main game, whose score is kept instead of
 being reset.

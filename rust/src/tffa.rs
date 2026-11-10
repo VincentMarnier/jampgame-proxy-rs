@@ -3,9 +3,11 @@
 //! Match `0` is the **main TFFA**: every connected client belongs to it
 //! unless they create/join another match; it is always active and its
 //! fraglimit is enforced like any other match. Slots `1..=MAX_MATCHES` are
-//! player-created. Setting `proxy_tffa_enable` back to `0` closes every
-//! created match and returns its members to the main game as spectators, with
-//! a message explaining why (D-006.9). Scores are kept proxy-side per match
+//! player-created. Setting `proxy_parallel_tffas_enable` back to `0` closes
+//! every created match and returns its members to the main game as spectators,
+//! with a message explaining why (D-006.9). The pre-rename spelling
+//! `proxy_tffa_enable` keeps working as its alias (D-026). Scores are kept
+//! proxy-side per match
 //! (team tally + per-player copy); the game's global `level.teamScores` is
 //! neutralised (see `on_add_score`) so pristine `CheckExitRules` never ends
 //! the server early, and the `scores` trap rewrite substitutes the per-player
@@ -65,8 +67,9 @@ use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_M
 // `tffa::…` call sites keep their names while the policy module shrinks.
 pub use crate::instances::*;
 
-/// The TFFA feature's own match ceiling (`proxy_tffa_maxMatches`), kept at 8
-/// while the shared instance slate grew to 16 for the duel ladder (D-025).
+/// The TFFA feature's own match ceiling (`proxy_parallel_tffas_maxMatches`),
+/// kept at 8 while the shared instance slate grew to 16 for the duel ladder
+/// (D-025).
 pub const TFFA_MATCH_CAP: usize = 8;
 /// Maximum length of a match password, in bytes. A password is one client
 /// command argument (`trap_Argv`); quoting it (`tffa_create "my pass"`) allows
@@ -756,10 +759,12 @@ pub fn reset_round(restart: bool) {
     let mut kept = false;
     state::with_state(|s| {
         kept = reset_round_state(&mut s.tffa, keep, max);
-        // Re-latch the enable gate: an admin who set `proxy_tffa_enable 0`
-        // before the restart must not see a first-frame disable sweep for
-        // matches `reset_round_state` already closed.
-        s.tffa.enable_latched = s.cvars[CVAR_TFFA_ENABLE].integer != 0;
+        // Re-latch the enable gate: an admin who set
+        // `proxy_parallel_tffas_enable 0` before the restart must not see a
+        // first-frame disable sweep for matches `reset_round_state` already
+        // closed.
+        let enable_on = state::cvar_integer_in(s, CVAR_TFFA_ENABLE) != 0;
+        s.tffa.enable_latched = enable_on;
         // Per-instance worlds are per map (see above).
         s.tffa.entity_instance = [ENTITY_SHARED; MAX_GENTITIES];
         s.tffa.world_clone_cost = 0;
@@ -783,8 +788,8 @@ pub fn reset_round(restart: bool) {
 /// unit-tested without an engine.
 ///
 /// `keep` retains the overlay carried by `state::reset_session`; `max` is the
-/// live `proxy_tffa_maxMatches` (an admin may have lowered it before the
-/// restart). Retained matches keep no tallies.
+/// live `proxy_parallel_tffas_maxMatches` (an admin may have lowered it before
+/// the restart). Retained matches keep no tallies.
 ///
 /// Every client returns to its **home id** (`TffaState::home`): a game promoted
 /// into the main slot was runtime-assigned to main, but its TFFA id never
@@ -912,8 +917,8 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
 }
 
 /// The created matches `restore_instances` must rebuild after a carry: every
-/// active one inside the live `proxy_tffa_maxMatches`. Ids above the limit were
-/// already closed (and their members returned to main) by `reset_round_state`.
+/// active one inside the live `proxy_parallel_tffas_maxMatches`. Ids above the
+/// limit were already closed (and their members returned to main) by `reset_round_state`.
 /// Pure so the selection is unit-tested.
 fn restorable_instances(matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS], max: usize) -> Vec<u8> {
     (1..=max.min(TOTAL_MATCH_SLOTS - 1))
@@ -1193,12 +1198,12 @@ pub fn on_frame_start() {
     // only starts on the first frame whose acknowledgements have been read
     // (D-006.12).
     advance_restart_burst();
-    // `proxy_tffa_enable` turned off since the last frame (the cvar mirror was
-    // just refreshed): dissolve every created match before the game runs, so
-    // no frame plays with the isolation gates off while players are still
-    // split across instances.
+    // `proxy_parallel_tffas_enable` turned off since the last frame (the cvar
+    // mirror was just refreshed): dissolve every created match before the game
+    // runs, so no frame plays with the isolation gates off while players are
+    // still split across instances.
     let turned_off = state::with_state(|s| {
-        let now_on = s.cvars[CVAR_TFFA_ENABLE].integer != 0;
+        let now_on = state::cvar_integer_in(s, CVAR_TFFA_ENABLE) != 0;
         enable_turned_off(&mut s.tffa.enable_latched, now_on)
     });
     if turned_off {
@@ -1216,8 +1221,8 @@ pub fn on_frame_start() {
     }
 }
 
-/// Remember this frame's `proxy_tffa_enable` value and report a non-zero → zero
-/// edge (an admin turned parallel TFFA off). Pure so the edge is unit-tested.
+/// Remember this frame's `proxy_parallel_tffas_enable` value and report a
+/// non-zero → zero edge (an admin turned parallel TFFA off). Pure so the edge is unit-tested.
 fn enable_turned_off(latched: &mut bool, now_on: bool) -> bool {
     let off = *latched && !now_on;
     *latched = now_on;
@@ -1235,8 +1240,8 @@ fn created_matches_to_close(matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS]) -> 
         .collect()
 }
 
-/// `proxy_tffa_enable` was turned off: hand the main game's score back to the
-/// game, close every created match, and return its members to the main game as
+/// `proxy_parallel_tffas_enable` was turned off: hand the main game's score back
+/// to the game, close every created match, and return its members to the main game as
 /// spectators, telling each of them what happened. Main (id 0) stays — it is
 /// the pristine map's own game.
 ///
@@ -2869,14 +2874,14 @@ fn tell(client_num: c_int, text: &str) {
 }
 
 fn max_matches() -> usize {
-    let v = state::with_state(|s| s.cvars[CVAR_TFFA_MAX_MATCHES].integer);
+    let v = state::cvar_integer(CVAR_TFFA_MAX_MATCHES);
     // Clamp before the `as usize` cast: a negative admin value would
     // otherwise wrap huge and silently select the maximum.
     v.clamp(1, TFFA_MATCH_CAP as i32) as usize
 }
 
 fn max_group_size() -> usize {
-    let v = state::with_state(|s| s.cvars[CVAR_TFFA_MAX_GROUP_SIZE].integer);
+    let v = state::cvar_integer(CVAR_TFFA_MAX_GROUP_SIZE);
     // Same negative-wrap guard as max_matches (bounds 2..=MAX_CLIENTS).
     v.clamp(2, MAX_CLIENTS as i32) as usize
 }
@@ -5185,7 +5190,7 @@ mod tests {
         assert_eq!(join_target(-1, 8), None);
         assert_eq!(join_target(1, 8), Some(1));
         assert_eq!(join_target(8, 8), Some(8));
-        // The admin's `proxy_tffa_maxMatches` caps the accepted ids.
+        // The admin's `proxy_parallel_tffas_maxMatches` caps the accepted ids.
         assert_eq!(join_target(5, 4), None);
         assert_eq!(join_target(9, 8), None);
         // A wrapped negative must not select the top slot.
@@ -5633,8 +5638,8 @@ mod tests {
         }
     }
 
-    /// Only a non-zero → zero flip of `proxy_tffa_enable` shuts the matches
-    /// down: turning it on, leaving it on/off, and the frames after a disable
+    /// Only a non-zero → zero flip of `proxy_parallel_tffas_enable` shuts the
+    /// matches down: turning it on, leaving it on/off, and the frames after a disable
     /// all stay quiet (a repeated shutdown would re-send every message and
     /// reset the overlay every frame).
     #[test]
@@ -5678,8 +5683,8 @@ mod tests {
             blue: 0,
             ..Default::default()
         };
-        // A slot above a lowered `proxy_tffa_maxMatches` is still an open
-        // match: a disable closes it like any other (only `map_restart`'s carry
+        // A slot above a lowered `proxy_parallel_tffas_maxMatches` is still an
+        // open match: a disable closes it like any other (only `map_restart`'s carry
         // applies the limit).
         matches[TOTAL_MATCH_SLOTS - 1].active = true;
         assert!(matches[1].set_password(b"hunter2"));
@@ -5962,8 +5967,8 @@ mod tests {
     }
 
     /// A full map change starts from main, and so does an instance above a
-    /// lowered `proxy_tffa_maxMatches` even on a restart: its members cannot
-    /// stay in a slot that no longer exists.
+    /// lowered `proxy_parallel_tffas_maxMatches` even on a restart: its members
+    /// cannot stay in a slot that no longer exists.
     #[test]
     fn reset_round_closes_matches_a_restart_does_not_keep() {
         let mut t = state::TffaState::default();
@@ -6000,7 +6005,8 @@ mod tests {
         matches[1].active = true;
         matches[4].active = true;
         assert_eq!(restorable_instances(&matches, MAX_MATCHES), vec![1, 4]);
-        // Above the live `proxy_tffa_maxMatches` (closed by the reset already).
+        // Above the live `proxy_parallel_tffas_maxMatches` (closed by the reset
+        // already).
         assert_eq!(restorable_instances(&matches, 2), vec![1]);
         assert!(restorable_instances(&matches, 0).is_empty());
     }

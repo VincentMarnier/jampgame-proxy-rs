@@ -30,8 +30,9 @@ docs/ holds the reverse-engineering evidence, the architecture notes and the dec
 - docs/decisions/0022-fov-cap.md — per-viewer FOV cap (`proxy_sv_maxFov*`) and the shared hide/restore path.
 - docs/decisions/0023-anti-wallhack.md — anti-wallhack (`proxy_sv_antiWallHack*`) built on the FOV cap's hide path and sample points (line-of-sight traces).
 - docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeamsAfterXSecs`.
-- docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM).
+- docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_parallel_tffas_*`, GT_TEAM; the pre-rename `proxy_tffa_*` spellings remain as aliases, D-026).
 - docs/decisions/0025-parallel-duels.md — parallel duels on GT_DUEL (`proxy_parallel_duels_enable`): the shared instancing core, ladder formation/bump/queue, per-round resolution, carried `map_restart`, per-viewer duel HUD/board and stock-duel suppression; records the `SetTeamQuick` binary finding and the restart classifier.
+- docs/decisions/0026-tffa-cvar-rename.md — the `proxy_tffa_*` → `proxy_parallel_tffas_*` cvar rename, the legacy spellings kept as registered aliases, and the canonical-unless-default resolution rule.
 - docs/decisions/README.md — index of the decision records.
 
 Source authority (game vs engine)

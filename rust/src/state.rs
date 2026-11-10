@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 46] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 49] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -32,9 +32,9 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 46] = [
     (c"proxy_sv_enableEndGameStats", c"1"),
     (c"proxy_sv_lockTeamsAfterXSecs", c"0"),
     (c"proxy_sv_teamSizeRules", c""),
-    (c"proxy_tffa_enable", c"0"),
-    (c"proxy_tffa_maxMatches", c"8"),
-    (c"proxy_tffa_maxGroupSize", c"12"),
+    (c"proxy_parallel_tffas_enable", c"0"),
+    (c"proxy_parallel_tffas_maxMatches", c"8"),
+    (c"proxy_parallel_tffas_maxGroupSize", c"12"),
     (c"proxy_sv_spectatorTeamOverlay", c"1"),
     (c"proxy_sv_muteMode", c"1"),
     (c"proxy_sv_debugLog", c"0"),
@@ -69,6 +69,13 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 46] = [
     (c"proxy_sv_antiWallHackMargin", c"0"),
     (c"proxy_sv_antiWallHackCameraRange", c"100"),
     (c"proxy_parallel_duels_enable", c"0"),
+    // Legacy spellings of the parallel-TFFA cvars, kept for retro-compatibility
+    // after the D-026 rename. They are registered so an old config/server
+    // script keeps working (and shows up in `cvarlist`), but the code only
+    // reads them as a fallback: see [`cvar_integer`] and [`legacy_alias`].
+    (c"proxy_tffa_enable", c"0"),
+    (c"proxy_tffa_maxMatches", c"8"),
+    (c"proxy_tffa_maxGroupSize", c"12"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -85,11 +92,14 @@ pub const CVAR_LOCK_TEAMS_AFTER_SECS: usize = 7;
 /// Per-team-size `timelimit`/`fraglimit`/`capturelimit` rules (reconciled every
 /// frame with the roster, independent of `proxy_sv_lockTeamsAfterXSecs`).
 pub const CVAR_TEAM_SIZE_RULES: usize = 8;
-/// Parallel TFFA matches (`GT_TEAM` only): `0` off, non-zero on.
+/// Parallel TFFA matches (`GT_TEAM` only): `0` off, non-zero on
+/// (`proxy_parallel_tffas_enable`; the pre-D-026 `proxy_tffa_enable` spelling
+/// is still read as its alias, see [`cvar_integer`]).
 pub const CVAR_TFFA_ENABLE: usize = 9;
-/// Maximum number of parallel matches.
+/// Maximum number of parallel matches (`proxy_parallel_tffas_maxMatches`).
 pub const CVAR_TFFA_MAX_MATCHES: usize = 10;
-/// Maximum players per match (both teams combined).
+/// Maximum players per match, both teams combined
+/// (`proxy_parallel_tffas_maxGroupSize`).
 pub const CVAR_TFFA_MAX_GROUP_SIZE: usize = 11;
 /// Spectator team overlay (`crate::teamoverlay`): while on, a spectator
 /// following a player receives the stock `tinfo` roster (HP/armor/powerups) for
@@ -243,8 +253,31 @@ pub const CVAR_ANTI_WALLHACK_MARGIN: usize = 43;
 pub const CVAR_ANTI_WALLHACK_CAMERA_RANGE: usize = 44;
 /// `proxy_parallel_duels_enable`: run the parallel duel ladder on
 /// `GT_DUEL` (`crate::duel`, D-025). `0` off (stock duel tournament), non-zero
-/// on. One shared instance core serves both this and `proxy_tffa_enable`.
+/// on. One shared instance core serves both this and
+/// `proxy_parallel_tffas_enable`.
 pub const CVAR_PARALLEL_DUELS_ENABLE: usize = 45;
+
+/// Legacy `proxy_tffa_enable` spelling (D-026), the pre-rename name of
+/// [`CVAR_TFFA_ENABLE`]. Registered for retro-compatibility; read only as a
+/// fallback when the canonical cvar still holds its default.
+pub const CVAR_LEGACY_TFFA_ENABLE: usize = 46;
+/// Legacy `proxy_tffa_maxMatches` spelling (D-026).
+pub const CVAR_LEGACY_TFFA_MAX_MATCHES: usize = 47;
+/// Legacy `proxy_tffa_maxGroupSize` spelling (D-026).
+pub const CVAR_LEGACY_TFFA_MAX_GROUP_SIZE: usize = 48;
+
+/// The pre-rename spelling of a canonical cvar, if it has one (D-026).
+///
+/// Only the parallel-TFFA cvars were renamed so far; every other index maps to
+/// `None`.
+pub fn legacy_alias(index: usize) -> Option<usize> {
+    match index {
+        CVAR_TFFA_ENABLE => Some(CVAR_LEGACY_TFFA_ENABLE),
+        CVAR_TFFA_MAX_MATCHES => Some(CVAR_LEGACY_TFFA_MAX_MATCHES),
+        CVAR_TFFA_MAX_GROUP_SIZE => Some(CVAR_LEGACY_TFFA_MAX_GROUP_SIZE),
+        _ => None,
+    }
+}
 
 /// Which instancing feature owns the shared instance core right now.
 ///
@@ -288,7 +321,7 @@ pub fn instance_mode() -> InstanceMode {
     }
     let (tffa_on, duel_on) = with_state(|s| {
         (
-            s.cvars[CVAR_TFFA_ENABLE].integer != 0,
+            cvar_integer_in(s, CVAR_TFFA_ENABLE) != 0,
             s.cvars[CVAR_PARALLEL_DUELS_ENABLE].integer != 0,
         )
     });
@@ -814,8 +847,8 @@ pub struct TffaState {
     /// map takes no instance at all — all-or-nothing, D-006.6.
     pub world_clone_blocked: bool,
     /// Whether `scan_world_entities` has measured this map. A server that turns
-    /// `proxy_tffa_enable` on mid-map has not scanned yet, and an unmeasured
-    /// map must not take an instance (an empty clone set would silently leave
+    /// `proxy_parallel_tffas_enable` on mid-map has not scanned yet, and an
+    /// unmeasured map must not take an instance (an empty clone set would silently leave
     /// every door shared).
     pub world_scanned: bool,
     /// Reusable save list for the world-entity gates: `(address of r.contents,
@@ -845,7 +878,8 @@ pub struct TffaState {
     /// that turn out *interactive* join an instance; the rest (temp event
     /// entities, missiles, debris) keep their tagless, shared life.
     pub spawn_pending: Vec<(u16, u8)>,
-    /// Last `proxy_tffa_enable` value the per-frame cvar mirror showed
+    /// Last `proxy_parallel_tffas_enable` value the per-frame cvar mirror
+    /// showed
     /// (`crate::tffa::on_frame_start`): a non-zero → zero edge closes every
     /// created match and returns its members to spectator, because the feature
     /// is off from that frame on. Re-latched from the cvar at `GAME_INIT`.
@@ -1162,6 +1196,43 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
     let mut guard = lock();
     let state = guard.get_or_insert_with(ProxyState::default);
     f(state)
+}
+
+/// Effective integer value of proxy cvar `index`, honoring its legacy alias
+/// (D-026): the canonical spelling wins once an admin changed it away from its
+/// default; while it still holds the default, a non-default legacy value
+/// applies, so a config written before the rename keeps its effect. When both
+/// were changed, the canonical one wins.
+pub fn cvar_integer(index: usize) -> i32 {
+    with_state(|s| cvar_integer_in(s, index))
+}
+
+/// [`cvar_integer`] for call sites that already hold the state lock.
+pub fn cvar_integer_in(s: &ProxyState, index: usize) -> i32 {
+    let canonical = &s.cvars[index];
+    if !cvar_is_default(canonical, index) {
+        return canonical.integer;
+    }
+    if let Some(legacy_index) = legacy_alias(index) {
+        let legacy = &s.cvars[legacy_index];
+        if !cvar_is_default(legacy, legacy_index) {
+            return legacy.integer;
+        }
+    }
+    canonical.integer
+}
+
+/// Whether the mirror still holds the default string it was registered with
+/// (`PROXY_CVARS[index].1`). The engine copies the value verbatim into the
+/// mirror, so a plain string comparison is enough — no parsing.
+fn cvar_is_default(cvar: &VmCvar, index: usize) -> bool {
+    let default = PROXY_CVARS[index].1.to_bytes();
+    let raw = &cvar.string;
+    let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    raw[..len]
+        .iter()
+        .map(|&c| c as u8)
+        .eq(default.iter().copied())
 }
 
 /// Drop every per-session value so the next `GAME_INIT` starts from the state
@@ -1499,6 +1570,80 @@ mod tests {
                 String::from_utf8_lossy(n)
             );
         }
+    }
+
+    #[test]
+    fn parallel_tffa_cvars_carry_their_legacy_alias() {
+        // D-026: the canonical spellings replaced `proxy_tffa_*`, which stays
+        // registered (same defaults) as the alias.
+        for (canonical, legacy) in [
+            (CVAR_TFFA_ENABLE, CVAR_LEGACY_TFFA_ENABLE),
+            (CVAR_TFFA_MAX_MATCHES, CVAR_LEGACY_TFFA_MAX_MATCHES),
+            (CVAR_TFFA_MAX_GROUP_SIZE, CVAR_LEGACY_TFFA_MAX_GROUP_SIZE),
+        ] {
+            assert_eq!(legacy_alias(canonical), Some(legacy));
+            assert_eq!(
+                PROXY_CVARS[canonical].1.to_bytes(),
+                PROXY_CVARS[legacy].1.to_bytes()
+            );
+        }
+        let names: Vec<_> = PROXY_CVARS.iter().map(|(n, _)| n.to_bytes()).collect();
+        assert!(names.contains(&b"proxy_parallel_tffas_enable".as_slice()));
+        assert!(names.contains(&b"proxy_parallel_tffas_maxMatches".as_slice()));
+        assert!(names.contains(&b"proxy_parallel_tffas_maxGroupSize".as_slice()));
+        assert!(names.contains(&b"proxy_tffa_enable".as_slice()));
+        assert!(names.contains(&b"proxy_tffa_maxMatches".as_slice()));
+        assert!(names.contains(&b"proxy_tffa_maxGroupSize".as_slice()));
+        // Only the renamed cvars have an alias.
+        assert_eq!(legacy_alias(CVAR_ENABLE), None);
+        assert_eq!(legacy_alias(CVAR_PARALLEL_DUELS_ENABLE), None);
+    }
+
+    /// Copy `value` into the cvar mirror `index` the way the engine would
+    /// (`string` verbatim, `integer` parsed from it).
+    fn set_cvar(index: usize, value: &str) {
+        with_state(|s| {
+            let cvar = &mut s.cvars[index];
+            *cvar = VmCvar::default();
+            for (dst, src) in cvar.string.iter_mut().zip(value.bytes()) {
+                *dst = src as _;
+            }
+            cvar.integer = value.parse().unwrap_or(0);
+        });
+    }
+
+    #[test]
+    fn legacy_tffa_alias_is_read_only_as_a_fallback() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *lock() = None;
+
+        // Both at their defaults: canonical decides (off / 8 / 12).
+        set_cvar(CVAR_TFFA_ENABLE, "0");
+        set_cvar(CVAR_LEGACY_TFFA_ENABLE, "0");
+        assert_eq!(cvar_integer(CVAR_TFFA_ENABLE), 0);
+        set_cvar(CVAR_TFFA_MAX_GROUP_SIZE, "12");
+        set_cvar(CVAR_LEGACY_TFFA_MAX_GROUP_SIZE, "12");
+        assert_eq!(cvar_integer(CVAR_TFFA_MAX_GROUP_SIZE), 12);
+
+        // A config written before the rename: only the legacy spelling moved.
+        set_cvar(CVAR_LEGACY_TFFA_ENABLE, "1");
+        set_cvar(CVAR_LEGACY_TFFA_MAX_GROUP_SIZE, "6");
+        assert_eq!(cvar_integer(CVAR_TFFA_ENABLE), 1);
+        assert_eq!(cvar_integer(CVAR_TFFA_MAX_GROUP_SIZE), 6);
+
+        // The canonical spelling wins over a non-default legacy value.
+        set_cvar(CVAR_TFFA_ENABLE, "2");
+        set_cvar(CVAR_TFFA_MAX_GROUP_SIZE, "20");
+        assert_eq!(cvar_integer(CVAR_TFFA_ENABLE), 2);
+        assert_eq!(cvar_integer(CVAR_TFFA_MAX_GROUP_SIZE), 20);
+
+        // A default canonical value falls back again (documented D-026 limit:
+        // an explicit `0` cannot be told apart from the untouched default).
+        set_cvar(CVAR_TFFA_ENABLE, "0");
+        assert_eq!(cvar_integer(CVAR_TFFA_ENABLE), 1);
+
+        // Reset for the next test that touches the global.
+        *lock() = None;
     }
 
     #[test]

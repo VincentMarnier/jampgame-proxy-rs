@@ -150,7 +150,7 @@ value every round-start frame receives.
   (`proxy_sv_lockTeamsAfterXSecs`, default `0`, opt-in so existing servers keep
   pristine behavior). Since D-004.6 the value is the grace delay in seconds
   (`0` = off) and the caps are per TFFA instance, so the feature works with
-  `proxy_tffa_enable`.
+  `proxy_parallel_tffas_enable`.
 - The snapshot/enforcement/grace logic is proxy-local (`rust/src/teamlock.rs`),
   so it is unit-testable (`snapshot_caps`, `snapshot_match_caps`, `grace_due`,
   `requested_team`) without the engine.

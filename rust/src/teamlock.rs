@@ -15,9 +15,9 @@
 //! one.
 //!
 //! The lock is **per instance**. With parallel TFFA matches
-//! (`proxy_tffa_enable`), every match that existed at the round start is
-//! snapshotted against its own roster, and a join is refused against the caps of
-//! the match the joining player belongs to. A join in one match cancels only
+//! (`proxy_parallel_tffas_enable`), every match that existed at the round
+//! start is snapshotted against its own roster, and a join is refused against
+//! the caps of the match the joining player belongs to. A join in one match cancels only
 //! that match's lock. With TFFA off the whole server is the one (main) instance.
 //! A match created after the round started has no round-start roster and stays
 //! unlocked until the next round (a `map_restart` keeps the matches, so their

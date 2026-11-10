@@ -13,10 +13,11 @@
 //! when the *effective* rule changes, so a stable roster issues no trap calls.
 //! This feature is independent of `proxy_sv_lockTeamsAfterXSecs`.
 //!
-//! With parallel TFFA matches on (`proxy_tffa_enable 1`), the limits are still
-//! one set of server-wide cvars, so the rule is chosen from the matches that
-//! are actually being played: when every populated match is `N vs N` with the
-//! same `N`, the rule for `N` applies (not the sum of all matches). A match
+//! With parallel TFFA matches on (`proxy_parallel_tffas_enable 1`), the limits
+//! are still one set of server-wide cvars, so the rule is chosen from the
+//! matches that are actually being played: when every populated match is
+//! `N vs N` with the same `N`, the rule for `N` applies (not the sum of all
+//! matches). A match
 //! nobody is playing in is ignored; a mix of sizes, or a match that is itself
 //! uneven, keeps the previously applied rule.
 //!

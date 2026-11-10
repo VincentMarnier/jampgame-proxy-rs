@@ -161,3 +161,7 @@
   stock-duel suppression hooks (LogExit, CheckIntermissionExit,
   AdjustTournamentScores, the TEAM_FREE gate, credit compensations); the
   `SetTeamQuick` and restart-classification evidence/deviations.
+- `0026-tffa-cvar-rename.md` — the `proxy_tffa_*` → `proxy_parallel_tffas_*`
+  cvar rename, the legacy spellings kept as registered aliases, the
+  canonical-unless-default resolution rule, and why a last-write-wins alias
+  cannot be built from the engine's `modificationCount`.

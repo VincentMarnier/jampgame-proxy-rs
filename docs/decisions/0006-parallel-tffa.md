@@ -1,4 +1,11 @@
-# D-006 — Parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM)
+# D-006 — Parallel self-organized TFFA matches (`proxy_parallel_tffas_*`, GT_TEAM)
+
+> **Rename note (D-026).** The cvars this record calls `proxy_tffa_enable`,
+> `proxy_tffa_maxMatches` and `proxy_tffa_maxGroupSize` are now canonically
+> `proxy_parallel_tffas_enable`, `proxy_parallel_tffas_maxMatches` and
+> `proxy_parallel_tffas_maxGroupSize`. The old spellings stay registered and are
+> read as aliases, so every command and runtime record below remains exactly as
+> it was typed at the time; read the old names as the canonical ones.
 
 Date: 2026-09-11. Status: accepted (user directive). Evidence: SDK
 `g_cmds.c:25-100` (`DeathmatchScoreboardMessage`/`Cmd_Score_f`),

@@ -62,7 +62,8 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
 15. **Bots are drafted like players.**
 16. **Court count** = what the map can host, up to `floor(willing/2)` and 16;
     the surplus queues. The shared slate is 16 created slots
-    (`TOTAL_MATCH_SLOTS 17`); `proxy_tffa_maxMatches` keeps its 8-match ceiling.
+    (`TOTAL_MATCH_SLOTS 17`); `proxy_parallel_tffas_maxMatches` keeps its
+    8-match ceiling.
 17. **HUD/board**: per-court duel HUD + top score bar; the board is sorted by
     court, bench last, with W/L in the score column (the stock cgame draws
     `ci->wins/ci->losses` on `GT_DUEL`, `cg_scoreboard.c:170,229`).
