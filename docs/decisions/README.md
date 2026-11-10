@@ -149,6 +149,13 @@
   trace), a world-unit body margin (`proxy_sv_antiWallHackMargin`),
   `MASK_OPAQUE` traces, spectator/bot/Force-Sight exemptions, the shared
   apply/restore point, and per-instance TFFA trace filtering.
+- `0025-parallel-duels.md` — parallel duels on `GT_DUEL`
+  (`proxy_parallel_duels_enable`): courts from the shared D-006 instancing
+  core, the shuffle/bump/FIFO ladder, per-round resolution and carry through
+  the proxy's own `map_restart`, per-viewer duel HUD/W-L board, and the
+  stock-duel suppression hooks (LogExit, CheckIntermissionExit,
+  AdjustTournamentScores, the TEAM_FREE gate, credit compensations); the
+  `SetTeamQuick` and restart-classification evidence/deviations.
 - `0024-coinflip-vote.md` — `callvote coinflip`: a proxy-claimed vote that uses
   the game's own `Cmd_Vote_f`/`CheckVote` machinery (30 s tally, pass/fail,
   three-second execution delay); the vote string is the private

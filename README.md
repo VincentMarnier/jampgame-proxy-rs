@@ -48,6 +48,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_tffa_enable`                   | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below) |
 | `proxy_tffa_maxMatches`               | 8       | maximum parallel TFFA matches |
 | `proxy_tffa_maxGroupSize`             | 12      | maximum players per TFFA match (both teams combined) |
+| `proxy_parallel_duels_enable`         | 0       | run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners move up and losers down between rounds, first to `duel_fraglimit` wins (see [Parallel duels](#parallel-duels)) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
 | `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± `proxy_sv_clientPpsFpsMargin`, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
 | `proxy_sv_globalMaxPps`               | 100     | global hard ceiling on accepted packets per second per client (`0` = no ceiling); the per-client FPS-derived limit is capped to it |
@@ -957,6 +958,33 @@ whose interactive entities cannot be duplicated (an NPC or vehicle actor among
 them) takes no parallel matches at all, and `tffa_create` is refused with a
 message when the map's remaining entity slots cannot hold another whole set —
 coverage is never traded for match count.
+
+### Parallel duels
+
+With `proxy_parallel_duels_enable 1` (`GT_DUEL` only), the map runs several
+1v1 duels at once. Every connected willing player (spectators by default, plus
+bots) is shuffled into courts: court 1 plays in the main world, the others in
+their own instance, so courts neither see, hit, hear nor collide with each
+other. Each court plays one duel to the server's `fraglimit`; the round ends
+when every court is decided, the stock intermission shows the board, and a real
+`map_restart` carries the ladder into the next round: winners move up a court,
+losers move down, the top winner and bottom loser stay, and with an odd roster
+(or a map that cannot host every court) the bench is a FIFO queue — one in, one
+out per round. Standings are kept for the whole ladder and shown as W/L on the
+scoreboard, sorted by court with the bench last; each viewer also gets their
+own court's duelist HUD and top score. The first player to `duel_fraglimit`
+duel wins is champion, then a fresh ladder starts (`0` = endless).
+A round's own `timelimit` decides unfinished courts by health + shield (random
+on an exact tie); `fraglimit 0` removes the per-duel kill limit and
+`timelimit 0` the round cap. A player who disconnects or goes spectator
+mid-duel gives the opponent a walkover. A voted or rcon `map_restart` is an
+admin restart — the ladder starts over with a fresh shuffle — while the proxy's
+own round restart carries the ladder. Setting the cvar back to `0` returns
+everyone to spectator and hands the map back to the stock duel tournament.
+A full map change always starts a fresh ladder. The stock duel's automatic
+pull-in, its global duelist/health configstrings and its own intermission/
+win-limit handling are suppressed while the ladder runs, and players cannot
+join a court with `team free` (the ladder assigns courts).
 
 ## Usage
 

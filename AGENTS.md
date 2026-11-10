@@ -31,6 +31,7 @@ docs/ holds the reverse-engineering evidence, the architecture notes and the dec
 - docs/decisions/0023-anti-wallhack.md — anti-wallhack (`proxy_sv_antiWallHack*`) built on the FOV cap's hide path and sample points (line-of-sight traces).
 - docs/decisions/0005-team-size-rules.md — per-team-size game rules (`proxy_sv_teamSizeRules`) and their interaction with `proxy_sv_lockTeamsAfterXSecs`.
 - docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_tffa_*`, GT_TEAM).
+- docs/decisions/0025-parallel-duels.md — parallel duels on GT_DUEL (`proxy_parallel_duels_enable`): the shared instancing core, ladder formation/bump/queue, per-round resolution, carried `map_restart`, per-viewer duel HUD/board and stock-duel suppression; records the `SetTeamQuick` binary finding and the restart classifier.
 - docs/decisions/README.md — index of the decision records.
 
 Source authority (game vs engine)

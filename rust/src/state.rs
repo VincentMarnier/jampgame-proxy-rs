@@ -986,6 +986,9 @@ pub struct DuelState {
     /// The round clock starts on the first frame a court player is connected
     /// (clients reconnect after the settle frames).
     pub round_clock_started: bool,
+    /// `svs.time` when a carried round was installed at `GAME_INIT`; the
+    /// fallback for a carry nobody reconnects into.
+    pub carried_at: i32,
     /// Per-viewer HUD dedup: the duelists configstring last queued, the
     /// healths string and the top-score pair (`CS_SCORES1/2`).
     pub hud_duelists: [String; MAX_CLIENTS],
@@ -1020,6 +1023,7 @@ impl Default for DuelState {
             spawned: [false; MAX_CLIENTS],
             restart_pending: false,
             round_clock_started: false,
+            carried_at: 0,
             last_roster_check: 0,
             hud_duelists: core::array::from_fn(|_| String::new()),
             hud_healths: core::array::from_fn(|_| String::new()),

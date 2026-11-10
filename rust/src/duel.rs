@@ -12,14 +12,15 @@
 
 use core::ffi::{CStr, c_int};
 
-use crate::hooks::engine_sv::{read_i32, write_i32};
+use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::original;
 use crate::sdk::{
-    CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_SCORES1, CS_SCORES2, EXEC_APPEND, MAX_CLIENTS,
-    OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT, OFFSET_LEVEL_SORTED_CLIENTS,
-    OFFSET_LEVEL_TIME, OFFSET_PS_PERSISTANT, OFFSET_PS_STATS, OFFSET_SESS_LOSSES,
-    OFFSET_SESS_SESSION_TEAM, OFFSET_SESS_WINS, PERS_SCORE, SIZEOF_GENTITY, STAT_ARMOR,
-    STAT_HEALTH, TEAM_FREE, TEAM_SPECTATOR,
+    CON_CONNECTED, CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_SCORES1, CS_SCORES2, EXEC_APPEND,
+    MAX_CLIENTS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS,
+    OFFSET_GENTITY_CLIENT, OFFSET_LEVEL_SORTED_CLIENTS, OFFSET_LEVEL_TIME, OFFSET_PERS_CONNECTED,
+    OFFSET_PS_PERSISTANT, OFFSET_PS_STATS, OFFSET_SESS_LOSSES, OFFSET_SESS_SESSION_TEAM,
+    OFFSET_SESS_WINS, OFFSET_SHARED_SVFLAGS, PERS_SCORE, SIZEOF_GENTITY, STAT_ARMOR, STAT_HEALTH,
+    SVF_BOT, TEAM_FREE, TEAM_SPECTATOR,
 };
 use crate::state::{self, DuelPhase, InstanceMode};
 use crate::syscall;
@@ -59,6 +60,9 @@ pub struct Court {
     /// The court could not run (its instance could not be rebuilt): both
     /// players go to the back of the queue instead of playing.
     pub void: bool,
+    /// The resolved pair has finished its void window and moved to spectator;
+    /// the round may only end once every court is settled.
+    pub settled: bool,
 }
 
 impl Court {
@@ -757,6 +761,53 @@ fn announce(text: &str) {
     unsafe { syscall::send_server_command(-1, &msg) };
 }
 
+/// Mirror the bots the game adds itself. `BotConnect` calls `ClientConnect`
+/// and `ClientBegin` *inside* the game module (`g_bot.c:954`, `:1020`), so a
+/// bot never passes through the engine's `GAME_CLIENT_CONNECT` /
+/// `GAME_CLIENT_BEGIN` vmMain events. Detect them from the game's own
+/// `r.svFlags & SVF_BOT` (the engine's bot discriminator) and their
+/// `pers.connected`, and clear the mirror when a bot is removed.
+fn adopt_game_bots() {
+    let g = g_entities();
+    if g == 0 {
+        return;
+    }
+    let mut present = [false; MAX_CLIENTS];
+    for (i, slot) in present.iter_mut().enumerate() {
+        let ent = g + i * SIZEOF_GENTITY;
+        // SAFETY: ent is inside the g_entities array.
+        let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+        if client == 0 {
+            continue;
+        }
+        // SAFETY: the engine's own bot discriminator lives at r.svFlags.
+        let svflags = unsafe { read_i32(ent + OFFSET_SHARED_SVFLAGS) };
+        if svflags & SVF_BOT as i32 == 0 {
+            continue;
+        }
+        // SAFETY: client is a live gclient_t.
+        let state_ = unsafe { read_i32(client + OFFSET_GCLIENT_PERS + OFFSET_PERS_CONNECTED) };
+        if state_ == CON_CONNECTED {
+            *slot = true;
+        }
+    }
+    state::with_state(|s| {
+        for (i, &is_present) in present.iter().enumerate() {
+            if is_present {
+                s.clients[i].is_bot = true;
+                s.clients[i].is_connected = true;
+                s.duel.willing[i] = true;
+            } else if s.clients[i].is_bot {
+                // Bot removed by the game (bot_minplayers, `kick`): drop it.
+                s.clients[i].is_connected = false;
+                s.duel.willing[i] = false;
+                s.duel.spawn_pending.retain(|&c| c as usize != i);
+                s.duel.queue.retain(|&c| c as usize != i);
+            }
+        }
+    });
+}
+
 /// The live roster: connected clients that are willing (bots always are).
 fn roster() -> Vec<u8> {
     state::with_state(|s| {
@@ -821,6 +872,13 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
             s.duel.willing[n] = willing;
             s.duel.spawned[n] = false;
             s.tffa.client_match[n] = crate::instances::MAIN_MATCH;
+        }
+        // Bots are added by the game (`BotConnect` → `ClientBegin` directly),
+        // so they never pass through the engine's `GAME_CLIENT_BEGIN`. Mark
+        // them connected here: the roster, scoreboard and chat gates all use
+        // this mirror, and a disconnected bot is cleared by ClientDisconnect.
+        if bot {
+            s.clients[n].is_connected = true;
         }
         s.duel.spawn_pending.retain(|&c| c as usize != n);
     });
@@ -994,6 +1052,7 @@ pub fn on_game_init(restart: bool) {
     let carry = state::with_state(|s| {
         s.duel.ladder && restart && s.duel.carry_round && !s.duel.pending_courts.is_empty()
     });
+    eprintln!("----- proxy-rs: parallel duels GAME_INIT restart={restart} carry={carry}");
     if carry {
         install_carried_courts();
     } else {
@@ -1015,12 +1074,14 @@ fn install_carried_courts() {
             core::mem::take(&mut s.duel.pending_queue),
         )
     });
+    let installed_at = svs_time();
     let mut bench = queue;
     let mut courts: Vec<Court> = Vec::with_capacity(pairs.len());
-    for (i, pair) in pairs.iter().enumerate() {
-        let instance = i as u8;
+    for pair in pairs.iter() {
         // Realize the instance world before the clients reconnect; court 1 is
-        // the pristine main slot (no clone).
+        // the pristine main slot (no clone). The instance id is the compacted
+        // court index, so a failed court never desynchronises the two.
+        let instance = courts.len() as u8;
         if instance != crate::instances::MAIN_MATCH
             && crate::instances::realize_instance(instance).is_err()
         {
@@ -1028,10 +1089,9 @@ fn install_carried_courts() {
             bench.extend([pair.a, pair.b].into_iter().flatten());
             continue;
         }
-        let court_index = courts.len();
         state::with_state(|s| {
             for player in [pair.a, pair.b].into_iter().flatten() {
-                s.tffa.client_match[player as usize] = court_index as u8;
+                s.tffa.client_match[player as usize] = instance;
                 s.duel.spawned[player as usize] = false;
             }
         });
@@ -1051,6 +1111,7 @@ fn install_carried_courts() {
         s.duel.carry_round = false;
         s.duel.round_clock_started = false;
         s.duel.round_start = 0;
+        s.duel.carried_at = installed_at;
         s.duel.resolved_at = [0; MAX_COURTS];
         s.duel.spawn_pending.clear();
         for court in s.duel.courts.iter().take(courts.len()) {
@@ -1059,10 +1120,9 @@ fn install_carried_courts() {
             }
         }
     });
-    announce(&round_announcement(
-        &state::with_state(|s| s.duel.courts),
-        &state::with_state(|s| s.duel.queue.clone()),
-    ));
+    announce(&state::with_state(|s| {
+        round_announcement(&s.duel.courts[..s.duel.court_count], &s.duel.queue)
+    }));
     refresh_all_cs_players();
     push_hud();
 }
@@ -1106,18 +1166,19 @@ fn start_round() {
     }
     let mut bench = formation.queue;
     let mut courts: Vec<Court> = Vec::with_capacity(formation.courts.len());
-    for (i, pair) in formation.courts.iter().enumerate() {
-        let instance = i as u8;
+    for pair in formation.courts.iter() {
+        // The instance id is the compacted court index: a court whose world
+        // failed must not leave later courts realized under a different id.
+        let instance = courts.len() as u8;
         if instance != crate::instances::MAIN_MATCH
             && crate::instances::realize_instance(instance).is_err()
         {
             bench.extend([pair.a, pair.b].into_iter().flatten());
             continue;
         }
-        let court_index = courts.len();
         state::with_state(|s| {
             for player in [pair.a, pair.b].into_iter().flatten() {
-                s.tffa.client_match[player as usize] = court_index as u8;
+                s.tffa.client_match[player as usize] = instance;
                 s.duel.spawned[player as usize] = false;
             }
         });
@@ -1132,11 +1193,11 @@ fn start_round() {
     state::with_state(|s| {
         // A fresh ladder clears the standings and the champion; a carried
         // ladder keeps them.
-        if s.duel.fresh_restart && s.duel.champion.is_some() {
+        if s.duel.fresh_restart {
+            // A fresh shuffle (first ladder, champion, or an admin restart)
+            // starts with clean standings.
             reset_standings(&mut s.duel.wins, &mut s.duel.losses);
             s.duel.champion = None;
-        }
-        if s.duel.fresh_restart {
             s.duel.queue.clear();
         }
         s.duel.fresh_restart = false;
@@ -1162,11 +1223,43 @@ fn start_round() {
             }
         }
     });
-    announce(&state::with_state(|s| {
-        round_announcement(&s.duel.courts[..s.duel.court_count], &s.duel.queue)
-    }));
+    let (courts, queue, serial) = state::with_state(|s| {
+        (
+            s.duel.courts[..s.duel.court_count].to_vec(),
+            s.duel.queue.clone(),
+            s.duel.round_serial,
+        )
+    });
+    eprintln!(
+        "----- proxy-rs: parallel duels round {} — {} court(s), {} queued",
+        serial,
+        courts.len(),
+        queue.len()
+    );
+    announce(&round_announcement(&courts, &queue));
     refresh_all_cs_players();
     push_hud();
+}
+
+/// Enabling the ladder mid-duel takes over immediately: the stock duel's
+/// current players are willing (they were playing) and become spectators, and
+/// the ladder forms its first round from the roster.
+fn take_over_stock_duel() {
+    let connected: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|&cn| s.clients[cn as usize].is_connected)
+            .collect()
+    });
+    let players: Vec<c_int> = connected
+        .into_iter()
+        .filter(|&cn| session_team(cn) != Some(TEAM_SPECTATOR))
+        .collect();
+    for cn in &players {
+        state::with_state(|s| s.duel.willing[*cn as usize] = true);
+    }
+    for cn in players {
+        crate::tffa::set_client_spectator(cn);
+    }
 }
 
 /// `GAME_RUN_FRAME` pre-pass.
@@ -1175,6 +1268,9 @@ pub fn on_frame_start() {
         if state::with_state(|s| s.duel.ladder || s.duel.phase != DuelPhase::Idle) {
             teardown();
         }
+        // A gametype change (or a master-switch change) re-arms the cvar edge,
+        // so returning to GT_DUEL with the cvar still on starts a fresh ladder.
+        state::with_state(|s| s.duel.enable_latched = false);
         return;
     }
     let now_on = state::with_state(|s| s.cvars[state::CVAR_PARALLEL_DUELS_ENABLE].integer != 0);
@@ -1191,17 +1287,22 @@ pub fn on_frame_start() {
     }
     if turned_on {
         seed_all_willing();
+        take_over_stock_duel();
         state::with_state(|s| {
             s.duel.ladder = true;
             s.duel.phase = DuelPhase::Idle;
             s.duel.fresh_restart = true;
+            s.duel.courts = [Court::default(); MAX_COURTS];
+            s.duel.court_count = 0;
+            s.duel.queue.clear();
+            s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
         });
         announce("Parallel duels enabled — the ladder starts with two willing players.");
     }
     if !state::with_state(|s| s.duel.ladder) {
         return;
     }
-    drain_spawns();
+    adopt_game_bots();
     let (phase, pending, started) = state::with_state(|s| {
         (
             s.duel.phase,
@@ -1209,12 +1310,37 @@ pub fn on_frame_start() {
             s.duel.round_clock_started,
         )
     });
-    if phase == DuelPhase::Playing && !started && any_court_player_connected() {
-        let now = level_time();
-        state::with_state(|s| {
-            s.duel.round_start = now;
-            s.duel.round_clock_started = true;
-        });
+    if phase == DuelPhase::Playing && !started {
+        if any_court_player_connected() {
+            let now = level_time();
+            state::with_state(|s| {
+                s.duel.round_start = now;
+                s.duel.round_clock_started = true;
+                s.duel.carried_at = 0;
+            });
+        } else {
+            // A carried round nobody reconnected into (every client left while
+            // the board was up): fall back to a fresh formation instead of
+            // stalling on a court that can never spawn.
+            let carried_at = state::with_state(|s| s.duel.carried_at);
+            let now = svs_time();
+            if carried_at != 0 && now.wrapping_sub(carried_at) > 10_000 {
+                state::with_state(|s| {
+                    s.duel.courts = [Court::default(); MAX_COURTS];
+                    s.duel.court_count = 0;
+                    s.duel.queue.clear();
+                    s.duel.spawn_pending.clear();
+                    s.duel.pending_courts.clear();
+                    s.duel.pending_queue.clear();
+                    s.duel.phase = DuelPhase::Idle;
+                    s.duel.fresh_restart = true;
+                    s.duel.carried_at = 0;
+                    s.duel.restart_pending = false;
+                    s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
+                });
+                announce("Parallel duels: carried round abandoned — forming a fresh ladder.");
+            }
+        }
     }
     if phase == DuelPhase::Idle && !pending {
         if roster().len() >= 2 {
@@ -1229,17 +1355,29 @@ pub fn on_frame_start() {
         }
     }
     if phase == DuelPhase::Board {
-        let due = state::with_state(|s| svs_time() >= s.duel.board_until);
+        let now = svs_time();
+        let due = state::with_state(|s| now >= s.duel.board_until);
         if due {
             issue_restart();
         }
     }
+    // Spawn after any new round was formed above, so the first game frame
+    // already sees the court's bodies (and the resolver cannot mistake a
+    // just-formed court for a double walkover).
+    drain_spawns();
 }
 
 fn issue_restart() {
+    // The proxy calls the engine syscall directly, so its own `map_restart`
+    // never passes through the game's `G_SEND_CONSOLE_COMMAND` trap (we are
+    // that trap). The round carry is therefore recorded here, at issue time;
+    // `on_console_command` still classifies any *game-issued* `map_restart`
+    // (a vote) as an admin restart, and the armed-token form it also supports
+    // is pinned by `classify_restart`'s tests.
     state::with_state(|s| {
         s.duel.restart_pending = true;
-        s.duel.restart_armed = true;
+        s.duel.carry_round = true;
+        s.duel.restart_armed = false;
         s.duel.board_until = 0;
     });
     // SAFETY: engine syscall registered; the command is a static literal.
@@ -1251,8 +1389,12 @@ pub fn on_run_frame_post() {
     if !mode_on() || !state::with_state(|s| s.duel.ladder) {
         return;
     }
-    let (phase, count) = state::with_state(|s| (s.duel.phase, s.duel.court_count));
-    if phase != DuelPhase::Playing {
+    let (phase, count, started) =
+        state::with_state(|s| (s.duel.phase, s.duel.court_count, s.duel.round_clock_started));
+    if phase != DuelPhase::Playing || !started {
+        // A carried round starts its clock only once a court player has
+        // reconnected (`on_frame_start`); resolving before that would read
+        // every preserved court as a double walkover.
         return;
     }
     let now = svs_time();
@@ -1299,6 +1441,17 @@ pub fn on_run_frame_post() {
         if !court.resolved {
             let Some(a) = court.a else { continue };
             let Some(b) = court.b else { continue };
+            let (a_ready, b_ready) =
+                state::with_state(|s| (s.duel.spawned[a as usize], s.duel.spawned[b as usize]));
+            // Give a just-formed court its spawn frame before judging a
+            // walkover; a player that cannot spawn is still caught by the
+            // round timelimit (and the 10 s grace avoids a stuck court when
+            // no timelimit is set).
+            if (!a_ready || !b_ready)
+                && level_time().wrapping_sub(state::with_state(|s| s.duel.round_start)) < 10_000
+            {
+                continue;
+            }
             let a_gone = !connected(a as c_int)
                 || session_team(a as c_int) == Some(TEAM_SPECTATOR)
                 || !roster_contains(a);
@@ -1344,7 +1497,10 @@ pub fn on_run_frame_post() {
             if done {
                 spectator_court(i);
                 // Mark the window handled so this runs once.
-                state::with_state(|s| s.duel.resolved_at[i] = now.wrapping_sub(i32::MAX / 2));
+                state::with_state(|s| {
+                    s.duel.courts[i].settled = true;
+                    s.duel.resolved_at[i] = now.wrapping_sub(i32::MAX / 2);
+                });
             }
         }
     }
@@ -1359,7 +1515,7 @@ fn round_complete() -> bool {
     state::with_state(|s| {
         (0..s.duel.court_count).all(|i| {
             let c = s.duel.courts[i];
-            c.resolved && (c.void || c.winner.is_some())
+            c.resolved && (c.void || (c.winner.is_some() && c.settled))
         })
     })
 }
@@ -1415,8 +1571,13 @@ fn end_round() {
     });
     let _ = all_out;
     let paused = next_pairs.is_empty() || roster_now.len() < 2;
+    let now = svs_time();
     if let Some(champ) = champion {
         let wins = state::with_state(|s| s.duel.wins[champ as usize]);
+        eprintln!(
+            "----- proxy-rs: parallel duels champion client {} with {} win(s)",
+            champ, wins
+        );
         announce(&champion_announcement(champ, wins));
         announce_center(&champion_announcement(champ, wins));
         state::with_state(|s| {
@@ -1426,7 +1587,7 @@ fn end_round() {
             s.duel.pending_queue.clear();
             s.duel.queue.clear();
             s.duel.phase = DuelPhase::Board;
-            s.duel.board_until = svs_time() + BOARD_MS;
+            s.duel.board_until = now + BOARD_MS;
             s.duel.carry_round = true;
         });
         run_intermission();
@@ -1444,12 +1605,17 @@ fn end_round() {
         announce("Parallel duels paused — waiting for at least two willing players.");
         return;
     }
+    eprintln!(
+        "----- proxy-rs: parallel duels round complete — next round {} court(s), {} queued",
+        next_pairs.len(),
+        next_queue.len()
+    );
     state::with_state(|s| {
         s.duel.pending_courts = next_pairs;
         s.duel.pending_queue = next_queue.clone();
         s.duel.queue = next_queue;
         s.duel.phase = DuelPhase::Board;
-        s.duel.board_until = svs_time() + BOARD_MS;
+        s.duel.board_until = now + BOARD_MS;
         s.duel.carry_round = true;
         s.duel.fresh_restart = false;
     });
@@ -1499,7 +1665,8 @@ pub fn teardown() {
             ..state::DuelState::default()
         };
     });
-    crate::instances::forget_all_view_overrides();
+    eprintln!("----- proxy-rs: parallel duels torn down");
+    crate::instances::restore_pristine_views();
     announce("Parallel duels disabled — the stock duel tournament resumes.");
 }
 
@@ -1563,6 +1730,7 @@ pub fn on_console_command(text: &[u8]) -> Option<RestartKind> {
     }
     let armed = state::with_state(|s| core::mem::replace(&mut s.duel.restart_armed, false));
     let kind = classify_restart(armed, text)?;
+    eprintln!("----- proxy-rs: map_restart classified as {kind:?}");
     state::with_state(|s| match kind {
         RestartKind::Round => {
             s.duel.carry_round = true;
@@ -1999,29 +2167,33 @@ pub fn push_hud() {
     });
     for viewer in viewers {
         let vm = crate::instances::effective_match(viewer);
-        let (court, scores, healths) = state::with_state(|s| {
-            let court = s.duel.courts.get(vm as usize).copied();
-            let pair = court.and_then(|c| match (c.a, c.b) {
-                (Some(a), Some(b)) => Some((a, b)),
-                _ => None,
-            });
-            let scores = match pair {
-                Some((a, b)) => (pers_score(a as c_int), pers_score(b as c_int)),
-                None => (0, 0),
-            };
-            let healths = if show_health {
-                pair.map(|(a, b)| {
-                    format!(
-                        "{}|{}|!",
-                        stat(a as c_int, STAT_HEALTH),
-                        stat(b as c_int, STAT_HEALTH)
-                    )
+        // Read the pair under the lock, then the game memory outside it: the
+        // `pers_score`/`stat` helpers take the state lock themselves.
+        let court = state::with_state(|s| {
+            s.duel
+                .courts
+                .get(vm as usize)
+                .copied()
+                .and_then(|c| match (c.a, c.b) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
                 })
-            } else {
-                None
-            };
-            (pair, scores, healths)
         });
+        let scores = match court {
+            Some((a, b)) => (pers_score(a as c_int), pers_score(b as c_int)),
+            None => (0, 0),
+        };
+        let healths = if show_health {
+            court.map(|(a, b)| {
+                format!(
+                    "{}|{}|!",
+                    stat(a as c_int, STAT_HEALTH),
+                    stat(b as c_int, STAT_HEALTH)
+                )
+            })
+        } else {
+            None
+        };
         let duelists = match court {
             Some((a, b)) => format!("{a}|{b}"),
             None => "-1|-1".to_owned(),

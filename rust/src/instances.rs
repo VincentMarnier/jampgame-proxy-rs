@@ -24,13 +24,14 @@ use core::ffi::c_int;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
-    CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ENTITYNUM_MAX_NORMAL, ET_EVENTS,
-    ET_MOVER, ET_NPC, G_LINKENTITY, MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, OFFSET_GCLIENT_PS,
-    OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT,
-    OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
-    OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN,
-    OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER,
-    OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
+    CONTENTS_TRIGGER, CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_PLAYERS, CS_SCORES1,
+    CS_SCORES2, ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, MAX_CLIENTS,
+    MAX_GENTITIES, MAX_NETNAME, OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR,
+    OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2,
+    OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY, OFFSET_GENTITY_NEXT_TRAIN,
+    OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN, OFFSET_GENTITY_R_CONTENTS,
+    OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_REACHED,
+    OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
     OFFSET_GENTITY_TARGET_ENT, OFFSET_GENTITY_TARGETNAME, OFFSET_GENTITY_TEAM,
     OFFSET_GENTITY_TEAMCHAIN, OFFSET_GENTITY_TEAMMASTER, OFFSET_GENTITY_THINK,
     OFFSET_GENTITY_TOUCH, OFFSET_GENTITY_USE, OFFSET_PS_LEGS_FLIP, OFFSET_PS_TORSO_FLIP,
@@ -2290,6 +2291,35 @@ pub(crate) fn rebuild_owned(s: &mut state::ProxyState, g_entities: usize) {
         s.tffa.owned[s.tffa.owned_count] = (num as u16, owner as u8);
         s.tffa.owned_count += 1;
     }
+}
+
+/// Restore every client's pristine `CS_PLAYERS` bases and clear the duel HUD
+/// configstrings after the ladder is torn down. The per-viewer refresh helpers
+/// are gated on the instance core being enabled, which is already false by the
+/// time a cvar-off teardown runs; this pushes the bases directly so no
+/// `(Duel N)`/`(TFFA N)` prefix or proxy W/L survives into the stock game.
+pub(crate) fn restore_pristine_views() {
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    let bases: [String; MAX_CLIENTS] = state::with_state(|s| s.tffa.cs_players_base.clone());
+    for viewer in viewers {
+        for (slot, base) in bases.iter().enumerate() {
+            if !base.is_empty() {
+                send_cs_to_client(viewer, CS_PLAYERS + slot as i32, base);
+                record_cs_players_sent(viewer, slot, base);
+            }
+        }
+        send_cs_to_client(viewer, CS_CLIENT_DUELISTS, "-1|-1");
+        send_cs_to_client(viewer, CS_CLIENT_DUELHEALTHS, "-1|-1|!");
+    }
+    state::with_state(|s| {
+        s.duel.hud_duelists = core::array::from_fn(|_| String::new());
+        s.duel.hud_healths = core::array::from_fn(|_| String::new());
+        s.duel.hud_scores = [(i32::MIN, i32::MIN); MAX_CLIENTS];
+    });
 }
 
 /// Record a `CS_PLAYERS + n` base string the game just set, then push the
