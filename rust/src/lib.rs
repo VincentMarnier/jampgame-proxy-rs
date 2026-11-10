@@ -39,6 +39,7 @@ mod fov;
 mod guidban;
 mod hooks;
 mod ignore;
+mod instances;
 mod jampgame;
 mod macroguard;
 mod mute;
