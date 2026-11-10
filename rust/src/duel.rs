@@ -1657,7 +1657,6 @@ fn end_round() {
             }
         }
     });
-    refresh_all_cs_players();
     push_hud();
     let roster_now = roster();
     let threshold = duel_fraglimit();
