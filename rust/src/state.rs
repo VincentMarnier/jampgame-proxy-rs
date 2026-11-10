@@ -799,11 +799,11 @@ pub struct TffaState {
     /// must not be handed to a later match still tagged): instance `i` is
     /// marked for release when its match closes; the clones are freed at the
     /// next `GAME_RUN_FRAME` start, when no game code is mid-iteration.
-    pub world_release: u16,
+    pub world_release: u32,
     /// Instances whose clone sets exist, as a bitmask (bit `i` = instance `i`).
     /// Clone creation is idempotent: re-opening a slot whose set survived
     /// reuses the world it left behind.
-    pub world_cloned: u16,
+    pub world_cloned: u32,
     /// Whether the map holds an interactive entity that cannot be duplicated
     /// (an NPC/actor with a shared Ghoul2 model or a dynamic `client`): such a
     /// map takes no instance at all — all-or-nothing, D-006.6.
@@ -1334,6 +1334,17 @@ mod tests {
         with_state(|s| assert_eq!(s.svs_time, 42));
         // Reset for the next test that touches the global.
         *lock() = None;
+    }
+
+    #[test]
+    fn instance_slate_has_sixteen_created_slots_and_tffa_keeps_eight() {
+        assert_eq!(crate::instances::MAX_MATCHES, 16);
+        assert_eq!(crate::instances::TOTAL_MATCH_SLOTS, 17);
+        // The shared slate grew for the duel ladder; the TFFA admin ceiling
+        // did not (D-025).
+        assert_eq!(crate::tffa::TFFA_MATCH_CAP, 8);
+        // The world clone bitmask must cover every slot including 16.
+        assert!((1u32 << crate::instances::MAX_MATCHES) != 0);
     }
 
     #[test]

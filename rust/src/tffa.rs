@@ -65,6 +65,9 @@ use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_M
 // `tffa::…` call sites keep their names while the policy module shrinks.
 pub use crate::instances::*;
 
+/// The TFFA feature's own match ceiling (`proxy_tffa_maxMatches`), kept at 8
+/// while the shared instance slate grew to 16 for the duel ladder (D-025).
+pub const TFFA_MATCH_CAP: usize = 8;
 /// Maximum length of a match password, in bytes. A password is one client
 /// command argument (`trap_Argv`); quoting it (`tffa_create "my pass"`) allows
 /// spaces, so the limit is on bytes, not words. Longer passwords are refused at
@@ -1053,7 +1056,7 @@ fn discard_instance(id: u8) {
         // Nothing of this instance is live (a failed rebuild unwinds its
         // clones), but a stale piece of the old round's bookkeeping must not
         // keep a tag alive.
-        s.tffa.world_release |= 1u16 << id;
+        s.tffa.world_release |= 1u32 << id;
         let moved = close_instance_state(
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
@@ -1407,7 +1410,7 @@ fn close_created_matches(created: &[u8]) {
     // of this round.
     state::with_state(|s| {
         for (id, _) in &groups {
-            s.tffa.world_release |= 1u16 << id;
+            s.tffa.world_release |= 1u32 << id;
             close_instance_state(
                 &mut s.tffa.matches,
                 &mut s.tffa.client_match,
@@ -2106,7 +2109,7 @@ pub fn on_run_frame_post() {
                 m.remembered = roster;
                 // The instance is over: queue its world for release at the next
                 // frame start (members are being moved out below).
-                s.tffa.world_release |= 1u16 << f.id;
+                s.tffa.world_release |= 1u32 << f.id;
             }
         }
     });
@@ -2222,7 +2225,7 @@ pub fn on_run_frame_post() {
                     // The promoted instance's own world does not become main's:
                     // its players see the pristine map entity set from here on, and
                     // its clone set is given back at the next frame start.
-                    s.tffa.world_release |= 1u16 << id;
+                    s.tffa.world_release |= 1u32 << id;
                 });
                 // The promoted instance is the surviving game from here on, so
                 // its team-lock caps follow it into main.
@@ -2944,7 +2947,7 @@ fn max_matches() -> usize {
     let v = state::with_state(|s| s.cvars[CVAR_TFFA_MAX_MATCHES].integer);
     // Clamp before the `as usize` cast: a negative admin value would
     // otherwise wrap huge and silently select the maximum.
-    v.clamp(1, MAX_MATCHES as i32) as usize
+    v.clamp(1, TFFA_MATCH_CAP as i32) as usize
 }
 
 fn max_group_size() -> usize {
@@ -3571,7 +3574,7 @@ fn close_instance(id: u8) {
     }
     crate::teamlock::clear_match(id);
     let moved = state::with_state(|s| {
-        s.tffa.world_release |= 1u16 << id;
+        s.tffa.world_release |= 1u32 << id;
         close_instance_state(
             &mut s.tffa.matches,
             &mut s.tffa.client_match,
@@ -4732,7 +4735,7 @@ mod tests {
     /// match just started using. A live set is reported for reuse.
     #[test]
     fn reactivating_a_slot_cancels_its_pending_world_release() {
-        let mut pending = (1u16 << 3) | (1u16 << 4);
+        let mut pending = (1u32 << 3) | (1u32 << 4);
         assert!(claim_world(&mut pending, 1 << 3, 3));
         assert_eq!(pending, 1 << 4);
         // No live set: no reuse, but a stale pending bit is still cleared.

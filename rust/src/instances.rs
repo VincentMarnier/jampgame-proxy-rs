@@ -41,8 +41,10 @@ use crate::state;
 /// Match id of the implicit main TFFA.
 pub const MAIN_MATCH: u8 = 0;
 
-/// Maximum player-created matches (ids `1..=MAX_MATCHES`).
-pub const MAX_MATCHES: usize = 8;
+/// Maximum instance slots (ids `1..=MAX_MATCHES`). Raised from 8 to 16 by
+/// D-025: the duel ladder may host up to 16 courts, while `proxy_tffa_maxMatches`
+/// keeps its documented 8-match ceiling (`tffa::TFFA_MATCH_CAP`).
+pub const MAX_MATCHES: usize = 16;
 
 /// Backing array size: main slot + created slots.
 pub const TOTAL_MATCH_SLOTS: usize = 1 + MAX_MATCHES;
@@ -1196,8 +1198,8 @@ pub(crate) fn ensure_world_scanned() -> bool {
 /// it would free the clones the new match is using. Returns whether the set is
 /// already live (reuse) and clears any queued release for the slot either way
 /// (a slot with no set has nothing to release).
-pub(crate) fn claim_world(pending: &mut u16, cloned: u16, instance: u8) -> bool {
-    let bit = 1u16 << instance;
+pub(crate) fn claim_world(pending: &mut u32, cloned: u32, instance: u8) -> bool {
+    let bit = 1u32 << instance;
     *pending &= !bit;
     cloned & bit != 0
 }
@@ -1228,7 +1230,7 @@ pub fn realize_instance(instance: u8) -> Result<(), &'static str> {
             s.tffa.world_clone_cost,
         )
     });
-    let bit = 1u16 << instance;
+    let bit = 1u32 << instance;
     if done {
         // The set survived the instance that used it (a closed match keeps its
         // world until the next map): reuse it.
@@ -1367,7 +1369,7 @@ pub(crate) fn release_instance(instance: u8) {
         unsafe { crate::jampgame::g_free_entity(ent) };
         state::with_state(|s| s.tffa.entity_instance[num as usize] = ENTITY_SHARED);
     }
-    state::with_state(|s| s.tffa.world_cloned &= !(1u16 << instance));
+    state::with_state(|s| s.tffa.world_cloned &= !(1u32 << instance));
 }
 
 /// Drain the instance releases queued since the last frame.
@@ -1377,7 +1379,7 @@ pub fn drain_world_releases() {
         return;
     }
     for instance in 1..TOTAL_MATCH_SLOTS {
-        if pending & (1u16 << instance) != 0 {
+        if pending & (1u32 << instance) != 0 {
             release_instance(instance as u8);
         }
     }
