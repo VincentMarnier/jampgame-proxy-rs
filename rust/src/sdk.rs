@@ -66,6 +66,7 @@ pub const TEAM_NUM_TEAMS: i32 = 4;
 
 /// Game types (`bg_public.h:185-197`): duel modes allow spectators to call
 /// votes (`Cmd_CallVote_f`, `g_cmds.c:1906-1913`).
+pub const GT_FFA: i32 = 0;
 pub const GT_DUEL: i32 = 3;
 pub const GT_POWERDUEL: i32 = 4;
 

@@ -137,7 +137,7 @@ fn tffa_player_slot(ent: usize) -> Option<c_int> {
 /// Cross-match damage gate for `G_Damage`/`player_die`: `Some(true)` = drop,
 /// `Some(false)` = same match, `None` = not a player-vs-player hit (allow).
 fn tffa_damage_blocked(targ: usize, attacker: usize) -> Option<bool> {
-    if !crate::tffa::enabled() {
+    if !crate::state::instances_enabled() {
         return Some(false);
     }
     let targ_num = tffa_player_slot(targ);
@@ -283,7 +283,7 @@ pub unsafe extern "C" fn player_die(
     // does not isolate it. The dying player's own match is the scope here: the
     // S8 flush tags each dropped item with it, after which the visibility, trace
     // and touch gates scope the item like any other per-instance world entity.
-    let scope = if crate::tffa::enabled() {
+    let scope = if crate::state::instances_enabled() {
         Some(crate::tffa::open_acting_scope(self_))
     } else {
         None
@@ -456,7 +456,7 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
     // entities the think spawns that carry an owner (missiles, saber entities)
     // are left to the owned-entity machinery, so only what nothing else scopes
     // (a weapon-force drop) is tagged.
-    let scope = if crate::tffa::enabled() {
+    let scope = if crate::state::instances_enabled() {
         Some(crate::tffa::open_acting_scope(ent))
     } else {
         None
@@ -488,7 +488,7 @@ pub unsafe extern "C" fn client_think_real(ent: usize) {
 /// Entered from the game module with the pristine `WP_ForcePowersUpdate`
 /// argument list.
 pub unsafe extern "C" fn wp_force_powers_update(self_: usize, ucmd: usize) {
-    let scope = if crate::tffa::enabled() {
+    let scope = if crate::state::instances_enabled() {
         Some(crate::tffa::open_acting_scope(self_))
     } else {
         None
@@ -526,7 +526,7 @@ pub unsafe extern "C" fn wp_force_powers_update(self_: usize, ucmd: usize) {
 pub unsafe extern "C" fn client_spawn(ent: usize) {
     // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
     let original = original_call(crate::hooks::game_hook_original_client_spawn);
-    let scope = if ent != 0 && crate::tffa::enabled() {
+    let scope = if ent != 0 && crate::state::instances_enabled() {
         Some(crate::tffa::open_acting_scope(ent))
     } else {
         None
@@ -1032,7 +1032,7 @@ pub unsafe extern "C" fn add_score(ent: usize, origin: *const f32, score: c_int)
     let original = original_call(crate::hooks::game_hook_original_add_score);
     unsafe { original(ent, origin, score) };
 
-    if !crate::tffa::enabled() || score == 0 || ent == 0 {
+    if !crate::state::instances_enabled() || score == 0 || ent == 0 {
         return;
     }
     let client = unsafe { ent_client(ent) };
@@ -1071,7 +1071,7 @@ pub unsafe extern "C" fn log_exit(string: *const c_char) {
     let kill_limit = !string.is_null()
         // SAFETY: game passes a NUL-terminated exit string.
         && unsafe { CStr::from_ptr(string) }.to_bytes() == b"Kill limit hit.";
-    if kill_limit && crate::tffa::enabled() {
+    if kill_limit && crate::state::instances_enabled() {
         return;
     }
     // SAFETY: trampoline attached at GAME_INIT.
@@ -1168,7 +1168,7 @@ pub unsafe extern "C" fn g_touch_triggers(ent: usize) {
     let original = original_call(crate::hooks::game_hook_original_g_touch_triggers);
     // `enabled()` must not run under the state lock (it reads a cvar engine-side)
     // and the pristine body early-returns for a non-player entity anyway.
-    if ent == 0 || !crate::tffa::enabled() {
+    if ent == 0 || !crate::state::instances_enabled() {
         unsafe { original(ent) };
         return;
     }
@@ -1211,7 +1211,7 @@ pub unsafe extern "C" fn g_use_targets2(ent: usize, activator: usize, string: us
     let original = original_call(crate::hooks::game_hook_original_g_use_targets2);
     // `enabled()` must not run under the state lock (it reads a cvar
     // engine-side); the pristine body returns early for a null target anyway.
-    if ent == 0 || !crate::tffa::enabled() {
+    if ent == 0 || !crate::state::instances_enabled() {
         unsafe { original(ent, activator, string) };
         return;
     }
@@ -1302,7 +1302,7 @@ pub unsafe extern "C" fn g_run_think(ent: usize) {
     let original = original_call(crate::hooks::game_hook_original_g_run_think);
     // `enabled()` must not run under the state lock (it reads a cvar
     // engine-side); an unattributable think is the pristine call.
-    if ent == 0 || !crate::tffa::enabled() {
+    if ent == 0 || !crate::state::instances_enabled() {
         unsafe { original(ent) };
         return;
     }
@@ -1327,7 +1327,7 @@ pub unsafe extern "C" fn g_run_think(ent: usize) {
 pub unsafe extern "C" fn g_run_missile(ent: usize) {
     // SAFETY: trampoline attached at GAME_INIT; arg forwarded unchanged.
     let original = original_call(crate::hooks::game_hook_original_g_run_missile);
-    if ent == 0 || !crate::tffa::enabled() {
+    if ent == 0 || !crate::state::instances_enabled() {
         unsafe { original(ent) };
         return;
     }
@@ -1375,7 +1375,7 @@ pub unsafe extern "C" fn team_count(ignore_client_num: c_int, team: c_int) -> c_
 ///
 /// Entered from the game module with no arguments.
 pub unsafe extern "C" fn score_is_tied() -> c_int {
-    if crate::tffa::enabled() {
+    if crate::state::instances_enabled() {
         // "Tied": CheckExitRules returns before the timelimit/fraglimit
         // checks. The proxy runs them per match.
         return 1;

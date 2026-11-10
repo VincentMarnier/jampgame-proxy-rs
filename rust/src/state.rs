@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 45] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 46] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -68,6 +68,7 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 45] = [
     (c"proxy_sv_antiWallHack", c"0"),
     (c"proxy_sv_antiWallHackMargin", c"0"),
     (c"proxy_sv_antiWallHackCameraRange", c"100"),
+    (c"proxy_parallel_duels_enable", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -240,6 +241,91 @@ pub const CVAR_ANTI_WALLHACK_MARGIN: usize = 43;
 /// the stock `cg_thirdPersonRange`; `0` traces from the player's eye
 /// (first-person-strict).
 pub const CVAR_ANTI_WALLHACK_CAMERA_RANGE: usize = 44;
+/// `proxy_parallel_duels_enable`: run the parallel duel ladder on
+/// `GT_DUEL` (`crate::duel`, D-025). `0` off (stock duel tournament), non-zero
+/// on. One shared instance core serves both this and `proxy_tffa_enable`.
+pub const CVAR_PARALLEL_DUELS_ENABLE: usize = 45;
+
+/// Which instancing feature owns the shared instance core right now.
+///
+/// Both features are overlays on the one pristine game module and reuse the
+/// same per-instance machinery (assignment slate, isolation gates, world
+/// clones, acting scope, per-viewer cs plumbing). They are mutually exclusive
+/// by gametype: parallel TFFA only runs on `GT_TEAM`, parallel duels only on
+/// `GT_DUEL`, so a gametype can never select both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstanceMode {
+    /// No instancing: pristine game behaviour.
+    #[default]
+    Off,
+    /// Parallel self-organized TFFA matches (`GT_TEAM`, D-006).
+    Tffa,
+    /// Parallel duels on a ladder (`GT_DUEL`, D-025).
+    Duel,
+}
+
+impl InstanceMode {
+    /// Whether either instancing feature is active.
+    pub fn is_on(self) -> bool {
+        self != InstanceMode::Off
+    }
+
+    /// Whether the active feature is the team-match policy.
+    pub fn is_team(self) -> bool {
+        self == InstanceMode::Tffa
+    }
+}
+
+/// The active instance mode: master switch, the feature cvar and `g_gametype`.
+///
+/// Read on hot paths (every damage, trace, snapshot and client command), but
+/// only two cvar reads and one engine cvar query after the state check; a
+/// server with both features off pays the master-switch read and one state
+/// lock.
+pub fn instance_mode() -> InstanceMode {
+    if !proxy_enabled() {
+        return InstanceMode::Off;
+    }
+    let (tffa_on, duel_on) = with_state(|s| {
+        (
+            s.cvars[CVAR_TFFA_ENABLE].integer != 0,
+            s.cvars[CVAR_PARALLEL_DUELS_ENABLE].integer != 0,
+        )
+    });
+    if !tffa_on && !duel_on {
+        return InstanceMode::Off;
+    }
+    // SAFETY: engine syscall registered (GAME_INIT ran before any hook/frame).
+    let gt = unsafe { crate::syscall::cvar_variable_integer_value(c"g_gametype") };
+    split_mode(true, tffa_on, duel_on, gt)
+}
+
+/// Pure mode split: master switch, the two feature cvars and `g_gametype`.
+/// Split out so the mutually-exclusive-gametype rule is unit-tested without an
+/// engine (the caller reads the cvar through a trap).
+pub fn split_mode(proxy: bool, tffa_on: bool, duel_on: bool, gametype: i32) -> InstanceMode {
+    if !proxy {
+        return InstanceMode::Off;
+    }
+    match gametype {
+        crate::sdk::GT_TEAM if tffa_on => InstanceMode::Tffa,
+        crate::sdk::GT_DUEL if duel_on => InstanceMode::Duel,
+        _ => InstanceMode::Off,
+    }
+}
+
+/// Whether the shared instance core is active (either feature on its
+/// gametype). Gates the instance-wide machinery: isolation, per-viewer cs,
+/// acting scopes, world clones.
+pub fn instances_enabled() -> bool {
+    instance_mode().is_on()
+}
+
+/// Whether parallel TFFA (team matches) is active: the TFFA-only policy
+/// (teams, rules, passwords, promotion, team chat, `tffa_*` commands).
+pub fn team_mode() -> bool {
+    instance_mode().is_team()
+}
 
 /// `LocatedGameData_t` (`Proxy_Header.hpp:69-77`) — recorded by the
 /// `G_LOCATE_GAME_DATA` trap interception. Addresses kept as `usize`.
@@ -1216,6 +1302,7 @@ mod tests {
             PROXY_CVARS[CVAR_ANTI_WALLHACK_CAMERA_RANGE].1.to_bytes(),
             b"100"
         );
+        assert_eq!(PROXY_CVARS[CVAR_PARALLEL_DUELS_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
@@ -1247,6 +1334,26 @@ mod tests {
         with_state(|s| assert_eq!(s.svs_time, 42));
         // Reset for the next test that touches the global.
         *lock() = None;
+    }
+
+    #[test]
+    fn instance_mode_split_respects_gametype_and_master_switch() {
+        use crate::sdk::{GT_CTF, GT_DUEL, GT_FFA, GT_TEAM};
+        // Both features on, but each only owns its own gametype.
+        assert_eq!(split_mode(true, true, true, GT_TEAM), InstanceMode::Tffa);
+        assert_eq!(split_mode(true, true, true, GT_DUEL), InstanceMode::Duel);
+        // A feature whose cvar is off never takes over.
+        assert_eq!(split_mode(true, false, true, GT_TEAM), InstanceMode::Off);
+        assert_eq!(split_mode(true, true, false, GT_DUEL), InstanceMode::Off);
+        // Other gametypes and the master switch keep instancing off.
+        assert_eq!(split_mode(true, true, true, GT_FFA), InstanceMode::Off);
+        assert_eq!(split_mode(true, true, true, GT_CTF), InstanceMode::Off);
+        assert_eq!(split_mode(false, true, true, GT_TEAM), InstanceMode::Off);
+        assert_eq!(split_mode(false, true, true, GT_DUEL), InstanceMode::Off);
+        // Gating helpers agree with the split.
+        assert!(!InstanceMode::Off.is_on());
+        assert!(InstanceMode::Tffa.is_on() && InstanceMode::Tffa.is_team());
+        assert!(InstanceMode::Duel.is_on() && !InstanceMode::Duel.is_team());
     }
 
     #[test]

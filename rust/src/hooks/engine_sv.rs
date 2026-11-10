@@ -1242,7 +1242,7 @@ pub unsafe extern "C" fn sv_send_client_game_state(cl: usize) {
     // gone from its `cgs`. Drop the proxy's record of it and re-push on the next
     // frame (a mid-game resend of an outdated client message), so the next
     // scoreboard request does not rely on values the client no longer has.
-    if crate::tffa::enabled() {
+    if crate::state::instances_enabled() {
         let client_num = client_num_from_addr(cl);
         if client_num < crate::sdk::MAX_CLIENTS {
             crate::tffa::forget_view_overrides(client_num as c_int);
@@ -1525,7 +1525,7 @@ pub unsafe extern "C" fn sv_add_entities_visible_from_point(
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
-    if crate::tffa::enabled() {
+    if crate::state::instances_enabled() {
         // Snapshot the match table and the sound attribution once (no
         // per-entity locking); the viewer's own match is follow-aware
         // (spectating someone adopts their instance).

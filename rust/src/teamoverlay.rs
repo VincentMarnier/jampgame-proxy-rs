@@ -183,7 +183,7 @@ pub fn on_run_frame_post() {
 
     // One feature read per frame, not per spectator slot: `enabled()` reads an
     // engine cvar through a trap.
-    let tffa_on = crate::tffa::enabled();
+    let tffa_on = crate::state::instances_enabled();
     for viewer in 0..MAX_CLIENTS as c_int {
         let Some(scope) = follow_scope(viewer, g_entities, level, tffa_on) else {
             // No longer following: the cgame hides the overlay, and the next

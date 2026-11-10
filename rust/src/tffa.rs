@@ -53,10 +53,10 @@ use core::ffi::{CStr, c_char, c_int};
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use crate::sdk::{
     CON_CONNECTED, CON_DISCONNECTED, CONTENTS_TRIGGER, CS_PLAYERS, CS_SCORES1, CS_SCORES2,
-    ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, GT_TEAM, MAX_CLIENTS,
-    MAX_GENTITIES, MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS,
-    OFFSET_GCLIENT_SESS, OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT,
-    OFFSET_GENTITY_ENEMY, OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
+    ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, MAX_CLIENTS, MAX_GENTITIES,
+    MAX_NETNAME, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS,
+    OFFSET_GENTITY_ACTIVATOR, OFFSET_GENTITY_BLOCKED, OFFSET_GENTITY_CLIENT, OFFSET_GENTITY_ENEMY,
+    OFFSET_GENTITY_GHOUL2, OFFSET_GENTITY_INUSE, OFFSET_GENTITY_LAST_ENEMY,
     OFFSET_GENTITY_NEXT_TRAIN, OFFSET_GENTITY_PARENT, OFFSET_GENTITY_PREV_TRAIN,
     OFFSET_GENTITY_R_CONTENTS, OFFSET_GENTITY_R_LINKED, OFFSET_GENTITY_R_OWNER,
     OFFSET_GENTITY_REACHED, OFFSET_GENTITY_S_ETYPE, OFFSET_GENTITY_S_NUMBER, OFFSET_GENTITY_TARGET,
@@ -103,18 +103,14 @@ const ANIM_PS_FLIP_FRAMES: u8 = 5;
 const SCORE_ENTRY_INTS: usize = 14;
 const SCORE_ENTRY_SCORE: usize = 1;
 
-/// Whether the feature is on: master switch + `proxy_tffa_enable` + `GT_TEAM`.
+/// Whether parallel TFFA (the team-match policy) is active.
+///
+/// Instance-wide machinery (isolation gates, per-viewer `cs`, acting scopes,
+/// per-instance worlds) is gated by [`state::instances_enabled`] instead, so
+/// the shared core serves the parallel duel ladder too (D-025). The `tffa_*`
+/// commands, team rules, passwords, promotion and team chat stay here.
 pub fn enabled() -> bool {
-    if !state::proxy_enabled() {
-        return false;
-    }
-    let on = state::with_state(|s| s.cvars[CVAR_TFFA_ENABLE].integer != 0);
-    if !on {
-        return false;
-    }
-    // SAFETY: engine syscall registered (GAME_INIT ran before any hook/frame).
-    let gt = unsafe { crate::syscall::cvar_variable_integer_value(c"g_gametype") };
-    gt == GT_TEAM
+    state::team_mode()
 }
 
 /// Match of a client (`0` = main TFFA). Out-of-range or connecting → main.
@@ -901,7 +897,7 @@ pub fn forget_all_view_overrides() {
 /// connected client. Call after the trap has been forwarded so the engine
 /// broadcast lands first and our per-viewer corrections win.
 pub fn on_set_cs_players(slot: i32, value: &str) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as i32).contains(&slot) {
@@ -945,7 +941,7 @@ pub fn on_set_cs_players(slot: i32, value: &str) {
 /// after proxy-side match moves, which change prefix/team without any game
 /// `G_SET_CONFIGSTRING`).
 pub fn broadcast_cs_players_slot(slot: i32) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as i32).contains(&slot) {
@@ -1139,7 +1135,7 @@ fn get_live_cs_players(slot: i32) -> Option<String> {
 ///   and leave a `(TFFA N)` prefix + spectator team on a same-match player
 ///   (D-006.16).
 pub fn send_all_overrides_to_client(client_num: c_int) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
@@ -1217,7 +1213,7 @@ fn override_push_plan(
 /// Refresh one viewer's `CS_PLAYERS` overrides for every slot (called when
 /// that viewer changes matches, so stale prefixes/teams are corrected).
 pub fn refresh_cs_players_for_viewer(client_num: c_int) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
@@ -1275,7 +1271,7 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
 /// re-sending all of them on every scoreboard request queued kilobytes of
 /// reliable commands to the one client that opened the board.
 pub fn refresh_cs_players_for_scores(viewer: c_int) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
@@ -1753,7 +1749,7 @@ fn clamp_global_scores() {
 pub fn reset_round(restart: bool) {
     // `enabled()` and `max_matches()` take the state lock themselves: hoist
     // them (the lock is non-reentrant).
-    let keep = restart && enabled();
+    let keep = restart && state::instances_enabled();
     let max = max_matches();
     let mut kept = false;
     state::with_state(|s| {
@@ -1937,7 +1933,10 @@ fn restorable_instances(matches: &[state::TffaMatch; TOTAL_MATCH_SLOTS], max: us
 /// layer attached (`hooks::set_enabled` at the end of `GAME_INIT`), and the
 /// pristine module loaded.
 pub fn restore_instances() {
-    if !enabled() || crate::original::base() == 0 || !crate::hooks::engine_sv::attached() {
+    if !state::instances_enabled()
+        || crate::original::base() == 0
+        || !crate::hooks::engine_sv::attached()
+    {
         return;
     }
     let max = max_matches();
@@ -2051,7 +2050,7 @@ pub fn on_client_disconnect(client_num: c_int) {
     // The slot is free: other viewers' stale prefixed views of it will be
     // refreshed when the game clears `CS_PLAYERS + n` (empty base). Push an
     // immediate restore so a stale `(TFFA N)` does not linger.
-    if enabled() {
+    if state::instances_enabled() {
         let viewers: Vec<c_int> = state::with_state(|s| {
             (0..MAX_CLIENTS as c_int)
                 .filter(|v| s.clients[*v as usize].is_connected)
@@ -2072,7 +2071,7 @@ pub fn on_client_disconnect(client_num: c_int) {
 /// that runs first so the overrides below are built from the final team and
 /// instance.
 pub fn on_client_begin(client_num: c_int) {
-    if !enabled() {
+    if !state::instances_enabled() {
         return;
     }
     // The `map_restart` reconnect burst queues the game's own per-client
@@ -2220,7 +2219,7 @@ pub fn on_frame_start() {
     // gated on `enabled()`: a disable queues its releases a moment before this
     // and `enabled()` is already false by then.
     drain_world_releases();
-    if enabled() {
+    if state::instances_enabled() {
         clamp_global_scores();
         // Defensive: a spawn recorded by a call that never reached its close
         // (nothing should) is classified rather than carried into the next map.
@@ -3654,7 +3653,7 @@ fn ensure_world_scanned() -> bool {
     if state::with_state(|s| s.tffa.world_scanned) {
         return true;
     }
-    if !enabled() {
+    if !state::instances_enabled() {
         return false;
     }
     scan_world_entities();
@@ -4783,7 +4782,7 @@ fn rebuild_owned(s: &mut state::ProxyState, g_entities: usize) {
 
 /// Handle `tffa_*` client commands. Returns true when consumed (do not forward).
 pub fn handle_client_command(client_num: c_int) -> bool {
-    if !state::proxy_enabled() {
+    if !state::proxy_enabled() || state::instance_mode() == state::InstanceMode::Duel {
         return false;
     }
     let mut cmd = [0u8; MAX_TOKEN_CHARS];

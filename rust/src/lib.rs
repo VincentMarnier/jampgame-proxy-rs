@@ -240,7 +240,7 @@ pub unsafe extern "C" fn vmMain(
             // A disconnecting client drops what they carry
             // (`ClientDisconnect` → `TossClientItems`, `g_client.c:3876`): the
             // dropped items belong to the match the player was in (S9).
-            let scope = if tffa::enabled() {
+            let scope = if state::instances_enabled() {
                 Some(tffa::open_client_scope(a0))
             } else {
                 None
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn vmMain(
             // named target looks it up with `G_Find`, `g_cmds.c:3251`): running
             // it in the issuing player's scope keeps that lookup inside their
             // instance (S9).
-            let scope = if tffa::enabled() {
+            let scope = if state::instances_enabled() {
                 Some(tffa::open_client_scope(a0))
             } else {
                 None
@@ -463,7 +463,7 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // D-006 extension): the gentity cost of one further instance, and thus how
     // many matches the map can still take. Map entities now exist (the pristine
     // GAME_INIT spawned them).
-    if tffa::enabled() {
+    if state::instances_enabled() {
         tffa::scan_world_entities();
     }
     // Fresh round for the team lock (caps and grace bookkeeping cleared, the

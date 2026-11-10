@@ -313,7 +313,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 // One feature read per command: the same gate covers the
                 // kill-limit prune, the team-chat prune and the score rewrite
                 // below.
-                let tffa_on = crate::tffa::enabled();
+                let tffa_on = crate::state::instances_enabled();
                 // Team chat (`say_team` → `tchat`/`ltchat`) stays inside the
                 // sender's instance: G_SayTo already limited it to the sender's
                 // team, and this drops the recipients of another match (blue in
@@ -413,7 +413,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // that never turns the feature on pays one cvar read per trace and no
         // state buffer traffic at all.
         crate::sdk::G_TRACE | crate::sdk::G_G2TRACE | crate::sdk::G_TRACECAPSULE => {
-            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+            if crate::state::proxy_enabled() && crate::state::instances_enabled() {
                 let mut flips = crate::state::with_state(|s| core::mem::take(&mut s.tffa.flip_buf));
                 let n = crate::tffa::trace_flips(a5, a6, &mut flips);
                 if n > 0 {
@@ -454,7 +454,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // selection runs in the spawning player's instance); with no scope open
         // the query is pristine, exactly as before this gate.
         crate::sdk::G_ENTITIES_IN_BOX => {
-            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+            if crate::state::proxy_enabled() && crate::state::instances_enabled() {
                 let scope = crate::tffa::acting_scope();
                 if scope != crate::tffa::SCOPE_NONE {
                     // SAFETY: engine syscall registered; words forwarded.
@@ -478,7 +478,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             }
         }
         crate::sdk::G_ENTITY_CONTACT | crate::sdk::G_ENTITY_CONTACTCAPSULE => {
-            if crate::state::proxy_enabled() && crate::tffa::enabled() {
+            if crate::state::proxy_enabled() && crate::state::instances_enabled() {
                 let scope = crate::tffa::acting_scope();
                 if scope == crate::tffa::SCOPE_NONE {
                     // fall through to the pristine call below
@@ -531,7 +531,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             // for a later gamestate.
             if (a0 == CS_SCORES1 || a0 == CS_SCORES2)
                 && crate::state::proxy_enabled()
-                && crate::tffa::enabled()
+                && crate::state::instances_enabled()
                 && crate::state::with_state(|s| s.tffa.restart_burst)
             {
                 return 0;

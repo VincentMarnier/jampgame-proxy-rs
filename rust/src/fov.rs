@@ -691,7 +691,7 @@ pub unsafe fn apply(
     // viewer's line of sight and hide a player who is visible in their own
     // instance.
     let mut wall_flips = state::with_state(|s| core::mem::take(&mut s.tffa.flip_buf));
-    let wall_flips_n = if wall_cam.is_some() && crate::tffa::enabled() {
+    let wall_flips_n = if wall_cam.is_some() && crate::state::instances_enabled() {
         crate::tffa::trace_flips(viewer_client, MASK_OPAQUE, &mut wall_flips)
     } else {
         0
