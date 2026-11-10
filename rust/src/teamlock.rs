@@ -41,7 +41,7 @@
 use core::ffi::{CStr, c_char, c_int};
 use std::ffi::CString;
 
-use crate::hooks::engine_sv::{read_i32, read_usize};
+use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::hooks::{game_hook_original_set_team, original_call};
 use crate::sdk::{
     CON_DISCONNECTED, GT_CTF, GT_TEAM, MAX_CLIENTS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS,
@@ -660,6 +660,63 @@ pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
         }
     }
 }
+
+/// Run an explicit team request (`red`/`blue`) for `client_num` exactly as the
+/// game's own `Cmd_Team_f` would: through [`set_team`], so the password gate,
+/// the per-instance lock and the roster observers all apply. Used by the
+/// proxy's `join` spelling, which base JKA has no command for (the engine
+/// forwards the unknown line to the game module, whose `ClientCommand` has no
+/// arm for it).
+///
+/// The pristine `Cmd_Team_f` debounce is reproduced too: a request within five
+/// seconds of the last one is refused with the game's `NOSWITCH` text, and an
+/// attempt re-arms it even when `SetTeam` refuses (the password gate does not
+/// skip the debounce in the base path either).
+pub(crate) fn request_team(client_num: c_int, team: &'static CStr) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return;
+    }
+    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
+    let level = crate::original::level_address();
+    if g_entities == 0 || level == 0 {
+        return;
+    }
+    let ent = g_entities + client_num as usize * crate::sdk::SIZEOF_GENTITY;
+    // SAFETY: `ent` points into `g_entities`; a free slot's null `client` is
+    // filtered here before the game body would dereference it.
+    let client = unsafe { read_usize(ent + OFFSET_GENTITY_CLIENT) };
+    if client == 0 {
+        return;
+    }
+    // SAFETY: `client` is a live `gclient_t`; `level+32` is `level.time`.
+    let now = unsafe { read_i32(level + crate::sdk::OFFSET_LEVEL_TIME) };
+    // SAFETY: `switchTeamTime` is a plain int at the shipped binary's offset.
+    if unsafe { read_i32(client + crate::sdk::OFFSET_GCLIENT_SWITCH_TEAM_TIME) } > now {
+        let Ok(msg) = CString::new(NOSWITCH) else {
+            return;
+        };
+        // SAFETY: engine syscall registered; msg is NUL-terminated.
+        unsafe { syscall::send_server_command(client_num, &msg) };
+        return;
+    }
+    // SAFETY: same contract as the game's own call into the wrapper: a live
+    // client entity and a static C string.
+    unsafe { set_team(ent, team.as_ptr()) };
+    // SAFETY: as above; `Cmd_Team_f` reads `level.time` after `SetTeam` and
+    // stores `+5000`.
+    let now = unsafe { read_i32(level + crate::sdk::OFFSET_LEVEL_TIME) };
+    unsafe {
+        write_i32(
+            client + crate::sdk::OFFSET_GCLIENT_SWITCH_TEAM_TIME,
+            now + 5000,
+        )
+    };
+}
+
+/// The game's `MP_SVGAME`/`NOSWITCH` string (`strings/english/mp_svgame.str`),
+/// which pristine `Cmd_Team_f` prints for a request inside the 5-second
+/// debounce.
+const NOSWITCH: &str = "print \"May not switch teams more than once per 5 seconds.\n\"";
 
 #[cfg(test)]
 mod tests {

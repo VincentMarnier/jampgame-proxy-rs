@@ -894,6 +894,14 @@ command that names the instance the player is already in changes nothing
 (no needless death). Auto team picks (`team free`, the client's
 auto-join, `g_teamAutoJoin`) balance the match being joined rather than
 the whole server, so one match's sides stay even.
+Spectating follows the same rule: a spectator who watches a player of another
+match (the game's own `follow`/`follownext`) and then types `/team red` or
+`/team blue` (or `/join red`/`/join blue`, which the proxy accepts as the same
+request while parallel TFFA is on) joins **that** match, not the one they were
+assigned to — they are moved there as a spectator first and then put on the
+chosen team. A password-protected match still answers with the
+`tffa_join <id> <password>` invite instead of fielding a team; spectating it
+stays open.
 Each match is isolated: cross-match damage is
 dropped, cross-match players (and their projectiles, sabers and kill feed)
 are hidden from snapshots, and the scoreboard lists all matches' players — so

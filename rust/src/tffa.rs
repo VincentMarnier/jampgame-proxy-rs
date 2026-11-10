@@ -2541,7 +2541,17 @@ pub fn handle_client_command(client_num: c_int) -> bool {
     let end = cmd.iter().position(|&b| b == 0).unwrap_or(cmd.len());
     let name = &cmd[..end];
     if !name.starts_with(b"tffa") {
-        return false;
+        // A team request from a follow-spectating client names the instance it
+        // is **watching** (`/join red` on TFFA 2 must join TFFA 2, not the
+        // match its own `client_match` still points at). `join` reaches a JKA
+        // server as an unknown client command (the engine forwards it; the
+        // pristine `ClientCommand` has no such arm), so the proxy spells it
+        // out as the same request.
+        return if name == b"team" || name == b"join" {
+            join_spectated_instance(client_num, name == b"join")
+        } else {
+            false
+        };
     }
     // tffa commands work even when the feature gate (gametype) is off so
     // players get a helpful message instead of an unknown-command.
@@ -2569,8 +2579,189 @@ pub fn handle_client_command(client_num: c_int) -> bool {
     false
 }
 
-/// What a travel command must do about the client's team before it can move
-/// them to another instance.
+/// A `team`/`join` argument that asks to field a playing team, or `None` for
+/// every other request (`spectator`, `follow1`…). `free` (and `f`) is the
+/// game's own auto-pick: in a team gametype pristine `SetTeam` routes it through
+/// `PickTeam`, which the proxy already balances inside the instance.
+fn join_team_arg(arg: &[u8]) -> Option<&'static CStr> {
+    if arg.eq_ignore_ascii_case(b"red") || arg.eq_ignore_ascii_case(b"r") {
+        Some(c"red")
+    } else if arg.eq_ignore_ascii_case(b"blue") || arg.eq_ignore_ascii_case(b"b") {
+        Some(c"blue")
+    } else if arg.eq_ignore_ascii_case(b"free") || arg.eq_ignore_ascii_case(b"f") {
+        Some(c"free")
+    } else {
+        None
+    }
+}
+
+/// What a playing-team request from a follow-spectating client must do about
+/// instances before the team join can run. Pure for the tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpectatedJoin {
+    /// Already in the instance being watched (or not watching another one):
+    /// nothing to move, the game's own join path applies.
+    Same,
+    /// Move first: `runtime` is the slot the watched game runs in, `identity`
+    /// its TFFA id (a game promoted into the main slot keeps its own id).
+    Travel { runtime: u8, identity: u8 },
+    /// The watched created match no longer exists.
+    NotActive,
+    /// Its outcome is already decided, so joining it would only bounce the
+    /// client back to spectator.
+    Ending,
+    /// It already holds `proxy_parallel_tffas_maxGroupSize` members.
+    Full,
+}
+
+/// Decide the move for a team request. Main is never refused (it is implicit
+/// and always hosts a game), exactly like `tffa_join 0`; a created match is
+/// checked with the same three rules `tffa_join` applies before a travel.
+#[allow(clippy::too_many_arguments)]
+fn spectated_join(
+    runtime: u8,
+    watched: u8,
+    main_origin: u8,
+    watched_active: bool,
+    watched_ending: bool,
+    watched_size: usize,
+    max_group: usize,
+) -> SpectatedJoin {
+    if watched == runtime {
+        return SpectatedJoin::Same;
+    }
+    if watched != MAIN_MATCH {
+        if !watched_active {
+            return SpectatedJoin::NotActive;
+        }
+        if watched_ending {
+            return SpectatedJoin::Ending;
+        }
+        if watched_size >= max_group {
+            return SpectatedJoin::Full;
+        }
+    }
+    SpectatedJoin::Travel {
+        runtime: watched,
+        identity: slot_identity(main_origin, watched),
+    }
+}
+
+/// Run the join request the client sent (`team red|blue|free`, or the same
+/// with `join`) in the instance it is spectating.
+///
+/// A follow-spectating client sees the followed player's instance
+/// (`effective_match`, D-006.6 follow round) but its own `client_match` still
+/// names the match it was assigned to, so the pristine `SetTeam` would put it
+/// on a team of the wrong match and drop it out of what it was watching. This
+/// moves it to the watched instance first (as a spectator, the same step every
+/// `tffa_join` makes), then lets the request run there: a protected match still
+/// answers through the existing `SetTeam` password gate with the
+/// `tffa_join <id> <password>` invite.
+///
+/// Returns true when the command was consumed (progress was refused or the
+/// `join` spelling was handled here); false lets the engine's `team` path
+/// continue, now in the watched instance.
+fn join_spectated_instance(client_num: c_int, alias: bool) -> bool {
+    let mut arg = [0u8; 16];
+    let len = cmd_arg(1, &mut arg);
+    let Some(team) = join_team_arg(&arg[..len]) else {
+        // Bare `team`, `team spectator`, `team score(board)` and follow
+        // requests are not a playing-team join and keep their pristine
+        // behaviour.
+        return false;
+    };
+    if !enabled() {
+        return false;
+    }
+    let runtime = client_match(client_num);
+    let watched = effective_match(client_num);
+    let main_origin = state::with_state(|s| s.tffa.main_origin);
+
+    if watched == runtime {
+        if !alias {
+            return false;
+        }
+        // `join` is not a base game command: run the request the game's
+        // `Cmd_Team_f` would run, through the same `SetTeam` wrapper (caps and
+        // password gate included) and inside the client's acting scope.
+        let previous = open_client_scope(client_num);
+        crate::teamlock::request_team(client_num, team);
+        close_acting_scope(previous);
+        return true;
+    }
+
+    let (watched_active, watched_ending) = state::with_state(|s| {
+        s.tffa
+            .matches
+            .get(watched as usize)
+            .map_or((false, false), |m| (m.active, m.ending()))
+    });
+    let decision = spectated_join(
+        runtime,
+        watched,
+        main_origin,
+        watched_active,
+        watched_ending,
+        match_size(watched),
+        max_group_size(),
+    );
+    let identity = slot_identity(main_origin, watched);
+    match decision {
+        SpectatedJoin::Same => false,
+        SpectatedJoin::NotActive => {
+            tell(client_num, "print \"That match is not active.\n\"");
+            true
+        }
+        SpectatedJoin::Ending => {
+            tell(
+                client_num,
+                &format!("print \"Match {identity} is ending.\n\""),
+            );
+            true
+        }
+        SpectatedJoin::Full => {
+            tell(client_num, "print \"That match is full.\n\"");
+            true
+        }
+        SpectatedJoin::Travel { runtime, identity } => {
+            if !travel_to_spectator(client_num) {
+                return true;
+            }
+            cmd_leave_silent(client_num);
+            state::with_state(|s| {
+                assign_client_instance(
+                    &mut s.tffa.client_match,
+                    &mut s.tffa.home,
+                    &mut s.tffa.player_score,
+                    &mut s.clients,
+                    client_num,
+                    runtime,
+                );
+                // A promoted game keeps its own id as the client's identity,
+                // even though both play in the main slot.
+                s.tffa.home[client_num as usize] = identity;
+            });
+            forget_return_rosters(client_num);
+            reset_game_scores(client_num);
+            broadcast_cs_players_slot(client_num);
+            refresh_cs_players_for_viewer(client_num);
+            tell(
+                client_num,
+                &format!("print \"Moved to match {identity} (the match you are spectating).\n\""),
+            );
+            if alias {
+                let previous = open_client_scope(client_num);
+                crate::teamlock::request_team(client_num, team);
+                close_acting_scope(previous);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TravelMove {
     /// Already spectating: nothing to do.
@@ -5195,6 +5386,92 @@ mod tests {
         assert_eq!(join_target(9, 8), None);
         // A wrapped negative must not select the top slot.
         assert_eq!(join_target(i32::MIN, 8), None);
+    }
+
+    /// `/join red` from a spectator watching another instance: the move goes to
+    /// the watched game, never to the match the client is assigned to. Main is
+    /// accepted as a destination (a promoted game keeps its own identity), and
+    /// a created match is checked with the same active/ending/full rules
+    /// `tffa_join` applies.
+    #[test]
+    fn a_spectated_join_travels_to_the_watched_instance() {
+        // Already there: no move, the game's own join path runs.
+        assert_eq!(
+            spectated_join(2, 2, 0, true, false, 0, 12),
+            SpectatedJoin::Same
+        );
+        // Spectating TFFA 2 from another match: travel there under its own id.
+        assert_eq!(
+            spectated_join(0, 2, 0, true, false, 1, 12),
+            SpectatedJoin::Travel {
+                runtime: 2,
+                identity: 2
+            }
+        );
+        // Watching main from a created match: back to main.
+        assert_eq!(
+            spectated_join(3, MAIN_MATCH, 0, true, false, 0, 12),
+            SpectatedJoin::Travel {
+                runtime: MAIN_MATCH,
+                identity: MAIN_MATCH
+            }
+        );
+        // Watching a promoted game in the main slot: runtime 0, identity 5.
+        assert_eq!(
+            spectated_join(3, MAIN_MATCH, 5, true, false, 0, 12),
+            SpectatedJoin::Travel {
+                runtime: MAIN_MATCH,
+                identity: 5
+            }
+        );
+        // Main is never refused for the rules that only guard created slots.
+        assert_eq!(
+            spectated_join(1, MAIN_MATCH, 0, false, true, 99, 12),
+            SpectatedJoin::Travel {
+                runtime: MAIN_MATCH,
+                identity: MAIN_MATCH
+            }
+        );
+        // Created match rules.
+        assert_eq!(
+            spectated_join(0, 2, 0, false, false, 0, 12),
+            SpectatedJoin::NotActive
+        );
+        assert_eq!(
+            spectated_join(0, 2, 0, true, true, 0, 12),
+            SpectatedJoin::Ending
+        );
+        assert_eq!(
+            spectated_join(0, 2, 0, true, false, 12, 12),
+            SpectatedJoin::Full
+        );
+        assert_eq!(
+            spectated_join(0, 2, 0, true, false, 11, 12),
+            SpectatedJoin::Travel {
+                runtime: 2,
+                identity: 2
+            }
+        );
+    }
+
+    /// Only a playing-team request is a join; every other `team` request keeps
+    /// its pristine meaning (spectator/follow/scoreboard must not move the
+    /// client between instances).
+    #[test]
+    fn only_a_playing_team_request_is_a_join() {
+        assert_eq!(join_team_arg(b"red"), Some(c"red"));
+        assert_eq!(join_team_arg(b"RED"), Some(c"red"));
+        assert_eq!(join_team_arg(b"r"), Some(c"red"));
+        assert_eq!(join_team_arg(b"blue"), Some(c"blue"));
+        assert_eq!(join_team_arg(b"B"), Some(c"blue"));
+        // The game's auto-pick (`PickTeam` within the instance).
+        assert_eq!(join_team_arg(b"free"), Some(c"free"));
+        assert_eq!(join_team_arg(b"F"), Some(c"free"));
+        assert_eq!(join_team_arg(b"spectator"), None);
+        assert_eq!(join_team_arg(b"s"), None);
+        assert_eq!(join_team_arg(b"score"), None);
+        assert_eq!(join_team_arg(b"follow1"), None);
+        assert_eq!(join_team_arg(b""), None);
     }
 
     /// A protected match is marked in `tffa_list`, including a protected game

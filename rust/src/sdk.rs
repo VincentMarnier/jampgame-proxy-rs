@@ -889,6 +889,15 @@ pub const OFFSET_PERS_TEAM_INFO: usize = 152;
 pub const OFFSET_PERS_VOTE_COUNT: usize = 144;
 /// `offsetof(gclient_t, mGameFlags)` — `PSG_VOTED` lives here.
 pub const OFFSET_GCLIENT_MGAMEFLAGS: usize = 7216;
+/// `offsetof(gclient_t, switchTeamTime)` in the **shipped** module: the 5-second
+/// team-switch debounce `Cmd_Team_f` applies. `Cmd_Team_f__FP9gentity_s`
+/// (`0x1252b8`) reads `client->switchTeamTime` at `0x125444`
+/// (`mov 0x173c(%edx),%eax`, after `mov 0x360(%ebx),%edx` loads `ent->client`)
+/// and compares it with `level.time` (`level+32`), then re-arms it at
+/// `0x1254b6` (`mov %eax,0x173c(%edx)` with `level.time + 0x1388`). The SDK
+/// header layout computes 6444, but the shipped binary — authoritative per the
+/// project rules — uses `0x173c` = 6396.
+pub const OFFSET_GCLIENT_SWITCH_TEAM_TIME: usize = 0x173c;
 
 /// `offsetof(clientSession_t, sessionTeam)` — team_t.
 pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
@@ -1204,6 +1213,7 @@ mod tests {
         assert_eq!(OFFSET_PERS_TEAM_INFO, 152);
         assert_eq!(OFFSET_PERS_VOTE_COUNT, 144);
         assert_eq!(OFFSET_GCLIENT_MGAMEFLAGS, 7216);
+        assert_eq!(OFFSET_GCLIENT_SWITCH_TEAM_TIME, 0x173c);
         assert_eq!(OFFSET_PS_WEAPON, 176);
         assert_eq!(OFFSET_PS_LEGS_FLIP, 120);
         assert_eq!(OFFSET_PS_TORSO_FLIP, 124);

@@ -1523,6 +1523,92 @@ that used to become permanent, and it names the one client whose view is at
 risk. With the fix the next full re-push replays it, so the log is evidence
 that the trigger occurred and that the repair ran, not a symptom by itself.
 
+### D-006.17 — An explicit team request joins the instance being spectated
+
+*Status: landed (user directive, 2026-11-10). Runtime A6 below.*
+
+A follow-spectating client already *sees* the followed player's instance
+(`effective_match`, the follow round above): snapshot, per-viewer `CS_PLAYERS`,
+the `scores` header and the scoreboard are all built for it. Its own
+`client_match`, however, still names the instance it is assigned to (main, or
+the match it left), so an explicit `/team red`/`/team blue` — what the Join
+buttons and `/join red` mean to a player — was resolved by pristine `SetTeam`
+against the **wrong** match: it put the spectator on main's red team (or their
+old match's) and dropped them out of what they were watching. Reported as:
+*people who spectate a TFFA instance should join that very same TFFA.*
+
+**Decision.** Before an explicit playing-team request runs, a client whose
+`effective_match` differs from its `client_match` is moved to the watched
+instance, exactly as `tffa_join` moves a client: the pristine set-team-to-
+spectator step (`travel_to_spectator`; a spectator is already there), then
+`cmd_leave_silent` + `assign_client_instance` with `home` set to the watched
+game's **identity** (a promoted game in the main slot keeps its own id,
+D-006.11). The team request then runs in that instance. Only a playing-team
+argument counts (`red`/`r`, `blue`/`b`, and the game's auto-pick `free`/`f`);
+bare `team`, `team spectator`, `team score(board)` and the `follow*` requests
+keep their pristine meaning and never move a client.
+
+Target checks reuse `tffa_join`'s: a created match must be active, not inside
+its end delay, and below `proxy_parallel_tffas_maxGroupSize`; main is never
+refused (it is implicit and always hosts a game). A refusal prints the same
+`That match is not active.` / `Match {id} is ending.` / `That match is full.`
+lines and consumes the request, so the spectator is never silently dropped into
+their own match.
+
+**Passwords.** The move happens first — spectating a protected match is always
+allowed — and the normal `SetTeam` password gate then refuses the team and
+sends the existing invite: `This match is password protected: use tffa_join
+<id> <password> to play in it. Anyone may spectate.` The client is now assigned
+to the protected match as a spectator, so `tffa_join <id> <password>` in place
+takes the `already in` branch (`authenticate_here`), records `pass_ok` and the
+next `/team red|blue` plays there. This is exactly the requested flow.
+
+**`/join` spelling.** Base JKA has no client-side `join` command: the engine
+forwards an unknown console line to the server, and the game module's
+`ClientCommand` has no `join` arm, so `/join red` was a no-op there. While
+parallel TFFA is enabled the proxy now accepts `join red|blue|r|b|free|f` as
+the same request. Because there is no pristine `Cmd_Team_f` to continue into,
+the proxy runs the join itself through the same `SetTeam` wrapper
+(`teamlock::request_team`: password gate, per-instance lock, roster observers)
+inside the client's acting scope. It also reproduces `Cmd_Team_f`'s 5-second
+team-switch debounce — read and re-armed at the **shipped** module's
+`gclient_t.switchTeamTime` offset `0x173c` (disassembly: read `0x125444`, write
+`0x1254b6`; the SDK header's computed 6444 is wrong for the shipped binary,
+which wins per project rules) — including the base quirk that a refused attempt
+still arms it, and with the `MP_SVGAME`/`NOSWITCH` English text.
+
+**Tests.** `a_spectated_join_travels_to_the_watched_instance` (same match, a
+created target, main, a promoted main with its own identity, and the
+active/ending/full refusals), `only_a_playing_team_request_is_a_join` (team
+tokens vs spectator/follow/scoreboard), plus the existing travel/assignment
+tests. `cargo test` 445/445, `clippy --all-targets -D warnings`, `fmt --check`
+and the i686 release build are green.
+
+**Runtime (A6, `tools/runtime/a6_tffa_spectate_join.sh`).** `linuxjampded` +
+this proxy, `mp/ctf1`, `g_gametype 6`, `proxy_parallel_tffas_enable 1`, four
+synthetic protocol clients. `Alpha` creates match 1 (open), `Bravo` match 2
+(`tffa_create hunter2`); `Charlie` follows `Alpha`, `Delta` follows `Bravo`.
+Observed via `tffa_list` and per-viewer `CS_PLAYERS`:
+
+```text
+before: 0 (main): 2 players | 1: 1 players | 2: 1 players [password]
+mid:    0 (main): 0 players | 1: 2 players | 2: 2 players [password]
+after:  0 (main): 0 players | 1: 2 players | 2: 2 players [password]
+
+Charlie  join red      -> "Moved to match 1 (the match you are spectating)."
+                          then t=1 in match 1; an immediate join blue ->
+                          "May not switch teams more than once per 5 seconds."
+Delta    team red      -> "Moved to match 2 ..."
+                          + "This match is password protected: use tffa_join
+                             2 <password> to play in it. Anyone may spectate."
+Delta    tffa_join 2 hunter2 -> "Password accepted: join a team with /team red|blue."
+Delta    team red      -> t=1 in match 2, as seen from Bravo
+```
+
+i.e. both spectators left main for the instance they were watching, the
+protected one got the invite, and the open one joined its team directly. The
+harness asserts every line above and exits 0.
+
 ## Consequences
 
 - New hooks: game `AddScore`, engine `SV_AddEntitiesVisibleFromPoint`
