@@ -962,8 +962,8 @@ coverage is never traded for match count.
 ### Parallel duels
 
 With `proxy_parallel_duels_enable 1` (`GT_DUEL` only), the map runs several
-1v1 duels at once. Every connected willing player (spectators by default, plus
-bots) is shuffled into courts: court 1 plays in the main world, the others in
+1v1 duels at once. Every connected player (and bot) is willing by default and
+is shuffled into courts: court 1 plays in the main world, the others in
 their own instance, so courts neither see, hit, hear nor collide with each
 other. Each court plays one duel to the server's `fraglimit`; the round ends
 when every court is decided, the stock intermission shows the board, and a real

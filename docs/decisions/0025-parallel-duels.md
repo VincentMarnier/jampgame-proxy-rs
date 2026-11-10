@@ -47,9 +47,12 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
     mid-duel takes over immediately.
 12. **Cvar off (or a gametype/map change) tears the ladder down** and returns
     everyone to spectator, so the stock duel tournament resumes.
-13. **Willingness is proxy-side**: seeded at connect from userinfo `team == "s"`,
-    set by an explicit spectator request, never changed by the ladder's own
-    trampoline moves. A queued player's `team free` is refused and stays queued.
+13. **Willingness is proxy-side**: a connecting client is willing by default
+    (the stock "waiting in line" case; a fresh userinfo usually has no `team`
+    key, and `team s` is only the "not waiting in line" marker), set by an
+    explicit spectator request (it joins if not on a court and leaves — with a
+    walkover — if on one), and never changed by the ladder's own trampoline
+    moves. A queued player's `team free` is refused and stays queued.
 14. **Mid-duel leaver → walkover win.**
 15. **Bots are drafted like players.**
 16. **Court count** = what the map can host, up to `floor(willing/2)` and 16;
@@ -174,6 +177,11 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
   - a joiners run grew the ladder 1 → 2 → 3 courts across round boundaries as
     bots joined (`bot_minplayers` raised mid-ladder), with the bench growing
     and shrinking around it;
+  - with `timelimit 8`, every round (fresh and carried) measured 8000 ms from
+    its own clock start to expiry, so the limit is per match, not per ladder;
+  - round/enable/champion messages showed player names (bots' netnames) rather
+    than slot numbers after the carried round was announced at its first
+    spawned frame;
   - `rcon map_restart` → `classified as Admin`, `GAME_INIT … carry=false`;
   - `rcon proxy_parallel_duels_enable 0` → teardown, the stock duel resumes;
   - re-enable → takeover and a new ladder.

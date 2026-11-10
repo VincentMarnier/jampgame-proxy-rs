@@ -588,12 +588,17 @@ pub fn score_order(courts: &[Court], queue: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// The per-round announcement: one line per court plus the bench.
-pub fn round_announcement(courts: &[Court], queue: &[u8]) -> String {
+pub fn round_announcement(courts: &[Court], queue: &[u8], names: &[String; MAX_CLIENTS]) -> String {
     let mut out = String::from("Parallel duels - this round:");
     for (i, court) in courts.iter().enumerate() {
         match (court.a, court.b) {
             (Some(a), Some(b)) => {
-                out.push_str(&format!("\n court {}: #{a} vs #{b}", i + 1));
+                out.push_str(&format!(
+                    "\n court {}: {} vs {}",
+                    i + 1,
+                    name_label(names, a),
+                    name_label(names, b)
+                ));
             }
             _ => {
                 out.push_str(&format!("\n court {}: -", i + 1));
@@ -603,15 +608,15 @@ pub fn round_announcement(courts: &[Court], queue: &[u8]) -> String {
     if queue.is_empty() {
         out.push_str("\n bench: empty.");
     } else {
-        let names: Vec<String> = queue.iter().map(|c| format!("#{c}")).collect();
-        out.push_str(&format!("\n bench: {}.", names.join(", ")));
+        let bench: Vec<String> = queue.iter().map(|&c| name_label(names, c)).collect();
+        out.push_str(&format!("\n bench: {}.", bench.join(", ")));
     }
     out
 }
 
 /// Champion announcement.
-pub fn champion_announcement(client_num: u8, wins: i32) -> String {
-    format!("Ladder champion: #{client_num} with {wins} duel win(s) - a fresh ladder starts now.")
+pub fn champion_announcement(champion: &str, wins: i32) -> String {
+    format!("Ladder champion: {champion} with {wins} duel win(s) - a fresh ladder starts now.")
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +631,6 @@ pub const BOARD_MS: i32 = 4000;
 pub const RESOLVE_VOID_MS: i32 = 1000;
 /// Court players spawned per frame after a restart burst (D-006.12 deferral).
 const SPAWN_PER_FRAME: usize = 4;
-/// Base-JA's "willing spectator, not waiting in line" userinfo marker.
-const WILLING_TEAM: &[u8] = b"s";
 
 /// Whether the parallel-duel feature owns the game right now.
 pub fn mode_on() -> bool {
@@ -702,6 +705,40 @@ fn is_bot(client_num: c_int) -> bool {
         && state::with_state(|s| s.clients[client_num as usize].is_bot)
 }
 
+/// Display name of a client: the name the game last put in `CS_PLAYERS`
+/// (colour codes kept), else the live `pers.netname` cleaned, else `#slot`.
+fn client_name(client_num: u8) -> String {
+    let slot = client_num as usize;
+    if slot < MAX_CLIENTS {
+        let from_cs =
+            state::with_state(|s| crate::instances::info_value(&s.tffa.cs_players_base[slot], "n"));
+        if let Some(name) = from_cs.filter(|n| !n.is_empty()) {
+            return name;
+        }
+    }
+    let mut buf = [0u8; crate::sdk::MAX_NETNAME];
+    crate::hooks::game::client_clean_netname(client_num as c_int, &mut buf);
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
+    if name.is_empty() {
+        format!("#{client_num}")
+    } else {
+        name
+    }
+}
+
+fn client_names() -> [String; MAX_CLIENTS] {
+    core::array::from_fn(|i| client_name(i as u8))
+}
+
+fn name_label(names: &[String; MAX_CLIENTS], client_num: u8) -> String {
+    names
+        .get(client_num as usize)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("#{client_num}"))
+}
+
 fn cvar(name: &CStr) -> i32 {
     // SAFETY: engine syscall registered (GAME_INIT ran before any frame).
     unsafe { syscall::cvar_variable_integer_value(name) }
@@ -717,35 +754,6 @@ fn timelimit() -> i32 {
 
 fn duel_fraglimit() -> i32 {
     cvar(c"duel_fraglimit")
-}
-
-fn userinfo(client_num: c_int) -> Vec<u8> {
-    let mut buf = [0u8; crate::sdk::MAX_INFO_STRING];
-    if !(0..MAX_CLIENTS as c_int).contains(&client_num) || original::base() == 0 {
-        return Vec::new();
-    }
-    // SAFETY: engine syscall registered; buffer writable.
-    unsafe { syscall::get_userinfo(client_num, &mut buf) };
-    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    buf[..n].to_vec()
-}
-
-/// Base JA's `userinfo` `team` marker, byte-exact (IPv6/latin-1 safe).
-fn userinfo_team_is_willing(info: &[u8]) -> bool {
-    // `\team\s` or `team\s`; the info string is a sequence of backslash pairs.
-    let mut parts = info.split(|&b| b == b'\\');
-    let mut key = None;
-    for part in parts.by_ref() {
-        match key.take() {
-            None => key = Some(part),
-            Some(k) => {
-                if k.eq_ignore_ascii_case(b"team") {
-                    return part == WILLING_TEAM;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// In-game `print` payload: quote-safe and single-byte. The 2003 client parses
@@ -861,28 +869,16 @@ fn court_of(client_num: u8) -> Option<usize> {
     })
 }
 
-fn any_court_player_connected() -> bool {
-    state::with_state(|s| {
-        s.duel.courts[..s.duel.court_count]
-            .iter()
-            .flat_map(|c| c.players())
-            .any(|c| s.clients[c as usize].is_connected)
-    })
-}
-
 /// Seed willingness for every connected client (cvar turned on mid-map, so
 /// the connects happened while the feature was off).
 fn seed_all_willing() {
-    let clients: Vec<(usize, bool, bool)> = state::with_state(|s| {
-        (0..MAX_CLIENTS)
-            .filter(|&i| s.clients[i].is_connected)
-            .map(|i| (i, s.clients[i].is_bot, s.duel.willing[i]))
-            .collect()
+    state::with_state(|s| {
+        for i in 0..MAX_CLIENTS {
+            if s.clients[i].is_connected {
+                s.duel.willing[i] = true;
+            }
+        }
     });
-    for (i, bot, current) in clients {
-        let willing = bot || current || userinfo_team_is_willing(&userinfo(i as c_int));
-        state::with_state(|s| s.duel.willing[i] = willing);
-    }
 }
 
 /// `GAME_CLIENT_CONNECT` bookkeeping: seed this client's willingness. A fresh
@@ -895,7 +891,10 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
     }
     let n = client_num as usize;
     let bot = is_bot(client_num);
-    let willing = bot || userinfo_team_is_willing(&userinfo(client_num));
+    // A normal connect is base JA's "waiting in line" case (no `team s`
+    // marker): the client asked to play, so it is willing. Only the ladder's
+    // own spectator move (a court player leaving) clears the flag.
+    let willing = true;
     state::with_state(|s| {
         if first_time || !s.duel.ladder {
             s.duel.willing[n] = willing;
@@ -1149,11 +1148,6 @@ fn install_carried_courts() {
             }
         }
     });
-    announce(&state::with_state(|s| {
-        round_announcement(&s.duel.courts[..s.duel.court_count], &s.duel.queue)
-    }));
-    refresh_all_cs_players();
-    push_hud();
 }
 
 /// One instance capacity: the main slot plus the clone sets the map can host,
@@ -1264,12 +1258,14 @@ fn start_round() {
         )
     });
     eprintln!(
-        "----- proxy-rs: parallel duels round {} — {} court(s), {} queued",
+        "----- proxy-rs: parallel duels round {} - {} court(s), {} queued (timelimit {}s)",
         serial,
         courts.len(),
-        queue.len()
+        queue.len(),
+        timelimit()
     );
-    announce(&round_announcement(&courts, &queue));
+    let names = client_names();
+    announce(&round_announcement(&courts, &queue, &names));
     refresh_all_cs_players();
     push_hud();
 }
@@ -1317,6 +1313,28 @@ fn park_non_court_players() {
     }
 }
 
+/// Whether a carried round can start its clock: every connected court player
+/// has its body (`spawned`), and at least one court has a connected player.
+/// A disconnected player is treated as ready (the court resolves as a
+/// walkover); this keeps the full round timelimit for the players who did
+/// reconnect instead of starting it at the first reconnect.
+fn round_can_start() -> bool {
+    state::with_state(|s| {
+        let mut any_connected = false;
+        for court in s.duel.courts.iter().take(s.duel.court_count) {
+            for player in court.players() {
+                if s.clients[player as usize].is_connected {
+                    any_connected = true;
+                    if !s.duel.spawned[player as usize] {
+                        return false;
+                    }
+                }
+            }
+        }
+        any_connected
+    })
+}
+
 /// `GAME_RUN_FRAME` pre-pass.
 pub fn on_frame_start() {
     if !mode_on() {
@@ -1352,7 +1370,18 @@ pub fn on_frame_start() {
             s.duel.queue.clear();
             s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
         });
-        announce("Parallel duels enabled - the ladder starts with two willing players.");
+        let roster = roster();
+        let names = client_names();
+        let players: Vec<String> = roster.iter().map(|&c| name_label(&names, c)).collect();
+        if players.len() >= 2 {
+            announce(&format!(
+                "Parallel duels enabled - {} willing player(s): {}.",
+                players.len(),
+                players.join(", ")
+            ));
+        } else {
+            announce("Parallel duels enabled - waiting for at least two willing players.");
+        }
     }
     if !state::with_state(|s| s.duel.ladder) {
         return;
@@ -1366,13 +1395,25 @@ pub fn on_frame_start() {
         )
     });
     if phase == DuelPhase::Playing && !started {
-        if any_court_player_connected() {
+        if round_can_start() {
             let now = level_time();
+            let tl = timelimit();
+            eprintln!(
+                "----- proxy-rs: parallel duels round clock start level.time={now} timelimit={tl}s"
+            );
             state::with_state(|s| {
                 s.duel.round_start = now;
                 s.duel.round_clock_started = true;
                 s.duel.carried_at = 0;
             });
+            // Announce once the clients are back: at `GAME_INIT` the game
+            // slots are still empty, so names would fall back to slot numbers.
+            let names = client_names();
+            announce(&state::with_state(|s| {
+                round_announcement(&s.duel.courts[..s.duel.court_count], &s.duel.queue, &names)
+            }));
+            refresh_all_cs_players();
+            push_hud();
         } else {
             // A carried round nobody reconnected into (every client left while
             // the board was up): fall back to a fresh formation instead of
@@ -1459,7 +1500,17 @@ pub fn on_run_frame_post() {
     let round_start = state::with_state(|s| s.duel.round_start);
 
     // Per-round timelimit: every unresolved court decides on HP + shield now.
-    if tl > 0 && level_time().wrapping_sub(round_start) >= tl.saturating_mul(1000) {
+    let unresolved = state::with_state(|s| {
+        s.duel.courts[..count]
+            .iter()
+            .any(|c| !c.resolved && !c.void)
+    });
+    if tl > 0 && unresolved && level_time().wrapping_sub(round_start) >= tl.saturating_mul(1000) {
+        eprintln!(
+            "----- proxy-rs: parallel duels round timelimit expired elapsed={}ms limit={}ms",
+            level_time().wrapping_sub(round_start),
+            tl.saturating_mul(1000)
+        );
         let mut pick = state::with_state(|s| s.duel.seed).wrapping_add(now as u32);
         for i in 0..count {
             let court = state::with_state(|s| s.duel.courts[i]);
@@ -1634,8 +1685,9 @@ fn end_round() {
             "----- proxy-rs: parallel duels champion client {} with {} win(s)",
             champ, wins
         );
-        announce(&champion_announcement(champ, wins));
-        announce_center(&champion_announcement(champ, wins));
+        let champion_name = client_name(champ);
+        announce(&champion_announcement(&champion_name, wins));
+        announce_center(&champion_announcement(&champion_name, wins));
         state::with_state(|s| {
             s.duel.champion = Some(champ);
             s.duel.fresh_restart = true;
@@ -2526,11 +2578,12 @@ mod tests {
 
     #[test]
     fn round_message_uses_real_newlines_and_single_byte_text() {
-        let text = round_announcement(&[Court::new(1, 2), Court::new(3, 4)], &[7]);
+        let names = core::array::from_fn(|i| format!("P{i}"));
+        let text = round_announcement(&[Court::new(1, 2), Court::new(3, 4)], &[7], &names);
         assert!(text.is_ascii(), "client renders latin-1: {text:?}");
-        assert!(text.contains("\n court 1: #1 vs #2"), "{text:?}");
-        assert!(text.contains("\n court 2: #3 vs #4"), "{text:?}");
-        assert!(text.contains("\n bench: #7"), "{text:?}");
+        assert!(text.contains("\n court 1: P1 vs P2"), "{text:?}");
+        assert!(text.contains("\n court 2: P3 vs P4"), "{text:?}");
+        assert!(text.contains("\n bench: P7"), "{text:?}");
         // A UI dash or curly quote becomes single-byte, never a literal
         // backslash-n or UTF-8 mojibake.
         let safe = message_safe("a \u{2014} \u{201c}b\u{201d}");
@@ -2655,11 +2708,12 @@ mod tests {
     #[test]
     fn messages_name_courts_and_bench() {
         let courts = vec![Court::new(1, 2), Court::new(3, 4)];
-        let text = round_announcement(&courts, &[7]);
-        assert!(text.contains("court 1: #1 vs #2"));
-        assert!(text.contains("court 2: #3 vs #4"));
-        assert!(text.contains("bench: #7"));
-        assert!(round_announcement(&courts, &[]).contains("bench: empty"));
-        assert!(champion_announcement(5, 3).contains("#5"));
+        let names = core::array::from_fn(|i| format!("P{i}"));
+        let text = round_announcement(&courts, &[7], &names);
+        assert!(text.contains("court 1: P1 vs P2"));
+        assert!(text.contains("court 2: P3 vs P4"));
+        assert!(text.contains("bench: P7"));
+        assert!(round_announcement(&courts, &[], &names).contains("bench: empty"));
+        assert!(champion_announcement("P5", 3).contains("P5"));
     }
 }
