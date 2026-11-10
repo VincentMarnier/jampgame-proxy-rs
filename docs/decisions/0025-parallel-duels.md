@@ -31,9 +31,11 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
 4. **Round transition = real `map_restart`** (the stock duel cycle).
 5. **Only the proxy's own round restart carries.** A voted or rcon
    `map_restart` is an admin restart → fresh shuffle and reset standings.
-6. **Per-round timelimit**, reset with each round; expiry decides unfinished
-   courts by HP + shield (`AdjustTournamentScores`' rule), exact tie random.
-   `timelimit 0` = no round cap.
+6. **Per-round timelimit**, reset with each round; the server's own
+   `timelimit` cvar is in minutes and is compared as `minutes * 60000` ms.
+   Expiry decides unfinished courts by HP + shield
+   (`AdjustTournamentScores`' rule), exact tie random. `timelimit 0` = no
+   round cap.
 7. **Ladder ends at `duel_fraglimit` wins.** The round finishes first, then
    champion + fresh ladder. `duel_fraglimit 0` = endless ladder.
 8. **Ladder-long standings** (W/L) live proxy-side, reset only on a new
@@ -49,10 +51,11 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
     everyone to spectator, so the stock duel tournament resumes.
 13. **Willingness is proxy-side**: a connecting client is willing by default
     (the stock "waiting in line" case; a fresh userinfo usually has no `team`
-    key, and `team s` is only the "not waiting in line" marker), set by an
-    explicit spectator request (it joins if not on a court and leaves — with a
-    walkover — if on one), and never changed by the ladder's own trampoline
-    moves. A queued player's `team free` is refused and stays queued.
+    key, and `team s` is only the "not waiting in line" marker). An explicit
+    `/team spectator` request is the only way out: it removes a queued player
+    from the bench and gives a court player's opponent a walkover. `team free`
+    is refused and never removes anyone. The ladder's own trampoline moves
+    never change the flag.
 14. **Mid-duel leaver → walkover win.**
 15. **Bots are drafted like players.**
 16. **Court count** = what the map can host, up to `floor(willing/2)` and 16;
@@ -177,8 +180,9 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
   - a joiners run grew the ladder 1 → 2 → 3 courts across round boundaries as
     bots joined (`bot_minplayers` raised mid-ladder), with the bench growing
     and shrinking around it;
-  - with `timelimit 8`, every round (fresh and carried) measured 8000 ms from
-    its own clock start to expiry, so the limit is per match, not per ladder;
+  - with `timelimit 1` (one minute) a round expired at 60000 ms from its own
+    clock start, and carried rounds were re-measured against their own start,
+    so the limit is per match, not per ladder;
   - round/enable/champion messages showed player names (bots' netnames) rather
     than slot numbers after the carried round was announced at its first
     spawned frame;
@@ -188,6 +192,10 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 - Announcements are single-byte ASCII with real newlines (`message_safe` +
   `print`), so a stock latin-1 client renders the round board and champion
   text instead of `\n` and UTF-8 mojibake.
+- The end-of-duel scoreboard no longer triggers an all-viewer `CS_PLAYERS`
+  refresh: only the viewer asking for the board gets its labels/W-L pushed,
+  removing the O(viewers²) reliable burst that could hang clients at round
+  end.
 - Teardown restores every `CS_PLAYERS` base directly per viewer (only where
   the recorded value differs) and clears the duelist/health strings, bypassing
   the reliable-pressure deferral because the instance core is already off.

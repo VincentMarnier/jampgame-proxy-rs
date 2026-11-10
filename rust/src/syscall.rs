@@ -359,7 +359,11 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                         } else if let Some(scores) =
                             crate::duel::rewrite_scores_for_viewer(text_str, a0)
                         {
-                            crate::duel::refresh_all_cs_players();
+                            // Only the viewer asking for the board needs its
+                            // `CS_PLAYERS` labels/W-L; refreshing every viewer
+                            // for every scoreboard send was O(viewers^2) and
+                            // queued a reliable burst per client at round end.
+                            crate::tffa::refresh_cs_players_for_scores(a0);
                             rewritten = Some(scores);
                         }
                     }

@@ -975,10 +975,10 @@ more courts at the next round, up to what the map can host. Standings are kept f
 scoreboard, sorted by court with the bench last; each viewer also gets their
 own court's duelist HUD and top score. The first player to `duel_fraglimit`
 duel wins is champion, then a fresh ladder starts (`0` = endless).
-A round's own `timelimit` decides unfinished courts by health + shield (random
-on an exact tie); `fraglimit 0` removes the per-duel kill limit and
-`timelimit 0` the round cap. A player who disconnects or goes spectator
-mid-duel gives the opponent a walkover. A voted or rcon `map_restart` is an
+A round's own `timelimit` (in minutes) decides unfinished courts by health +
+shield (random on an exact tie); `fraglimit 0` removes the per-duel kill limit and
+`timelimit 0` the round cap. A player who disconnects or explicitly uses `/team spectator`
+mid-duel gives the opponent a walkover; everyone else stays in the ladder. A voted or rcon `map_restart` is an
 admin restart — the ladder starts over with a fresh shuffle — while the proxy's
 own round restart carries the ladder. Setting the cvar back to `0` returns
 everyone to spectator and hands the map back to the stock duel tournament.

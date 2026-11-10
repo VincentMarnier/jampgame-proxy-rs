@@ -629,6 +629,9 @@ pub const BOARD_MS: i32 = 4000;
 /// Void-damage window after a duel is decided, mirroring the pristine
 /// `LogExit` → `BeginIntermission` delay.
 pub const RESOLVE_VOID_MS: i32 = 1000;
+/// Base JA's `timelimit` cvar is in **minutes**; the round clock compares it
+/// against `level.time` in milliseconds.
+const MS_PER_MINUTE: i32 = 60_000;
 /// Court players spawned per frame after a restart burst (D-006.12 deferral).
 const SPAWN_PER_FRAME: usize = 4;
 
@@ -1258,7 +1261,7 @@ fn start_round() {
         )
     });
     eprintln!(
-        "----- proxy-rs: parallel duels round {} - {} court(s), {} queued (timelimit {}s)",
+        "----- proxy-rs: parallel duels round {} - {} court(s), {} queued (timelimit {} min)",
         serial,
         courts.len(),
         queue.len(),
@@ -1399,7 +1402,7 @@ pub fn on_frame_start() {
             let now = level_time();
             let tl = timelimit();
             eprintln!(
-                "----- proxy-rs: parallel duels round clock start level.time={now} timelimit={tl}s"
+                "----- proxy-rs: parallel duels round clock start level.time={now} timelimit={tl} min"
             );
             state::with_state(|s| {
                 s.duel.round_start = now;
@@ -1505,11 +1508,14 @@ pub fn on_run_frame_post() {
             .iter()
             .any(|c| !c.resolved && !c.void)
     });
-    if tl > 0 && unresolved && level_time().wrapping_sub(round_start) >= tl.saturating_mul(1000) {
+    if tl > 0
+        && unresolved
+        && level_time().wrapping_sub(round_start) >= tl.saturating_mul(MS_PER_MINUTE)
+    {
         eprintln!(
             "----- proxy-rs: parallel duels round timelimit expired elapsed={}ms limit={}ms",
             level_time().wrapping_sub(round_start),
-            tl.saturating_mul(1000)
+            tl.saturating_mul(MS_PER_MINUTE)
         );
         let mut pick = state::with_state(|s| s.duel.seed).wrapping_add(now as u32);
         for i in 0..count {
@@ -1897,11 +1903,24 @@ pub fn on_set_team_request(ent: usize, team: &CStr) -> Option<SetTeamVerdict> {
         return Some(SetTeamVerdict::Refuse);
     }
     if let Some(cn) = slot {
+        // Only a client already in the world can explicitly opt out; a
+        // connect-time automatic `team s` must not silently remove a joiner.
+        if !connected(cn) {
+            return Some(SetTeamVerdict::Allow);
+        }
         let n = cn as usize;
-        let in_court = state::with_state(|s| court_of_locked(s, cn as u8).is_some());
-        state::with_state(|s| s.duel.willing[n] = !in_court);
+        let id = cn as u8;
+        let in_court = state::with_state(|s| court_of_locked(s, id).is_some());
+        // The only explicit way out of the ladder: joining the spectator
+        // team. A player who does it on a court also gives the opponent a
+        // walkover; one who does it from the bench leaves the queue.
+        state::with_state(|s| {
+            s.duel.willing[n] = false;
+            s.duel.queue.retain(|&c| c != id);
+            s.duel.spawn_pending.retain(|&c| c != id);
+        });
         if in_court {
-            resolve_walkover(cn as u8);
+            resolve_walkover(id);
         }
     }
     Some(SetTeamVerdict::Allow)
