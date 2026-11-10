@@ -55,7 +55,9 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
     `/team spectator` request is the only way out: it removes a queued player
     from the bench and gives a court player's opponent a walkover. `team free`
     is refused and never removes anyone. The ladder's own trampoline moves
-    never change the flag.
+    never change the flag. An opted-out player is labelled `(Spec)` on the
+    scoreboard/team overlay; a bench player is `(Bench)` and a court player
+    `(Duel N)`.
 14. **Mid-duel leaver → walkover win.**
 15. **Bots are drafted like players.**
 16. **Court count** = what the map can host, up to `floor(willing/2)` and 16;
@@ -166,7 +168,7 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 
 ## 9. Verification
 
-- `cargo test`: 440 unit tests (ladder model: shuffle/formation/bump for
+- `cargo test`: 441 unit tests (ladder model: shuffle/formation/bump for
   C=1..N with even/odd/queue, reconcile on roster change, each resolution rule,
   standings, champion/tie, board order, restart classifier, LogExit ownership,
   score reorder, credit offsets).

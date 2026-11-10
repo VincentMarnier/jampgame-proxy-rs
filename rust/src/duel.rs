@@ -1968,11 +1968,6 @@ pub fn damage_void(client_num: c_int) -> bool {
     })
 }
 
-/// The client's court (1-based) for the HUD/board, or `None` (spectator/bench).
-pub fn court_number(client_num: u8) -> Option<usize> {
-    state::with_state(|s| court_of_locked(s, client_num).map(|i| i + 1))
-}
-
 /// Standings injected per viewer into `CS_PLAYERS` (w/l).
 pub fn standings(client_num: u8) -> (i32, i32) {
     let n = client_num as usize;
@@ -2254,6 +2249,22 @@ pub fn rewrite_scores_for_viewer(text: &str, _viewer: c_int) -> Option<String> {
     Some(out)
 }
 
+/// Board label for a client: an opted-out player is `(Spec) `, a court player
+/// `(Duel N) `, a waiting player `(Bench) `, and a willing client that is
+/// neither (should not happen mid-ladder) gets no label.
+fn board_label(court: Option<usize>, queued: bool, willing: bool) -> Option<String> {
+    if !willing {
+        return Some("(Spec) ".to_owned());
+    }
+    if let Some(index) = court {
+        return Some(court_prefix(index + 1));
+    }
+    if queued {
+        return Some("(Bench) ".to_owned());
+    }
+    None
+}
+
 /// Rewrite a player's `CS_PLAYERS` info string for the duel board: court or
 /// bench label in the name, ladder W/L in the `w`/`l` keys the stock cgame
 /// draws instead of frags on `GT_DUEL` (`cg_scoreboard.c:170,229`). Court
@@ -2264,17 +2275,15 @@ pub fn rewrite_cs_players(base: &str, slot: usize) -> Option<String> {
         return None;
     }
     let id = slot as u8;
-    court_number(id);
-    let (court, queued) =
-        state::with_state(|s| (court_of_locked(s, id), s.duel.queue.contains(&id)));
-    if court.is_none() && !queued {
-        return None;
-    }
+    let (court, queued, willing) = state::with_state(|s| {
+        (
+            court_of_locked(s, id),
+            s.duel.queue.contains(&id),
+            s.duel.willing[slot],
+        )
+    });
+    let label = board_label(court, queued, willing)?;
     let original = crate::instances::info_value(base, "n").unwrap_or_default();
-    let label = match court {
-        Some(i) => court_prefix(i + 1),
-        None => "(Bench) ".to_owned(),
-    };
     let named = crate::instances::prefixed_name_with(&label, &original);
     let mut out = crate::instances::info_set(base, "n", &named);
     let (wins, losses) = standings(id);
@@ -2419,6 +2428,26 @@ mod tests {
         assert_eq!(name_label(&names, 4), "^2Team ^3Alice^7");
         names[5] = String::new();
         assert_eq!(name_label(&names, 5), "#5^7");
+    }
+
+    #[test]
+    fn board_labels_mark_spec_bench_and_court() {
+        assert_eq!(
+            board_label(Some(0), false, true).as_deref(),
+            Some("(Duel 1) ")
+        );
+        assert_eq!(
+            board_label(Some(2), false, true).as_deref(),
+            Some("(Duel 3) ")
+        );
+        assert_eq!(board_label(None, true, true).as_deref(), Some("(Bench) "));
+        assert_eq!(board_label(None, false, false).as_deref(), Some("(Spec) "));
+        // Opting out wins even while the walkover is being settled.
+        assert_eq!(
+            board_label(Some(1), false, false).as_deref(),
+            Some("(Spec) ")
+        );
+        assert_eq!(board_label(None, false, true), None);
     }
 
     #[test]
