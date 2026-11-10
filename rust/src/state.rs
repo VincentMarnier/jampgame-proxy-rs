@@ -908,6 +908,126 @@ impl Default for TffaState {
     }
 }
 
+/// Phase of the parallel-duel ladder (D-025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DuelPhase {
+    /// No ladder running (off, or waiting for two willing players).
+    #[default]
+    Idle,
+    /// A round is being played; courts resolve per frame.
+    Playing,
+    /// Every court resolved: the stock intermission shows the board until the
+    /// proxy issues its own `map_restart`.
+    Board,
+}
+
+/// Parallel-duel ladder state (D-025).
+///
+/// The instance assignment itself lives in [`TffaState::client_match`] (the
+/// shared slate): court 1 runs in the main slot (instance 0), court `i` in
+/// instance `i - 1`. `wins`/`losses` are the ladder-long standings the proxy
+/// injects per viewer into `CS_PLAYERS`; the game's own `sess.wins/losses`
+/// are never written, which keeps `DuelLimitHit` inert.
+#[derive(Debug, Clone)]
+pub struct DuelState {
+    pub phase: DuelPhase,
+    /// The cvar is on and a ladder may run (waiting for players included).
+    pub ladder: bool,
+    /// `proxy_parallel_duels_enable` edge latch.
+    pub enable_latched: bool,
+    /// Proxy-side willingness, seeded at connect from userinfo `team == "s"`
+    /// and changed only by explicit client requests. Bots are always willing.
+    pub willing: [bool; MAX_CLIENTS],
+    /// Bench (FIFO), carried across the proxy's own round restart.
+    pub queue: Vec<u8>,
+    /// This round's courts, in ladder order (index 0 = court 1 = top).
+    pub courts: [crate::duel::Court; crate::duel::MAX_COURTS],
+    pub court_count: usize,
+    /// `level.time` at the round start (per-round timelimit base).
+    pub round_start: i32,
+    /// `svs.time` at which the board window ends and the proxy restarts.
+    pub board_until: i32,
+    /// The one-shot "round restart" token armed immediately before the
+    /// proxy's own `map_restart` (`crate::duel::classify_restart`).
+    pub restart_armed: bool,
+    /// Monotonic round counter mixed into the shuffle seed.
+    pub round_serial: u32,
+    /// Ladder-long standings (reset only on a new ladder).
+    pub wins: [i32; MAX_CLIENTS],
+    pub losses: [i32; MAX_CLIENTS],
+    /// The ladder champion once someone reached `duel_fraglimit` wins; the
+    /// round finishes first, then a fresh ladder starts.
+    pub champion: Option<u8>,
+    /// Shuffle seed for the next formation.
+    pub seed: u32,
+    /// Next round's courts and queue, captured at round end and carried
+    /// through the proxy's own `map_restart` (`GAME_INIT(restart = true)`).
+    pub pending_courts: Vec<crate::duel::Pair>,
+    pub pending_queue: Vec<u8>,
+    /// The pending carry belongs to a proxy round transition (round) or an
+    /// admin/voted restart (fresh shuffle). Set by the restart classifier.
+    pub carry_round: bool,
+    /// Set when the ladder must start from a fresh shuffle after the next
+    /// `GAME_INIT` (admin restart, champion, full map change).
+    pub fresh_restart: bool,
+    /// Per-court `level.time` at which the court's duel was decided (the 1 s
+    /// void-damage window before both players move to spectator).
+    pub resolved_at: [i32; crate::duel::MAX_COURTS],
+    /// `svs.time` when the ladder last poked the roster (waiting message).
+    pub last_roster_check: i32,
+    /// Players waiting to be spawned into their court, drained a few per frame
+    /// after the `map_restart` burst (D-006.12 deferral).
+    pub spawn_pending: Vec<u8>,
+    /// Whether a court player already has a body this round.
+    pub spawned: [bool; MAX_CLIENTS],
+    /// The proxy issued its own `map_restart` and is waiting for `GAME_INIT`;
+    /// no formation may run in between.
+    pub restart_pending: bool,
+    /// The round clock starts on the first frame a court player is connected
+    /// (clients reconnect after the settle frames).
+    pub round_clock_started: bool,
+    /// Per-viewer HUD dedup: the duelists configstring last queued, the
+    /// healths string and the top-score pair (`CS_SCORES1/2`).
+    pub hud_duelists: [String; MAX_CLIENTS],
+    pub hud_healths: [String; MAX_CLIENTS],
+    pub hud_scores: [(i32, i32); MAX_CLIENTS],
+}
+
+impl Default for DuelState {
+    fn default() -> Self {
+        DuelState {
+            phase: DuelPhase::Idle,
+            ladder: false,
+            enable_latched: false,
+            willing: [false; MAX_CLIENTS],
+            queue: Vec::new(),
+            courts: [crate::duel::Court::default(); crate::duel::MAX_COURTS],
+            court_count: 0,
+            round_start: 0,
+            board_until: 0,
+            restart_armed: false,
+            round_serial: 0,
+            wins: [0; MAX_CLIENTS],
+            losses: [0; MAX_CLIENTS],
+            champion: None,
+            seed: 0,
+            pending_courts: Vec::new(),
+            pending_queue: Vec::new(),
+            carry_round: false,
+            fresh_restart: false,
+            resolved_at: [0; crate::duel::MAX_COURTS],
+            spawn_pending: Vec::new(),
+            spawned: [false; MAX_CLIENTS],
+            restart_pending: false,
+            round_clock_started: false,
+            last_roster_check: 0,
+            hud_duelists: core::array::from_fn(|_| String::new()),
+            hud_healths: core::array::from_fn(|_| String::new()),
+            hud_scores: [(i32::MIN, i32::MIN); MAX_CLIENTS],
+        }
+    }
+}
+
 /// Per-client bookkeeping (`Proxy_Header.hpp:87-106`).
 #[derive(Debug, Clone, Copy)]
 pub struct ClientEntry {
@@ -1007,6 +1127,10 @@ pub struct ProxyState {
     /// waiting for the next periodic tick.
     pub spec_overlay_scope: [i32; MAX_CLIENTS],
     pub tffa: TffaState,
+    /// Parallel-duel ladder state (D-025). Mutually exclusive with the TFFA
+    /// policy by gametype; both share `tffa.client_match` as the instance
+    /// assignment slate.
+    pub duel: DuelState,
     /// Per-viewer visibility-filter snapshot mutations (`crate::fov`): the FOV
     /// cap and the anti-wallhack. Holds the entity fields changed for the
     /// snapshot currently being built, restored as soon as the engine has
@@ -1048,16 +1172,18 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
 /// per-instance worlds are per round / per map and are never carried.
 pub fn reset_session(restart: bool) {
     let mut guard = lock();
-    let (tffa, muted, ignored) = {
+    let (tffa, duel, muted, ignored) = {
         let previous = guard.as_ref();
         (
             tffa_after_reset(previous.map(|s| &s.tffa), restart),
+            duel_after_reset(previous.map(|s| &s.duel), restart),
             mutes_after_reset(previous, restart),
             ignores_after_reset(previous, restart),
         )
     };
     let mut next = ProxyState::default();
     next.tffa = tffa;
+    next.duel = duel;
     // A `map_restart` keeps every player in their slot, so an admin mute stays
     // on the player it was issued for and a player's ignore list keeps pointing
     // at the same neighbours. A full map change drops everyone (the slots are
@@ -1096,6 +1222,47 @@ fn ignores_after_reset(previous: Option<&ProxyState>, restart: bool) -> [u32; MA
         *carried = entry.ignored;
     }
     ignored
+}
+
+/// The [`DuelState`] a `GAME_INIT` starts from (D-025).
+///
+/// A full map change ends the ladder: the new map starts from a fresh shuffle
+/// (and the players' willingness is seeded again at connect). A `map_restart`
+/// carries the ladder only when the proxy's own round transition armed it
+/// (`carry_round`): then the pending courts, queue and standings survive. Any
+/// other `map_restart` — rcon, a voted `map_restart`, or a restart with no
+/// armed token — is an admin restart: standings reset and the next formation
+/// is a fresh shuffle. Per-round timers, resolved markers and the board window
+/// never carry.
+///
+/// Kept separate from the lock so the carry/fresh-shuffle decision is
+/// unit-tested directly.
+fn duel_after_reset(previous: Option<&DuelState>, restart: bool) -> DuelState {
+    let mut fresh = DuelState::default();
+    let Some(previous) = previous.filter(|_| restart) else {
+        return fresh;
+    };
+    fresh.willing = previous.willing;
+    fresh.ladder = previous.ladder;
+    fresh.enable_latched = previous.enable_latched;
+    fresh.seed = previous.seed;
+    fresh.round_serial = previous.round_serial;
+    if previous.carry_round && !previous.fresh_restart {
+        fresh.wins = previous.wins;
+        fresh.losses = previous.losses;
+        fresh.champion = previous.champion;
+        fresh.queue = previous.queue.clone();
+        fresh.pending_courts = previous.pending_courts.clone();
+        fresh.pending_queue = previous.pending_queue.clone();
+        fresh.carry_round = true;
+        fresh.phase = DuelPhase::Playing;
+    } else {
+        // Admin restart, champion or no armed carry: fresh ladder next frame
+        // (willingness survives, the standings do not).
+        fresh.fresh_restart = true;
+        fresh.phase = DuelPhase::Idle;
+    }
+    fresh
 }
 
 /// The fresh [`TffaState`] a `GAME_INIT` starts from, carrying the match overlay
@@ -1167,6 +1334,7 @@ impl ProxyState {
             spec_overlay_last_time: 0,
             spec_overlay_scope: [0; MAX_CLIENTS],
             tffa: TffaState::default(),
+            duel: DuelState::default(),
             fov: crate::fov::FovState::default(),
         }
     }
@@ -1344,7 +1512,7 @@ mod tests {
         // did not (D-025).
         assert_eq!(crate::tffa::TFFA_MATCH_CAP, 8);
         // The world clone bitmask must cover every slot including 16.
-        assert!((1u32 << crate::instances::MAX_MATCHES) != 0);
+        assert_eq!(1u32 << crate::instances::MAX_MATCHES, 0x1_0000);
     }
 
     #[test]

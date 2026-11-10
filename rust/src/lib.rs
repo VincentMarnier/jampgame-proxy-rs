@@ -34,6 +34,7 @@ mod banfile;
 mod challenge;
 mod coinflip;
 mod diagnostics;
+mod duel;
 mod engine;
 mod fov;
 mod guidban;
@@ -150,6 +151,7 @@ pub unsafe extern "C" fn vmMain(
                 teamlock::on_run_frame();
                 rules::on_run_frame();
                 tffa::on_frame_start();
+                duel::on_frame_start();
                 // S22: if an engine counter is about to wrap, append the map
                 // (or killserver + map) command before this frame is forwarded,
                 // so it runs at the next Cbuf_Execute, ahead of SV_Frame's own
@@ -161,6 +163,7 @@ pub unsafe extern "C" fn vmMain(
             let response = forward(GAME_RUN_FRAME, &args);
             if state::proxy_enabled() {
                 tffa::on_run_frame_post();
+                duel::on_run_frame_post();
                 // The pristine game only sends the team overlay's `tinfo`
                 // roster to teammates; give it to following spectators too.
                 teamoverlay::on_run_frame_post();
@@ -210,6 +213,7 @@ pub unsafe extern "C" fn vmMain(
             if state::proxy_enabled() {
                 shared_api::client_connect(a0, a1 != 0, a2 != 0);
                 tffa::on_client_connect(a0, a1 != 0);
+                duel::on_client_connect(a0, a1 != 0);
                 teamlock::on_client_connect(a1 != 0);
             }
             if diagnostics::verbose_enabled() {
@@ -237,6 +241,7 @@ pub unsafe extern "C" fn vmMain(
             teamoverlay::on_client_disconnect(a0);
             if state::proxy_enabled() {
                 tffa::on_client_disconnect(a0);
+                duel::on_client_disconnect(a0);
             }
             // A disconnecting client drops what they carry
             // (`ClientDisconnect` → `TossClientItems`, `g_client.c:3876`): the
@@ -252,7 +257,19 @@ pub unsafe extern "C" fn vmMain(
                     hooks::engine_sv::client_label_for_num(a0),
                 );
             }
+            // D-025: the pristine duel disconnect block credits the global
+            // top two (and zeroes the partner's score, bumps `sess.wins`).
+            // Snapshot it before the forward and restore afterwards; the
+            // proxy's own walkover already ran in `duel::on_client_disconnect`.
+            let duel_credit = if state::proxy_enabled() {
+                duel::disconnect_snapshot(a0)
+            } else {
+                None
+            };
             let response = forward(command, &args);
+            if let Some(snapshot) = duel_credit {
+                duel::compensate_disconnect(&snapshot);
+            }
             if let Some(previous) = scope {
                 tffa::close_acting_scope(previous);
             }
@@ -276,6 +293,7 @@ pub unsafe extern "C" fn vmMain(
             let response = forward(command, &args);
             if state::proxy_enabled() {
                 tffa::on_client_begin(a0);
+                duel::on_client_begin(a0);
             }
             response
         }
@@ -482,6 +500,9 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // after the hook layer is up; clients reconnect after the settle frames,
     // so they find their instance already rebuilt.
     tffa::restore_instances();
+    // Restore the carried duel round's courts/worlds (D-025); a fresh ladder
+    // waits for the clients to reconnect and then forms its first round.
+    duel::on_game_init(restart);
 
     response
 }

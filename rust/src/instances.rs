@@ -323,7 +323,12 @@ pub(crate) fn prefix_for(player_match: u8) -> String {
 /// escapes may be cut mid-code in pathological cases, same as the game's own
 /// `Q_strncpyz` behaviour.
 pub fn prefixed_name(orig: &str, player_match: u8) -> String {
-    let prefix = prefix_for(player_match);
+    prefixed_name_with(&prefix_for(player_match), orig)
+}
+
+/// Prefix a display name with an already-built instance label, truncated so
+/// the whole thing fits `MAX_NETNAME` (36 inc NUL → 35 bytes max).
+pub(crate) fn prefixed_name_with(prefix: &str, orig: &str) -> String {
     let max_total = MAX_NETNAME.saturating_sub(1);
     let budget = max_total.saturating_sub(prefix.len());
     let mut cut = orig.len().min(budget);
@@ -335,6 +340,15 @@ pub fn prefixed_name(orig: &str, player_match: u8) -> String {
         cut -= 1;
     }
     format!("{prefix}{}", &orig[..cut])
+}
+
+/// The label an outsider's name carries in a viewer's clientinfo: the TFFA
+/// match (`(TFFA N) `) or, on the duel ladder, the court (`(Duel N) `).
+fn instance_prefix(instance: u8) -> String {
+    if crate::state::instance_mode() == crate::state::InstanceMode::Duel {
+        return crate::duel::court_prefix(instance as usize + 1);
+    }
+    prefix_for(instance)
 }
 
 /// Rewrite a `CS_PLAYERS + n` info string for `viewer`:
@@ -360,8 +374,29 @@ pub fn rewrite_cs_players_for_viewer(
         return None;
     }
     let orig = info_value(base, "n").unwrap_or_default();
-    let out = info_set(base, "n", &prefixed_name(&orig, player_match));
+    let named = if state::instance_mode() == state::InstanceMode::Duel {
+        prefixed_name_with(&instance_prefix(player_match), &orig)
+    } else {
+        prefixed_name(&orig, player_match)
+    };
+    let out = info_set(base, "n", &named);
     Some(info_set(&out, "t", &TEAM_SPECTATOR.to_string()))
+}
+
+/// Per-viewer `CS_PLAYERS` rewrite for one slot. TFFA demotes a playing
+/// outsider to spectator and prefixes the match; the duel ladder keeps every
+/// court player in the arena (the board lists the whole ladder in court
+/// order), prefixes the court or bench label and injects the ladder W/L.
+pub(crate) fn rewrite_cs_players_for_slot(
+    base: &str,
+    slot: usize,
+    player_match: u8,
+    viewer_match: u8,
+) -> Option<String> {
+    if state::instance_mode() == state::InstanceMode::Duel {
+        return crate::duel::rewrite_cs_players(base, slot);
+    }
+    rewrite_cs_players_for_viewer(base, player_match, viewer_match)
 }
 
 /// Reliable commands the engine still owes `client_num`: `reliableSequence -
@@ -819,7 +854,7 @@ pub(crate) fn override_push_plan(
     table: &[u8; MAX_CLIENTS],
     bases: &[String; MAX_CLIENTS],
 ) -> Vec<(i32, String)> {
-    if from_gamestate {
+    if from_gamestate && state::instance_mode() != state::InstanceMode::Duel {
         demotions_for_viewer(viewer_match, table, bases)
     } else {
         desired_cs_players(viewer_match, table, bases)
@@ -850,8 +885,9 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
                 continue;
             }
         }
-        let value = rewrite_cs_players_for_viewer(&base, table[slot as usize], viewer_match)
-            .unwrap_or(base);
+        let value =
+            rewrite_cs_players_for_slot(&base, slot as usize, table[slot as usize], viewer_match)
+                .unwrap_or(base);
         push_cs_players(client_num, slot as usize, &value);
     }
     let (red, blue) = view_scores(viewer_match);
@@ -886,7 +922,7 @@ pub(crate) fn desired_cs_players(
         if base.is_empty() {
             continue;
         }
-        let value = rewrite_cs_players_for_viewer(base, table[slot], viewer_match)
+        let value = rewrite_cs_players_for_slot(base, slot, table[slot], viewer_match)
             .unwrap_or_else(|| base.clone());
         out.push((slot as i32, value));
     }
@@ -907,7 +943,7 @@ pub(crate) fn demotions_for_viewer(
         if table[slot] == viewer_match || base.is_empty() {
             continue;
         }
-        if let Some(modified) = rewrite_cs_players_for_viewer(base, table[slot], viewer_match) {
+        if let Some(modified) = rewrite_cs_players_for_slot(base, slot, table[slot], viewer_match) {
             out.push((slot as i32, modified));
         }
     }
@@ -2253,5 +2289,92 @@ pub(crate) fn rebuild_owned(s: &mut state::ProxyState, g_entities: usize) {
         }
         s.tffa.owned[s.tffa.owned_count] = (num as u16, owner as u8);
         s.tffa.owned_count += 1;
+    }
+}
+
+/// Record a `CS_PLAYERS + n` base string the game just set, then push the
+/// per-viewer variants (prefixed outsiders forced to spectator) to every
+/// connected client. Call after the trap has been forwarded so the engine
+/// broadcast lands first and our per-viewer corrections win.
+pub fn on_set_cs_players(slot: i32, value: &str) {
+    if !state::instances_enabled() {
+        return;
+    }
+    if !(0..MAX_CLIENTS as i32).contains(&slot) {
+        return;
+    }
+    state::with_state(|s| {
+        s.tffa.cs_players_base[slot as usize] = value.to_owned();
+    });
+    // The engine broadcast this value to every client before the handler ran
+    // (the trap was forwarded first), so every connected viewer holds it now —
+    // record that instead of re-sending it to same-match viewers below.
+    record_cs_players_broadcast(slot as usize, value);
+    // Follow-aware viewer matches (spectating adopts the target's instance).
+    // State snapshot first (no nesting: effective_match locks per viewer).
+    let (table, base): (u8, String) = state::with_state(|s| {
+        (
+            s.tffa.client_match[slot as usize],
+            s.tffa.cs_players_base[slot as usize].clone(),
+        )
+    });
+    if base.is_empty() {
+        return;
+    }
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    for viewer in viewers {
+        let viewer_match = effective_match(viewer);
+        // Same-match / spectator viewers already received this base via the
+        // engine broadcast we just forwarded — resending it doubles traffic
+        // for zero effect (and overflows the reliable buffer on team swaps).
+        if let Some(modified) =
+            rewrite_cs_players_for_slot(&base, slot as usize, table, viewer_match)
+        {
+            push_cs_players(viewer, slot as usize, &modified);
+        }
+    }
+}
+
+/// Broadcast one player's slot to every viewer from the stored base (called
+/// after proxy-side match moves, which change prefix/team without any game
+/// `G_SET_CONFIGSTRING`).
+pub fn broadcast_cs_players_slot(slot: i32) {
+    if !state::instances_enabled() {
+        return;
+    }
+    if !(0..MAX_CLIENTS as i32).contains(&slot) {
+        return;
+    }
+    let (table, base): (u8, String) = state::with_state(|s| {
+        (
+            s.tffa.client_match[slot as usize],
+            s.tffa.cs_players_base[slot as usize].clone(),
+        )
+    });
+    if base.is_empty() {
+        // No base yet (missed the game's SetConfigstring while disabled?):
+        // fall back to the live server configstring so moves still prefix.
+        if let Some(live) = get_live_cs_players(slot) {
+            state::with_state(|s| {
+                s.tffa.cs_players_base[slot as usize] = live.clone();
+            });
+            return broadcast_cs_players_slot(slot);
+        }
+        return;
+    }
+    let viewers: Vec<c_int> = state::with_state(|s| {
+        (0..MAX_CLIENTS as c_int)
+            .filter(|v| s.clients[*v as usize].is_connected)
+            .collect()
+    });
+    for viewer in viewers {
+        let viewer_match = effective_match(viewer);
+        let value = rewrite_cs_players_for_slot(&base, slot as usize, table, viewer_match)
+            .unwrap_or_else(|| base.clone());
+        push_cs_players(viewer, slot as usize, &value);
     }
 }

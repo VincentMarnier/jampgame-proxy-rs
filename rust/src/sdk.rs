@@ -696,6 +696,13 @@ pub const EF_PLAYER_EVENT: i32 = 1 << 5;
 /// (`cgs.scores1/2`), `CS_PLAYERS + n` carries client `n`'s `n\t\…` info.
 pub const CS_SCORES1: i32 = 6;
 pub const CS_SCORES2: i32 = 7;
+/// `CS_CLIENT_DUELISTS` (`bg_public.h:86`): the pair the duel HUD draws.
+/// The stock game sets it globally from `level.sortedClients[0..2]`; the
+/// parallel ladder sends each viewer its own court instead.
+pub const CS_CLIENT_DUELISTS: i32 = 30;
+/// `CS_CLIENT_DUELHEALTHS` (`bg_public.h:87`, `g_showDuelHealths`):
+/// `hp1|hp2|!` for the duel HUD.
+pub const CS_CLIENT_DUELHEALTHS: i32 = 31;
 /// `CS_VOTE_TIME` (`bg_public.h:65`): set to the vote start time, emptied at
 /// the end. S14 snapshots the slot addresses when it becomes non-empty.
 pub const CS_VOTE_TIME: i32 = 8;
@@ -890,6 +897,11 @@ pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
 pub const OFFSET_SESS_SPECTATOR_STATE: usize = 8;
 /// `offsetof(clientSession_t, spectatorClient)` (`spectatorState(8)` + 4).
 pub const OFFSET_SESS_SPECTATOR_CLIENT: usize = 12;
+/// `offsetof(clientSession_t, wins)` / `losses`: the duel tournament tallies
+/// (`g_local.h:417`; `sessionTeam@0`, `spectatorTime@4`, `spectatorState@8`,
+/// `spectatorClient@12`, `wins@16`, `losses@20`).
+pub const OFFSET_SESS_WINS: usize = 16;
+pub const OFFSET_SESS_LOSSES: usize = 20;
 
 /// `spectatorState_t` (`g_local.h:373-378`).
 pub const SPECTATOR_NOT: i32 = 0;
@@ -923,6 +935,14 @@ pub const OFFSET_LEVEL_TEAM_SCORES_BLUE: usize = 52;
 /// spectator targets (`g_main.c:CalculateRanks`). A spectator whose
 /// `sess.spectatorClient` is `-1`/`-2` follows these instead
 /// (`g_active.c:SpectatorClientEndFrame`).
+pub const OFFSET_LEVEL_NUM_CONNECTED_CLIENTS: usize = 72;
+/// `level.numNonSpectatorClients` (`g_local.h`, after `numConnectedClients`):
+/// the counter the shipped `SetTeam` tests at `0x12b267` (`level+0x4c`).
+pub const OFFSET_LEVEL_NUM_NON_SPECTATOR_CLIENTS: usize = 76;
+pub const OFFSET_LEVEL_NUM_PLAYING_CLIENTS: usize = 80;
+/// `offsetof(level_locals_t, sortedClients)` (`g_local.h:843`): clients sorted
+/// by score, the array the stock duel credit and `CheckTournament` read.
+pub const OFFSET_LEVEL_SORTED_CLIENTS: usize = 84;
 pub const OFFSET_LEVEL_FOLLOW1: usize = 212;
 pub const OFFSET_LEVEL_FOLLOW2: usize = 216;
 /// `offsetof(level_locals_t, clients)` — the `gclient_t` array (`level.clients`,
@@ -1019,6 +1039,23 @@ mod tests {
     use super::layout_pins::*;
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn duel_credit_offsets_follow_the_sdk_field_order() {
+        // clientSession_t (`g_local.h:413-417`): sessionTeam, spectatorTime,
+        // spectatorState, spectatorClient, wins, losses.
+        assert_eq!(OFFSET_SESS_SESSION_TEAM, 0);
+        assert_eq!(OFFSET_SESS_SPECTATOR_STATE, 8);
+        assert_eq!(OFFSET_SESS_SPECTATOR_CLIENT, 12);
+        assert_eq!(OFFSET_SESS_WINS, 16);
+        assert_eq!(OFFSET_SESS_LOSSES, 20);
+        // level_locals_t: the counter the shipped SetTeam tests is 0x4c
+        // (objdump at 0x12b267 + the `level` relocation), and sortedClients
+        // follows numPlayingClients.
+        assert_eq!(OFFSET_LEVEL_NUM_NON_SPECTATOR_CLIENTS, 0x4c);
+        assert_eq!(OFFSET_LEVEL_NUM_PLAYING_CLIENTS, 0x50);
+        assert_eq!(OFFSET_LEVEL_SORTED_CLIENTS, 0x54);
+    }
 
     #[test]
     fn server_static_challenge_layout_matches_sdk() {

@@ -826,7 +826,7 @@ pub static ENGINE_HOOKS: [Hook; 23] = [
 /// per-match sudden-death rule; `ClientSpawn` so spawn-point selection runs in
 /// the spawning player's instance and `SpotWouldTelefrag` only counts that
 /// instance's players).
-pub static GAME_HOOKS: [Hook; 22] = [
+pub static GAME_HOOKS: [Hook; 24] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -869,6 +869,16 @@ pub static GAME_HOOKS: [Hook; 22] = [
         true,
     ),
     Hook::new("ClientSpawn", crate::jampgame::FN_CLIENT_SPAWN, true),
+    Hook::new(
+        "CheckIntermissionExit",
+        crate::jampgame::FN_CHECK_INTERMISSION_EXIT,
+        true,
+    ),
+    Hook::new(
+        "AdjustTournamentScores",
+        crate::jampgame::FN_ADJUST_TOURNAMENT_SCORES,
+        true,
+    ),
 ];
 
 /// The single call-site feed for the netStatus per-usercmd stats: the
@@ -1325,6 +1335,16 @@ mod tests {
             name: "ClientSpawn",
             bytes: b"\x55\x8b\xec\x81\xec\x38\x19\x00\x00",
             want: 9,
+        },
+        Site {
+            name: "CheckIntermissionExit",
+            bytes: b"\x55\x8b\xec\x83\xec\x50",
+            want: 6,
+        },
+        Site {
+            name: "AdjustTournamentScores",
+            bytes: b"\x55\x8b\xec\x83\xec\x20",
+            want: 6,
         },
     ];
 

@@ -69,6 +69,18 @@ pub const FN_ADD_SCORE: usize = 0x0013_13a4;
 /// before the `AddScore` wrapper can neutralise the bump, so neutralising
 /// alone can never win the race.
 pub const FN_LOG_EXIT: usize = 0x0008_81d4;
+/// `void CheckIntermissionExit(void)` (nm `CheckIntermissionExit__Fv`, file
+/// offset `0x882e4`; prologue `55 8b ec 83 ec 50`, 6 detour-safe bytes). The
+/// stock duel intermission: at 2 s it removes the "loser" and pulls a
+/// spectator in, at 4 s it calls `ExitLevel` → `map_restart`. The parallel
+/// ladder no-ops it and drives its own board window and restart (D-025).
+pub const FN_CHECK_INTERMISSION_EXIT: usize = 0x0008_82e4;
+/// `void AdjustTournamentScores(void)` (nm `AdjustTournamentScores__Fv`, file
+/// offset `0x86f44`; prologue `55 8b ec 83 ec 20`, 6 detour-safe bytes). The
+/// stock `BeginIntermission` calls it to add a win/loss to the top two
+/// scorers; the ladder owns W/L proxy-side and no-ops it, so `sess.wins` can
+/// never revive `DuelLimitHit` (D-025).
+pub const FN_ADJUST_TOURNAMENT_SCORES: usize = 0x0008_6f44;
 /// `qboolean ScoreIsTied(void)` (nm `ScoreIsTied__Fv`, file offset `0x88a74`;
 /// prologue `55 8b ec 83 ec 08 89 75 fc`, 6 detour-safe bytes; the sole caller
 /// is `CheckExitRules` at `0x88bba`, R_386_PC32-verified). Hooked by the
@@ -315,6 +327,30 @@ pub unsafe fn g_free_entity(ent: usize) {
     // SAFETY: pointer from base+offset of a loaded module.
     let f: unsafe extern "C" fn(usize) = game_fn!(unsafe extern "C" fn(usize), FN_G_FREE_ENTITY);
     unsafe { f(ent) }
+}
+
+/// `void SetTeamQuick(gentity_t*, int team, qboolean doBegin)` (nm
+/// `SetTeamQuick__FP9gentity_si8qboolean`, file offset `0x159804`; prologue
+/// `55 8b ec 81 ec 20 04 00 00`). The game's own forced team placement: it
+/// writes `sess.sessionTeam` directly, sets the `team` userinfo key and calls
+/// `ClientUserinfoChanged` + `ClientBegin`. The duel ladder uses it because the
+/// shipped `SetTeam("f")` refuses a third non-spectator on `GT_DUEL`
+/// (`level.numNonSpectatorClients >= 2` → spectator, verified at `0x12b267`),
+/// which would leave every court but the first without players.
+pub const FN_SET_TEAM_QUICK: usize = 0x0015_9804;
+
+/// `SetTeamQuick(gentity_t *ent, int team, qboolean doBegin)`.
+///
+/// # Safety
+///
+/// The original module must be loaded and `GAME_INIT` must have run. `ent` must
+/// be a live client gentity; `do_begin` non-zero runs `ClientBegin` (and thus
+/// `ClientSpawn`) synchronously.
+pub unsafe fn set_team_quick(ent: usize, team: c_int, do_begin: c_int) {
+    // SAFETY: pointer from base+offset of a loaded module.
+    let f: unsafe extern "C" fn(usize, c_int, c_int) =
+        game_fn!(unsafe extern "C" fn(usize, c_int, c_int), FN_SET_TEAM_QUICK);
+    unsafe { f(ent, team, do_begin) };
 }
 
 #[cfg(test)]

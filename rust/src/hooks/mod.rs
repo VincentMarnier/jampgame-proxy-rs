@@ -240,6 +240,16 @@ game_trampoline!(
     21,
     unsafe extern "C" fn(usize)
 );
+game_trampoline!(
+    game_hook_original_check_intermission_exit,
+    22,
+    unsafe extern "C" fn()
+);
+game_trampoline!(
+    game_hook_original_adjust_tournament_scores,
+    23,
+    unsafe extern "C" fn()
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -395,6 +405,8 @@ pub unsafe fn attach_all() {
         game::score_is_tied as usize,
         game::wp_force_powers_update as usize,
         game::client_spawn as usize,
+        game::check_intermission_exit as usize,
+        game::adjust_tournament_scores as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the
@@ -501,6 +513,8 @@ mod tests {
             "ScoreIsTied",
             "WP_ForcePowersUpdate",
             "ClientSpawn",
+            "CheckIntermissionExit",
+            "AdjustTournamentScores",
         ];
         assert_eq!(patch::GAME_HOOKS.len(), by_index.len());
         for (index, name) in by_index.into_iter().enumerate() {

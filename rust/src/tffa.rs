@@ -324,91 +324,6 @@ pub fn is_kill_limit_print(text: &str) -> bool {
     text.starts_with("print \"") && text.contains("HIT_THE_KILL_LIMIT")
 }
 
-/// Record a `CS_PLAYERS + n` base string the game just set, then push the
-/// per-viewer variants (prefixed outsiders forced to spectator) to every
-/// connected client. Call after the trap has been forwarded so the engine
-/// broadcast lands first and our per-viewer corrections win.
-pub fn on_set_cs_players(slot: i32, value: &str) {
-    if !state::instances_enabled() {
-        return;
-    }
-    if !(0..MAX_CLIENTS as i32).contains(&slot) {
-        return;
-    }
-    state::with_state(|s| {
-        s.tffa.cs_players_base[slot as usize] = value.to_owned();
-    });
-    // The engine broadcast this value to every client before the handler ran
-    // (the trap was forwarded first), so every connected viewer holds it now —
-    // record that instead of re-sending it to same-match viewers below.
-    record_cs_players_broadcast(slot as usize, value);
-    // Follow-aware viewer matches (spectating adopts the target's instance).
-    // State snapshot first (no nesting: effective_match locks per viewer).
-    let (table, base): (u8, String) = state::with_state(|s| {
-        (
-            s.tffa.client_match[slot as usize],
-            s.tffa.cs_players_base[slot as usize].clone(),
-        )
-    });
-    if base.is_empty() {
-        return;
-    }
-    let viewers: Vec<c_int> = state::with_state(|s| {
-        (0..MAX_CLIENTS as c_int)
-            .filter(|v| s.clients[*v as usize].is_connected)
-            .collect()
-    });
-    for viewer in viewers {
-        let viewer_match = effective_match(viewer);
-        // Same-match / spectator viewers already received this base via the
-        // engine broadcast we just forwarded — resending it doubles traffic
-        // for zero effect (and overflows the reliable buffer on team swaps).
-        if let Some(modified) = rewrite_cs_players_for_viewer(&base, table, viewer_match) {
-            push_cs_players(viewer, slot as usize, &modified);
-        }
-    }
-}
-
-/// Broadcast one player's slot to every viewer from the stored base (called
-/// after proxy-side match moves, which change prefix/team without any game
-/// `G_SET_CONFIGSTRING`).
-pub fn broadcast_cs_players_slot(slot: i32) {
-    if !state::instances_enabled() {
-        return;
-    }
-    if !(0..MAX_CLIENTS as i32).contains(&slot) {
-        return;
-    }
-    let (table, base): (u8, String) = state::with_state(|s| {
-        (
-            s.tffa.client_match[slot as usize],
-            s.tffa.cs_players_base[slot as usize].clone(),
-        )
-    });
-    if base.is_empty() {
-        // No base yet (missed the game's SetConfigstring while disabled?):
-        // fall back to the live server configstring so moves still prefix.
-        if let Some(live) = get_live_cs_players(slot) {
-            state::with_state(|s| {
-                s.tffa.cs_players_base[slot as usize] = live.clone();
-            });
-            return broadcast_cs_players_slot(slot);
-        }
-        return;
-    }
-    let viewers: Vec<c_int> = state::with_state(|s| {
-        (0..MAX_CLIENTS as c_int)
-            .filter(|v| s.clients[*v as usize].is_connected)
-            .collect()
-    });
-    for viewer in viewers {
-        let viewer_match = effective_match(viewer);
-        let value = rewrite_cs_players_for_viewer(&base, table, viewer_match)
-            .unwrap_or_else(|| base.clone());
-        push_cs_players(viewer, slot as usize, &value);
-    }
-}
-
 /// Push per-viewer `CS_SCORES1/2` (the viewer's own match tallies) to every
 /// connected client. Call after the game's `CalculateRanks` broadcast so the
 /// global (neutralised/transient) values are corrected per viewer and the
@@ -2320,7 +2235,7 @@ fn announce_name(raw: &str) -> String {
 /// the same C string `/team` takes. Returns false when the client has no live
 /// game entity (a free slot's `ent->client` is null and the game body would
 /// deref it) or the trampoline is not attached.
-fn set_client_team(client_num: c_int, team: &CStr) -> bool {
+pub(crate) fn set_client_team(client_num: c_int, team: &CStr) -> bool {
     if crate::original::base() == 0 {
         return false;
     }
@@ -2349,7 +2264,7 @@ fn set_client_team(client_num: c_int, team: &CStr) -> bool {
 /// (trampoline, not the wrapper → no recursion, no teamlock block: spectator
 /// requests always pass). This is the same move `/team spectator` makes, so
 /// the player suicides and respawns spectating.
-fn set_client_spectator(client_num: c_int) -> bool {
+pub(crate) fn set_client_spectator(client_num: c_int) -> bool {
     set_client_team(client_num, c"spectator")
 }
 

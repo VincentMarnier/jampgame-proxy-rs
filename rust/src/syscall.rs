@@ -333,6 +333,9 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     if tffa_on && crate::tffa::is_kill_limit_print(text_str) {
                         return 0;
                     }
+                    if crate::duel::swallow_print(text_str) {
+                        return 0;
+                    }
                     // The scoreboard rewrite runs on the message the viewer
                     // will actually receive: the parallel-TFFA rewrite first
                     // (it parses the stock 14-int entry layout and substitutes
@@ -352,6 +355,11 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                             // lost/overwritten override cannot show another
                             // match's player on this viewer's RED/BLUE side.
                             crate::tffa::refresh_cs_players_for_scores(a0);
+                            rewritten = Some(scores);
+                        } else if let Some(scores) =
+                            crate::duel::rewrite_scores_for_viewer(text_str, a0)
+                        {
+                            crate::duel::refresh_all_cs_players();
                             rewritten = Some(scores);
                         }
                     }
@@ -510,6 +518,20 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // own mini-HUD scores and its own team-overlay client names. The
         // corrections arrive after the broadcast and win per client.
         G_SET_CONFIGSTRING => {
+            // D-025: the duel ladder owns the duel HUD configstrings. The
+            // pristine `CheckTournament` rewrites them globally from
+            // `level.sortedClients[0..2]` every frame, which is wrong for
+            // every court but the first; drop the broadcast and send each
+            // viewer its own court's values (`duel::push_hud`).
+            if crate::state::proxy_enabled()
+                && crate::state::instance_mode() == crate::state::InstanceMode::Duel
+                && (a0 == crate::sdk::CS_CLIENT_DUELISTS
+                    || a0 == crate::sdk::CS_CLIENT_DUELHEALTHS
+                    || a0 == CS_SCORES1
+                    || a0 == CS_SCORES2)
+            {
+                return 0;
+            }
             // S14: `CS_VOTE_TIME` becoming non-empty marks a vote start; copy
             // every slot's address so the vote's kick can be tied to the
             // client it was called about.
@@ -586,6 +608,16 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 }
                 if !crate::coinflip::console_command_from_ptr(a0, text) {
                     return 0;
+                }
+                // D-025: classify a `map_restart` as the proxy's own round
+                // transition (armed token) or an admin/voted restart. The
+                // engine's rcon path never reaches this trap; it lands in
+                // `GAME_INIT(restart = true)` with no armed token, which the
+                // duel carry also treats as an admin restart.
+                if !text.is_null() {
+                    // SAFETY: the game passes a NUL-terminated command string.
+                    let bytes = unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes();
+                    crate::duel::on_console_command(bytes);
                 }
             }
         }

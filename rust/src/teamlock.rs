@@ -616,6 +616,17 @@ fn send_locked_message(block: &Block) {
 ///
 /// Entered from the game module with the pristine `SetTeam` argument list.
 pub unsafe extern "C" fn set_team(ent: usize, s: *const c_char) {
+    // Parallel duels own every team request while the ladder runs: court
+    // assignment is automatic, and refusing `free` here also neutralises the
+    // game's own `AddTournamentPlayer` (which calls SetTeam("f")).
+    if !s.is_null() {
+        // SAFETY: the game passes a NUL-terminated team string.
+        let team = unsafe { CStr::from_ptr(s) };
+        if crate::duel::on_set_team_request(ent, team) == Some(crate::duel::SetTeamVerdict::Refuse)
+        {
+            return;
+        }
+    }
     if let Some(client_num) = password_blocked_join(ent, s) {
         tffa::send_password_required(client_num);
         return;

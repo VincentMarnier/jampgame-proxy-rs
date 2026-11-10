@@ -142,6 +142,17 @@ fn tffa_damage_blocked(targ: usize, attacker: usize) -> Option<bool> {
     }
     let targ_num = tffa_player_slot(targ);
     let attacker_num = tffa_player_slot(attacker);
+    // Parallel duels: a decided court's pair is damage-void for the 1 s
+    // window before both move to spectator (the pristine intermissionQueued
+    // shape).
+    if crate::state::instance_mode() == crate::state::InstanceMode::Duel
+        && [targ_num, attacker_num]
+            .into_iter()
+            .flatten()
+            .any(crate::duel::damage_void)
+    {
+        return Some(true);
+    }
     // End-of-match delay: once a match's outcome is decided (fraglimit, or the
     // timelimit expired untied) its players neither deal nor take damage for
     // `tffa::END_DELAY_MS`, exactly like pristine `G_Damage` returning on
@@ -273,6 +284,9 @@ pub unsafe extern "C" fn player_die(
     damage: c_int,
     means_of_death: c_int,
 ) {
+    // D-025: snapshot the stock duel suicide credit (global top two) before
+    // the pristine body awards it, then move the win to the court opponent.
+    let duel_suicide = crate::duel::suicide_snapshot(self_, attacker);
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_player_die);
     // D-006 extension (S9): a dying player's code creates the items they drop
@@ -291,6 +305,9 @@ pub unsafe extern "C" fn player_die(
     unsafe { original(self_, inflictor, attacker, damage, means_of_death) };
     if let Some(previous) = scope {
         crate::tffa::close_acting_scope(previous);
+    }
+    if let Some(snapshot) = duel_suicide {
+        crate::duel::compensate_suicide(&snapshot);
     }
 
     let self_client = unsafe { ent_client(self_) };
@@ -1068,9 +1085,18 @@ pub unsafe extern "C" fn add_score(ent: usize, origin: *const f32, score: c_int)
 ///
 /// Entered from the game module with the pristine `LogExit` argument list.
 pub unsafe extern "C" fn log_exit(string: *const c_char) {
-    let kill_limit = !string.is_null()
-        // SAFETY: game passes a NUL-terminated exit string.
-        && unsafe { CStr::from_ptr(string) }.to_bytes() == b"Kill limit hit.";
+    // SAFETY: the game passes a NUL-terminated exit string (or null).
+    let bytes: &[u8] = if string.is_null() {
+        b""
+    } else {
+        unsafe { CStr::from_ptr(string) }.to_bytes()
+    };
+    // Parallel duels own every end: the per-duel fraglimit (including the
+    // `fraglimit 1` empty string), the win limit and the map timelimit.
+    if crate::duel::swallow_log_exit(bytes) {
+        return;
+    }
+    let kill_limit = bytes == b"Kill limit hit.";
     if kill_limit && crate::state::instances_enabled() {
         return;
     }
@@ -1383,6 +1409,45 @@ pub unsafe extern "C" fn score_is_tied() -> c_int {
     // SAFETY: trampoline attached at GAME_INIT.
     let original = original_call(crate::hooks::game_hook_original_score_is_tied);
     unsafe { original() }
+}
+
+// ---------------------------------------------------------------------------
+// CheckIntermissionExit / AdjustTournamentScores — stock duel suppression
+// ---------------------------------------------------------------------------
+
+/// `void CheckIntermissionExit(void)` wrapper (D-025): while the duel ladder
+/// runs, the stock 2 s/4 s intermission cycle is a no-op. The pristine body
+/// would move the "loser" to spectator and pull a spectator in at 2 s, then
+/// call `ExitLevel` → `map_restart` at 4 s; the ladder drives its own board
+/// window and arms its own round restart instead.
+///
+/// # Safety
+///
+/// Entered from the game module with no arguments.
+pub unsafe extern "C" fn check_intermission_exit() {
+    if crate::duel::suppress_stock_intermission() {
+        return;
+    }
+    // SAFETY: trampoline attached at GAME_INIT.
+    let original = original_call(crate::hooks::game_hook_original_check_intermission_exit);
+    unsafe { original() };
+}
+
+/// `void AdjustTournamentScores(void)` wrapper (D-025): the pristine
+/// `BeginIntermission` calls it to add a win/loss to the top two scorers. The
+/// ladder records its own W/L and injects it into per-viewer `CS_PLAYERS`;
+/// no-opping the write keeps `sess.wins` at 0, so `DuelLimitHit` stays inert.
+///
+/// # Safety
+///
+/// Entered from the game module with no arguments.
+pub unsafe extern "C" fn adjust_tournament_scores() {
+    if crate::duel::suppress_stock_intermission() {
+        return;
+    }
+    // SAFETY: trampoline attached at GAME_INIT.
+    let original = original_call(crate::hooks::game_hook_original_adjust_tournament_scores);
+    unsafe { original() };
 }
 
 #[cfg(test)]
