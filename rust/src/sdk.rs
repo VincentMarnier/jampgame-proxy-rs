@@ -64,6 +64,16 @@ pub const TEAM_BLUE: i32 = 2;
 pub const TEAM_SPECTATOR: i32 = 3;
 pub const TEAM_NUM_TEAMS: i32 = 4;
 
+/// Game types (`bg_public.h:185-197`): duel modes allow spectators to call
+/// votes (`Cmd_CallVote_f`, `g_cmds.c:1906-1913`).
+pub const GT_DUEL: i32 = 3;
+pub const GT_POWERDUEL: i32 = 4;
+
+/// `PSG_VOTED` (`g_local.h:430-432`): the client already cast its vote.
+pub const PSG_VOTED: u32 = 1 << 0;
+/// `MAX_VOTE_COUNT` (`g_local.h:436`): votes one client may call.
+pub const MAX_VOTE_COUNT: i32 = 3;
+
 /// `TEAM_MAXOVERLAY` (`bg_public.h:1031`): the stock `tinfo` parser's array
 /// size in every cgame (`sortedTeamPlayers[TEAM_MAXOVERLAY]`). A `tinfo` count
 /// above this overflows a stock cgame's array (its parser has no bounds check)
@@ -133,7 +143,9 @@ pub const G_GET_USERCMD: i32 = 40;
 /// `G_SEND_CONSOLE_COMMAND(int exec_when, const char *text)` (`g_public.h:138`,
 /// enum-counted 16). S14 screens the vote's `EXEC_APPEND clientkick`.
 pub const G_SEND_CONSOLE_COMMAND: i32 = 16;
-/// `cbufExec_t::EXEC_APPEND` (`qcommon.h`): run at the next `Cbuf_Execute`.
+/// `cbufExec_t` (`qcommon.h`): execute the command now, or append it to the
+/// buffer that `Cbuf_Execute` drains next.
+pub const EXEC_NOW: i32 = 0;
 pub const EXEC_APPEND: i32 = 2;
 pub const G_NAV_FREE: i32 = 201;
 /// `G_NAV_LOAD` (`g_public.h:298-300`, right after `G_NAV_FREE`): the game's
@@ -686,6 +698,11 @@ pub const CS_SCORES2: i32 = 7;
 /// `CS_VOTE_TIME` (`bg_public.h:65`): set to the vote start time, emptied at
 /// the end. S14 snapshots the slot addresses when it becomes non-empty.
 pub const CS_VOTE_TIME: i32 = 8;
+/// `CS_VOTE_STRING` (`bg_public.h:66`): the text the vote UI shows.
+pub const CS_VOTE_STRING: i32 = 9;
+/// `CS_VOTE_YES` / `CS_VOTE_NO` (`bg_public.h:67-68`): the running tally.
+pub const CS_VOTE_YES: i32 = 10;
+pub const CS_VOTE_NO: i32 = 11;
 /// `CS_PLAYERS = CS_ICONS + MAX_ICONS = 1131` (`bg_public.h` chain:
 /// `CS_AMBIENT_SET 37 + MAX_AMBIENT_SETS 256 → … → CS_SOUNDS 811 +
 /// MAX_SOUNDS 256 → CS_ICONS 1067 + MAX_ICONS 64`).
@@ -859,6 +876,11 @@ pub const OFFSET_PERS_TEAM_STATE_LOCATION: usize = 100;
 /// updates?" (`g_local.h:454`), set from the `teamoverlay` userinfo key by
 /// `ClientUserinfoChanged` (forced on in team gametypes, `g_client.c:2160`).
 pub const OFFSET_PERS_TEAM_INFO: usize = 152;
+/// `offsetof(clientPersistant_t, voteCount)` — the per-client vote-call count
+/// `Cmd_CallVote_f` tests against `MAX_VOTE_COUNT`.
+pub const OFFSET_PERS_VOTE_COUNT: usize = 144;
+/// `offsetof(gclient_t, mGameFlags)` — `PSG_VOTED` lives here.
+pub const OFFSET_GCLIENT_MGAMEFLAGS: usize = 7216;
 
 /// `offsetof(clientSession_t, sessionTeam)` — team_t.
 pub const OFFSET_SESS_SESSION_TEAM: usize = 0;
@@ -902,6 +924,21 @@ pub const OFFSET_LEVEL_TEAM_SCORES_BLUE: usize = 52;
 /// (`g_active.c:SpectatorClientEndFrame`).
 pub const OFFSET_LEVEL_FOLLOW1: usize = 212;
 pub const OFFSET_LEVEL_FOLLOW2: usize = 216;
+/// `offsetof(level_locals_t, clients)` — the `gclient_t` array (`level.clients`,
+/// first field of the SDK layout).
+pub const OFFSET_LEVEL_CLIENTS: usize = 0;
+/// `offsetof(level_locals_t, maxclients)` — the latched `sv_maxclients`.
+pub const OFFSET_LEVEL_MAXCLIENTS: usize = 24;
+/// `offsetof(level_locals_t, voteString)` / `voteDisplayString`: what is run
+/// when the vote passes and what the vote UI shows.
+pub const OFFSET_LEVEL_VOTE_STRING: usize = 240;
+pub const OFFSET_LEVEL_VOTE_DISPLAY_STRING: usize = 1264;
+/// `offsetof(level_locals_t, voteTime)` / `voteExecuteTime` / `voteYes` /
+/// `voteNo` — the fields the game's `CheckVote` and `Cmd_Vote_f` drive.
+pub const OFFSET_LEVEL_VOTE_TIME: usize = 2288;
+pub const OFFSET_LEVEL_VOTE_EXECUTE_TIME: usize = 2292;
+pub const OFFSET_LEVEL_VOTE_YES: usize = 2296;
+pub const OFFSET_LEVEL_VOTE_NO: usize = 2300;
 
 /// `offsetof(msg_t, oob)` — the three booleans before `data`
 /// (`allowoverflow` 0, `overflowed` 4, `oob` 8; `qcommon.h:17-26`).
@@ -1127,6 +1164,8 @@ mod tests {
         assert_eq!(OFFSET_PERS_NETNAME, 48);
         assert_eq!(OFFSET_PERS_TEAM_STATE_LOCATION, 100);
         assert_eq!(OFFSET_PERS_TEAM_INFO, 152);
+        assert_eq!(OFFSET_PERS_VOTE_COUNT, 144);
+        assert_eq!(OFFSET_GCLIENT_MGAMEFLAGS, 7216);
         assert_eq!(OFFSET_PS_WEAPON, 176);
         assert_eq!(OFFSET_PS_LEGS_FLIP, 120);
         assert_eq!(OFFSET_PS_TORSO_FLIP, 124);
@@ -1142,6 +1181,14 @@ mod tests {
         assert_eq!(OFFSET_LEVEL_TEAM_SCORES_BLUE, 52);
         assert_eq!(OFFSET_LEVEL_FOLLOW1, 212);
         assert_eq!(OFFSET_LEVEL_FOLLOW2, 216);
+        assert_eq!(OFFSET_LEVEL_CLIENTS, 0);
+        assert_eq!(OFFSET_LEVEL_MAXCLIENTS, 24);
+        assert_eq!(OFFSET_LEVEL_VOTE_STRING, 240);
+        assert_eq!(OFFSET_LEVEL_VOTE_DISPLAY_STRING, 1264);
+        assert_eq!(OFFSET_LEVEL_VOTE_TIME, 2288);
+        assert_eq!(OFFSET_LEVEL_VOTE_EXECUTE_TIME, 2292);
+        assert_eq!(OFFSET_LEVEL_VOTE_YES, 2296);
+        assert_eq!(OFFSET_LEVEL_VOTE_NO, 2300);
         assert_eq!(OFFSET_GENTITY_S_ETYPE, 4);
         assert_eq!(OFFSET_GENTITY_S_EFLAGS, 8);
         assert_eq!(OFFSET_GENTITY_S_OTHER_ENTITY_NUM, 188);

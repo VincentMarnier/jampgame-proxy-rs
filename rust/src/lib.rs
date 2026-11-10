@@ -32,6 +32,7 @@
 mod ban;
 mod banfile;
 mod challenge;
+mod coinflip;
 mod diagnostics;
 mod engine;
 mod fov;

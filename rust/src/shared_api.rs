@@ -295,6 +295,12 @@ pub fn client_command(client_num: c_int) -> bool {
         return false;
     }
 
+    // `callvote coinflip` is a proxy vote: start it with the game's own vote
+    // state/configstrings instead of letting the game reject the unknown type.
+    if crate::coinflip::handle_client_command(client_num, cmd, cmd_arg1) {
+        return false;
+    }
+
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"callvote".as_ptr(), 8) } == 0 {
         let cmd_arg2_number_value = utils::atoi(cmd_arg2);
         let mut min_arg2 = 0i32;

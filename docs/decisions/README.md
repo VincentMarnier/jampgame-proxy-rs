@@ -149,3 +149,8 @@
   trace), a world-unit body margin (`proxy_sv_antiWallHackMargin`),
   `MASK_OPAQUE` traces, spectator/bot/Force-Sight exemptions, the shared
   apply/restore point, and per-instance TFFA trace filtering.
+- `0024-coinflip-vote.md` — `callvote coinflip`: a proxy-claimed vote that uses
+  the game's own `Cmd_Vote_f`/`CheckVote` machinery (30 s tally, pass/fail,
+  three-second execution delay); the vote string is the private
+  `proxy_coinflip`, and its `EXEC_APPEND` execution is replaced by a random
+  `svsay` `Heads`/`Tails` announcement to everyone.

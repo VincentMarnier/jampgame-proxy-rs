@@ -576,15 +576,17 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         // `G_SEND_CONSOLE_COMMAND(int exec, const char *text)`: S14 drops the
         // vote's `EXEC_APPEND clientkick <slot>` when the slot no longer holds
         // the client it held when the vote started. The team-killer kick uses
-        // `EXEC_INSERT` and is left alone.
+        // `EXEC_INSERT` and is left alone. A passed coinflip vote executes a
+        // proxy-private command that is turned into an `svsay` result here.
         G_SEND_CONSOLE_COMMAND => {
-            if crate::state::proxy_enabled()
-                && !crate::votes::console_command_from_ptr(
-                    a0,
-                    a1 as usize as *const core::ffi::c_char,
-                )
-            {
-                return 0;
+            if crate::state::proxy_enabled() {
+                let text = a1 as usize as *const core::ffi::c_char;
+                if !crate::votes::console_command_from_ptr(a0, text) {
+                    return 0;
+                }
+                if !crate::coinflip::console_command_from_ptr(a0, text) {
+                    return 0;
+                }
             }
         }
         _ => {}
@@ -720,6 +722,19 @@ pub unsafe fn get_configstring(index: c_int, buffer: &mut [u8]) {
     }
 }
 
+/// `trap_SetConfigstring` — set server configstring `index` to `value`
+/// (`G_SET_CONFIGSTRING`).
+///
+/// # Safety
+///
+/// The engine syscall pointer must be registered; `value` must be
+/// NUL-terminated.
+pub unsafe fn set_configstring(index: c_int, value: &CStr) {
+    unsafe {
+        call_engine(G_SET_CONFIGSTRING, &[index, value.as_ptr() as c_int]);
+    }
+}
+
 /// `trap_Print` — write `text` to the server console.
 ///
 /// Inside an rcon packet the engine is redirecting `Com_Printf` into its reply
@@ -787,6 +802,20 @@ pub unsafe fn send_server_command(client_num: c_int, text: &CStr) {
     }
     unsafe {
         call_engine(G_SEND_SERVER_COMMAND, &[client_num, text.as_ptr() as c_int]);
+    }
+}
+
+/// `trap_SendConsoleCommand` — execute `text` at `exec_when` (`EXEC_NOW`,
+/// `EXEC_APPEND` or `EXEC_INSERT`) through the engine console. Used to reach
+/// engine commands such as `svsay` from the game side.
+///
+/// # Safety
+///
+/// `text` must be NUL-terminated; the engine syscall pointer must be
+/// registered.
+pub unsafe fn send_console_command(exec_when: c_int, text: &CStr) {
+    unsafe {
+        call_engine(G_SEND_CONSOLE_COMMAND, &[exec_when, text.as_ptr() as c_int]);
     }
 }
 

@@ -92,7 +92,7 @@ unsafe extern "C" {
 }
 
 /// Fill `buffer` from `/dev/urandom`; `false` if the device is unavailable.
-fn fill_random(buffer: &mut [u8]) -> bool {
+pub(crate) fn fill_random(buffer: &mut [u8]) -> bool {
     const O_RDONLY: c_int = 0;
     // SAFETY: the path is a NUL-terminated static literal; the buffer is valid
     // for `buffer.len()` bytes; the descriptor is closed before returning.

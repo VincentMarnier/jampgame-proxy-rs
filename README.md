@@ -141,6 +141,18 @@ lists already set stay dormant and work again when it is turned back on. Like
 every proxy feature it also needs `proxy_sv_enable 1`.
 
 
+### Coin flip
+
+`/callvote coinflip` starts a normal vote like any other: the vote UI shows
+`coinflip`, everyone gets 30 seconds to vote, and the caller automatically
+votes yes. When the vote passes, the server announces `Heads` or `Tails` to
+everyone in chat through `svsay` (as `Server: Coin flip: Heads!`). The side is
+drawn from `/dev/urandom`, with a clock/counter fallback if that device is
+unavailable. The usual vote rules apply (`g_allowVote`, one vote at a time,
+the caller's vote limit, and no spectator votes outside duel). Like every proxy
+feature it needs `proxy_sv_enable 1`.
+
+
 ### IP bans
 
 The stock `addip` keeps its filters in memory and mirrors them into the
