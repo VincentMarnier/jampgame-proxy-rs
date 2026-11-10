@@ -41,7 +41,7 @@ install → `next build` → upload `out/` → deploy to GitHub Pages.
 
 ```text
 app/
-  page.jsx        # the whole site (hero, how, install, features, TFFA, build)
+  page.jsx        # the whole site (hero, how, install, features, TFFA, duels, build)
   interactive.jsx # client islands: CopyButton, CmdChip, CvarExplorer (SSR-rendered, static-safe)
   layout.jsx      # metadata + bundled display fonts
   fonts.js        # next/font/local wiring (Audiowide + Michroma, SIL OFL — see app/fonts/OFL-*.txt)

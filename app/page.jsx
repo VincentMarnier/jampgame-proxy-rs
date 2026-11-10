@@ -26,9 +26,10 @@ const cvars = [
   ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "gameplay"],
   ["proxy_sv_lockTeamsAfterXSecs", "0", "Grace delay in seconds before a round's teams lock (0 = off); teams stay open for that long, and a join in a match cancels its lock for the round", "teams"],
   ["proxy_sv_teamSizeRules", "(empty)", "Per-team-size timelimit / fraglimit / capturelimit overrides, reconciled as the roster changes; per match under TFFA", "teams"],
-  ["proxy_tffa_enable", "0", "Run parallel self-organized TFFA matches on one GT_TEAM map: per-match world, teams, chat and scores", "tffa"],
-  ["proxy_tffa_maxMatches", "8", "Maximum parallel TFFA matches", "tffa"],
-  ["proxy_tffa_maxGroupSize", "12", "Maximum players per TFFA match (both teams combined)", "tffa"],
+  ["proxy_parallel_tffas_enable", "0", "Run parallel self-organized TFFA matches on one GT_TEAM map: per-match world, teams, chat and scores; the pre-rename proxy_tffa_enable still works as an alias", "tffa"],
+  ["proxy_parallel_tffas_maxMatches", "8", "Maximum parallel TFFA matches (alias proxy_tffa_maxMatches)", "tffa"],
+  ["proxy_parallel_tffas_maxGroupSize", "12", "Maximum players per TFFA match, both teams combined (alias proxy_tffa_maxGroupSize)", "tffa"],
+  ["proxy_parallel_duels_enable", "0", "Run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners climb and losers drop between rounds, first to duel_fraglimit wins", "duels"],
   ["proxy_sv_spectatorTeamOverlay", "1", "Send the team overlay's HP/armor roster to spectators following a player (TaystJK cg_drawTeamOverlay and the stock team info HUD)", "observability"],
   ["proxy_sv_enableClientPpsLimit", "0", "Per-client packet-rate limiter: the limit is an integer downscale of the client's measured FPS ± proxy_sv_clientPpsFpsMargin, capped by proxy_sv_globalMaxPps; excess packets are dropped evenly through the next second", "network"],
   ["proxy_sv_globalMaxPps", "100", "Global hard ceiling on accepted packets per second per client (0 = no ceiling); the FPS-derived per-client limit is capped to it", "network"],
@@ -70,6 +71,8 @@ const playerCommands = [
   "tffa_join <id> [password]",
   "tffa_join 0",
   "tffa_list",
+  "/join red|blue",
+  "callvote coinflip",
   "/ignore <player>",
   "/unignore <player>",
   "netStatus",
@@ -140,6 +143,7 @@ export default function Home() {
             <a href="#install">Install</a>
             <a href="#features">Features</a>
             <a href="#tffa">TFFA</a>
+            <a href="#duels">Duels</a>
             <a href="#build">Build</a>
           </nav>
           <a className="nav-cta" href={REPO}>
@@ -264,7 +268,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">46 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">47 · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -293,6 +297,15 @@ export default function Home() {
                 chat, with a silent mode — <code>proxy_sv_muteMode 2</code>. Any
                 player can hide someone&apos;s chat for themselves with{" "}
                 <code>/ignore</code>.
+              </p>
+            </li>
+            <li>
+              <b>Coinflip vote</b>
+              <p>
+                <code>/callvote coinflip</code> runs a normal 30-second vote;
+                when it passes, the server announces <code>Heads</code> or{" "}
+                <code>Tails</code> to everyone in chat, drawn from{" "}
+                <code>/dev/urandom</code>.
               </p>
             </li>
             <li>
@@ -371,7 +384,8 @@ export default function Home() {
           </div>
           <p className="note">
             Typed in the game console; <code>tffa</code> is a shortcut for{" "}
-            <code>tffa_list</code>. All player commands are listed here.
+            <code>tffa_list</code>, and <code>/join red|blue</code> is accepted
+            while parallel TFFA is on. All player commands are listed here.
           </p>
           <h3 className="sub">Admin commands <span className="count">rcon / console</span></h3>
           <div className="cmds">
@@ -393,7 +407,7 @@ export default function Home() {
 
         {/* ---------- TFFA ---------- */}
         <section className="block" id="tffa" aria-labelledby="tffa-title">
-          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_tffa_enable 1 (GT_TEAM only), players run parallel matches on one map — separate teams, worlds, chat and scores. Passwords protect a match&apos;s teams without closing spectating." />
+          <SectionHead id="tffa-title" eyebrow="Parallel play" title="TFFA: many matches, one map" lede="With proxy_parallel_tffas_enable 1 (GT_TEAM only), players run parallel matches on one map — separate teams, worlds, chat and scores. Passwords protect a match&apos;s teams without closing spectating." />
           <div className="lifecycle" aria-label="TFFA match lifecycle">
             <div><b><i>1</i>Create</b><code>tffa_create [password]</code> opens a match, joins its smaller side and protects its teams.</div>
             <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt; [password]</code> switches mid-game; <code>tffa_join 0</code> returns to main. Without the password a protected match is spectate-only.</div>
@@ -403,15 +417,38 @@ export default function Home() {
           <div className="hook-grid">
             <div className="hook-card"><b>Own world per match</b><p>Doors, plats, triggers and map items are duplicated; runtime spawns belong to their creator. Maps with NPC or vehicle actors take no parallel matches.</p></div>
             <div className="hook-card"><b>Survives map_restart</b><p>Players return to their match and team, passwords included, with the world rebuilt and scores reset. A full map change starts everyone in main.</p></div>
-            <div className="hook-card"><b>Closes cleanly</b><p>An emptied created match closes itself. <code>proxy_tffa_enable 0</code> moves created-match players to spectator with a message.</p></div>
+            <div className="hook-card"><b>Closes cleanly</b><p>An emptied created match closes itself. <code>proxy_parallel_tffas_enable 0</code> moves created-match players to spectator with a message.</p></div>
           </div>
           <ul className="tight">
-            <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_join 0</code> / <code>tffa_list</code> work while playing: travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>. All player commands are listed above.</li>
+            <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_join 0</code> / <code>tffa_list</code> work while playing: travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>. The pre-rename <code>proxy_tffa_*</code> cvars stay registered as aliases. All player commands are listed above.</li>
+            <li>Spectating a match and then typing <code>/team red|blue</code> (or <code>/join red|blue</code>) joins <em>that</em> match, not the one you were assigned to; a protected match still answers with the <code>tffa_join &lt;id&gt; &lt;password&gt;</code> invite, and simply watching it stays open.</li>
             <li>A password only gates joining a team — anyone can spectate without it, and <code>tffa_list</code> marks the match <code>[password]</code>. <code>tffa_join &lt;id&gt; &lt;password&gt;</code> unlocks a match you are already in, including one promoted to the main slot. Passwords are case-sensitive, up to 32 characters, and redacted from the log.</li>
             <li>Auto team picks balance the match being joined; team lock and team-size rules use per-match rosters, and a rule applies only when every populated match is the same <code>N vs N</code>.</li>
             <li>A match that hits the fraglimit plays one second with damage void, then moves its players to spectator and remembers its group for the next <code>map_restart</code>. A full map change drops it; the restart defers proxy pushes over frames so every client is retained.</li>
             <li>Global chat is server-wide; team chat stays in its match, and spectator chat reaches the spectators of every match. The scoreboard groups other matches as spectators and takes the header and scores from your own match (HUD team scores stay global).</li>
             <li>Spawn points are shared, but occupancy is judged per match, so a match never drops players onto another match&apos;s bodies.</li>
+          </ul>
+        </section>
+
+        {/* ---------- duels ---------- */}
+        <section className="block" id="duels" aria-labelledby="duels-title">
+          <SectionHead id="duels-title" eyebrow="Parallel play" title="Duels: a ladder, side by side" lede="With proxy_parallel_duels_enable 1 (GT_DUEL only), every player and bot is shuffled into 1v1 courts on one map, each in its own world. Winners climb, losers drop, and the ladder carries across rounds until a champion is crowned." />
+          <div className="lifecycle" aria-label="Parallel duel ladder lifecycle">
+            <div><b><i>1</i>Courts</b>Willing players and bots are shuffled into 1v1 courts: court 1 in the main world, the others in their own instances.</div>
+            <div><b><i>2</i>Round</b>Each court fights one duel to the server&apos;s <code>fraglimit</code>; the round ends when every court is decided.</div>
+            <div><b><i>3</i>Bump</b>A carried <code>map_restart</code> moves winners up a court and losers down; the top winner and bottom loser stay, the surplus waits on a FIFO bench.</div>
+            <div><b><i>4</i>Champion</b>The first to <code>duel_fraglimit</code> duel wins takes the ladder, then a fresh shuffle starts (<code>0</code> = endless).</div>
+          </div>
+          <div className="hook-grid">
+            <div className="hook-card"><b>Own arena per court</b><p>Courts neither see, hit, hear nor collide with each other. The map&apos;s entity budget bounds the court count; later joiners queue and more courts open at the next round.</p></div>
+            <div className="hook-card"><b>Carried by round restart</b><p>The proxy&apos;s own round restart keeps the ladder and standings. A voted or rcon <code>map_restart</code> is an admin restart with a fresh shuffle, and a full map change always starts over.</p></div>
+            <div className="hook-card"><b>Board &amp; HUD</b><p>W/L standings cover the whole ladder, sorted by court with the bench last. Each viewer gets their own court&apos;s duelist HUD and top score.</p></div>
+          </div>
+          <ul className="tight">
+            <li>A round&apos;s own <code>timelimit</code> (minutes) decides unfinished courts by health + shield, random on an exact tie. <code>fraglimit 0</code> removes the per-duel kill limit, <code>timelimit 0</code> the round cap and <code>duel_fraglimit 0</code> the champion threshold.</li>
+            <li>A disconnect or an explicit <code>/team spectator</code> mid-duel gives the opponent a walkover; everyone else stays in the ladder, and bots are drafted like players. <code>team free</code> cannot take a court.</li>
+            <li>Opted-out spectators are marked <code>(Spec)</code>, bench players <code>(Bench)</code> and court players <code>(Duel N)</code>; one round-level message replaces the repeating time-limit notice.</li>
+            <li>Setting <code>proxy_parallel_duels_enable 0</code> returns everyone to spectator and hands the map back to the stock duel tournament; its automatic pull-in, global duelist configstrings and intermission handling are suppressed while the ladder runs.</li>
           </ul>
         </section>
 
@@ -447,6 +484,7 @@ export default function Home() {
               <a href="#install">Install</a>
               <a href="#features">Features</a>
               <a href="#tffa">Parallel TFFA</a>
+              <a href="#duels">Parallel duels</a>
               <a href="#build">Build</a>
             </div>
             <div>
