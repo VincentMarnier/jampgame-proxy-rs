@@ -300,6 +300,9 @@ pub unsafe extern "C" fn vmMain(
         GAME_CLIENT_COMMAND => {
             let mut shadow_mute = None;
             if state::proxy_enabled() {
+                // Record the TAB board request so the scoreboard trap only
+                // repairs that viewer's CS_PLAYERS (not every final board).
+                instances::note_client_command(a0);
                 if tffa::handle_client_command(a0) {
                     return 0;
                 }

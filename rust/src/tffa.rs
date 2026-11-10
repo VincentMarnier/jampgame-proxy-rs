@@ -450,6 +450,14 @@ pub fn refresh_cs_players_for_scores(viewer: c_int) {
     if !(0..MAX_CLIENTS as c_int).contains(&viewer) {
         return;
     }
+    // Per-viewer and deduped: a TAB request pays for the repair, and the
+    // intermission's server-initiated final board must also carry the fresh
+    // W/L/labels (one viewer at a time — never the old all-viewer burst).
+    let requested = crate::instances::take_score_request(viewer);
+    let intermission = state::with_state(|s| s.tffa.intermission);
+    if !requested && !intermission {
+        return;
+    }
     // Same board match the `scores` rewrite uses (follow-aware, and the
     // pre-intermission capture while the final board is built).
     let viewer_match = viewer_board_match(viewer);
@@ -1006,6 +1014,7 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
     // instance may remember them, and no pending auto-join survives.
     forget_client_everywhere(client_num);
     state::with_state(|s| {
+        s.tffa.score_requested[client_num as usize] = false;
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
         s.tffa.cs_players_base[client_num as usize].clear();
@@ -1028,6 +1037,7 @@ pub fn on_client_disconnect(client_num: c_int) {
     }
     forget_client_everywhere(client_num);
     state::with_state(|s| {
+        s.tffa.score_requested[client_num as usize] = false;
         s.tffa.client_match[client_num as usize] = MAIN_MATCH;
         s.tffa.player_score[client_num as usize] = 0;
         s.tffa.cs_players_base[client_num as usize].clear();

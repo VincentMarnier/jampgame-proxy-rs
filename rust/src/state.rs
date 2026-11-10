@@ -714,6 +714,11 @@ pub struct TffaState {
     /// (the 128-slot reliable buffer overflows otherwise: every frag would
     /// re-push unchanged scores to every client).
     pub cs_scores_sent: [(i32, i32); MAX_CLIENTS],
+    /// The client asked for the scoreboard (`score`/`scoreboard` command, the
+    /// TAB request). Only that request pays for the per-viewer `CS_PLAYERS`
+    /// repair; a server-initiated final board (intermission) must not trigger
+    /// a burst.
+    pub score_requested: [bool; MAX_CLIENTS],
     /// Last `effective_match` per viewer, to re-push prefixed names + scores
     /// when spectating (game follow) changes your instance without any proxy
     /// command.
@@ -881,6 +886,7 @@ impl Default for TffaState {
             cs_players_sent: core::array::from_fn(|_| core::array::from_fn(|_| String::new())),
             view_bases_from_gamestate: [false; MAX_CLIENTS],
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
+            score_requested: [false; MAX_CLIENTS],
             viewer_match_cache: [0; MAX_CLIENTS],
             intermission_boards: [0; MAX_CLIENTS],
             pending_join: [crate::tffa::REMEMBERED_NONE; MAX_CLIENTS],

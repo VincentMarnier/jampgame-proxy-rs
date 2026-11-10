@@ -166,7 +166,7 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 
 ## 9. Verification
 
-- `cargo test`: 438 unit tests (ladder model: shuffle/formation/bump for
+- `cargo test`: 440 unit tests (ladder model: shuffle/formation/bump for
   C=1..N with even/odd/queue, reconcile on roster change, each resolution rule,
   standings, champion/tie, board order, restart classifier, LogExit ownership,
   score reorder, credit offsets).
@@ -183,19 +183,44 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
   - with `timelimit 1` (one minute) a round expired at 60000 ms from its own
     clock start, and carried rounds were re-measured against their own start,
     so the limit is per match, not per ladder;
-  - round/enable/champion messages showed player names (bots' netnames) rather
-    than slot numbers after the carried round was announced at its first
-    spawned frame;
+  - round/enable/champion messages showed player names (bots' netnames, reset
+    to `^7`) rather than slot numbers after the carried round was announced at
+    its first spawned frame;
+  - `timelimit 1` produced exactly one `Time limit reached` line and zero
+    stock `TIMELIMIT_HIT` broadcasts per round;
   - `rcon map_restart` → `classified as Admin`, `GAME_INIT … carry=false`;
   - `rcon proxy_parallel_duels_enable 0` → teardown, the stock duel resumes;
   - re-enable → takeover and a new ladder.
 - Announcements are single-byte ASCII with real newlines (`message_safe` +
   `print`), so a stock latin-1 client renders the round board and champion
   text instead of `\n` and UTF-8 mojibake.
-- The end-of-duel scoreboard no longer triggers an all-viewer `CS_PLAYERS`
-  refresh: only the viewer asking for the board gets its labels/W-L pushed,
-  removing the O(viewers²) reliable burst that could hang clients at round
-  end.
+- **Scoreboard refresh decision (D-006.13 shape, applied to both modes).** Two
+  candidates were measured:
+  1. TFFA's per-viewer refresh: the `scores` trap repairs only the requesting
+     viewer, deduped against `cs_players_sent` and deferred under reliable
+     pressure. Cost is O(slots) for one client.
+  2. The duel's earlier all-viewer refresh: every `scores` message refreshed
+     every viewer, O(viewers × slots) per send. At an intermission that queued
+     up to `viewers × slots` commands per client and is the reliable
+     `CL_GetServerCommand: a reliable command was cycled out` source.
+  The TFFA shape wins and is now the only one. The repair runs on a TAB
+  (`score`/`scoreboard`, recorded from `GAME_CLIENT_COMMAND`) or on the
+  intermission's final board; other server-initiated boards send nothing. The
+  all-viewer refresh at `end_round` was removed. TFFA's end-game stats tables
+  (the `proxy_sv_enableEndGameStats` feature) are a separate intermission
+  burst and are not part of the scoreboard path.
+- The stock `TIMELIMIT_HIT` print is swallowed while the ladder runs: the game
+  re-broadcasts it on every rank calculation after `level.startTime`, which
+  flooded reliable commands (a direct source of
+  `CL_GetServerCommand: a reliable command was cycled out`) and produced the
+  repeated "time over" line. The proxy prints one
+  `Time limit reached - this round ends.` per round instead.
+- Announced names append `^7` so a player's colour code cannot bleed into the
+  rest of the line.
+- A connect after a `g_gametype` switch + restart reseeds willingness
+  (`should_seed_on_connect`: first connect, idle/fresh ladder, or
+  `fresh_restart`); before this, the post-restart reconnect saw `ladder = true`
+  with the default false flags and the humans were never drafted.
 - Teardown restores every `CS_PLAYERS` base directly per viewer (only where
   the recorded value differs) and clears the duelist/health strings, bypassing
   the reliable-pressure deferral because the instance core is already off.

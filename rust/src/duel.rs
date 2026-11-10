@@ -735,11 +735,14 @@ fn client_names() -> [String; MAX_CLIENTS] {
 }
 
 fn name_label(names: &[String; MAX_CLIENTS], client_num: u8) -> String {
-    names
+    let name = names
         .get(client_num as usize)
         .filter(|n| !n.is_empty())
         .cloned()
-        .unwrap_or_else(|| format!("#{client_num}"))
+        .unwrap_or_else(|| format!("#{client_num}"));
+    // The name may carry its own `^n` colour codes; reset to white before the
+    // rest of the sentence so one player's colour does not leak into it.
+    format!("{}^7", name.trim_end_matches('^'))
 }
 
 fn cvar(name: &CStr) -> i32 {
@@ -899,7 +902,10 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
     // own spectator move (a court player leaving) clears the flag.
     let willing = true;
     state::with_state(|s| {
-        if first_time || !s.duel.ladder {
+        // A carried ladder keeps each reconnect's carried flag; a fresh
+        // ladder (first start, map change, admin restart, or a gametype switch
+        // whose clients reconnect after the restart) reseeds everybody.
+        if should_seed_on_connect(first_time, s.duel.ladder, s.duel.fresh_restart) {
             s.duel.willing[n] = willing;
             s.duel.spawned[n] = false;
             s.tffa.client_match[n] = crate::instances::MAIN_MATCH;
@@ -913,6 +919,13 @@ pub fn on_client_connect(client_num: c_int, first_time: bool) {
         }
         s.duel.spawn_pending.retain(|&c| c as usize != n);
     });
+}
+
+/// Whether a connect seeds willingness. A first connect, an idle/fresh ladder
+/// and a fresh-restart carry do; a reconnect into a running carried round
+/// keeps the flag it was drafted with.
+fn should_seed_on_connect(first_time: bool, ladder: bool, fresh_restart: bool) -> bool {
+    first_time || !ladder || fresh_restart
 }
 
 /// `GAME_CLIENT_DISCONNECT` bookkeeping: a leaver loses their court by
@@ -1517,6 +1530,7 @@ pub fn on_run_frame_post() {
             level_time().wrapping_sub(round_start),
             tl.saturating_mul(MS_PER_MINUTE)
         );
+        announce("Time limit reached - this round ends.");
         let mut pick = state::with_state(|s| s.duel.seed).wrapping_add(now as u32);
         for i in 0..count {
             let court = state::with_state(|s| s.duel.courts[i]);
@@ -1690,7 +1704,7 @@ fn end_round() {
             "----- proxy-rs: parallel duels champion client {} with {} win(s)",
             champ, wins
         );
-        let champion_name = client_name(champ);
+        let champion_name = format!("{}^7", client_name(champ).trim_end_matches('^'));
         announce(&champion_announcement(&champion_name, wins));
         announce_center(&champion_announcement(&champion_name, wins));
         state::with_state(|s| {
@@ -1739,12 +1753,15 @@ fn run_intermission() {
     if original::base() == 0 {
         return;
     }
+    // Set the intermission state *before* the pristine body, which builds and
+    // sends the final scoreboard from inside the call: the per-viewer refresh
+    // and the pre-move board capture must already see it.
+    state::with_state(|s| s.tffa.intermission = true);
+    crate::tffa::snapshot_intermission_boards();
     // SAFETY: the pristine BeginIntermission trampoline is attached at
     // GAME_INIT and the game is between frames.
     let original = crate::hooks::original_call(crate::hooks::game_hook_original_begin_intermission);
     unsafe { original() };
-    state::with_state(|s| s.tffa.intermission = true);
-    crate::tffa::snapshot_intermission_boards();
 }
 
 /// Cvar off, wrong gametype or full teardown: release the courts and return
@@ -1808,7 +1825,12 @@ pub fn log_exit_owned(string: &[u8]) -> bool {
 /// Pristine fraglimit/win-limit chat notices (the `LogExit` companions).
 pub fn swallow_print(text: &str) -> bool {
     suppress_stock_intermission()
-        && (text.contains("HIT_THE_KILL_LIMIT") || text.contains("hit the win limit"))
+        && (text.contains("HIT_THE_KILL_LIMIT")
+            || text.contains("hit the win limit")
+            // `CheckExitRules` re-broadcasts this on every rank calculation
+            // once the stock `level.startTime` timer passes; the ladder emits
+            // one round-level message instead.
+            || text.contains("TIMELIMIT_HIT"))
 }
 
 /// Restart classification (D-025 §5): only the proxy's own round transition
@@ -2381,6 +2403,25 @@ mod tests {
     }
 
     #[test]
+    fn connects_seed_willingness_on_a_fresh_ladder() {
+        assert!(should_seed_on_connect(true, true, false));
+        assert!(should_seed_on_connect(false, false, false));
+        assert!(should_seed_on_connect(false, true, true));
+        assert!(!should_seed_on_connect(false, true, false));
+    }
+
+    #[test]
+    fn name_labels_reset_to_white() {
+        let mut names: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        names[3] = "^1Bob".to_owned();
+        assert_eq!(name_label(&names, 3), "^1Bob^7");
+        names[4] = "^2Team ^3Alice^".to_owned();
+        assert_eq!(name_label(&names, 4), "^2Team ^3Alice^7");
+        names[5] = String::new();
+        assert_eq!(name_label(&names, 5), "#5^7");
+    }
+
+    #[test]
     fn shuffle_is_a_permutation_and_seed_stable() {
         let r = roster(16);
         let a = shuffle(&r, 12345);
@@ -2599,9 +2640,9 @@ mod tests {
         let names = core::array::from_fn(|i| format!("P{i}"));
         let text = round_announcement(&[Court::new(1, 2), Court::new(3, 4)], &[7], &names);
         assert!(text.is_ascii(), "client renders latin-1: {text:?}");
-        assert!(text.contains("\n court 1: P1 vs P2"), "{text:?}");
-        assert!(text.contains("\n court 2: P3 vs P4"), "{text:?}");
-        assert!(text.contains("\n bench: P7"), "{text:?}");
+        assert!(text.contains("\n court 1: P1^7 vs P2^7"), "{text:?}");
+        assert!(text.contains("\n court 2: P3^7 vs P4^7"), "{text:?}");
+        assert!(text.contains("\n bench: P7^7"), "{text:?}");
         // A UI dash or curly quote becomes single-byte, never a literal
         // backslash-n or UTF-8 mojibake.
         let safe = message_safe("a \u{2014} \u{201c}b\u{201d}");
@@ -2728,10 +2769,10 @@ mod tests {
         let courts = vec![Court::new(1, 2), Court::new(3, 4)];
         let names = core::array::from_fn(|i| format!("P{i}"));
         let text = round_announcement(&courts, &[7], &names);
-        assert!(text.contains("court 1: P1 vs P2"));
-        assert!(text.contains("court 2: P3 vs P4"));
-        assert!(text.contains("bench: P7"));
+        assert!(text.contains("court 1: P1^7 vs P2^7"));
+        assert!(text.contains("court 2: P3^7 vs P4^7"));
+        assert!(text.contains("bench: P7^7"));
         assert!(round_announcement(&courts, &[], &names).contains("bench: empty"));
-        assert!(champion_announcement("P5", 3).contains("P5"));
+        assert!(champion_announcement("P5^7", 3).contains("P5^7"));
     }
 }

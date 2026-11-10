@@ -400,6 +400,32 @@ pub(crate) fn rewrite_cs_players_for_slot(
     rewrite_cs_players_for_viewer(base, player_match, viewer_match)
 }
 
+/// Mark a client's `score`/`scoreboard` request (the TAB board) so the
+/// `scores` trap knows the per-viewer `CS_PLAYERS` repair is owed. Called from
+/// the `GAME_CLIENT_COMMAND` path before the game's own `Cmd_Score_f`.
+pub fn note_client_command(client_num: c_int) {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) || crate::original::base() == 0 {
+        return;
+    }
+    let mut cmd = [0u8; 32];
+    // SAFETY: engine syscall registered; buffer writable.
+    unsafe { crate::syscall::argv(0, &mut cmd) };
+    let end = cmd.iter().position(|&b| b == 0).unwrap_or(cmd.len());
+    let name = &cmd[..end];
+    if name.eq_ignore_ascii_case(b"score") || name.eq_ignore_ascii_case(b"scoreboard") {
+        state::with_state(|s| s.tffa.score_requested[client_num as usize] = true);
+    }
+}
+
+/// Consume a client's pending scoreboard request. `false` for a
+/// server-initiated board, which must not pay for a CS repair burst.
+pub(crate) fn take_score_request(client_num: c_int) -> bool {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return false;
+    }
+    state::with_state(|s| core::mem::take(&mut s.tffa.score_requested[client_num as usize]))
+}
+
 /// Reliable commands the engine still owes `client_num`: `reliableSequence -
 /// reliableAcknowledge`, the number queued but not yet acknowledged.
 ///

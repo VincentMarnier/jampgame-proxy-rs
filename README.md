@@ -978,7 +978,8 @@ duel wins is champion, then a fresh ladder starts (`0` = endless).
 A round's own `timelimit` (in minutes) decides unfinished courts by health +
 shield (random on an exact tie); `fraglimit 0` removes the per-duel kill limit and
 `timelimit 0` the round cap. A player who disconnects or explicitly uses `/team spectator`
-mid-duel gives the opponent a walkover; everyone else stays in the ladder. A voted or rcon `map_restart` is an
+mid-duel gives the opponent a walkover; everyone else stays in the ladder. The
+stock repeating time-limit notice is replaced by one round-level message. A voted or rcon `map_restart` is an
 admin restart — the ladder starts over with a fresh shuffle — while the proxy's
 own round restart carries the ladder. Setting the cvar back to `0` returns
 everyone to spectator and hands the map back to the stock duel tournament.
