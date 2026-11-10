@@ -970,7 +970,8 @@ when every court is decided, the stock intermission shows the board, and a real
 `map_restart` carries the ladder into the next round: winners move up a court,
 losers move down, the top winner and bottom loser stay, and with an odd roster
 (or a map that cannot host every court) the bench is a FIFO queue — one in, one
-out per round. Standings are kept for the whole ladder and shown as W/L on the
+out per round; players who join later enter the queue and the ladder opens
+more courts at the next round, up to what the map can host. Standings are kept for the whole ladder and shown as W/L on the
 scoreboard, sorted by court with the bench last; each viewer also gets their
 own court's duelist HUD and top score. The first player to `duel_fraglimit`
 duel wins is champion, then a fresh ladder starts (`0` = endless).

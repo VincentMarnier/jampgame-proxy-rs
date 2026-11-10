@@ -514,6 +514,14 @@ pub fn reconcile(
             bench.push(pair.b.unwrap());
         }
     }
+    // Joins extend the ladder: promote pairs from the bench into new courts
+    // (appended below the existing ones) while the map can host them and the
+    // roster has a full pair for every court.
+    while kept.len() < cap && kept.len() < roster.len() / 2 && bench.len() >= 2 {
+        let a = queue_pop_front(&mut bench).unwrap();
+        let b = queue_pop_front(&mut bench).unwrap();
+        kept.push(Pair::new(a, b));
+    }
     (kept, bench)
 }
 
@@ -581,29 +589,29 @@ pub fn score_order(courts: &[Court], queue: &[u8]) -> Vec<u8> {
 
 /// The per-round announcement: one line per court plus the bench.
 pub fn round_announcement(courts: &[Court], queue: &[u8]) -> String {
-    let mut out = String::from("Parallel duels — this round:");
+    let mut out = String::from("Parallel duels - this round:");
     for (i, court) in courts.iter().enumerate() {
         match (court.a, court.b) {
             (Some(a), Some(b)) => {
-                out.push_str(&format!(" court {}: #{a} vs #{b};", i + 1));
+                out.push_str(&format!("\n court {}: #{a} vs #{b}", i + 1));
             }
             _ => {
-                out.push_str(&format!(" court {}: —;", i + 1));
+                out.push_str(&format!("\n court {}: -", i + 1));
             }
         }
     }
     if queue.is_empty() {
-        out.push_str(" bench: empty.");
+        out.push_str("\n bench: empty.");
     } else {
         let names: Vec<String> = queue.iter().map(|c| format!("#{c}")).collect();
-        out.push_str(&format!(" bench: {}.", names.join(", ")));
+        out.push_str(&format!("\n bench: {}.", names.join(", ")));
     }
     out
 }
 
 /// Champion announcement.
 pub fn champion_announcement(client_num: u8, wins: i32) -> String {
-    format!("Ladder champion: #{client_num} with {wins} duel win(s) — a fresh ladder starts now.")
+    format!("Ladder champion: #{client_num} with {wins} duel win(s) - a fresh ladder starts now.")
 }
 
 // ---------------------------------------------------------------------------
@@ -740,12 +748,26 @@ fn userinfo_team_is_willing(info: &[u8]) -> bool {
     false
 }
 
+/// In-game `print` payload: quote-safe and single-byte. The 2003 client parses
+/// the command as bytes and renders latin-1, so non-ASCII (an em dash, a
+/// curly quote) would arrive as mojibake; the string ends the command with a
+/// real newline, as every stock `print` does.
+fn message_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_ascii() => c,
+            _ => '?',
+        })
+        .collect()
+}
+
 fn tell(client_num: c_int, text: &str) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return;
     }
-    let safe = text.replace('"', "'");
-    let Ok(msg) = std::ffi::CString::new(format!("print \"{safe}\\n\"")) else {
+    let safe = message_safe(text);
+    let Ok(msg) = std::ffi::CString::new(format!("print \"{safe}\n\"")) else {
         return;
     };
     // SAFETY: engine syscall registered; msg NUL-terminated.
@@ -753,8 +775,8 @@ fn tell(client_num: c_int, text: &str) {
 }
 
 fn announce(text: &str) {
-    let safe = text.replace('"', "'");
-    let Ok(msg) = std::ffi::CString::new(format!("print \"{safe}\\n\"")) else {
+    let safe = message_safe(text);
+    let Ok(msg) = std::ffi::CString::new(format!("print \"{safe}\n\"")) else {
         return;
     };
     // SAFETY: engine syscall registered; msg NUL-terminated.
@@ -1142,12 +1164,16 @@ fn instance_capacity() -> usize {
     if !scanned {
         crate::instances::scan_world_entities();
     }
-    let cost = state::with_state(|s| s.tffa.world_clone_cost);
-    let free = crate::instances::free_world_slots(g_entities);
+    let (cost, cloned) = state::with_state(|s| (s.tffa.world_clone_cost, s.tffa.world_cloned));
+    // The free-slot count excludes the clone sets already live for this
+    // round; add their cost back so capacity is the map's total, not what is
+    // left after the current courts (otherwise the ladder could never grow).
+    let live_cost = cost.saturating_mul(cloned.count_ones() as usize);
+    let total_free = crate::instances::free_world_slots(g_entities).saturating_add(live_cost);
     let clones = if cost == 0 {
         crate::instances::MAX_MATCHES
     } else {
-        free / cost
+        total_free / cost
     };
     (1 + clones.min(crate::instances::MAX_MATCHES)).min(MAX_COURTS)
 }
@@ -1326,7 +1352,7 @@ pub fn on_frame_start() {
             s.duel.queue.clear();
             s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
         });
-        announce("Parallel duels enabled — the ladder starts with two willing players.");
+        announce("Parallel duels enabled - the ladder starts with two willing players.");
     }
     if !state::with_state(|s| s.duel.ladder) {
         return;
@@ -1367,7 +1393,7 @@ pub fn on_frame_start() {
                     s.duel.restart_pending = false;
                     s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
                 });
-                announce("Parallel duels: carried round abandoned — forming a fresh ladder.");
+                announce("Parallel duels: carried round abandoned - forming a fresh ladder.");
             }
         }
     }
@@ -1632,7 +1658,7 @@ fn end_round() {
             s.duel.carry_round = false;
             s.duel.fresh_restart = false;
         });
-        announce("Parallel duels paused — waiting for at least two willing players.");
+        announce("Parallel duels paused - waiting for at least two willing players.");
         return;
     }
     eprintln!(
@@ -1697,7 +1723,7 @@ pub fn teardown() {
     });
     eprintln!("----- proxy-rs: parallel duels torn down");
     crate::instances::restore_pristine_views();
-    announce("Parallel duels disabled — the stock duel tournament resumes.");
+    announce("Parallel duels disabled - the stock duel tournament resumes.");
 }
 
 /// Whether the stock duel intermission machinery must be no-opped: the
@@ -2466,6 +2492,50 @@ mod tests {
         assert_eq!(champion(&wins, &roster, 3, 0), None);
         // Only roster members can be champion (a leaver's wins do not count).
         assert_eq!(champion(&wins, &[9], 2, 0), None);
+    }
+
+    #[test]
+    fn reconcile_grows_the_ladder_when_players_queue_up() {
+        // One court, seven queued players, room for four: the next round opens
+        // four courts (joins extend the ladder at the round boundary).
+        let roster: Vec<u8> = (0..8).collect();
+        let pairs = vec![Pair::new(0, 1)];
+        let queue = vec![2, 3, 4, 5, 6, 7];
+        let (courts, bench) = reconcile(&pairs, &queue, &roster, 16);
+        assert_eq!(
+            courts,
+            vec![
+                Pair::new(0, 1),
+                Pair::new(2, 3),
+                Pair::new(4, 5),
+                Pair::new(6, 7)
+            ]
+        );
+        assert!(bench.is_empty());
+        // Odd roster: the last player stays benched.
+        let roster: Vec<u8> = (0..7).collect();
+        let (courts, bench) = reconcile(&pairs, &[2, 3, 4, 5, 6], &roster, 16);
+        assert_eq!(courts.len(), 3);
+        assert_eq!(bench, vec![6]);
+        // Capacity still caps the growth.
+        let roster: Vec<u8> = (0..8).collect();
+        let (courts, bench) = reconcile(&pairs, &[2, 3, 4, 5, 6, 7], &roster, 2);
+        assert_eq!(courts.len(), 2);
+        assert_eq!(bench, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn round_message_uses_real_newlines_and_single_byte_text() {
+        let text = round_announcement(&[Court::new(1, 2), Court::new(3, 4)], &[7]);
+        assert!(text.is_ascii(), "client renders latin-1: {text:?}");
+        assert!(text.contains("\n court 1: #1 vs #2"), "{text:?}");
+        assert!(text.contains("\n court 2: #3 vs #4"), "{text:?}");
+        assert!(text.contains("\n bench: #7"), "{text:?}");
+        // A UI dash or curly quote becomes single-byte, never a literal
+        // backslash-n or UTF-8 mojibake.
+        let safe = message_safe("a \u{2014} \u{201c}b\u{201d}");
+        assert_eq!(safe, "a ? ?b?");
+        assert!(safe.is_ascii());
     }
 
     #[test]

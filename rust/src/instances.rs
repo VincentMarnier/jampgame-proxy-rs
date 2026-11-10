@@ -526,6 +526,30 @@ pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> b
     true
 }
 
+/// Send a `cs` correction now, bypassing the reliable-window deferral. Used
+/// only by the teardown restore: the instance core is already off, so a
+/// deferred `pending_view_refresh` would never run, and the caller has already
+/// deduped the values it sends.
+fn send_cs_now(client_num: c_int, index: i32, value: &str) -> bool {
+    if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
+        return false;
+    }
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => safe.push('\''),
+            '\n' | '\r' => safe.push(' '),
+            c => safe.push(c),
+        }
+    }
+    let Ok(msg) = std::ffi::CString::new(format!("cs {index} \"{safe}\"\n")) else {
+        return false;
+    };
+    // SAFETY: engine syscall registered; msg NUL-terminated.
+    unsafe { crate::syscall::send_server_command(client_num, &msg) };
+    true
+}
+
 /// `CS_PLAYERS + slot` slot of a configstring index (`None` for every other
 /// configstring). Pure so the index arithmetic is unit-tested.
 pub(crate) fn cs_players_slot(index: i32) -> Option<usize> {
@@ -2299,22 +2323,51 @@ pub(crate) fn rebuild_owned(s: &mut state::ProxyState, g_entities: usize) {
 /// time a cvar-off teardown runs; this pushes the bases directly so no
 /// `(Duel N)`/`(TFFA N)` prefix or proxy W/L survives into the stock game.
 pub(crate) fn restore_pristine_views() {
+    // The engine's `SV_SetConfigstring` skips a value equal to the server's,
+    // so writing the base back would not broadcast: the per-viewer override
+    // has to be replaced on each client directly. The instance core is off by
+    // now, so a normal `send_cs_to_client` would defer under reliable
+    // pressure into a `pending_view_refresh` that never runs; these are sent
+    // immediately, and only where the viewer's recorded value differs.
     let viewers: Vec<c_int> = state::with_state(|s| {
         (0..MAX_CLIENTS as c_int)
             .filter(|v| s.clients[*v as usize].is_connected)
             .collect()
     });
-    let bases: [String; MAX_CLIENTS] = state::with_state(|s| s.tffa.cs_players_base.clone());
+    let (bases, sent): ([String; MAX_CLIENTS], [[String; MAX_CLIENTS]; MAX_CLIENTS]) =
+        state::with_state(|s| {
+            (
+                s.tffa.cs_players_base.clone(),
+                s.tffa.cs_players_sent.clone(),
+            )
+        });
+    let mut restored = 0usize;
+    let viewer_count = viewers.len();
     for viewer in viewers {
-        for (slot, base) in bases.iter().enumerate() {
-            if !base.is_empty() {
-                send_cs_to_client(viewer, CS_PLAYERS + slot as i32, base);
-                record_cs_players_sent(viewer, slot, base);
+        let v = viewer as usize;
+        for (slot, stored) in bases.iter().enumerate() {
+            let base = if stored.is_empty() {
+                get_live_cs_players(slot as i32).unwrap_or_default()
+            } else {
+                stored.clone()
+            };
+            if sent[v][slot] != base {
+                send_cs_now(viewer, CS_PLAYERS + slot as i32, &base);
+                restored += 1;
             }
         }
-        send_cs_to_client(viewer, CS_CLIENT_DUELISTS, "-1|-1");
-        send_cs_to_client(viewer, CS_CLIENT_DUELHEALTHS, "-1|-1|!");
+        send_cs_now(viewer, CS_CLIENT_DUELISTS, "-1|-1");
+        send_cs_now(viewer, CS_CLIENT_DUELHEALTHS, "-1|-1|!");
+        state::with_state(|s| {
+            for value in s.tffa.cs_players_sent[v].iter_mut() {
+                value.clear();
+            }
+            s.tffa.view_bases_from_gamestate[v] = false;
+        });
     }
+    eprintln!(
+        "----- proxy-rs: restored {restored} per-viewer CS_PLAYERS value(s) across {viewer_count} viewer(s)"
+    );
     state::with_state(|s| {
         s.duel.hud_duelists = core::array::from_fn(|_| String::new());
         s.duel.hud_healths = core::array::from_fn(|_| String::new());

@@ -160,7 +160,7 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 
 ## 9. Verification
 
-- `cargo test`: 436+ unit tests (ladder model: shuffle/formation/bump for
+- `cargo test`: 438 unit tests (ladder model: shuffle/formation/bump for
   C=1..N with even/odd/queue, reconcile on roster change, each resolution rule,
   standings, champion/tie, board order, restart classifier, LogExit ownership,
   score reorder, credit offsets).
@@ -171,9 +171,21 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
   `bot_minplayers 4`, `fraglimit 1`, `duel_fraglimit 3`, `mp/duel1`:
   - round 1 (1 court) → round complete → carried `map_restart` → round 2
     (2 courts) → champion after 3 wins → fresh ladder;
+  - a joiners run grew the ladder 1 → 2 → 3 courts across round boundaries as
+    bots joined (`bot_minplayers` raised mid-ladder), with the bench growing
+    and shrinking around it;
   - `rcon map_restart` → `classified as Admin`, `GAME_INIT … carry=false`;
   - `rcon proxy_parallel_duels_enable 0` → teardown, the stock duel resumes;
   - re-enable → takeover and a new ladder.
+- Announcements are single-byte ASCII with real newlines (`message_safe` +
+  `print`), so a stock latin-1 client renders the round board and champion
+  text instead of `\n` and UTF-8 mojibake.
+- Teardown restores every `CS_PLAYERS` base directly per viewer (only where
+  the recorded value differs) and clears the duelist/health strings, bypassing
+  the reliable-pressure deferral because the instance core is already off.
+  An engine `SV_SetConfigstring` write would be skipped as unchanged (it only
+  broadcasts a differing value), so the direct per-viewer `cs` sends are the
+  path that actually clears a benched player's `(Bench)` prefix.
 - The live run found and fixed two real defects: bots bypass
   `GAME_CLIENT_BEGIN` (now adopted via `SVF_BOT`), and reading `PERS_SCORE`/
   `STAT_HEALTH` inside `state::with_state` re-entered the non-reentrant state
