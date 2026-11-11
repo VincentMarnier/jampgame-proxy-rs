@@ -986,7 +986,10 @@ duel wins is champion, then a fresh ladder starts (`0` = endless).
 A round's own `timelimit` (in minutes) decides unfinished courts by health +
 shield (random on an exact tie); `fraglimit 0` removes the per-duel kill limit and
 `timelimit 0` the round cap. A player who disconnects or explicitly uses `/team spectator`
-mid-duel gives the opponent a walkover; everyone else stays in the ladder.
+mid-duel gives the opponent a walkover; everyone else stays in the ladder. When
+a leaver shrinks the roster to an odd count, the ladder compacts: the
+highest-ranked survivors keep their courts and the lowest-ranked player takes
+the bench (a winner is never benched while a lower court keeps playing).
 Opted-out spectators are marked `(Spec)` on the scoreboard, bench players
 `(Bench)` and court players `(Duel N)`. The
 stock repeating time-limit notice is replaced by one round-level message. A voted or rcon `map_restart` is an

@@ -448,8 +448,11 @@ pub fn champion(
 /// Reconcile the bump's pairs with the live roster (D-025 §3.1): a player who
 /// disconnected or opted out leaves; a newcomer joins the back of the queue;
 /// a missing court slot is filled from the front of the queue; and the court
-/// count is capped to the map's capacity (surplus pairs queue). Order is
-/// preserved throughout, so the ladder stays stable.
+/// count is capped to the map's capacity (surplus pairs queue). When a leaver
+/// leaves a hole the queue cannot fill, the ladder is compacted (survivors move
+/// up in ladder order) instead of dropping the whole pair, so the ranking is
+/// preserved and the lowest-ranked survivor takes the bench. Order is preserved
+/// throughout, so the ladder stays stable.
 pub fn reconcile(
     pairs: &[Pair],
     queue: &[u8],
@@ -497,13 +500,31 @@ pub fn reconcile(
             }
         }
     }
-    // A pair with fewer than two players cannot run: its player queues.
+    // A pair left incomplete because a leaver emptied its slot and the bench
+    // could not fill the hole: compact the ladder instead of dropping the
+    // whole pair. The survivors move up in ladder order, so a winner is never
+    // benched while a lower-ranked loser keeps a court; the last (lowest)
+    // survivor takes the back of the queue. This is the leaky-roster case: a
+    // leaver in a higher pair must not promote a lower pair over its survivor.
+    let incomplete = slots.iter().any(|s| s.iter().any(Option::is_none));
     let mut kept: Vec<Pair> = Vec::new();
-    for slot in slots {
-        match slot {
-            [Some(a), Some(b)] => kept.push(Pair::new(a, b)),
-            [Some(a), None] | [None, Some(a)] => bench.push(a),
-            [None, None] => {}
+    if incomplete {
+        let ladder: Vec<u8> = slots
+            .iter()
+            .flat_map(|s| s.iter().copied().flatten())
+            .collect();
+        let mut chunks = ladder.chunks_exact(2);
+        for chunk in &mut chunks {
+            kept.push(Pair::new(chunk[0], chunk[1]));
+        }
+        if let Some(&last) = chunks.remainder().first() {
+            bench.push(last);
+        }
+    } else {
+        for slot in slots {
+            if let [Some(a), Some(b)] = slot {
+                kept.push(Pair::new(a, b));
+            }
         }
     }
     // Cap the court count; surplus pairs queue in ladder order.
@@ -2710,6 +2731,53 @@ mod tests {
         let (courts, queue) = reconcile(&pairs, &[], &[0], 16);
         assert!(courts.is_empty());
         assert_eq!(queue, vec![0]);
+    }
+
+    #[test]
+    fn reconcile_compacts_a_leaver_hole_instead_of_benching_the_winner() {
+        // D-025 revision: a leaver shrinks the roster, not the ranking. Four
+        // players and two courts; the bump is {W1, W2} vs {L1, L2}.
+        let courts = vec![resolved(0, 1, 0), resolved(2, 3, 2)];
+        let (pairs, bench) = bump(&courts, &[]);
+        assert_eq!(pairs, vec![Pair::new(0, 2), Pair::new(1, 3)]);
+        // The second court's winner (2) leaves while the first court is still
+        // playing. The survivor of the winners' pair must stay: the ladder
+        // compacts (top winner 0 + loser 1) and the bottom loser (3) benches.
+        let (next, queue) = reconcile(&pairs, &bench, &[0, 1, 3], 16);
+        assert_eq!(next, vec![Pair::new(0, 1)], "the winner stays on court");
+        assert_eq!(queue, vec![3], "the lowest-ranked loser takes the bench");
+        // A loser leaving keeps the plain result: both winners play, the
+        // surviving loser benches.
+        let (next, queue) = reconcile(&pairs, &bench, &[0, 1, 2], 16);
+        assert_eq!(next, vec![Pair::new(0, 2)]);
+        assert_eq!(queue, vec![1]);
+    }
+
+    #[test]
+    fn reconcile_compaction_keeps_every_winner_above_the_bench() {
+        // Three courts: {W1, W2}, {L1, W3}, {L2, L3}; the middle court's winner
+        // (4) leaves. The top pair and the two lowest losers must not push a
+        // winner onto the bench.
+        let courts = vec![resolved(0, 1, 0), resolved(2, 3, 3), resolved(4, 5, 4)];
+        let (pairs, bench) = bump(&courts, &[]);
+        assert_eq!(
+            pairs,
+            vec![Pair::new(0, 3), Pair::new(1, 4), Pair::new(2, 5)]
+        );
+        let (next, queue) = reconcile(&pairs, &bench, &[0, 1, 2, 3, 5], 16);
+        assert_eq!(next, vec![Pair::new(0, 3), Pair::new(1, 2)]);
+        assert_eq!(queue, vec![5]);
+    }
+
+    #[test]
+    fn reconcile_fills_a_leavers_hole_from_the_queue_before_compacting() {
+        // A queued player fills the hole left in the winners' pair, exactly as
+        // before (compaction only runs when the queue cannot fill it).
+        let courts = vec![resolved(0, 1, 0), resolved(2, 3, 2)];
+        let (pairs, bench) = bump(&courts, &[]);
+        let (next, queue) = reconcile(&pairs, &bench, &[0, 1, 3, 9], 16);
+        assert_eq!(next, vec![Pair::new(0, 9), Pair::new(1, 3)]);
+        assert!(queue.is_empty());
     }
 
     #[test]

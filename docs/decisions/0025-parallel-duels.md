@@ -41,7 +41,10 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
 8. **Ladder-long standings** (W/L) live proxy-side, reset only on a new
    ladder. `sess.wins/losses` are never written.
 9. **Courts re-derived every round** from the live roster (joins extend,
-   leavers shrink); membership changes never interrupt a running duel.
+   leavers shrink); membership changes never interrupt a running duel. A
+   leaver removes one rank, not a pair: when the queue cannot fill the hole
+   they leave, the remaining ranking is compacted, so a winner is never
+   benched in favour of a lower-ranked loser.
 10. **Bench is a FIFO queue** (base-JA-style): bottom court's loser → back of
     the queue, front of the queue → bottom court. A full roster queues only the
     odd player (or the capacity surplus).
@@ -162,6 +165,11 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
   random on an exact tie.
 - A court whose instance cannot be rebuilt after a restart: both players queue.
 - Queue longer than one: exactly one in / one out per round.
+- A leaver shrinks the ranking, not the pair list: when the queue cannot fill
+  the empty slot, the surviving players compact upward in ladder order and the
+  lowest-ranked one benches. A leaver in a higher pair therefore never benches
+  a winner while a lower court keeps playing; a loser leaving still benches the
+  other loser.
 - A queued player's `team free`: refused, stays queued.
 - A player who goes spectator mid-duel: walkover, then leaves the ladder.
 - Cvar off mid-duel: teardown, no walkover recorded.
@@ -169,10 +177,11 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 
 ## 9. Verification
 
-- `cargo test`: 441 unit tests (ladder model: shuffle/formation/bump for
-  C=1..N with even/odd/queue, reconcile on roster change, each resolution rule,
-  standings, champion/tie, board order, restart classifier, LogExit ownership,
-  score reorder, credit offsets).
+- `cargo test`: 448 unit tests (ladder model: shuffle/formation/bump for
+  C=1..N with even/odd/queue, reconcile on roster change — including a leaver
+  in a higher pair, which compacts the ranking instead of benching its
+  survivor — each resolution rule, standings, champion/tie, board order,
+  restart classifier, LogExit ownership, score reorder, credit offsets).
 - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`.
 - `rust/dev.sh ./scripts/build.sh` (i686 cdylib).
 - `rust/scripts/engine-test.sh`: PASS.
@@ -249,3 +258,34 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 7. A `map_restart` reconnects court players into their carried courts through
    the proxy's court assignment at `GAME_INIT`; `SetTeamQuick` then spawns them.
 8. Court capacity is the map's entity budget; the surplus queues.
+
+## 11. Revision 2026-11-11 — leaver compaction
+
+Reported: four players on two courts; one duel ended and a player left the
+server, then the other duel ended; the next round benched a **winner** while a
+loser kept a court.
+
+Cause: `reconcile` kept each bump pair's surviving side and, when the queue
+could not fill the emptied slot, dropped the whole pair to the bench. The
+leaver therefore removed a *pair* rather than a *rank*: a leaver in the winners'
+pair dropped its survivor (`{W1, W2}` minus `W2` benched `W1`) and promoted the
+lower losers' pair (`{L1, L2}`), so a winner was benched in favour of a
+lower-ranked loser and the documented "top winner stays" rule broke. The same
+happens for a middle court's winner (`{L1, W3}` minus `W3`).
+
+Fix: the queue still fills a hole first (unchanged). If a hole remains, the
+surviving players are flattened in ladder order (court 1's pair, then court 2's,
+…) and re-paired adjacently; the last, lowest-ranked survivor takes the back of
+the queue. A leaver now removes one rank and the rest of the ladder compacts, so
+the highest survivors keep their courts and the bench always receives the
+lowest-ranked player (a loser, or a bench player), never a higher-ranked winner.
+With a queue that fills the hole the result is unchanged, and a leaver in the
+bottom pair still benches that pair's survivor (a loser).
+
+Tests: `reconcile_compacts_a_leaver_hole_instead_of_benching_the_winner`,
+`reconcile_compaction_keeps_every_winner_above_the_bench`,
+`reconcile_fills_a_leavers_hole_from_the_queue_before_compacting`; the existing
+queue-fill and capacity tests are unchanged. A pre-fix live run with four bots
+on `mp/duel1` (two courts, the bottom court's loser kicked after its duel) still
+benched the other loser, as designed; the higher-pair leaver is pinned by the
+new pure tests (the bot run was not reproducing a leaver in the winners' pair).
