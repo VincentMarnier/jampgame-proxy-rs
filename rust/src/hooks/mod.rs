@@ -250,6 +250,11 @@ game_trampoline!(
     23,
     unsafe extern "C" fn()
 );
+game_trampoline!(
+    game_hook_original_wp_saber_position_update,
+    24,
+    unsafe extern "C" fn(usize, usize)
+);
 engine_trampoline!(
     engine_hook_original_sv_add_entities_visible_from_point,
     14,
@@ -407,6 +412,7 @@ pub unsafe fn attach_all() {
         game::client_spawn as usize,
         game::check_intermission_exit as usize,
         game::adjust_tournament_scores as usize,
+        game::wp_saber_position_update as usize,
     ];
     for (hook, wrapper) in patch::GAME_HOOKS.iter().zip(&game_wrappers) {
         // SAFETY: game offsets are nm-verified (R-011); wrappers match the
@@ -515,6 +521,7 @@ mod tests {
             "ClientSpawn",
             "CheckIntermissionExit",
             "AdjustTournamentScores",
+            "WP_SaberPositionUpdate",
         ];
         assert_eq!(patch::GAME_HOOKS.len(), by_index.len());
         for (index, name) in by_index.into_iter().enumerate() {

@@ -104,6 +104,18 @@ pub const FN_SCORE_IS_TIED: usize = 0x0008_8a74;
 /// body. Without it those sounds take the world stamp and are heard in every
 /// instance (the force-jump leak).
 pub const FN_WP_FORCE_POWERS_UPDATE: usize = 0x0018_a554;
+/// `void WP_SaberPositionUpdate(gentity_t *self, usercmd_t *ucmd)` (nm
+/// `WP_SaberPositionUpdate__FP9gentity_sP9usercmd_s`, file offset `0x194c24`;
+/// prologue `55 8b ec 81 ec 88 02 00 00`, 9 detour-safe bytes). Called from
+/// `G_RunFrame` for every client and NPC (`g_main.c:4051,4078`), outside every
+/// other acting scope — the `ClientThink_real` call is commented out
+/// (`g_active.c:2803`). It is where the owner-less saber effects are built:
+/// the clash/saber-lock `EV_SABER_BLOCK` (`w_saber.c` `WP_SaberDoClash` and the
+/// saber-lock tick) and the wall-hit `EV_SABER_CLASHFLARE`. Hooked by the
+/// parallel-instance feature so those events are stamped with the acting
+/// player's instance instead of falling back to their ambiguous memset `0`
+/// owner fields (D-006).
+pub const FN_WP_SABER_POSITION_UPDATE: usize = 0x0019_4c24;
 /// `void G_Sound(gentity_t*, int, int)` (nm `G_Sound__FP9gentity_siT2`, file
 /// offset `0x16e824`; prologue `55 8b ec 83 ec 20`, 6 detour-safe bytes).
 /// Parallel-TFFA sound isolation: records which match's action owns the temp

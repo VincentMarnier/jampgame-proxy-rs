@@ -177,7 +177,7 @@ Court spawns are queued and drained four per frame (D-006.12 deferral).
 
 ## 9. Verification
 
-- `cargo test`: 448 unit tests (ladder model: shuffle/formation/bump for
+- `cargo test`: 450 unit tests (ladder model: shuffle/formation/bump for
   C=1..N with even/odd/queue, reconcile on roster change — including a leaver
   in a higher pair, which compacts the ranking instead of benching its
   survivor — each resolution rule, standings, champion/tie, board order,
@@ -289,3 +289,18 @@ queue-fill and capacity tests are unchanged. A pre-fix live run with four bots
 on `mp/duel1` (two courts, the bottom court's loser kicked after its duel) still
 benched the other loser, as designed; the higher-pair leaver is pinned by the
 new pure tests (the bot run was not reproducing a leaver in the winners' pair).
+
+## 12. Revision 2026-11-11 — cross-court saber clash effects
+
+Reported for both modes ("we can see and hear saber clash effects from other
+duel & tffa instances"): the clash-family temp events (`EV_SABER_BLOCK`, the
+saber-lock tick, thrown-saber blocks, deflects, and the wall-hit
+`EV_SABER_CLASHFLARE`) were built outside any acting scope, so the snapshot
+filter attributed them to the world and every court saw/heard them. The shared
+core now stamps them with the acting player's instance
+(`event_uses_construction_source` / `temp_stamp_source`) and a new
+`WP_SaberPositionUpdate` detour opens that scope, exactly as
+`WP_ForcePowersUpdate` does for the force sounds. Full evidence, fix and test
+notes: D-006, 2026-11-11 round. Court isolation for these effects is therefore
+shared with TFFA and needs no duel-specific code; the live two-court listen
+remains open (bots never create split instances).

@@ -1541,7 +1541,9 @@ pub enum EventOwners {
     /// there is the untouched default ("no target"), not client 0.
     OptionalVictim,
     /// `s.otherEntityNum2` names the other player only in some clash paths; a
-    /// `0` there is the untouched default, not client 0.
+    /// `0` there is the untouched default, not client 0. When the constructing
+    /// scope was open, the stamp recorded by `stamp_temp_source_event` is used
+    /// instead (it also resolves the real client 0).
     OptionalAttacker,
     /// `s.otherEntityNum` (victim) and `s.otherEntityNum2` (attacker/killer),
     /// both always set.
@@ -1710,10 +1712,11 @@ pub fn stamp_temp_source(te: usize) {
 }
 
 /// `G_TempEntity` wrapper's stamping rule: a pending `G_Sound` handshake wins;
-/// otherwise an `EV_PREDEFSOUND` constructed while an acting scope is open
-/// belongs to that instance (force jump/protect/absorb sounds), and every
-/// other direct `G_TempEntity` call stays a world/map sound. Consumes the
-/// pending source in every case.
+/// otherwise an event that carries no reliable owner of its own takes the open
+/// acting scope — the owner-less `EV_PREDEFSOUND` force sounds (force
+/// jump/protect/absorb) and the clash-family events (see
+/// `event_uses_construction_source`) — and every other direct `G_TempEntity`
+/// call stays a world/map sound. Consumes the pending source in every case.
 pub fn stamp_temp_source_event(te: usize, event: c_int) {
     state::with_state(|s| {
         let Some(num) = ent_num_of(s.located_game_data.g_entities, te) else {
@@ -1725,14 +1728,36 @@ pub fn stamp_temp_source_event(te: usize, event: c_int) {
     });
 }
 
+/// Temp events whose match must be read from the construction-time stamp
+/// (the open acting scope) rather than from their own entity fields.
+///
+/// `EV_PREDEFSOUND` is a sound built by `G_PreDefSound` with a plain
+/// `G_TempEntity`: no owner field at all.
+///
+/// `EV_SABER_BLOCK` and `EV_SABER_CLASHFLARE` are the saber clash effects the
+/// client renders and plays (`cg_event.c:2318-2426`: block sound, block effect,
+/// screen flash; `saberhitwall` sound on the flare). Most creators leave every
+/// owner field at the freed slot's memset zero — the saber-lock tick
+/// (`w_saber.c` `8300+`), a thrown saber blocked by a player (`:5516`),
+/// projectile/disruptor deflects (`g_missile.c:338,507,582`,
+/// `g_weapon.c:559,762`) and the wall-hit flare (`w_saber.c:3548,5674`) — and
+/// `WP_SaberDoClash`'s `s.otherEntityNum2 = self->s.number` is ambiguous with
+/// that zero when the attacker is client 0. The stamp, recorded while the
+/// creating player's acting scope is open, names the instance in every one of
+/// those paths.
+pub fn event_uses_construction_source(event: c_int) -> bool {
+    use crate::sdk::{EV_PREDEFSOUND, EV_SABER_BLOCK, EV_SABER_CLASHFLARE};
+    matches!(event, EV_PREDEFSOUND | EV_SABER_BLOCK | EV_SABER_CLASHFLARE)
+}
+
 /// Pure stamping rule (unit-tested): the `G_Sound` handshake beats everything;
-/// an owner-less `EV_PREDEFSOUND` takes the open acting scope (no scope → world
-/// sound, audible everywhere); anything else is a world sound.
+/// an event in `event_uses_construction_source` takes the open acting scope;
+/// with no scope it stays a world event (audible/visible everywhere).
 pub fn temp_stamp_source(pending: u8, event: c_int, scope: u8) -> u8 {
     if pending != SOURCE_WORLD {
         return pending;
     }
-    if event == crate::sdk::EV_PREDEFSOUND && scope != SCOPE_NONE {
+    if scope != SCOPE_NONE && event_uses_construction_source(event) {
         return scope;
     }
     SOURCE_WORLD

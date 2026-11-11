@@ -1684,6 +1684,21 @@ fn snapshot_keep(
             }
             crate::tffa::SoundAttribution::None => {}
         }
+        // Clash effects carry no usable owner on most creator paths (the
+        // saber-lock tick, a thrown-saber block, a deflect and the wall-hit
+        // flare set none at all, and `WP_SaberDoClash`'s `s.otherEntityNum2` is
+        // ambiguous with the memset zero for client 0). The construction stamp —
+        // recorded while the acting player's scope was open (`WP_SaberPositionUpdate`
+        // / `ClientThink_real` / `G_RunMissile`) — names the instance, so it is
+        // authoritative whenever it is not the world stamp. A world stamp keeps
+        // the old field-based behaviour below (`EV_SABER_BLOCK`'s
+        // `OptionalAttacker` rule).
+        if crate::tffa::event_uses_construction_source(event) {
+            let source = sound_source[ent_num as usize];
+            if source != crate::tffa::SOURCE_WORLD {
+                return crate::tffa::sound_visible(viewer_match, source);
+            }
+        }
         // SAFETY: ent is inside the g_entities array; `s.*` fields are ints.
         let field = |off: usize| unsafe { read_i32(ent + off) };
         return match crate::tffa::event_owners(event) {
@@ -2114,6 +2129,67 @@ mod tests {
                 game.base(),
                 48
             ));
+        }
+    }
+
+    /// Saber clash effects from another instance: `EV_SABER_BLOCK` (block
+    /// sound + effect + screen flash) and `EV_SABER_CLASHFLARE`
+    /// (`saberhitwall` sound + flare) are built by the saber update outside
+    /// every owner field. The construction stamp recorded while
+    /// `WP_SaberPositionUpdate` (or the blocking think / missile think) had the
+    /// player's acting scope open is authoritative, including when
+    /// `WP_SaberDoClash`'s `s.otherEntityNum2` is `0` for client 0.
+    #[test]
+    fn clash_effects_follow_their_construction_stamp() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        for event in [crate::sdk::EV_SABER_BLOCK, crate::sdk::EV_SABER_CLASHFLARE] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            // The saber-lock / flare shapes: no owner field at all.
+            let mut sounds = sound_table();
+            sounds[48] = 1;
+            assert!(
+                snapshot_keep(1, &table, &sounds, &shared_table(), game.base(), 48),
+                "event {event} stamped for instance 1 must be kept there"
+            );
+            for foreign in [0, 2] {
+                assert!(
+                    !snapshot_keep(foreign, &table, &sounds, &shared_table(), game.base(), 48),
+                    "event {event} stamped for instance 1 must be hidden in match {foreign}"
+                );
+            }
+            // `WP_SaberDoClash` names the attacker, but client 0's `0` is the
+            // same value as the untouched default: the stamp still wins.
+            game.put_i32(48, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, 0);
+            assert!(snapshot_keep(
+                1,
+                &table,
+                &sounds,
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            assert!(!snapshot_keep(
+                0,
+                &table,
+                &sounds,
+                &shared_table(),
+                game.base(),
+                48
+            ));
+            // A world stamp (no scope was open) keeps the old behaviour: see
+            // `ownerless_temp_effect_stays_visible_in_every_instance`.
+            for viewer_match in [0, 1, 2] {
+                assert!(snapshot_keep(
+                    viewer_match,
+                    &table,
+                    &sound_table(),
+                    &shared_table(),
+                    game.base(),
+                    48
+                ));
+            }
         }
     }
 

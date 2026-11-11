@@ -810,9 +810,10 @@ pub static ENGINE_HOOKS: [Hook; 23] = [
 ];
 
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
-/// (`Proxy_Engine_Patch.cpp:61-70`) minus the dropped `WP_SaberPositionUpdate`
-/// (sabersFps) and `G_RegisterCvars`/`G_UpdateCvars` (vmMain cvar mirror),
-/// plus the Rust-only parallel-TFFA hooks (`AddScore` accounting; sound
+/// (`Proxy_Engine_Patch.cpp:61-70`) minus the `G_RegisterCvars`/`G_UpdateCvars`
+/// (vmMain cvar mirror) and the original `WP_SaberPositionUpdate` detour (which
+/// only served the dropped `proxy_sv_sabersFps`), plus the Rust-only
+/// parallel-TFFA hooks (`AddScore` accounting; sound
 /// attribution `G_Sound`/`G_SoundTempEntity`/`G_TempEntity`; `G_FreeEntity` for
 /// per-instance world-entity lifetimes; `G_TouchTriggers` for the per-instance
 /// touch gate; `G_UseTargets2` + `G_Find` for the per-instance link gate;
@@ -820,13 +821,15 @@ pub static ENGINE_HOOKS: [Hook; 23] = [
 /// `G_RunMissile` so a missile's impact (radius damage) runs in its owner's
 /// instance; `WP_ForcePowersUpdate` so the force sounds it builds
 /// (`G_PreDefSound`) are stamped with the updated player's instance instead of
-/// the world's; `TeamCount` so the game's auto team pick and its team-balance
-/// check census the joining client's own instance; `ScoreIsTied` so the
-/// pristine `CheckExitRules` defers the shared timelimit to the proxy's
+/// the world's; `WP_SaberPositionUpdate` so the clash/saber-lock
+/// `EV_SABER_BLOCK` and the wall-hit `EV_SABER_CLASHFLARE` are stamped with the
+/// acting player's instance; `TeamCount` so the game's auto team pick and its
+/// team-balance check census the joining client's own instance; `ScoreIsTied`
+/// so the pristine `CheckExitRules` defers the shared timelimit to the proxy's
 /// per-match sudden-death rule; `ClientSpawn` so spawn-point selection runs in
 /// the spawning player's instance and `SpotWouldTelefrag` only counts that
 /// instance's players).
-pub static GAME_HOOKS: [Hook; 24] = [
+pub static GAME_HOOKS: [Hook; 25] = [
     Hook::new("G_Damage", crate::jampgame::FN_G_DAMAGE, true),
     Hook::new("player_die", crate::jampgame::FN_PLAYER_DIE, true),
     Hook::new(
@@ -877,6 +880,11 @@ pub static GAME_HOOKS: [Hook; 24] = [
     Hook::new(
         "AdjustTournamentScores",
         crate::jampgame::FN_ADJUST_TOURNAMENT_SCORES,
+        true,
+    ),
+    Hook::new(
+        "WP_SaberPositionUpdate",
+        crate::jampgame::FN_WP_SABER_POSITION_UPDATE,
         true,
     ),
 ];
@@ -1345,6 +1353,11 @@ mod tests {
             name: "AdjustTournamentScores",
             bytes: b"\x55\x8b\xec\x83\xec\x20",
             want: 6,
+        },
+        Site {
+            name: "WP_SaberPositionUpdate",
+            bytes: b"\x55\x8b\xec\x81\xec\x88\x02\x00\x00",
+            want: 9,
         },
     ];
 

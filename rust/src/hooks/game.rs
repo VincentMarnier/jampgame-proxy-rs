@@ -519,6 +519,44 @@ pub unsafe extern "C" fn wp_force_powers_update(self_: usize, ucmd: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// WP_SaberPositionUpdate — parallel-instance saber effect attribution
+// ---------------------------------------------------------------------------
+
+/// `void WP_SaberPositionUpdate(gentity_t *self, usercmd_t *ucmd)`: open the
+/// acting scope of the player whose saber is updated.
+///
+/// `G_RunFrame` calls this every frame for every client and NPC
+/// (`g_main.c:4051,4078`) outside every other acting scope (the `ClientThink_real`
+/// call is commented out, `g_active.c:2803`), and it is where the game builds the
+/// owner-less saber effects: `WP_SaberDoClash`'s clash `EV_SABER_BLOCK`
+/// (`w_saber.c`), the saber-lock tick's `EV_SABER_BLOCK` (which sets no
+/// `s.otherEntityNum2` at all) and the wall-hit `EV_SABER_CLASHFLARE` that cgame
+/// turns into the `saberhitwall` sound/flash (`cg_event.c:2318-2426`). Without
+/// the scope those events take the world stamp, so every other instance sees and
+/// hears them; `EV_SABER_BLOCK`'s attacker field is also ambiguous with the
+/// memset zero when the attacker is client 0. The constructor stamp (see
+/// `tffa::temp_stamp_source`) resolves all of them to the acting player's
+/// instance.
+///
+/// # Safety
+///
+/// Entered from the game module with the pristine `WP_SaberPositionUpdate`
+/// argument list.
+pub unsafe extern "C" fn wp_saber_position_update(self_: usize, ucmd: usize) {
+    let scope = if crate::state::instances_enabled() {
+        Some(crate::tffa::open_acting_scope(self_))
+    } else {
+        None
+    };
+    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
+    let original = original_call(crate::hooks::game_hook_original_wp_saber_position_update);
+    unsafe { original(self_, ucmd) };
+    if let Some(previous) = scope {
+        crate::tffa::close_acting_scope(previous);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ClientSpawn — per-instance spawn point selection (S11)
 // ---------------------------------------------------------------------------
 

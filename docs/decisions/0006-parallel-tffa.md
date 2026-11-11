@@ -1931,7 +1931,9 @@ harness asserts every line above and exits 0.
   owner" instead of client 0. Cost accepted, in line with the earlier
   world-entity round: an optional field that genuinely names client 0 (a
   client-0 sniper beam target, or the client-0 side of a clash) is broadcast
-  rather than match-scoped.
+  rather than match-scoped. *(The clash half of this cost is closed by the
+  2026-11-11 round below, which reads the construction stamp instead of the
+  ambiguous field.)*
   Verification: `cargo test` 191/191 (6 new: `event_owners` classification and
   five `snapshot_keep` fixtures over a fabricated `g_entities` buffer);
   `clippy -D warnings` clean; `fmt --check` clean; i686 release build. Four of
@@ -2738,3 +2740,90 @@ harness asserts every line above and exits 0.
   deferred base push in D-006.16. The alias resolution is kept (it costs one
   comparison and makes the two paths agree), but it is not the fix for the
   live report.
+
+- **Saber clash effects heard and seen across instances (2026-11-11, user
+  report: "we can see and hear saber clash effects from other duel & tffa
+  instances" — "at least sometimes").**
+
+  The clash family is two temp events and neither carries a reliable owner on
+  most creator paths:
+
+  - `EV_SABER_BLOCK` (SDK `w_saber.c:3800` `WP_SaberDoClash`, `:5938` a
+    thrown saber blocked by a player, `:8741` the saber-lock tick;
+    `g_missile.c:338,509,586` deflects; `g_weapon.c:559,764` disruptor
+    blocks). Only `WP_SaberDoClash` sets `s.otherEntityNum2 = self->s.number`
+    (`:3803`); the lock tick, the thrown-saber block and the deflects set
+    neither owner field, and `G_FreeEntity` memsets the recycled slot
+    (`g_utils.c:1100`), so those fields stay `0`. The 2026-11-01
+    classification (`OptionalAttacker`, see above) reads that `0` as "no
+    attacker" → `World`, and `WP_SaberDoClash`'s real attacker is
+    indistinguishable from it when the attacker is client 0. In cgame
+    (`cg_event.c:2310-2414`) `eventParm != 0` starts the block sound
+    (`trap_S_StartSound`, one of `saberblock1-9.wav`), plays the
+    `saber/saber_block.efx` effect and arms the screen flash (`cg_saberFlash`);
+    `eventParm == 0` plays `mBlasterDeflect`. So the lock tick, thrown-saber
+    blocks and deflects were visible/audible in every instance, and a
+    client-0 clash likewise.
+  - `EV_SABER_CLASHFLARE` (`w_saber.c:3687,6101`), the wall-hit flare. It sets
+    no owner at all, so it was `World` by design; cgame
+    (`cg_event.c:2418-2440`) arms the same flash and plays
+    `saberhitwall1-3` for it. A saber hitting a wall in one instance was heard
+    and seen from the others (instances share the map's geometry, so the
+    engine's PVS does not separate them).
+
+  Source evidence for *why* they are built unattributed: both are produced
+  inside `WP_SaberPositionUpdate` (`w_saber.c:7655` in `codemp/game`), which
+  `G_RunFrame` calls directly for every client and NPC (`g_main.c:4051,4078`
+  — the `ClientThink_real` call is commented out, `g_active.c:2803`), i.e.
+  outside every acting scope. The thrown-saber block runs in
+  `ClientImpacts` inside `ClientThink_real` (`g_active.c:3385`) and the
+  deflects in `G_MissileImpact` inside `G_RunMissile`; those two already run
+  inside a scope (the blocking player's / the missile owner's instance), which
+  is the same instance as the event's.
+
+  Fix (shared instancing core, so it covers `GT_TEAM` TFFA and `GT_DUEL`
+  alike):
+
+  - new game detour `WP_SaberPositionUpdate` (`nm`
+    `WP_SaberPositionUpdate__FP9gentity_sP9usercmd_s`, offset `0x194c24`,
+    prologue `55 8b ec 81 ec 88 02 00 00`, steal 9; `GAME_HOOKS` 24 → 25)
+    opens the acting scope of `self` around the pristine body — the same shape
+    as the 2026-10-27 `WP_ForcePowersUpdate` hook;
+  - `tffa::event_uses_construction_source` names the events whose match must
+    come from the construction stamp: `EV_PREDEFSOUND` (unchanged) plus
+    `EV_SABER_BLOCK` and `EV_SABER_CLASHFLARE`. `tffa::temp_stamp_source`
+    stamps them with the open acting scope (the `G_Sound` handshake still
+    wins; no scope still means a world event), and `snapshot_keep` consults
+    that stamp before the field-based rule, so the ambiguous client-0 field
+    no longer decides anything when a scope was open.
+
+  Tests: `construction_source_events_are_the_owner_less_saber_clash_family`
+  and the extended `temp_stamp_prefers_the_sound_handshake_then_the_scope`
+  (pure rules), plus the `snapshot_keep` fixture
+  `clash_effects_follow_their_construction_stamp` (both events stamped for
+  instance 1: kept there, hidden in main and instance 2, including with
+  `s.otherEntityNum2 == 0`; a world stamp keeps the old visible-everywhere
+  behaviour). `cargo test` 450/450 (was 448), `clippy -D warnings`,
+  `fmt --check` and the i686 release build green. The byte fixture pins the
+  new detour site in `GAME_SITES` and both wiring tests pin its index.
+
+  Live verification: a one-line probe in `stamp_temp_source_event` (removed
+  after the run) on a real `linuxjampded`, `mp/duel1`, `g_gametype 3`,
+  `proxy_parallel_duels_enable 1`, `bot_minplayers 6` (one court, main match)
+  printed `event=31 scope=0 stamp=0` (8 saber-block events) and
+  `event=32 scope=0 stamp=0` (4 wall-hit flares) — the acting scope is open in
+  `WP_SaberPositionUpdate` and the clash events carry the player's instance
+  instead of the world stamp they had before (no scope ⇒ `SCOPE_NONE`, i.e.
+  `SOURCE_WORLD`). A non-main court was not reachable: bots never form more
+  than one court/match here, so a real two-instance listen/visual check of a
+  lock or a thrown-saber block remains open (same caveat as the earlier sound
+  rounds). The attribution chain it relies on (acting scope open during
+  `WP_SaberPositionUpdate` → stamp → snapshot drop) is the one the
+  runtime-verified force-jump round established, and the drop half is the new
+  `clash_effects_follow_their_construction_stamp` fixture.
+
+  Residual, deliberately unchanged: the other player-caused, owner-less
+  positional effects (impact sparks, glass shards, model debris) still carry
+  the world stamp and stay visible to every instance; PVS does not separate
+  instances because they share the map's geometry. The optional `0` of a
+  client-0 sniper beam target is likewise still broadcast.

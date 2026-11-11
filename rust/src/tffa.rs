@@ -4937,7 +4937,17 @@ mod tests {
             temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_PREDEFSOUND, 2),
             2
         );
-        // No scope (or another event) stays a world sound.
+        // Clash effects take the open acting scope too: their owner fields are
+        // unset on most creator paths (saber-lock tick, thrown-saber block,
+        // deflect, wall-hit flare).
+        for event in [crate::sdk::EV_SABER_BLOCK, crate::sdk::EV_SABER_CLASHFLARE] {
+            assert_eq!(temp_stamp_source(SOURCE_WORLD, event, 2), 2);
+            assert_eq!(
+                temp_stamp_source(SOURCE_WORLD, event, SCOPE_NONE),
+                SOURCE_WORLD
+            );
+        }
+        // No scope (or another event) stays a world effect.
         assert_eq!(
             temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_PREDEFSOUND, SCOPE_NONE),
             SOURCE_WORLD
@@ -4946,6 +4956,28 @@ mod tests {
             temp_stamp_source(SOURCE_WORLD, EV_GENERAL_SOUND, 2),
             SOURCE_WORLD
         );
+        assert_eq!(
+            temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_SHIELD_HIT, 2),
+            SOURCE_WORLD
+        );
+    }
+
+    #[test]
+    fn construction_source_events_are_the_owner_less_saber_clash_family() {
+        assert!(event_uses_construction_source(crate::sdk::EV_PREDEFSOUND));
+        assert!(event_uses_construction_source(crate::sdk::EV_SABER_BLOCK));
+        assert!(event_uses_construction_source(
+            crate::sdk::EV_SABER_CLASHFLARE
+        ));
+        for event in [
+            crate::sdk::EV_SABER_HIT,
+            crate::sdk::EV_SHIELD_HIT,
+            crate::sdk::EV_OBITUARY,
+            crate::sdk::EV_GENERAL_SOUND,
+            0,
+        ] {
+            assert!(!event_uses_construction_source(event), "event {event}");
+        }
     }
 
     #[test]
