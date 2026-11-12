@@ -70,6 +70,12 @@ static G_ENTITIES: AtomicUsize = AtomicUsize::new(0);
 /// accounting too (otherwise it subtracts a point nobody added). Optional:
 /// a binary without the symbol still loads (treated as always-false).
 static G_DONT_PENALIZE_TEAM: AtomicUsize = AtomicUsize::new(0);
+/// `DeathmatchScoreboardMessage(gentity_t*)` (`g_cmds.c`), exported by the
+/// shipped module as `DeathmatchScoreboardMessage__FP9gentity_s`. The demo
+/// recorder calls it to have the game build the authoritative `scores` text
+/// (14-int stock layout) for the recorded stream. Optional: a module that does
+/// not export it records demos without a scoreboard.
+static DEATHMATCH_SCOREBOARD_MESSAGE: AtomicUsize = AtomicUsize::new(0);
 
 /// Look up a symbol, returning it as an opaque pointer or an error message.
 unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
@@ -136,6 +142,14 @@ pub fn load(path: &CStr) -> Result<(), String> {
             eprintln!("----- proxy-rs: optional symbol missing ({e}); team accounting unguarded")
         }
     }
+    // Optional: only used by the demo recorder; absence disables the recorded
+    // scoreboard, everything else keeps working.
+    match unsafe { symbol(handle, c"DeathmatchScoreboardMessage__FP9gentity_s") } {
+        Ok(sym) => DEATHMATCH_SCOREBOARD_MESSAGE.store(sym as usize, Ordering::Relaxed),
+        Err(e) => eprintln!(
+            "----- proxy-rs: optional symbol missing ({e}); recorded demos carry no scoreboard"
+        ),
+    }
 
     // Load base: `dladdr` on the module's own dllEntry gives `dli_fbase`
     // (`Proxy_Main.cpp:35-43`); the proxy rebases all game offsets by it.
@@ -179,6 +193,20 @@ pub fn level_address() -> usize {
 /// Address of the original module's exported `g_entities` symbol, or 0.
 pub fn g_entities_address() -> usize {
     G_ENTITIES.load(Ordering::Relaxed)
+}
+
+/// `void DeathmatchScoreboardMessage(gentity_t *ent)` from the loaded game
+/// module: fills the game's level data into the `scores ...` command and sends
+/// it through `trap_SendServerCommand`. `None` when the module does not export
+/// it.
+pub fn deathmatch_scoreboard_message() -> Option<unsafe extern "C" fn(usize)> {
+    let addr = DEATHMATCH_SCOREBOARD_MESSAGE.load(Ordering::Relaxed);
+    if addr == 0 {
+        return None;
+    }
+    // SAFETY: usize -> fn ptr; the address is the dlsym'd game function with
+    // the cdecl `(gentity_t*)` signature.
+    Some(unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(usize)>(addr) })
 }
 
 /// Whether pristine `SetTeam` is inside its protected suicide
@@ -289,6 +317,7 @@ pub fn unload() {
     BASE.store(0, Ordering::Relaxed);
     LEVEL.store(0, Ordering::Relaxed);
     G_ENTITIES.store(0, Ordering::Relaxed);
+    DEATHMATCH_SCOREBOARD_MESSAGE.store(0, Ordering::Relaxed);
     if !handle.is_null() {
         unsafe { dlclose(handle) };
     }

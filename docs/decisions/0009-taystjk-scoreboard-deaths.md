@@ -218,3 +218,16 @@ compatibility:
   implementation): rejected after the scoreboard collapse was reproduced with a
   2025-09-29 cgame. The layout is now selected per client from the capability
   the cgame advertises in its userinfo.
+
+
+## Demo recordings
+
+A recorded demo has one stream for every future cgame, so the per-client layout
+choice above cannot apply to it. The recorder (`docs/demo-format.md` §11)
+therefore records the **stock 14-int layout**: it calls the game's own
+`DeathmatchScoreboardMessage` to build the text (so every field is the game's,
+not a re-implementation), and removes the `taystJKinfo` key from the recorded
+`CS_SERVERINFO`. TaystJK's `CG_ParseScores` selects the entry width from
+`cgs.taystJKinfo`, which now reads 0 in playback, so both stock and TaystJK
+clients parse 14 ints; demos simply have no deaths column. Live clients keep
+bit 7 and receive the 15-int form per their userinfo advertisement.

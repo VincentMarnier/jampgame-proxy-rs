@@ -8,6 +8,14 @@ This directory contains knowledge derived from the original implementation and t
 - `reverse-engineering.md` — discoveries about symbols, ABI, hooks, binaries, and runtime behavior.
 - `uncertainties.md` — unresolved questions and hypotheses.
 - `runtime-environment.md` — how to build and run the original binaries in a container for runtime investigation (Dockerfiles, layout, verified behaviour).
+- `demo-format.md` — server-side demo recording: Phase 0 evidence (protocol 26
+  source-tree drift, the `.dm_26` container/gamestate/snapshot wire layout, the
+  static `msg_hData` Huffman fact, `PMF_FOLLOW` spectator evidence, the
+  `SV_SendClientMessages` hook point, pinned engine addresses) and the Phase 1
+  pure-Rust writer/encoder notes (naming, retention, buffering, RMG refusal,
+  generated tables, byte-exact fixture test) and Phase 2 recorder-core notes
+  (tick hook, frame ring/scratch, `cs` mirroring, `recorder_build`, gate-A
+  artifacts and playback limitation).
 - `inventory.md` — per-feature map of the original proxy: keep/drop decision
   per D-002 and the implementation technique for each hook.
 - `ybeproxy-2026-delta.md` — the 2026 security/crash fixes of the C++ proxy

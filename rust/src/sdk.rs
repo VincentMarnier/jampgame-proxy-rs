@@ -501,6 +501,12 @@ pub const OFFSET_GENTITY_ACTIVATOR: usize = 1384;
 /// `clientSnapshot_t` viewer: `areabytes(0) + areabits[32](4) + ps(36)`,
 /// `playerState_t.clientNum` at +172 → frame+208 (SDK `server.h:96-114`,
 /// `MAX_MAP_AREA_BYTES` 32 from `q_shared.h:416`).
+pub const OFFSET_SNAPSHOT_FRAME_AREABYTES: usize = 0;
+pub const OFFSET_SNAPSHOT_FRAME_AREABITS: usize = 4;
+pub const OFFSET_SNAPSHOT_FRAME_PS: usize = 36;
+pub const OFFSET_SNAPSHOT_FRAME_VPS: usize = 1588;
+pub const OFFSET_SNAPSHOT_FRAME_NUM_ENTITIES: usize = 3140;
+pub const OFFSET_SNAPSHOT_FRAME_FIRST_ENTITY: usize = 3144;
 pub const OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM: usize = 208;
 /// `offsetof(clientSnapshot_t, ps.viewangles)` — `ps` starts at 36
 /// (`areabytes` 4 + `areabits[MAX_MAP_AREA_BYTES]` 32) and `viewangles` is 184
@@ -692,6 +698,12 @@ pub const EV_SIEGESPEC: i32 = 191;
 /// `cg_event.c:3533` rewrites `number` to that player on the client).
 pub const EF_PLAYER_EVENT: i32 = 1 << 5;
 
+/// `CS_SERVERINFO = 0` and `CS_SYSTEMINFO = 1` (`q_shared.h:2041-2042`): the
+/// demo recorder rewrites the former (its `taystJKinfo` key advertises a wire
+/// layout that a single demo stream cannot satisfy for every cgame).
+pub const CS_SERVERINFO: i32 = 0;
+pub const CS_SYSTEMINFO: i32 = 1;
+
 /// Configstring indices (`bg_public.h`): `CS_SCORES1/2` drive the mini HUD
 /// (`cgs.scores1/2`), `CS_PLAYERS + n` carries client `n`'s `n\t\…` info.
 pub const CS_SCORES1: i32 = 6;
@@ -805,7 +817,15 @@ pub const OFFSET_CLIENT_SNAPSHOT_MESSAGE_ACKED: usize = 3152;
 pub const SIZEOF_CLIENT_SNAPSHOT_T: usize = 3160;
 
 /// `offsetof(server_t, svEntities)` — `svEntity_t[MAX_GENTITIES]`.
+pub const OFFSET_SV_STATE: usize = 0;
+pub const OFFSET_SV_CHECKSUM_FEED: usize = 16;
+pub const OFFSET_SV_SNAPSHOT_COUNTER: usize = 20;
+pub const OFFSET_SV_CONFIGSTRINGS: usize = 2080;
 pub const OFFSET_SV_SV_ENTITIES: usize = 8880;
+pub const OFFSET_SV_ENTITY_BASELINE: usize = 8;
+pub const OFFSET_SV_ENTITY_SNAPSHOT_COUNTER: usize = 620;
+pub const OFFSET_SV_NUM_ENTITIES: usize = 647868;
+pub const MAX_CONFIGSTRINGS: usize = 1700;
 /// `offsetof(server_t, gentities)` — `sharedEntity_t*`.
 pub const OFFSET_SV_GENTITIES: usize = 647860;
 /// `offsetof(server_t, gentitySize)`.
@@ -813,6 +833,7 @@ pub const OFFSET_SV_GENTITY_SIZE: usize = 647864;
 
 /// `offsetof(serverStatic_t, time)`.
 pub const OFFSET_SVS_TIME: usize = 4;
+pub const OFFSET_SVS_SNAPFLAG_SERVER_BIT: usize = 8;
 /// `offsetof(serverStatic_t, clients)` — `client_t[MAX_CLIENTS]` array start.
 pub const OFFSET_SVS_CLIENTS: usize = 12;
 /// `offsetof(serverStatic_t, numSnapshotEntities)` — snapshot capacity.
@@ -855,7 +876,17 @@ pub const OFFSET_PS_STATS: usize = 244;
 /// `offsetof(playerState_t, persistant)` — `int[MAX_PERSISTANT]` (PERS_SCORE/PERS_KILLED).
 pub const OFFSET_PS_PERSISTANT: usize = 308;
 /// `offsetof(playerState_t, clientNum)`.
+pub const OFFSET_PS_COMMAND_TIME: usize = 0;
+pub const OFFSET_PS_PM_FLAGS: usize = 12;
+pub const OFFSET_PS_ORIGIN: usize = 20;
+pub const OFFSET_PS_VIEWHEIGHT: usize = 196;
 pub const OFFSET_PS_CLIENT_NUM: usize = 172;
+pub const OFFSET_PS_M_I_VEHICLE_NUM: usize = 1436;
+pub const SIZEOF_PLAYER_STATE: usize = 1552;
+pub const MAX_MAP_AREA_BYTES: usize = 32;
+pub const MAX_MSGLEN: usize = 16384;
+pub const PMF_FOLLOW: i32 = 4096;
+pub const SS_GAME: i32 = 2;
 /// `offsetof(playerState_t, weapon)` — the `tinfo` weapon field the game sends
 /// as `player->client->ps.weapon` (`g_team.c:TeamplayInfoMessage`).
 pub const OFFSET_PS_WEAPON: usize = 176;
@@ -1272,9 +1303,35 @@ mod tests {
         assert_eq!(OFFSET_GENTITY_R_MAXS, 592);
         assert_eq!(OFFSET_GENTITY_R_CONTENTS, 604);
         assert_eq!(OFFSET_GENTITY_R_LINKED, 560);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_AREABYTES, 0);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_AREABITS, 4);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_PS, 36);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_VPS, 1588);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_NUM_ENTITIES, 3140);
+        assert_eq!(OFFSET_SNAPSHOT_FRAME_FIRST_ENTITY, 3144);
         assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, 208);
         assert_eq!(OFFSET_SNAPSHOT_FRAME_PS_VIEWANGLES, 220);
         assert_eq!(OFFSET_SNAPSHOT_ENUMS_LIST, 4);
+        assert_eq!(OFFSET_SV_STATE, 0);
+        assert_eq!(OFFSET_SV_CHECKSUM_FEED, 16);
+        assert_eq!(OFFSET_SV_SNAPSHOT_COUNTER, 20);
+        assert_eq!(OFFSET_SV_CONFIGSTRINGS, 2080);
+        assert_eq!(OFFSET_SV_SV_ENTITIES, 8880);
+        assert_eq!(SIZEOF_SV_ENTITY_T, 624);
+        assert_eq!(OFFSET_SV_ENTITY_BASELINE, 8);
+        assert_eq!(OFFSET_SV_ENTITY_SNAPSHOT_COUNTER, 620);
+        assert_eq!(OFFSET_SVS_SNAPFLAG_SERVER_BIT, 8);
+        assert_eq!(SIZEOF_PLAYER_STATE, 1552);
+        assert_eq!(OFFSET_PS_COMMAND_TIME, 0);
+        assert_eq!(OFFSET_PS_PM_FLAGS, 12);
+        assert_eq!(OFFSET_PS_ORIGIN, 20);
+        assert_eq!(OFFSET_PS_VIEWHEIGHT, 196);
+        assert_eq!(OFFSET_PS_M_I_VEHICLE_NUM, 1436);
+        assert_eq!(MAX_CONFIGSTRINGS, 1700);
+        assert_eq!(MAX_MAP_AREA_BYTES, 32);
+        assert_eq!(MAX_MSGLEN, 16384);
+        assert_eq!(PMF_FOLLOW, 4096);
+        assert_eq!(SS_GAME, 2);
         assert_eq!(ENTITYNUM_NONE, 1023);
         assert_eq!(ENTITYNUM_WORLD, 1022);
         assert_eq!(ENTITYNUM_MAX_NORMAL, 1022);

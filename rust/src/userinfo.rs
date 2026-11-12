@@ -158,6 +158,15 @@ pub fn value_for_key<'a>(info: &'a [u8], key: &[u8]) -> &'a [u8] {
     &[]
 }
 
+/// A copy of `info` with the first pair whose key matches exactly removed
+/// (`Info_RemoveKey`, `strcmp` semantics). Used to keep the proxy's own
+/// feature keys out of recorded demo serverinfo.
+pub fn without_key(info: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut out = info.to_vec();
+    remove_key(&mut out, key);
+    out
+}
+
 /// `Q_stricmpn(value, prefix, prefix.len()) == 0` for an ASCII prefix, with the
 /// implicit "value is long enough" test. Model names are asset names (ASCII);
 /// the game's `tolower` leaves bytes >= 0x80 unchanged in the C locale, so

@@ -63,6 +63,19 @@ pub mod functions {
     pub const SV_WRITE_DOWNLOAD_TO_CLIENT: usize = 0x0804_d764;
     pub const SV_ADD_ENTITIES_VISIBLE_FROM_POINT: usize = 0x0805_8404;
     pub const SV_SEND_CLIENT_SNAPSHOT: usize = 0x0805_8e04;
+    /// `void SV_SendClientMessages(void)` (`0x8059034`): `SV_Frame` calls it
+    /// once per server frame, after the `GAME_RUN_FRAME` chunk loop and
+    /// `SV_CheckTimeouts` (call site `0x8057a36`). This is the demo recorder's
+    /// hook point (run after the original returns).
+    pub const SV_SEND_CLIENT_MESSAGES: usize = 0x0805_9034;
+    /// `void SV_Frame(int msec)` (`0x8057844`), reference only.
+    pub const SV_FRAME: usize = 0x0805_7844;
+    /// `static void SV_WriteSnapshotToClient(client_t*, msg_t*)`
+    /// (`0x8058034`), reference only (the recorder replicates its layout).
+    pub const SV_WRITE_SNAPSHOT_TO_CLIENT: usize = 0x0805_8034;
+    /// `static void SV_EmitPacketEntities(clientSnapshot_t *from,
+    /// clientSnapshot_t *to, msg_t *msg)` (`0x8057e64`), reference only.
+    pub const SV_EMIT_PACKET_ENTITIES: usize = 0x0805_7e64;
     pub const SV_NEXT_DOWNLOAD_F: usize = 0x0804_d614;
     pub const SV_STOP_DOWNLOAD_F: usize = 0x0804_d5b4;
     pub const SV_UPDATE_USERINFO_F: usize = 0x0804_e314;
@@ -114,6 +127,18 @@ pub mod functions {
     pub const MSG_WRITE_BIG_STRING: usize = 0x0807_7c04;
     pub const MSG_WRITE_BYTE: usize = 0x0807_7a24;
     pub const MSG_WRITE_DELTA_ENTITY: usize = 0x0807_8d74;
+    /// `void MSG_WriteBits(msg_t*, int value, int bits)` (`0x8077634`):
+    /// whole bytes are encoded as symbols of the static `msg_hData` Huffman
+    /// tree (`MSG_initHuffman` preloads it; the writer does not adapt per
+    /// message).
+    pub const MSG_WRITE_BITS: usize = 0x0807_7634;
+    /// `void MSG_WriteDeltaPlayerstate(msg_t*, playerState_t *from,
+    /// playerState_t *to, qboolean isVehiclePS)` (`0x80799c4`): the compiled
+    /// function used by `SV_WriteSnapshotToClient` (five call sites at
+    /// `0x8058132/0x805816f/0x8058198/0x8058203/0x8058236`). The shipped
+    /// binary has `_OPTIMIZED_VEHICLE_NETWORKING`: the non-vehicle path writes
+    /// a leading 1-bit "pilot playerstate" flag.
+    pub const MSG_WRITE_DELTA_PLAYERSTATE: usize = 0x0807_99c4;
     pub const MSG_WRITE_LONG: usize = 0x0807_7ad4;
     pub const MSG_WRITE_SHORT: usize = 0x0807_7aa4;
     pub const MSG_WRITE_STRING: usize = 0x0807_7b34;
@@ -187,6 +212,9 @@ pub mod vars {
     pub const SV_SERVER_ID: usize = 0x0827_3ec8;
     /// `server.sv.restartedServerId` (`0x8273ecc`, same compare site).
     pub const SV_RESTARTED_SERVER_ID: usize = 0x0827_3ecc;
+    /// `TheRandomMissionManager` pointer (`SV_SendClientGameState` checks it
+    /// at `0x804d12a`); null on a normal map.
+    pub const THE_RANDOM_MISSION_MANAGER: usize = 0x0839_4b50;
     pub const RD_BUFFER: usize = 0x081e_90c0;
     pub const RD_BUFFERSIZE: usize = 0x081e_90c4;
     pub const RD_FLUSH: usize = 0x081e_90c8;
@@ -463,6 +491,89 @@ pub unsafe fn msg_write_string(msg: usize, s: *const c_char) {
     unsafe { f(msg, s) };
 }
 
+/// `void MSG_WriteBits(msg_t*, int value, int bits)` (0x8077634).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written. A negative `bits` means a signed
+/// value (the engine writes the same bit count; the sign only affects reads).
+#[allow(dead_code)] // used by the demo recorder (Phase 2)
+pub unsafe fn msg_write_bits(msg: usize, value: c_int, bits: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, c_int, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, c_int, c_int),
+        functions::MSG_WRITE_BITS
+    );
+    unsafe { f(msg, value, bits) };
+}
+
+/// `void MSG_WriteDeltaPlayerstate(msg_t*, playerState_t *from,
+/// playerState_t *to, qboolean isVehiclePS)` (0x80799c4).
+///
+/// `from` may be 0 for a non-delta playerstate. The shipped binary has the
+/// `_OPTIMIZED_VEHICLE_NETWORKING` layout: the non-vehicle path starts with a
+/// one-bit pilot flag, so callers must not pre-write anything.
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t; `from` must be 0 or point at a `playerState_t`;
+/// `to` must point at a `playerState_t`; `is_vehicle` must be 0 or 1.
+#[allow(dead_code)] // used by the demo recorder (Phase 2)
+pub unsafe fn msg_write_delta_playerstate(msg: usize, from: usize, to: usize, is_vehicle: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, usize, usize, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, usize, usize, c_int),
+        functions::MSG_WRITE_DELTA_PLAYERSTATE
+    );
+    unsafe { f(msg, from, to, is_vehicle) };
+}
+
+/// `void MSG_WriteData(msg_t*, const void*, int)` (0x8077a54).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t being written; `data` must be readable for
+/// `len` bytes.
+pub unsafe fn msg_write_data(msg: usize, data: *const u8, len: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, *const u8, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, *const u8, c_int),
+        functions::MSG_WRITE_DATA
+    );
+    unsafe { f(msg, data, len) };
+}
+
+/// `void MSG_WriteDeltaEntity(msg_t*, entityState_t *from,
+/// entityState_t *to, qboolean force)` (0x8078d74).
+///
+/// # Safety
+///
+/// `msg` must be a valid msg_t; `from`/`to` must be null or point at a live
+/// `entityState_t` (532 bytes).
+pub unsafe fn msg_write_delta_entity(msg: usize, from: usize, to: usize, force: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, usize, usize, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, usize, usize, c_int),
+        functions::MSG_WRITE_DELTA_ENTITY
+    );
+    unsafe { f(msg, from, to, force) };
+}
+
+/// `void MSG_Init(msg_t*, byte *data, int length)` (0x80774a4).
+///
+/// # Safety
+///
+/// `msg` must point at a writable `msg_t`; `data` must be writable for
+/// `length` bytes and stay alive while the message is used.
+pub unsafe fn msg_init(msg: usize, data: *mut u8, length: c_int) {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn(usize, *mut u8, c_int) = engine_fn!(
+        unsafe extern "C" fn(usize, *mut u8, c_int),
+        functions::MSG_INIT
+    );
+    unsafe { f(msg, data, length) };
+}
+
 /// `void SV_ClientThink(client_t*, usercmd_t*)` (0x804e634) — the original
 /// target of the retargeted usercmd-loop call site.
 ///
@@ -627,6 +738,21 @@ pub unsafe fn sv_send_message_to_client(msg: usize, cl: usize) {
     unsafe { f(msg, cl) };
 }
 
+/// `void SV_SendClientMessages(void)` (0x8059034): the engine's per-frame
+/// snapshot loop. The demo recorder runs its own build after this returns
+/// (see `functions::SV_SEND_CLIENT_MESSAGES`).
+///
+/// # Safety
+///
+/// Engine-only; the server must be running (`sv.state`, `svs.clients` live).
+#[allow(dead_code)] // used by the demo recorder hook (Phase 2)
+pub unsafe fn sv_send_client_messages() {
+    // SAFETY: pointer from the fixed engine table.
+    let f: unsafe extern "C" fn() =
+        engine_fn!(unsafe extern "C" fn(), functions::SV_SEND_CLIENT_MESSAGES);
+    unsafe { f() };
+}
+
 /// Read the engine `cmd_argc` var (int @ 0x8260e20).
 ///
 /// # Safety
@@ -733,10 +859,56 @@ mod tests {
     }
 
     #[test]
+    fn demo_recording_addresses_are_in_text_range() {
+        // Phase 0 pins for server-side demo recording (docs/demo-format.md):
+        // MSG_WriteBits / MSG_WriteDeltaPlayerstate, the SV_Frame hook point
+        // and the reference snapshot functions.
+        let pins = [
+            ("MSG_WRITE_BITS", functions::MSG_WRITE_BITS),
+            (
+                "MSG_WRITE_DELTA_PLAYERSTATE",
+                functions::MSG_WRITE_DELTA_PLAYERSTATE,
+            ),
+            ("MSG_WRITE_DELTA_ENTITY", functions::MSG_WRITE_DELTA_ENTITY),
+            ("MSG_WRITE_DATA", functions::MSG_WRITE_DATA),
+            ("MSG_INIT", functions::MSG_INIT),
+            (
+                "SV_SEND_CLIENT_MESSAGES",
+                functions::SV_SEND_CLIENT_MESSAGES,
+            ),
+            ("SV_FRAME", functions::SV_FRAME),
+            (
+                "SV_WRITE_SNAPSHOT_TO_CLIENT",
+                functions::SV_WRITE_SNAPSHOT_TO_CLIENT,
+            ),
+            (
+                "SV_EMIT_PACKET_ENTITIES",
+                functions::SV_EMIT_PACKET_ENTITIES,
+            ),
+        ];
+        for (name, addr) in pins {
+            assert!(
+                (ENGINE_TEXT_LO..ENGINE_TEXT_HI).contains(&addr),
+                "{name}: 0x{addr:x} outside engine .text"
+            );
+        }
+        // Distinct function entries (a copy/paste must not collapse two pins).
+        for i in 0..pins.len() {
+            for j in (i + 1)..pins.len() {
+                assert_ne!(pins[i].1, pins[j].1, "{} == {}", pins[i].0, pins[j].0);
+            }
+        }
+    }
+
+    #[test]
     fn engine_var_and_cvar_addresses_are_in_rw_range() {
         for (name, addr) in [
             ("SVS", vars::SVS),
             ("SV", vars::SV),
+            (
+                "THE_RANDOM_MISSION_MANAGER",
+                vars::THE_RANDOM_MISSION_MANAGER,
+            ),
             ("RD_BUFFER", vars::RD_BUFFER),
             ("CMD_ARGC", vars::CMD_ARGC),
             ("SV_FPS", cvar_slots::SV_FPS),

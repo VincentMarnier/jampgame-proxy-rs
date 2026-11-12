@@ -296,6 +296,13 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             {
                 // SAFETY: the game passes a NUL-terminated command string.
                 let text = unsafe { CStr::from_ptr(a1 as usize as *const core::ffi::c_char) };
+                // Demo recorder scoreboard probe: the recorder itself called
+                // the game's `DeathmatchScoreboardMessage`, so this `scores`
+                // trap belongs in the recorded stream, not in a live client's
+                // reliable queue.
+                if crate::demo::recorder::capture_scoreboard_command(a0, text.to_bytes()) {
+                    return 0;
+                }
                 // Silent mute (`proxy_sv_muteMode 2`): the muted client's text
                 // chat was forwarded so the game would echo it back to them,
                 // but only the speaker may receive it. Screened on bytes for
@@ -596,6 +603,10 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                         crate::tffa::on_set_cs_players(a0 - CS_PLAYERS, &value);
                     }
                 }
+                // Phase 2 demo recorder: mirror the engine's new configstring
+                // as the reliable `cs` command (the engine has already stored
+                // it; the recorder only reads it).
+                crate::demo::recorder::on_set_configstring(a0);
                 return response;
             }
         }
@@ -628,7 +639,7 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
         _ => {}
     }
 
-    match engine_syscall() {
+    let response = match engine_syscall() {
         Some(syscall) => unsafe {
             syscall(
                 command, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
@@ -638,7 +649,12 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             eprintln!("----- proxy-rs: syscall {command} before dllEntry");
             -1
         }
+    };
+    // Phase 2 demo recorder: only after the engine has stored the new value.
+    if command == G_SET_CONFIGSTRING {
+        crate::demo::recorder::on_set_configstring(a0);
     }
+    response
 }
 
 /// Call the engine syscall pointer with exactly the given words (used by the

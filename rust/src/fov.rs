@@ -97,6 +97,12 @@ pub struct FovState {
     /// `frame->ps.clientNum`, which is the followed player's slot for a
     /// spectating spectator). Set by the `SV_SendClientSnapshot` wrapper.
     pub viewer_client: i32,
+    /// True while the demo recorder builds its own snapshot. The visibility
+    /// filter (FOV cap + anti-wallhack) is for real viewers only; the recorder
+    /// build runs in the server-side recorder's own viewer and must not mutate
+    /// shared entity states. The recorder sets/clears this around its single
+    /// `SV_AddEntitiesVisibleFromPoint` call.
+    pub recorder_build: bool,
 }
 
 impl Default for FovState {
@@ -105,6 +111,7 @@ impl Default for FovState {
             saved: [SavedEntity::default(); MAX_CLIENTS],
             count: 0,
             viewer_client: -1,
+            recorder_build: false,
         }
     }
 }
@@ -578,7 +585,6 @@ pub unsafe fn apply(
     if portal != 0 {
         return;
     }
-    restore();
     if g_entities == 0 || origin == 0 || frame == 0 || e_nums == 0 {
         return;
     }
@@ -594,6 +600,7 @@ pub unsafe fn apply(
         wallhack_margin,
         wallhack_camera_range,
         requested_viewer,
+        recorder_build,
     ) = state::with_state(|s| {
         (
             s.cvars[state::CVAR_MAX_FOV].integer,
@@ -604,8 +611,13 @@ pub unsafe fn apply(
             s.cvars[state::CVAR_ANTI_WALLHACK_MARGIN].value,
             s.cvars[state::CVAR_ANTI_WALLHACK_CAMERA_RANGE].value,
             s.fov.viewer_client,
+            s.fov.recorder_build,
         )
     });
+    if recorder_build {
+        return;
+    }
+    restore();
     let viewer_client = if (0..MAX_CLIENTS as i32).contains(&requested_viewer) {
         requested_viewer
     } else {

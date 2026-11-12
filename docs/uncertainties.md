@@ -490,3 +490,146 @@ not claimed to be fixed by D-006.13.
   traffic to the requesting client around a `scores` request (the traffic
   should be the `scores` message only after the first refresh) and compare a
   tab press before/after a match move (exactly the moved slot re-pushed).
+
+---
+
+## U-010 — Server-side demo recording: unexercised wire-format cases
+
+### Question
+
+The Phase 0 evidence (`docs/demo-format.md`) pins the common `.dm_26` format,
+but four cases are not covered by the 49 shipped demos or by the runtime
+capture. Which of them must the recorder handle before release?
+
+### Classification
+
+**important — the common path is verified; these are release-gate scope
+questions, not blockers for starting the writer.**
+
+1. **RMG/terrain maps.** When `TheRandomMissionManager` (`0x8394b50`) is
+   non-null, the shipped `SV_SendClientGameState` writes a variable gamestate
+   tail (two deflated heightmaps, a seed and `SV_WriteRMGAutomapSymbols`)
+   instead of `MSG_WriteShort(0)`. No such capture exists; the current plan
+   only settles the null case.
+2. **Vehicle playerstate.** `SV_WriteSnapshotToClient` writes a second
+   `MSG_WriteDeltaPlayerstate(..., qtrue)` block when
+   `frame->ps.m_iVehicleNum != 0`. None of the 49 demos has a non-zero
+   `m_iVehicleNum` in its first 300 frames, so the block is untested against a
+   golden file.
+3. **Gamestate `clientNum` choice.** A real following-spectator recording has
+   gamestate `clientNum` = the *viewer* slot (5) and snapshot
+   `ps.clientNum` = the *subject* (1, `PMF_FOLLOW`). A server-side recorder has
+   no real viewer slot; whether to use the viewer-style slot or the subject's
+   slot needs a playback check.
+4. **Stock 1.01 client playback.** Not run here (no stock client binary and no
+   display). The 1.011 server writes the RMG short and the reference client
+   reads it; a stock client that did not would misparse the trailer
+   (**INFERRED** that it reads it).
+
+### Cheapest experiment
+
+- RMG: load a map that sets `TheRandomMissionManager` (or force the pointer in
+  a scratch container), capture `SV_SendClientGameState`, and compare the tail
+  with a client-recorded demo of the same map.
+- Vehicle: record a demo while a player mounts a vehicle, then run
+  `tools/demo_inspect.py --all-snapshots`; extend the decoder with the second
+  (vehicle) playerstate block and compare the frame boundaries.
+- clientNum: write the same short segment with both choices and play both in a
+  stock/TaystJK client; compare the camera, HUD and followed-model rendering.
+- Playback: validation gate A (stock 1.01 and TaystJK), as planned.
+
+### Phase 2 status (2026-11-11)
+
+The Phase 2 recorder (`docs/demo-format.md` §11) chose explicit non-fatal
+handling for the first two cases and left the playback questions open:
+
+1. **RMG/terrain maps** — refused, not encoded: the encoder only implements
+   the `int16 0` tail, so when `TheRandomMissionManager` is non-null the
+   recorder logs and starts no segment. Still unverified.
+2. **Vehicle playerstate** — unsupported: a frame whose subject has
+   `ps.m_iVehicleNum != 0` is discarded (the previous frame stays the delta
+   base); no stream is produced that a client would misparse. Still
+   unverified against a golden file.
+3. **Gamestate `clientNum`** — resolved (2026-11-12): the gamestate names an
+   unused slot (the highest slot the server never assigns, else the highest
+   free slot with a per-tick watchdog, else the subject itself as a self-view
+   POV), never a player other than the followed one. Naming the subject's slot made a player
+   who reconnects there the demo's "me", and the newcomer appeared fused with
+   the followed player (`docs/demo-format.md` §11). The playback check of a
+   *switched* stream is U-011.
+4. **Playback** — resolved by the owner (2026-11-11): the unmodified moving
+   artifact plays and ends as expected on both TaystJK and a stock client, so
+   the `svc_setgame base` frame, the gamestate `clientNum` choice and the
+   snapshot chain are accepted by real clients. The development session could
+   load the map but not capture the GL window; that limitation no longer
+   applies to the release decision.
+
+---
+
+## U-011 — Mid-file follow-target switch: client playback
+
+### Question
+
+`docs/demo-format.md` §11 now switches the recorded POV inside the same file
+when the subject leaves, is kicked, or joins spectators (spectator semantics:
+the next snapshot's `ps.clientNum` changes). The gamestate still carries the
+*original* subject slot, which may be gone or reused by then. Does a stock
+client follow the new target cleanly across that point?
+
+### Classification
+
+**minor — the format is the same follow-target change a spectator demo records,
+and the engine/cgame handle it while spectating; the risk is limited to the
+dangling `cg.clientNum` (a slot that may no longer hold a player) and to
+HUD/scoreboard presentation.**
+
+### Evidence so far
+
+- `artifacts/subject-switch/demos/20261111-222520_mp_ffa3_main_s1.dm_26`
+  (subject kicked, 0→1 at 13.05 s) and
+  `artifacts/subject-spectate/demos/20261111-222902_mp_ffa3_main_s1.dm_26`
+  (subject forced to `TEAM_SPECTATOR`, 0→1 at 65.45 s) both validate:
+  `max_delta=1`, entity order/range clean, gamestate round-trip identical.
+- No client has played a switched stream yet.
+
+### Cheapest experiment
+
+Play both files on TaystJK and a stock client; at the switch point check that
+the camera re-follows the new player, the HUD keeps the new player's health/
+scores, and `disconnect` after the end is clean. If the dangling
+`cg.clientNum` misbehaves, the alternative is to write a viewer-style
+`clientNum` (U-010 item 3) and retest.
+
+---
+
+## U-012 — Scoreboard inside recorded demos: playback check
+
+### Question
+
+Recorded demos now carry periodic `scores` commands generated by the game's own
+`DeathmatchScoreboardMessage` (`docs/demo-format.md` §11), with the stock 14-int
+layout and `taystJKinfo` removed from the recorded serverinfo. Does a stock and
+a TaystJK client draw the board from that stream across a whole demo?
+
+### Classification
+
+**minor — the payload is the game's own text and the layout matches the
+serverinfo the demo carries; the risk is presentation (column alignment,
+missing deaths) rather than a parse error.**
+
+### Evidence so far
+
+- `artifacts/demo-scoreboard-final/demos/20261111-225844_mp_ffa3_main_s1.dm_26`
+  carries boards for 1 and 2 clients (the earlier development run also covered
+  3), each a clean 14-int layout, and validates; the recorded `cs[0]` has no
+  `taystJKinfo` while the live server still advertises `128`.
+- No client has opened a recorded demo and pressed TAB yet.
+
+### Cheapest experiment
+
+Play that file (and a longer one with a real match) on a stock client and
+TaystJK; hold TAB at several points and check the roster, scores, pings and
+teams update, the deaths column is absent (stock layout), and the board does
+not shift after a client joins/leaves. If deaths in demos matter, the
+alternative is to record with the 15-int layout and strip nothing, accepting
+that stock clients then misparse the board (the two cannot share one stream).

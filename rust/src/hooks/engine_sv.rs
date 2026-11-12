@@ -1611,6 +1611,22 @@ pub unsafe extern "C" fn sv_send_client_snapshot(client: usize) {
     state::with_state(|s| s.fov.viewer_client = -1);
 }
 
+/// `void SV_SendClientMessages(void)` (`0x8059034`): run the pristine
+/// per-frame client snapshot loop, then give the demo recorder its own build.
+/// The recorder runs after every real client snapshot, so its extra
+/// `sv.snapshotCounter` bump and `svEntities` dedupe writes cannot leak into a
+/// real snapshot built in the same frame.
+///
+/// # Safety
+///
+/// Entered from the engine's `SV_Frame`; the server is live.
+pub unsafe extern "C" fn sv_send_client_messages() {
+    let original = original_call(crate::hooks::engine_hook_original_sv_send_client_messages);
+    // SAFETY: trampoline attached at GAME_INIT; no arguments.
+    unsafe { original() };
+    crate::demo::recorder::on_sv_send_client_messages();
+}
+
 /// Snapshot predicate for one entity number (pure given the match tables).
 /// Match `0` is the main TFFA; every live player belongs to exactly one.
 fn snapshot_keep(

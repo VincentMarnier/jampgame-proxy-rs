@@ -171,3 +171,30 @@ void jampgame_proxy_com_printf(const char *fmt, ...)
 	buf[sizeof(buf) - 1] = '\0';
 	engine_printf("%s", buf);
 }
+
+/*
+ * ABI-aligned entry for hooks the engine calls directly (D-001.1).
+ *
+ * The 2003 engine (and the vmMain dispatch) enters our detours with a
+ * 4-byte-aligned stack. This crate is built with SSE disabled so its own code
+ * is safe, but the *precompiled* std is built for the i386 16-byte ABI and
+ * zeroes/copies stack locals with `movaps` (observed: SIGSEGV at
+ * `movaps %xmm0,-0x68(%ebp)` in std::sys::pal::unix::fs::try_statx, reached
+ * from std::fs::create_dir_all when the demo recorder created its output
+ * directory). The trap path is already safe because this file's variadic
+ * receive shim realigns; hooks that call std file-system/env code need the
+ * same treatment, so they enter through this forwarder.
+ *
+ * force_align_arg_pointer restores the ABI alignment before `f` is called, so
+ * the Rust callee (and every std function it reaches) sees a conforming
+ * stack.
+ */
+typedef void (*jampgame_entry_fn)(int op);
+
+extern void jampgame_aligned_entry(jampgame_entry_fn f, int op)
+	__attribute__((force_align_arg_pointer));
+
+void jampgame_aligned_entry(jampgame_entry_fn f, int op)
+{
+	f(op);
+}

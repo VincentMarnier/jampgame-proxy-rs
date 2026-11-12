@@ -33,6 +33,7 @@ mod ban;
 mod banfile;
 mod challenge;
 mod coinflip;
+mod demo;
 mod diagnostics;
 mod duel;
 mod engine;
@@ -418,6 +419,8 @@ fn game_init(args: &[c_int; 12]) -> c_int {
     // players land back in their matches; a full map change starts from main,
     // exactly like a fresh module load.
     let restart = args[2] != 0;
+    // Phase 2 recorder: close the previous map's file before the state reset.
+    crate::demo::recorder::on_game_init();
     state::reset_session(restart);
     // S22: the upstream once-per-load flag lives in a game module the engine
     // reloads at every map load (map_restart included); our module is pinned
@@ -514,6 +517,8 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 /// redirect left open by an rcon map change, forward the shutdown, then unload
 /// the original module (`Proxy_Main.cpp:128-160`).
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
+    // Terminate the open demo file before detaching/unloading.
+    crate::demo::recorder::on_game_shutdown();
     // Drop the serverinfo feature bit: the engine's cvar table outlives this
     // module, and a pristine module loaded next must not keep advertising the
     // 15-int scoreboard parse.

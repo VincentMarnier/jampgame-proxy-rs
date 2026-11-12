@@ -63,8 +63,10 @@ Everything runs from this directory (`rust/`).
 
 `dev.sh` builds the dev image on first use (Rust 1.85 + the `i686-unknown-linux-gnu`
 target + gcc-multilib for `-m32` linking), then runs the given command inside a
-container with this directory mounted at `/work`. It runs as your uid, so build
-outputs are owned by you. Without arguments it drops you into a shell.
+container with this directory mounted at `/work` and the repository root
+read-only at `/repo` (`JAMP_REPO_ROOT`; the demo Phase 1 tests read
+`/repo/tests/fixtures/demo`). It runs as your uid, so build outputs are owned
+by you. Without arguments it drops you into a shell.
 
 The engine looks for the exact filename `jampgamei386.so` (Cargo names the
 cdylib `libjampgamei386.so`), so stage it:

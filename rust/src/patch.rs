@@ -703,7 +703,9 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `SV_Netchan_Process` is a Rust-only entry wrapper for the per-client packet
 /// rate limiter (`crate::pps`): it accounts one incoming packet and may return
 /// `qfalse` (drop) before the pristine body decodes it.
-pub static ENGINE_HOOKS: [Hook; 23] = [
+/// `SV_SendClientMessages` is the Phase 2 demo recorder's tick: run the
+/// pristine per-frame snapshot loop, then the recorder's own build.
+pub static ENGINE_HOOKS: [Hook; 24] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -805,6 +807,11 @@ pub static ENGINE_HOOKS: [Hook; 23] = [
     Hook::new(
         "SV_SendClientSnapshot",
         crate::engine::functions::SV_SEND_CLIENT_SNAPSHOT,
+        false,
+    ),
+    Hook::new(
+        "SV_SendClientMessages",
+        crate::engine::functions::SV_SEND_CLIENT_MESSAGES,
         false,
     ),
 ];

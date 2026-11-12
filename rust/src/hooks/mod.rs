@@ -120,6 +120,11 @@ engine_trampoline!(
     22,
     unsafe extern "C" fn(usize)
 );
+engine_trampoline!(
+    engine_hook_original_sv_send_client_messages,
+    23,
+    unsafe extern "C" fn()
+);
 
 game_trampoline!(
     game_hook_original_g_damage,
@@ -379,6 +384,7 @@ pub unsafe fn attach_all() {
         engine_sv::com_write_config_f as usize,
         engine_sv::msg_read_bits as usize,
         engine_sv::sv_send_client_snapshot as usize,
+        engine_sv::sv_send_client_messages as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine
@@ -472,6 +478,8 @@ pub unsafe fn set_enabled(enabled: bool) {
             crate::pps::reset_all();
         }
     } else {
+        // Stop an open demo file before the recorder tick hook is detached.
+        crate::demo::recorder::on_game_shutdown();
         if engine_sv::attached() {
             // SAFETY: hooks were attached by attach_all.
             unsafe { detach_all() };

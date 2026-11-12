@@ -54,6 +54,22 @@ cdylib's dynamic-export mechanism only exports Rust `#[no_mangle]` symbols, and
 getting the linker to both keep and export C-defined entry symbols under LTO
 was unreliable in this toolchain.
 
+**Update (Phase 2, 2026-11-11) — precompiled std.** The target-feature flag
+reaches only this crate; the precompiled std keeps SSE2 and the 16-byte i386
+ABI. A detour entered by the engine (4-byte stack) that reaches std code which
+zeroes a stack local faults: observed `SIGSEGV` at
+`movaps %xmm0,-0x68(%ebp)` in `std::sys::pal::unix::fs::try_statx` (module base
++ `0xe8ab3`), reached from `std::fs::create_dir_all` while the demo recorder
+created its output directory (gdb-confirmed; the fault depended on the call
+depth, so it appeared and vanished across builds). The trap path was always
+safe because `jampgame_vm_dllsyscall` realigns. `csrc/syscall_shim.c` now also
+exports `jampgame_aligned_entry(fn, op)` (same `force_align_arg_pointer`
+prologue); the demo recorder's tick and `GAME_INIT`/`GAME_SHUTDOWN` entries run
+through it, so every std call they reach sees a conforming stack. A C entry is
+used only as an internal forwarder (its address is never exported), so the
+export-surface objection above does not apply. Any future engine detour that
+calls std file-system/env code needs the same shim.
+
 ### D-001.2 — netStatus/showNet deferred
 
 `Proxy_Engine_ClientCommand_NetStatus` (and its `client_t`/`playerState_t` /

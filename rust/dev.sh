@@ -2,7 +2,9 @@
 # Dev-environment front-end for the rust/ workspace.
 #
 # Builds the dev image (rust + i686 target + multilib) on first use, then runs
-# a command inside it with the current directory (rust/) mounted at /work.
+# a command inside it with the current directory (rust/) mounted at /work and
+# the repository root read-only at /repo (`JAMP_REPO_ROOT`; the demo tests read
+# the Phase 0 fixtures from /repo/tests/fixtures).
 #
 # Usage:
 #   rust/dev.sh                  interactive shell in the dev container
@@ -18,6 +20,7 @@
 set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 IMAGE=${JAMP_DEV_IMAGE:-jampgame-proxy-rs:dev}
 REGISTRY_CACHE=${JAMP_DEV_CACHE:-jampgame-proxy-rs-cargo-registry}
 
@@ -47,8 +50,10 @@ fi
 
 exec docker run --rm $TTY $USERARG \
   -e HOME=/work \
+  -e JAMP_REPO_ROOT=/repo \
   -v "$REGISTRY_CACHE":/usr/local/cargo/registry \
   -v "$HERE":/work \
+  -v "$ROOT":/repo:ro \
   -w /work \
   "$IMAGE" \
   "$@"

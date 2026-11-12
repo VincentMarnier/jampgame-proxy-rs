@@ -104,6 +104,7 @@ exec docker run $RM $TTY --name "$NAME" --cap-add=SYS_PTRACE \
   $PROXY_MOUNT \
   -p "$BIND:$PORT:$PORT/udp" \
   -v "$GAMEDATA":/srv/jka/gamedata:ro \
+  -v "$ROOT/artifacts/demos:/srv/jka/demos" \
   "$IMAGE" \
   ./linuxjampded \
     +set rconpassword "proxy" \
