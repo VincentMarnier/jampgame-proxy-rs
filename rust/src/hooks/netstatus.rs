@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine;
 use crate::hooks::engine_sv::{
-    client_num_from_addr, clients_base, cstr_bytes, read_i32, read_usize, svs_time, write_i32,
+    client_num_from_addr, clients_base, cstr_bytes, is_bot, read_i32, svs_time, write_i32,
 };
 use crate::netstatus_est::{self, Estimate};
 use crate::sdk::{
@@ -129,27 +129,9 @@ fn sv_fps() -> c_int {
     unsafe { engine::cvar_integer(ptr) }
 }
 
-/// Whether the client is a bot — the same discriminator `SV_CalcPings` uses
-/// (`cl->gentity != 0 && gentity->r.svFlags & SVF_BOT`, binary-verified at
-/// `0x8057264-0x805727d`). Replaces the original's `ping >= 1` check, which
-/// conflated bots with real players whose computed ping is 0 (localhost/LAN),
-/// and excludes bots from the printed table.
-///
-/// # Safety
-///
-/// `cl` must be a valid `client_t*`.
-unsafe fn is_bot(cl: usize) -> bool {
-    // SAFETY: cl is a valid client_t; gentity is a sharedEntity_t*.
-    let gentity = unsafe { read_usize(cl + crate::sdk::OFFSET_CLIENT_GENTITY) };
-    if gentity == 0 {
-        // No gentity (connecting/zombie) — not a bot in the SVF sense.
-        return false;
-    }
-    // SAFETY: gentity is a valid sharedEntity_t.
-    unsafe {
-        read_i32(gentity + crate::sdk::OFFSET_SHARED_SVFLAGS) & crate::sdk::SVF_BOT as i32 != 0
-    }
-}
+// The bot discriminator lives in `crate::hooks::engine_sv::is_bot` so the
+// printed table and the ping-equalisation population rule (D-028) use the same
+// check.
 
 // ---------------------------------------------------------------------------
 // Measurement plumbing (D-007 step 2)
@@ -361,10 +343,14 @@ static FEED_WAS_OFF: AtomicBool = AtomicBool::new(false);
 /// then the per-usercmd netStatus feed (D-002.1 technique 3). While
 /// `proxy_sv_voidTimeNudge` is on, the cmd's `serverTime` is shifted by the
 /// client's estimated `cl_timeNudge` first (D-015, `crate::timenudge`), so the
-/// game processes the move on the neutral clock.
+/// game processes the move on the neutral clock. While
+/// `proxy_sv_pingEqualize` is on (D-028, `crate::pingequalize`), the cmd's
+/// stamp is shifted back by the client's applied delay, so a fast player's
+/// moves are processed as late as the slowest player's.
 ///
 /// The estimator is fed the client's **raw** stamp: correcting the value the
 /// estimator sees would make it converge to "no nudge" and switch itself off.
+/// The ping-equalisation delay is never fed back either.
 ///
 /// # Safety
 ///
@@ -382,14 +368,18 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     }
 
     let voiding = timenudge::enabled();
-    let (feed, offset, macro_events, macro_log) = state::with_state(|s| {
+    let (feed, nudge_offset, equalize_offset, macro_events, macro_log) = state::with_state(|s| {
         let feed = feed_enabled_in(s);
         // One ramp step per usercmd; the target is refreshed at packet start.
-        let offset = if feed && voiding {
+        let nudge_offset = if feed && voiding {
             s.clients[client_num].nudge_void.step()
         } else {
             0
         };
+        // Ping equalisation (D-028) does not depend on the estimator feed: it
+        // ramps from `cl->ping` (refreshed by the frame pass) and must keep
+        // stepping while it ramps out after the cap is set to 0.
+        let equalize_offset = s.clients[client_num].ping_equalize.step();
         // Anti-macro guard: observes the raw command every time it is on, so
         // `proxy_sv_antiMacroLog` reports what the guard would freeze; only
         // `proxy_sv_antiMacro` rewrites the command. The engine's duplicate
@@ -424,17 +414,20 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
             }
             crate::macroguard::Events::default()
         };
-        (feed, offset, events, log_level)
+        (feed, nudge_offset, equalize_offset, events, log_level)
     });
-    let offset = if !feed {
+    let nudge_offset = if !feed {
         FEED_WAS_OFF.store(true, Ordering::Relaxed);
         0
     } else if FEED_WAS_OFF.swap(false, Ordering::Relaxed) {
         reset_all();
         0
     } else {
-        offset
+        nudge_offset
     };
+    // The timeNudge correction is positive (it undoes the client's negative
+    // nudge); the ping-equalisation delay shifts the stamp back (D-028.2).
+    let offset = nudge_offset.wrapping_sub(equalize_offset);
 
     // SAFETY: cmd is the engine's usercmd buffer.
     let original = unsafe { (*cmd).server_time };
@@ -643,6 +636,33 @@ fn pps_cell(status: Option<crate::pps::PpsSample>, fallback_pps: i32, enforcing:
 /// header/rule; the `[lo..hi]` cell can be one character wider, as before).
 const TN_COL_WIDTH: usize = 13;
 
+/// Width of the `eff` column (D-028): effective ping, `ping + applied delay`.
+const EFF_COL_WIDTH: usize = 4;
+
+/// Header of the printed table (widths 4/4/6/5/4/9/13/4/6 + name).
+fn table_header() -> String {
+    format!(
+        "{:>4} {:>4} {:>6} {:>5} {:>4} {:>9} {:>13} {:>4} {:>6} {}\n",
+        "ping", "eff", "rtt", "jit", "fps", "packets/s", "timeNudge", "snaps", "rate", "name"
+    )
+}
+
+/// The rule under the header, same widths as [`table_header`].
+const TABLE_RULE: &[u8] =
+    b"---- ---- ------ ----- ---- --------- ------------- ----- ------ ---------------\n";
+
+/// The `eff` cell: `ping + applied delay` for a player with a reading, `-` for
+/// a connecting/zombie slot (the same slots whose `ping` cell is not a
+/// number). Without ping equalisation the applied delay is 0, so the cell
+/// matches the `ping` column; while a delay is applied it shows what the player
+/// really experiences (D-028.3).
+fn eff_cell(ping: Option<i32>, applied: i32) -> String {
+    match ping {
+        Some(ping) => format!("{:>EFF_COL_WIDTH$}", ping.saturating_add(applied).min(9999)),
+        None => format!("{:>EFF_COL_WIDTH$}", "-"),
+    }
+}
+
 /// The `timeNudge` cell for one client (D-007 diagnostic, D-015 colour rules).
 ///
 /// Without `proxy_sv_voidTimeNudge` the cell reports the estimated range:
@@ -690,8 +710,8 @@ fn tn_cell(est: Option<Estimate>, voiding: bool, margin: f32) -> String {
 
 /// `Proxy_Engine_ClientCommand_NetStatus` (`Proxy_Engine_ClientCommand.cpp:
 /// 13-96`): print the per-player net status table to `client_num` (rate-limited
-/// to once per 500 ms of game time). D-007 columns:
-/// `ping rtt jit fps packets/s timeNudge snaps rate name`.
+/// to once per 500 ms of game time). D-007 columns plus D-028's `eff`:
+/// `ping eff rtt jit fps packets/s timeNudge snaps rate name`.
 ///
 /// The `packets/s` cell renders the shared per-client packet accounting in
 /// `crate::pps` (the limiter's own counter, which sees every sequenced packet
@@ -720,19 +740,15 @@ pub fn client_command_net_status(client_num: c_int) {
     let tn_margin = time_nudge_margin();
     // SAFETY: engine memory layer initialised.
     let clients = unsafe { clients_base() };
+    // One snapshot of the per-client ping-equalisation delays for the whole
+    // table, rather than a lock per row.
+    let applied: [i32; crate::sdk::MAX_CLIENTS] =
+        state::with_state(|s| core::array::from_fn(|i| s.clients[i].ping_equalize.applied));
 
     let mut status: Vec<u8> = Vec::new();
-    // header + rule, same widths as the rows below (4/6/5/4/9/13/4/6)
-    status.extend_from_slice(
-        format!(
-            "{:>4} {:>6} {:>5} {:>4} {:>9} {:>13} {:>4} {:>6} {}\n",
-            "ping", "rtt", "jit", "fps", "packets/s", "timeNudge", "snaps", "rate", "name"
-        )
-        .as_bytes(),
-    );
-    status.extend_from_slice(
-        b"---- ------ ----- ---- --------- ------------- ----- ------ ---------------\n",
-    );
+    // header + rule, same widths as the rows below (4/4/6/5/4/9/13/4/6)
+    status.extend_from_slice(table_header().as_bytes());
+    status.extend_from_slice(TABLE_RULE);
 
     for i in 0..maxclients {
         let cl = clients + i as usize * SIZEOF_CLIENT_T;
@@ -746,15 +762,19 @@ pub fn client_command_net_status(client_num: c_int) {
         if unsafe { is_bot(cl) } {
             continue;
         }
+        let ping = if state == CS_CONNECTED || state == CS_ZOMBIE {
+            None
+        } else {
+            // SAFETY: cl is a valid client_t.
+            let ping = unsafe { read_i32(cl + OFFSET_CLIENT_PING) };
+            Some(if ping < 9999 { ping } else { 9999 })
+        };
         let ping_str = if state == CS_CONNECTED {
             "CON ".to_string()
         } else if state == CS_ZOMBIE {
             "ZMB ".to_string()
         } else {
-            // SAFETY: cl is a valid client_t.
-            let ping = unsafe { read_i32(cl + OFFSET_CLIENT_PING) };
-            let ping = if ping < 9999 { ping } else { 9999 };
-            format!("{ping:4}")
+            format!("{:4}", ping.unwrap_or(0))
         };
 
         // SAFETY: cl is a valid client_t.
@@ -812,8 +832,11 @@ pub fn client_command_net_status(client_num: c_int) {
         }
 
         status.extend_from_slice(
-            format!("{ping_str} {rtt:>6} {jit:>5} {fps:4} {pps_cell} {tn} {snaps:5} {rate:6} ")
-                .as_bytes(),
+            format!(
+                "{ping_str} {} {rtt:>6} {jit:>5} {fps:4} {pps_cell} {tn} {snaps:5} {rate:6} ",
+                eff_cell(ping, applied[i as usize])
+            )
+            .as_bytes(),
         );
         status.extend_from_slice(&clean_name);
         status.extend_from_slice(b"^7\n");
@@ -857,6 +880,33 @@ mod tests {
             fps: 60,
             limit,
         }
+    }
+
+    #[test]
+    fn the_table_header_and_rule_line_up() {
+        // The fixed columns (ping … rate) are the same width in both lines; the
+        // trailing rule segment is wider than the literal `name` label, as
+        // before.
+        assert_eq!(
+            table_header(),
+            "ping  eff    rtt   jit  fps packets/s     timeNudge snaps   rate name\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(TABLE_RULE),
+            "---- ---- ------ ----- ---- --------- ------------- ----- ------ ---------------\n"
+        );
+    }
+
+    #[test]
+    fn the_eff_cell_shows_ping_plus_the_applied_delay() {
+        assert_eq!(eff_cell(Some(20), 0), "  20");
+        assert_eq!(eff_cell(Some(20), 75), "  95");
+        // A slower player is never padded, so eff matches ping.
+        assert_eq!(eff_cell(Some(180), 0), " 180");
+        // Connecting/zombie slots have no ping reading.
+        assert_eq!(eff_cell(None, 0), "   -");
+        // The cell stays four wide even at the engine's display clamp.
+        assert_eq!(eff_cell(Some(9999), 250), "9999");
     }
 
     #[test]

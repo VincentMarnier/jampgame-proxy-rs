@@ -57,6 +57,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_voidTimeNudge`              | 0       | neutralise a player's non-zero `cl_timeNudge` on the server: when the estimated range clears 0 by the configured margin, shift their usercmds' clock by the estimated setting (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
 | `proxy_sv_voidTimeNudgeLog`           | 0       | log `cl_timeNudge` non-zero / back-to-zero transitions; works on its own (reports the shift without applying it) |
 | `proxy_sv_timeNudgeMargin`            | 2       | margin, in milliseconds, added to the `cl_timeNudge` estimate's confidence range and required between that range and 0: a range must clear 0 by the margin (its minimum for a positive reading, its maximum for a negative one) before it counts as a non-zero setting, so `[0.3..6.1]` with `2` stays "consistent with 0"; `0` reports the statistical interval alone (see [Time nudge neutralisation](#time-nudge-neutralisation)) |
+| `proxy_sv_pingEqualize`               | 0       | cap, in milliseconds, on the server-side delay added to the fastest players' inbound moves so everyone plays at the slowest player's ping (see [Ping equalisation](#ping-equalisation)); `0` = off, clamped to `250` |
+| `proxy_sv_pingEqualizeLog`            | 0       | log ping-equalisation target changes and per-player engage/release transitions; works on its own (previews what the maximum supported cap would apply) |
 | `proxy_sv_antiMacro`                  | 0       | freeze a usercmd channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands, view ≥ 15/s, or frame-exact `wait` holds): the macro signature behind scripted ground-strafe acceleration and turn-key view wiggling; hand play is untouched and the player is never told (see [Anti-macro guard](#anti-macro-guard)) |
 | `proxy_sv_antiMacroLog`               | 0       | `1` log anti-macro lock/release transitions, `2` add the statistics of locked channels, `3` the statistics of every channel with a reversal (diagnostic); works on its own (reports what would be frozen) |
 | `proxy_sv_antiMacroView`              | 0       | `0` observe/log the view verdict but never freeze `yaw`/`pitch` (hand mouse play is too close to a key wiggle at the wire level); non-zero freezes a locked view |
@@ -354,14 +356,19 @@ With `proxy_sv_enableNetStatus 1`, the `netStatus` and `showNet` commands print
 a per-player table (rate-limited to once per 500 ms, bots excluded):
 
 ```text
-ping    rtt   jit  fps packets/s     timeNudge snaps   rate name
----- ------ ----- ---- --------- ------------- ----- ------ ---------------
-   0    0.0   0.0   60        30 [-17.9..-10.5]    20  25000 client0
-   0    0.0   0.0   60 ^1      100^7 [-17.9..-10.5]    20  25000 client0
-   0    0.0   0.0   60 ^1   100^7/73 [-17.9..-10.5]    20  25000 client0
+ping  eff    rtt   jit  fps packets/s     timeNudge snaps   rate name
+---- ---- ------ ----- ---- --------- ------------- ----- ------ ---------------
+   0    0    0.0   0.0   60        30 [-17.9..-10.5]    20  25000 client0
+   0    0    0.0   0.0   60 ^1      100^7 [-17.9..-10.5]    20  25000 client0
+   0    0    0.0   0.0   60 ^1   100^7/73 [-17.9..-10.5]    20  25000 client0
 ```
 
 * **ping** — the player's ping as the game reports it on the scoreboard.
+* **eff** — the ping the player actually plays at when
+  [ping equalisation](#ping-equalisation) is on: `ping` plus the delay the
+  server adds to their inbound moves. Without the feature (or for a player who
+  is already the slowest, or serves as the cap's straggler) it matches `ping`;
+  `-` for a slot with no ping reading.
 * **rtt** — round-trip time: how long a message needs to travel to the
   player's game and back, in milliseconds. This is the "real" ping — the one
   the server measures itself. Lower is better; on the same machine it reads 0.
@@ -469,6 +476,61 @@ Details worth knowing:
 It works on its own: with `proxy_sv_voidTimeNudge 0` it still reports the shift
 the feature *would* apply, without rewriting any command. A client that stays
 on the same side of zero is silent.
+
+### Ping equalisation
+
+A player with a low ping sees the world sooner and has their moves processed
+sooner than a player with a high ping. `proxy_sv_pingEqualize` removes that
+difference on the **input** side: the server delays the fast players' inbound
+moves so that everyone's commands reach the game as late as the slowest
+in-game player's, up to a configurable cap. The server can only add delay, so
+players are pulled *up* to the slowest player's ping; the slowest player is
+never made faster.
+
+- The target is `min(cap, slowest in-game player's ping)`. With a single player
+  (or a LAN-only match) the target is their own ping and nobody is delayed. A
+  player slower than the cap does not raise the target: everyone else is
+  pulled to the cap and that player keeps their own ping.
+- `cap` is the cvar value in milliseconds, clamped to `0..=250`. The limit is
+  the client's prediction window: it can only replay its last 64 usercmds, and
+  beyond that its prediction freezes ("exceeded PACKET_BACKUP on commands").
+  At `cl_maxpackets 125` that window is about 512 ms including the round trip,
+  so 250 ms leaves margin. Do not expect values above 250 to be accepted.
+- The target refreshes at most every 500 ms from the engine's ping (already an
+  average), moves only when it changes by at least 10 ms, and retargets
+  immediately when players join/leave/spectate or the cap changes.
+- Every player's applied delay moves by **1 ms per command** in either
+  direction, so engaging or disengaging never creates an oversized movement
+  frame. Setting `proxy_sv_pingEqualize 0` therefore ramps the delay away
+  instead of jumping the clock forward; `proxy_sv_enable 0` detaches the hook
+  layer at once (the next command sees the raw stamp, one oversized `msec`
+  clamped by the game, as with every feature behind the master switch).
+- Only the **input** path is equalised. Snapshots are still sent to each player
+  as soon as their bandwidth allows, so a low-ping player's view stays fresher
+  than a natural high-pinger's; the equaliser does not hide that difference.
+- The server-side scoreboard ping (`ps.ping`) is overwritten with the effective
+  value for every delayed player, so the `scores` string and the end-of-game
+  ping log report it. The stock cgame has its scoreboard ping column commented
+  out, so the number is visible on clients/mods that render it; the
+  [net status](#net-status) table's `eff` column always shows it, and
+  `status`/rcon `status` keep the real engine ping.
+- Spectators, connecting clients and bots are never delayed.
+- It needs `proxy_sv_enable 1` like every feature, but not
+  `proxy_sv_enableNetStatus`.
+
+`proxy_sv_pingEqualizeLog 1` logs target changes and per-player
+engage/release transitions:
+
+```text
+----- proxy-rs: pingEqualize target=110 (slowest client=3 ping=180 capped)
+----- proxy-rs: pingEqualize client=0 delay=75 ping=20 target=95
+----- proxy-rs: pingEqualize client=0 delay=0 (released)
+```
+
+It works on its own: with `proxy_sv_pingEqualize 0` it previews what the
+maximum supported cap would apply (the lines carry a `(preview)` suffix)
+without rewriting any command. The per-player engage line reports the target
+delay; the release line follows once the delay has actually ramped to zero.
 
 ### Client packet rate
 

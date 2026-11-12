@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 60] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 62] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -90,6 +90,9 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 60] = [
     (c"proxy_sv_demoMaxFileMB", c"128"),
     (c"proxy_sv_demoMinFreeMB", c"512"),
     (c"proxy_sv_demoIntermissionSecs", c"3"),
+    // D-028: ping equalisation.
+    (c"proxy_sv_pingEqualize", c"0"),
+    (c"proxy_sv_pingEqualizeLog", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -318,6 +321,16 @@ pub const CVAR_DEMO_MIN_FREE_MB: usize = 58;
 /// at least 4 s (duel between rounds) / 5 s (other modes); a larger value may
 /// fall back to the next game start.
 pub const CVAR_DEMO_INTERMISSION_SECS: usize = 59;
+
+/// `proxy_sv_pingEqualize`: cap in milliseconds on the server-side delay added
+/// to the low-ping players' inbound usercmds (D-028). `0` = off; clamped to
+/// `0..=250` by [`crate::pingequalize::set_config`].
+pub const CVAR_PING_EQUALIZE: usize = 60;
+/// `proxy_sv_pingEqualizeLog`: `1` logs target changes and per-client
+/// engage/release transitions. Works without enforcement: with
+/// `proxy_sv_pingEqualize 0` it previews what the maximum supported cap would
+/// apply (see [`crate::pingequalize`]).
+pub const CVAR_PING_EQUALIZE_LOG: usize = 61;
 
 /// The pre-rename spelling of a canonical cvar, if it has one (D-026).
 ///
@@ -1156,6 +1169,9 @@ pub struct ClientEntry {
     /// `cl_timeNudge` neutralisation (`crate::timenudge`, D-015): the applied
     /// usercmd `serverTime` shift, its ramp target and the log edge.
     pub nudge_void: crate::timenudge::VoidState,
+    /// Ping equalisation (`crate::pingequalize`, D-028): the delay applied to
+    /// this client's inbound usercmds, its ramp target and the log edge.
+    pub ping_equalize: crate::pingequalize::PingEqualizeState,
     pub last_time_net_status: i32,
     /// Monotonic packet-identity counter for the cmdStats feed: bumped once
     /// per usercmd client message by the `SV_ExecuteClientMessage` entry
@@ -1181,6 +1197,7 @@ impl Default for ClientEntry {
             pps: crate::pps::PpsState::default(),
             macro_guard: crate::macroguard::MacroState::default(),
             nudge_void: crate::timenudge::VoidState::default(),
+            ping_equalize: crate::pingequalize::PingEqualizeState::default(),
             last_time_net_status: 0,
             packet_counter: 0,
             game_stats: [GameStats::default(); MAX_CLIENTS],
@@ -1210,6 +1227,9 @@ pub struct ProxyState {
     pub taystjk_info: VmCvar,
     pub jump_start_time: [i32; MAX_CLIENTS],
     pub team_lock: TeamLock,
+    /// Ping-equalisation target tracking (`crate::pingequalize`, D-028): the
+    /// member set, the per-member ping snapshot and the 500 ms/deadband target.
+    pub ping_equalize: crate::pingequalize::TargetState,
     /// The `proxy_sv_teamSizeRules` rule most recently written, so the per-frame
     /// reconciler only re-applies the limits when the effective rule changes.
     pub last_team_rule: Option<crate::rules::Rule>,
@@ -1473,6 +1493,7 @@ impl ProxyState {
             taystjk_info: VmCvar::default(),
             jump_start_time: [0; MAX_CLIENTS],
             team_lock: TeamLock::default(),
+            ping_equalize: crate::pingequalize::TargetState::default(),
             last_team_rule: None,
             base_limits: None,
             spec_overlay_last_time: 0,

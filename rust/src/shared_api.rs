@@ -113,6 +113,8 @@ pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
         crate::pps::reset_client(client_num as usize);
         // The anti-macro guard starts from no runs and no lock.
         crate::macroguard::reset_client(client_num as usize);
+        // A fresh player starts with no ping-equalisation delay.
+        crate::pingequalize::reset_client(client_num as usize);
     }
     if first_time && !is_bot {
         // Same shape as the original proxy's
@@ -151,6 +153,9 @@ pub fn client_disconnect(client_num: c_int) {
         entry.muted = false;
         // A slot reused by a human must not keep the bot exemption.
         entry.is_bot = false;
+        // A ping-equalisation delay belongs to the player who left: the next
+        // occupant of the slot starts from the neutral clock.
+        entry.ping_equalize.clear();
         if entry.is_connected {
             *entry = Default::default();
             // Drop any in-progress jump-hold so a new client reusing the slot

@@ -890,6 +890,15 @@ pub const OFFSET_ENTITY_POWERUPS: usize = 292;
 
 /// `offsetof(playerState_t, stats)` — `int[MAX_STATS]` (STAT_HEALTH/STAT_ARMOR).
 pub const OFFSET_PS_STATS: usize = 244;
+/// `offsetof(playerState_t, ping)` — "server to game info for scoreboard"
+/// (`q_shared.h:2252`). The engine's `SV_CalcPings` writes `cl->ping` and
+/// copies it into `ps->ping` every `SV_Frame` before `GAME_RUN_FRAME`; the game
+/// reads `cl->ps.ping` when it builds the `scores` string
+/// (`g_cmds.c:DeathmatchScoreboardMessage`). D-028 overwrites it after the
+/// forward with `cl->ping + applied_delay`. Verified with
+/// `g++ -m32 offsetof` against the SDK header (2026-11-12), alongside the
+/// `stats=244`, `persistant=308`, `sizeof=1552` anchors above.
+pub const OFFSET_PS_PING: usize = 524;
 /// `offsetof(playerState_t, persistant)` — `int[MAX_PERSISTANT]` (PERS_SCORE/PERS_KILLED).
 pub const OFFSET_PS_PERSISTANT: usize = 308;
 /// `offsetof(playerState_t, clientNum)`.
@@ -1343,6 +1352,7 @@ mod tests {
         assert_eq!(OFFSET_PS_PM_FLAGS, 12);
         assert_eq!(OFFSET_PS_ORIGIN, 20);
         assert_eq!(OFFSET_PS_VIEWHEIGHT, 196);
+        assert_eq!(OFFSET_PS_PING, 524);
         assert_eq!(OFFSET_PS_M_I_VEHICLE_NUM, 1436);
         assert_eq!(MAX_CONFIGSTRINGS, 1700);
         assert_eq!(MAX_MAP_AREA_BYTES, 32);

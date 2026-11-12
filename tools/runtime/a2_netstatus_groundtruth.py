@@ -17,10 +17,12 @@
 #                 window, clc_move vs clc_moveNoDelta, outPackets[]).
 #
 # Ground truth = the `cl_timeNudge` fed in. The scenario matrix drives
-# sv_fps x client fps x snaps x cl_maxpackets x LAN/non-LAN x tn (+ loss and
-# jitter cases) against the printed `netStatus` table — its `timeNudge` cell
-# `[lo..hi]` is symmetric around the point estimate — and reports the estimate
-# error. The proxy exposes no estimator internals at runtime.
+# sv_fps x client fps x snaps x cl_maxpackets x LAN/non-LAN x tn (+ loss, fixed
+# one-way delay and jitter cases) against the printed `netStatus` table — its
+# `timeNudge` cell `[lo..hi]` is symmetric around the point estimate — and
+# reports the estimate error. The proxy exposes no estimator internals at
+# runtime. `--mode equalize` runs two clients with different `delay_ms` values
+# and joins them to the free team for the D-028 ping-equalisation harness.
 #
 # Documented simplification (does not touch the timing): the usercmds carry
 # all-zero movement/angle fields, so MSG_WriteDeltaUsercmdKey takes its
@@ -83,14 +85,24 @@ def int_div(a, b):
 
 
 class Link:
-    """One client's datagram path. Loss and jitter are emulated client-side,
-    so both directions are covered without touching the server."""
+    """One client's datagram path. Loss, a fixed one-way delay and jitter are
+    emulated client-side, so both directions are covered without touching the
+    server."""
 
-    def __init__(self, server_addr, loss_up=0.0, loss_down=0.0, jitter_ms=0.0, rng=None):
+    def __init__(
+        self,
+        server_addr,
+        loss_up=0.0,
+        loss_down=0.0,
+        jitter_ms=0.0,
+        delay_ms=0.0,
+        rng=None,
+    ):
         self.server_addr = server_addr
         self.loss_up = loss_up
         self.loss_down = loss_down
         self.jitter_ms = jitter_ms
+        self.delay_ms = delay_ms
         self.rng = rng or random.Random(1)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
@@ -105,14 +117,15 @@ class Link:
         return self.sock.getsockname()
 
     def _delay(self):
-        return self.rng.uniform(0.0, self.jitter_ms) if self.jitter_ms else 0.0
+        jitter = self.rng.uniform(0.0, self.jitter_ms) if self.jitter_ms else 0.0
+        return self.delay_ms + jitter
 
     def send(self, data, now_ms):
         self.sent += 1
         if self.loss_up and self.rng.random() < self.loss_up:
             self.dropped_up += 1
             return
-        if self.jitter_ms:
+        if self.jitter_ms or self.delay_ms:
             # deliver later: keep a small send queue keyed by time
             self._pending_out = getattr(self, "_pending_out", [])
             self._pending_out.append((now_ms + self._delay(), data))
@@ -682,6 +695,8 @@ def run_batch(
     tag,
     loss=0.0,
     jitter_ms=0.0,
+    delay_ms=0.0,
+    join_after=0.0,
     request_table=True,
     seed=1,
     server_sets=(),
@@ -712,6 +727,7 @@ def run_batch(
                 loss_up=loss,
                 loss_down=loss,
                 jitter_ms=jitter_ms,
+                delay_ms=spec.get("delay_ms", delay_ms),
                 rng=rng,
             )
             c = ClientModel(
@@ -731,12 +747,21 @@ def run_batch(
         next_frame = {id(c): time.monotonic() * 1000.0 for c in clients}
         start = time.monotonic()
         table_requested = False
+        joined = False
         hard_stop = duration + 2.0
         while True:
             now_ms = time.monotonic() * 1000.0
             elapsed = time.monotonic() - start
             if elapsed >= hard_stop:
                 break
+            if join_after and not joined and elapsed >= join_after:
+                # Synthetic clients connect as free spectators (the game never
+                # auto-joins FFA); the ping-equalisation population rule needs
+                # playing clients, so put them on the free team explicitly.
+                if all(c.connected for c in clients):
+                    for c in clients:
+                        c.send_command("team free", now_ms)
+                    joined = True
             if request_table and not table_requested and elapsed >= duration - 2.5:
                 for c in clients:
                     if c.connected:
@@ -782,7 +807,8 @@ def run_batch(
 # The numeric prefix is what we score against; the name is the trailing field
 # (it may contain spaces).
 TABLE_ROW = re.compile(
-    r"^\s*(?P<ping>\S+)\s+(?P<rtt>\S+)\s+(?P<jit>\S+)\s+(?P<fps>\d+)\s+(?P<pps>\d+)\s+"
+    r"^\s*(?P<ping>\S+)\s+(?P<eff>\S+)\s+(?P<rtt>\S+)\s+(?P<jit>\S+)\s+"
+    r"(?P<fps>\d+)\s+(?P<pps>\d+)\s+"
     r"(?P<cell>\[[^]]+\]|-)\s+(?P<snaps>\d+)\s+(?P<rate>-?\d+)\s+(?P<name>\S.*?)\s*$"
 )
 
@@ -999,7 +1025,7 @@ def run_real(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["single", "matrix", "real"], default="single")
+    ap.add_argument("--mode", choices=["single", "matrix", "real", "equalize"], default="single")
     ap.add_argument("--engine", default="./linuxjampded")
     ap.add_argument("--gamedata", default="/srv/jka/gamedata")
     ap.add_argument("--artifacts", default="/srv/jka/artifacts")
@@ -1012,6 +1038,18 @@ def main():
     ap.add_argument("--lan", action="store_true", help="client packet mode: LAN bypass")
     ap.add_argument("--loss", type=float, default=0.0)
     ap.add_argument("--jitter-ms", type=float, default=0.0)
+    ap.add_argument(
+        "--delay-ms",
+        type=float,
+        default=0.0,
+        help="fixed one-way datagram delay, in ms, for every client (single/matrix)",
+    )
+    ap.add_argument(
+        "--slow-delay-ms",
+        type=float,
+        default=150.0,
+        help="equalize mode: fixed one-way delay of the slow client (client1)",
+    )
     ap.add_argument("--duration", type=float, default=15.0)
     ap.add_argument("--full-grid", action="store_true")
     ap.add_argument("--max-batches", type=int, default=0, help="matrix smoke test: stop after N batches")
@@ -1052,6 +1090,7 @@ def main():
             tag="single",
             loss=args.loss,
             jitter_ms=args.jitter_ms,
+            delay_ms=args.delay_ms,
             server_sets=args.server_sets,
         )
         with open(os.path.join(args.artifacts, "a2_single.json"), "w") as fh:
@@ -1063,6 +1102,43 @@ def main():
         results = compare_run(run)
         if any(r["estimate"] is not None for r in results):
             print_report(results)
+        return 0
+    if args.mode == "equalize":
+        # Two synthetic clients on the same server, different one-way delays:
+        # the fast one (client0) must be padded up to the target the slow one
+        # (client1) sets. a8_ping_equalize.sh samples both under gdb.
+        specs = []
+        for name, delay in (
+            ("client0", args.delay_ms or 15.0),
+            ("client1", args.slow_delay_ms),
+        ):
+            specs.append(
+                {
+                    "name": name,
+                    "tn": 0,
+                    "fps": args.client_fps,
+                    "maxpackets": args.cl_maxpackets,
+                    "snaps": args.snaps,
+                    "lan": False,
+                    "delay_ms": delay,
+                }
+            )
+        run = run_batch(
+            engine=args.engine,
+            gamedata=args.gamedata,
+            port=args.port,
+            sv_fps=args.sv_fps,
+            client_specs=specs,
+            duration=args.duration,
+            net_forcenonlocal=args.net_forcenonlocal,
+            artifacts=args.artifacts,
+            tag="equalize",
+            join_after=6.0,
+            server_sets=args.server_sets,
+        )
+        with open(os.path.join(args.artifacts, "a2_equalize.json"), "w") as fh:
+            json.dump(run, fh, indent=1)
+        print(json.dumps(run["clients"], indent=1)[:2000])
         return 0
     if args.mode == "real":
         run_real(args)

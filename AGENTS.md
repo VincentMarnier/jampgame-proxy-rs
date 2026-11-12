@@ -33,6 +33,8 @@ docs/ holds the reverse-engineering evidence, the architecture notes and the dec
 - docs/decisions/0006-parallel-tffa.md — parallel self-organized TFFA matches (`proxy_parallel_tffas_*`, GT_TEAM; the pre-rename `proxy_tffa_*` spellings remain as aliases, D-026).
 - docs/decisions/0025-parallel-duels.md — parallel duels on GT_DUEL (`proxy_parallel_duels_enable`): the shared instancing core, ladder formation/bump/queue, per-round resolution, carried `map_restart`, per-viewer duel HUD/board and stock-duel suppression; records the `SetTeamQuick` binary finding and the restart classifier.
 - docs/decisions/0026-tffa-cvar-rename.md — the `proxy_tffa_*` → `proxy_parallel_tffas_*` cvar rename, the legacy spellings kept as registered aliases, and the canonical-unless-default resolution rule.
+- docs/decisions/0027-server-demos.md — server-side demo recording (`.dm_26`), the shadow-state recorder, publication over the proxy's HTTP listener, retention and the accepted guards.
+- docs/decisions/0028-ping-equalize.md — ping equalisation (`proxy_sv_pingEqualize`): a server-side delay added to low-ping players' inbound usercmds, target = min(cap, slowest ping), 500 ms/deadband tracking, the 1 ms/command ramp, the `ps.ping` display and `eff` netStatus column, and the prediction-window cap rationale.
 - docs/decisions/README.md — index of the decision records.
 
 Source authority (game vs engine)

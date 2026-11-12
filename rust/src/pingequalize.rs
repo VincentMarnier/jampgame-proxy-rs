@@ -1,0 +1,934 @@
+//! Server-side ping equalisation (`proxy_sv_pingEqualize`,
+//! `proxy_sv_pingEqualizeLog`) — D-028.
+//!
+//! A player's usercmd `serverTime` is a stamp on the client's clock; the server
+//! processes the move when it arrives, so the game's `ps.commandTime` trails
+//! `level.time` by the network delay. The 1 ms-per-usercmd clock correction
+//! already exists for `cl_timeNudge` (D-015, [`crate::timenudge`]): the
+//! retargeted `call SV_ClientThink` inside `SV_UserMove` rewrites the stamp
+//! before the game reads it.
+//!
+//! Ping equalisation reuses that path to make every player in a match play at
+//! the same **effective** latency: the target is the slowest in-game player's
+//! `cl->ping`, capped by `proxy_sv_pingEqualize`, and every faster player's
+//! inbound commands are shifted *back* by `target - ping`. A player already
+//! slower than the target (or than the cap) is left alone: the server can only
+//! add delay, never remove it.
+//!
+//! What is equalised is the input path: the game processes a fast player's
+//! moves as late as a slow player's, so both see the same age on the world
+//! state that was current when the command was made. The **view** path is not
+//! delayed (no snapshot hold): the fast player still sees fresher snapshots.
+//!
+//! ## Population
+//!
+//! Members are engine `client_t`s in `CS_ACTIVE`, not bots, with a usable
+//! `cl->ping` (`1..999`; `999` is the engine's "no reading" sentinel) and a
+//! game session team other than `TEAM_SPECTATOR`. Spectators, connecting
+//! clients and bots are ignored and never padded.
+//!
+//! ## Tracking
+//!
+//! The target is recomputed from `cl->ping` at most every
+//! [`REFRESH_MS`] (the engine's own value is a 32-snapshot average,
+//! `SV_CalcPings`, so it is already smooth) and moves only when it differs by
+//! at least [`TARGET_DEADBAND_MS`]. A change of the member set (join, leave,
+//! spectator, return to play) or of the configured cap retargets immediately;
+//! the 1 ms-per-usercmd ramp still applies to the per-client delay.
+//!
+//! ## Ramp and off semantics
+//!
+//! Every client's applied delay moves by 1 ms per usercmd, exactly like the
+//! `cl_timeNudge` void: a jump would trip the game's `msec < 1` guard or
+//! produce one oversized movement frame (`g_active.c:2023-2028`). Setting
+//! `proxy_sv_pingEqualize` to `0` sets every target to `0` and lets the delay
+//! ramp out instead of snapping the clock forward. `proxy_sv_enable 0` detaches
+//! the hook layer immediately (the one following command sees the raw stamp,
+//! one oversized `msec` clamped to 200 by the game) — the same consequence as
+//! every other feature behind the master switch.
+//!
+//! ## Display
+//!
+//! After the pristine `GAME_RUN_FRAME` (and before `SV_SendClientMessages`
+//! builds the snapshots), every client with a non-zero applied delay has its
+//! game-side `level.clients[i].ps.ping` overwritten with `cl->ping + delay`.
+//! That is the value `DeathmatchScoreboardMessage` puts in the `scores` string
+//! (`g_cmds.c:52-53`); the shipped cgame has its ping column commented out
+//! (`cg_scoreboard.c:245`), so it shows on clients/mods that render it. The
+//! proxy's own netStatus table adds an `eff` column, and `status`/rcon
+//! `status` keep the engine's real ping.
+//!
+//! ## Cap
+//!
+//! The cap is clamped to `0..=250` ms. A client can only replay its last
+//! `CMD_BACKUP = 64` usercmds; when the snapshot's `ps.commandTime` falls
+//! behind that window, `CG_PredictPlayerState` freezes prediction ("exceeded
+//! PACKET_BACKUP on commands"). At `cl_maxpackets 125` that window is about
+//! 512 ms *including* the round trip, so 250 ms leaves margin at every packet
+//! rate. Do not raise it without a real-client measurement.
+//!
+//! `proxy_sv_pingEqualizeLog 1` logs target changes and per-client
+//! engage/release transitions. It works without enforcement: with
+//! `proxy_sv_pingEqualize 0` it previews what the maximum supported cap would
+//! apply (the log appends `(preview)`).
+
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+use crate::hooks::engine_sv::{clients_base, is_bot, read_i32, write_i32};
+use crate::sdk::{
+    CS_ACTIVE, MAX_CLIENTS, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE, OFFSET_GCLIENT_PS,
+    OFFSET_GCLIENT_SESS, OFFSET_LEVEL_MAXCLIENTS, OFFSET_PS_PING, OFFSET_SESS_SESSION_TEAM,
+    SIZEOF_CLIENT_T, SIZEOF_GCLIENT, TEAM_SPECTATOR,
+};
+use crate::state;
+use crate::syscall;
+
+/// Highest enforceable cap, in milliseconds (see the module docs: the
+/// `CMD_BACKUP` prediction window).
+pub const MAX_CAP_MS: i32 = 250;
+
+/// Target refresh interval. `cl->ping` is already a 32-snapshot average
+/// (`SV_CalcPings`), so a faster cadence would only rescan the same value.
+pub const REFRESH_MS: i32 = 500;
+
+/// Deadband for moving the target. Ping noise below this would otherwise keep
+/// every client ramping.
+pub const TARGET_DEADBAND_MS: i32 = 10;
+
+/// Lowest `cl->ping` that counts as a reading.
+pub const MIN_PING: i32 = 1;
+
+/// The engine's "no reading" sentinel (`SV_CalcPings` writes `999` when the
+/// client is not active, has no gentity or has no acked frame); `cl->ping` must
+/// stay strictly below it.
+pub const PING_SENTINEL: i32 = 999;
+
+// ---------------------------------------------------------------------------
+// Cvar mirror (set once per `GAME_RUN_FRAME` by `update_proxy_cvars`)
+// ---------------------------------------------------------------------------
+
+static CAP_MS: AtomicI32 = AtomicI32::new(0);
+static LOG: AtomicBool = AtomicBool::new(false);
+
+/// The configured cap in milliseconds (`0` = off). Already clamped.
+pub fn cap_ms() -> i32 {
+    CAP_MS.load(Ordering::Relaxed)
+}
+
+/// Whether transitions are logged (`proxy_sv_pingEqualizeLog`).
+pub fn logging() -> bool {
+    LOG.load(Ordering::Relaxed)
+}
+
+/// Clamp a cvar value to the supported cap range.
+pub fn clamp_cap(cap: i32) -> i32 {
+    cap.clamp(0, MAX_CAP_MS)
+}
+
+/// Mirror the cvars into lock-free atomics.
+///
+/// Turning the cap to `0` does **not** clear the applied delays: the targets
+/// are set to `0` by the next [`on_run_frame`] and the 1 ms-per-usercmd ramp
+/// brings them down (D-028.6).
+pub fn set_config(cap: i32, log: i32) {
+    CAP_MS.store(clamp_cap(cap), Ordering::Relaxed);
+    LOG.store(log != 0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Target policy (pure)
+// ---------------------------------------------------------------------------
+
+/// `min(cap, max ping)`, or `0` when there is no member (or the cap is off).
+///
+/// `pings` holds the member pings only; spectators/bots/invalid readings are
+/// filtered out by the caller.
+pub fn target_for(pings: &[i32], cap: i32) -> i32 {
+    let cap = clamp_cap(cap);
+    if cap <= 0 {
+        return 0;
+    }
+    match pings.iter().copied().max() {
+        Some(max) if max > 0 => max.min(cap),
+        _ => 0,
+    }
+}
+
+/// The delay one member needs to reach `target`: `max(0, target - ping)`.
+pub fn delay_for(ping: i32, target: i32) -> i32 {
+    if target <= 0 {
+        return 0;
+    }
+    (target - ping).max(0)
+}
+
+/// Whether a client belongs to the equalisation population (D-028.4): engine
+/// `CS_ACTIVE`, not a bot, a usable `cl->ping` (`1..999`) and a game session
+/// team other than `TEAM_SPECTATOR`. Spectators, connecting clients and bots
+/// are ignored and never padded.
+pub fn is_member(client_state: i32, bot: bool, ping: i32, session_team: i32) -> bool {
+    client_state == CS_ACTIVE
+        && !bot
+        && (MIN_PING..PING_SENTINEL).contains(&ping)
+        && session_team != TEAM_SPECTATOR
+}
+
+// ---------------------------------------------------------------------------
+// Per-client delay state
+// ---------------------------------------------------------------------------
+
+/// Per-client ping-equalisation state.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PingEqualizeState {
+    /// Delay currently applied to this client's usercmds (`0` = none).
+    pub applied: i32,
+    /// Delay [`step`](Self::step) moves toward.
+    pub target: i32,
+    /// Log edge: an engage line was emitted and no release line yet.
+    pub logged: bool,
+    /// A real (non-preview) delay has been applied since the last release;
+    /// distinguishes "the applied delay ended" from a preview-only edge.
+    pub applied_seen: bool,
+}
+
+impl PingEqualizeState {
+    /// Move the applied delay one millisecond toward the target and return it.
+    ///
+    /// The 1 ms step bounds the per-command `msec` change to ±1 (see the module
+    /// docs); a client that stopped producing commands leaves the delay where
+    /// it was, which is correct because its clock has not moved either.
+    pub fn step(&mut self) -> i32 {
+        self.applied += (self.target - self.applied).signum();
+        self.applied
+    }
+
+    /// Update the target (and the log edge) for one frame. `reported` is the
+    /// delay the feature would apply (differs from `effective` only in the
+    /// log-only preview, where `effective` is `0`).
+    ///
+    /// The engage line reports the target delay; the release line is emitted
+    /// only once the applied delay has ramped all the way to `0`, so a
+    /// spectator or a disabled cap is reported when the client really stops
+    /// being delayed.
+    pub fn update(
+        &mut self,
+        effective: i32,
+        reported: i32,
+        ping: i32,
+        global_target: i32,
+        enforce: bool,
+        log: bool,
+    ) -> Option<ClientTransition> {
+        self.target = effective;
+        if self.applied > 0 {
+            self.applied_seen = true;
+        }
+        let engaged = if enforce { effective > 0 } else { reported > 0 };
+        let was = self.logged;
+        // While merely previewing (enforcement off), the frame where a real
+        // applied delay finishes ramping out is still a release, even though
+        // the preview immediately reports a would-be delay again. A preview
+        // that never applied a delay has nothing to release.
+        let preview_released =
+            log && !enforce && effective == 0 && self.applied == 0 && was && self.applied_seen;
+        let transition = if preview_released {
+            Some(ClientTransition::Released)
+        } else if log && engaged && !was {
+            Some(ClientTransition::Engaged {
+                delay: effective.max(reported),
+                ping,
+                target: global_target,
+            })
+        } else if log && !engaged && self.applied == 0 && was {
+            Some(ClientTransition::Released)
+        } else {
+            None
+        };
+        if matches!(transition, Some(ClientTransition::Released)) {
+            self.applied_seen = false;
+        }
+        // Keep the edge while a previously engaged client ramps out.
+        self.logged = if preview_released {
+            false
+        } else {
+            log && (engaged || (was && self.applied > 0))
+        };
+        transition
+    }
+
+    /// Whether the client has nothing to do (idle state, no ramp pending).
+    pub fn is_idle(&self) -> bool {
+        self.applied == 0 && self.target == 0 && !self.logged
+    }
+
+    /// Stop applying the delay: the next usercmds ramp it out.
+    pub fn stop(&mut self) {
+        self.target = 0;
+    }
+
+    /// Forget everything (connect/disconnect, `GAME_INIT`, master switch).
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The ping the scoreboard should report while this delay is applied.
+    pub fn effective_ping(&self, ping: i32) -> i32 {
+        ping.saturating_add(self.applied)
+    }
+}
+
+/// One logged per-client transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientTransition {
+    Engaged { delay: i32, ping: i32, target: i32 },
+    Released,
+}
+
+// ---------------------------------------------------------------------------
+// Target tracking
+// ---------------------------------------------------------------------------
+
+/// One logged target change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetChange {
+    pub target: i32,
+    /// Engine slot of the slowest member (`None` when the roster is empty).
+    pub slowest: Option<usize>,
+    pub slowest_ping: i32,
+    /// The slowest member is above the cap, so everybody else was pulled to
+    /// the cap and the straggler keeps its own ping.
+    pub capped: bool,
+}
+
+/// The global target state: member set, the ping snapshot it was computed
+/// from, and the refresh/deadband bookkeeping.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TargetState {
+    pub target: i32,
+    /// Member mask used by the last computation.
+    pub members: [bool; MAX_CLIENTS],
+    /// Member pings used by the last computation (`0` for non-members).
+    pings: [i32; MAX_CLIENTS],
+    /// `svs.time` of the last recomputation (`0` = never).
+    pub last_check_ms: i32,
+    /// The cap the last computation used (also detects cap changes).
+    pub cap: i32,
+}
+
+impl TargetState {
+    /// Whether a recomputation is due (also true after the engine clock goes
+    /// backwards, e.g. a map restart).
+    pub fn due(&self, now: i32) -> bool {
+        let elapsed = now.wrapping_sub(self.last_check_ms);
+        !(0..REFRESH_MS).contains(&elapsed)
+    }
+
+    /// The latched ping of a member from the last recomputation.
+    pub fn latched_ping(&self, client_num: usize) -> i32 {
+        self.pings.get(client_num).copied().unwrap_or(0)
+    }
+
+    /// Recompute the target when due (or immediately on a roster/cap change).
+    ///
+    /// Returns the new target only when it moved, for the transition log.
+    pub fn observe(
+        &mut self,
+        now: i32,
+        members: &[bool; MAX_CLIENTS],
+        pings: &[i32; MAX_CLIENTS],
+        cap: i32,
+    ) -> Option<TargetChange> {
+        let roster_changed = *members != self.members;
+        let cap = clamp_cap(cap);
+        let cap_changed = cap != self.cap;
+        if !roster_changed && !cap_changed && !self.due(now) {
+            return None;
+        }
+
+        let mut member_pings: Vec<i32> = Vec::new();
+        let mut slowest = None;
+        let mut slowest_ping = 0;
+        for i in 0..MAX_CLIENTS {
+            self.pings[i] = if members[i] { pings[i] } else { 0 };
+            self.members[i] = members[i];
+            if members[i] {
+                member_pings.push(pings[i]);
+                if slowest.is_none() || pings[i] > slowest_ping {
+                    slowest = Some(i);
+                    slowest_ping = pings[i];
+                }
+            }
+        }
+
+        let new_target = target_for(&member_pings, cap);
+        self.members = *members;
+        self.cap = cap;
+        self.last_check_ms = now;
+
+        let moved = new_target != self.target
+            && (roster_changed
+                || cap_changed
+                || (new_target - self.target).abs() >= TARGET_DEADBAND_MS);
+        if !moved {
+            return None;
+        }
+        self.target = new_target;
+        Some(TargetChange {
+            target: new_target,
+            slowest,
+            slowest_ping,
+            capped: slowest.is_some() && slowest_ping > cap,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime integration
+// ---------------------------------------------------------------------------
+
+/// Reset one client's delay (connect/disconnect, slot reuse).
+pub fn reset_client(client_num: usize) {
+    state::with_state(|s| {
+        if let Some(client) = s.clients.get_mut(client_num) {
+            client.ping_equalize.clear();
+        }
+    });
+}
+
+/// Drop every client's delay and the target tracking (master switch off,
+/// `GAME_INIT`).
+pub fn clear_offsets() {
+    state::with_state(|s| {
+        for client in s.clients.iter_mut() {
+            client.ping_equalize.clear();
+        }
+        s.ping_equalize = TargetState::default();
+    });
+}
+
+/// Per-`GAME_RUN_FRAME` pass (after the pristine forward, before the engine
+/// builds the snapshots): refresh the target, update every client's ramp
+/// target, and write the effective ping into the game-side player state.
+///
+/// # Safety
+///
+/// Runs from the proxy's `GAME_RUN_FRAME` handler: the original module is
+/// loaded, the engine memory layer is initialised and `GAME_INIT` has run.
+pub fn on_run_frame(now: i32) {
+    let cap = cap_ms();
+    let log = logging();
+    let idle = state::with_state(|s| s.clients.iter().all(|c| c.ping_equalize.is_idle()));
+    if idle && cap == 0 && !log {
+        return;
+    }
+
+    let level = crate::original::level_address();
+    if level == 0 {
+        return;
+    }
+    let g_clients = state::with_state(|s| s.located_game_data.g_clients);
+    if g_clients == 0 {
+        return;
+    }
+    // SAFETY: engine memory layer initialised (hooks run after GAME_INIT).
+    let engine_clients = unsafe { clients_base() };
+    if engine_clients == 0 {
+        return;
+    }
+    // SAFETY: `level` is the original module's live `level_locals_t`;
+    // `maxclients` is a plain int.
+    let maxclients =
+        unsafe { read_i32(level + OFFSET_LEVEL_MAXCLIENTS) }.clamp(0, MAX_CLIENTS as i32) as usize;
+    if maxclients == 0 {
+        return;
+    }
+
+    let enforce = cap > 0;
+    let computation_cap = if enforce {
+        cap
+    } else if log {
+        // Log-only preview: what the maximum supported cap would apply.
+        MAX_CAP_MS
+    } else {
+        0
+    };
+
+    let mut members = [false; MAX_CLIENTS];
+    let mut pings = [0i32; MAX_CLIENTS];
+    for i in 0..maxclients {
+        let engine_cl = engine_clients + i * SIZEOF_CLIENT_T;
+        // SAFETY: `engine_cl` is slot `i` of `svs->clients` (`i <
+        // sv_maxclients`, the array's allocation); all three fields are plain
+        // ints/pointers of the live struct.
+        let client_state = unsafe { read_i32(engine_cl + OFFSET_CLIENT_STATE) };
+        let bot = unsafe { is_bot(engine_cl) };
+        let ping = unsafe { read_i32(engine_cl + OFFSET_CLIENT_PING) };
+        // `G_LOCATE_GAME_DATA` hands the game's `&level.clients[0].ps`, and
+        // `ps` is the first field of `gclient_t` (`OFFSET_GCLIENT_PS = 0`), so
+        // the pointer is also the gclient_t array base. `i` is below the
+        // latched `level.maxclients`.
+        let team = unsafe {
+            read_i32(
+                g_clients + i * SIZEOF_GCLIENT + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM,
+            )
+        };
+        if !is_member(client_state, bot, ping, team) {
+            continue;
+        }
+        members[i] = true;
+        pings[i] = ping;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    state::with_state(|s| {
+        if let Some(change) = s
+            .ping_equalize
+            .observe(now, &members, &pings, computation_cap)
+        {
+            if log {
+                lines.push(target_line(change, !enforce));
+            }
+        }
+        let target = s.ping_equalize.target;
+        // The per-client delay uses the ping snapshot of the last refresh, so
+        // the 500 ms/deadband rule also smooths the delay target. The display
+        // value below uses this frame's fresh reading, as D-028.3 specifies.
+        for i in 0..maxclients {
+            let latched = s.ping_equalize.latched_ping(i);
+            let reported = if members[i] {
+                delay_for(latched, target)
+            } else {
+                0
+            };
+            let effective = if enforce { reported } else { 0 };
+            let client = &mut s.clients[i].ping_equalize;
+            if !enforce {
+                // D-028.6: a cap of 0 ramps the delay away instead of snapping
+                // the clock forward.
+                client.stop();
+            }
+            if let Some(transition) =
+                client.update(effective, reported, latched, target, enforce, log)
+            {
+                if log {
+                    lines.push(client_line(i, transition));
+                }
+            }
+            if client.applied > 0 && (MIN_PING..PING_SENTINEL).contains(&pings[i]) {
+                // SAFETY: `g_clients` is the located `gclient_t` array and `i`
+                // is below `level.maxclients`; `ps.ping` is a writable int.
+                unsafe {
+                    write_i32(
+                        g_clients + i * SIZEOF_GCLIENT + OFFSET_GCLIENT_PS + OFFSET_PS_PING,
+                        client.effective_ping(pings[i]),
+                    );
+                }
+            }
+        }
+    });
+
+    for line in lines {
+        print_line(&line);
+    }
+}
+
+/// Print one log line (the engine print trap must not run under the state
+/// lock).
+fn print_line(line: &str) {
+    match std::ffi::CString::new(line) {
+        // SAFETY: engine syscall registered; text is NUL-terminated.
+        Ok(text) => unsafe { syscall::print(&text) },
+        // The line is built from numbers and static text only; this arm is
+        // unreachable but keeps the hot path panic-free.
+        Err(_) => {}
+    }
+}
+
+fn target_line(change: TargetChange, preview: bool) -> String {
+    let suffix = if preview { " (preview)" } else { "" };
+    match change.slowest {
+        Some(client) => format!(
+            "----- proxy-rs: pingEqualize target={} (slowest client={client} ping={}{}){suffix}\n",
+            change.target,
+            change.slowest_ping,
+            if change.capped { " capped" } else { "" }
+        ),
+        None => format!(
+            "----- proxy-rs: pingEqualize target={} (no players){suffix}\n",
+            change.target
+        ),
+    }
+}
+
+fn client_line(client_num: usize, transition: ClientTransition) -> String {
+    match transition {
+        ClientTransition::Engaged {
+            delay,
+            ping,
+            target,
+        } => format!(
+            "----- proxy-rs: pingEqualize client={client_num} delay={delay} ping={ping} \
+             target={target}\n"
+        ),
+        ClientTransition::Released => {
+            format!("----- proxy-rs: pingEqualize client={client_num} delay=0 (released)\n")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(
+        state: &mut TargetState,
+        now: i32,
+        entries: &[(usize, i32)],
+        cap: i32,
+    ) -> Option<TargetChange> {
+        let mut members = [false; MAX_CLIENTS];
+        let mut pings = [0i32; MAX_CLIENTS];
+        for &(client, ping) in entries {
+            members[client] = true;
+            pings[client] = ping;
+        }
+        state.observe(now, &members, &pings, cap)
+    }
+
+    #[test]
+    fn an_empty_roster_has_no_target() {
+        assert_eq!(target_for(&[], 250), 0);
+        let mut state = TargetState::default();
+        assert_eq!(
+            frame(&mut state, 1000, &[], 250),
+            None,
+            "0 -> 0 is not a target change"
+        );
+        // Once a player has set a target, the empty roster drops it at once.
+        frame(&mut state, 2000, &[(0, 80)], 250);
+        let change = frame(&mut state, 2500, &[], 250).expect("roster change retargets");
+        assert_eq!(change.target, 0);
+        assert_eq!(change.slowest, None);
+        assert_eq!(
+            frame(&mut state, 3000, &[], 250),
+            None,
+            "the empty state does not log every refresh"
+        );
+    }
+
+    #[test]
+    fn one_player_targets_their_own_ping_and_is_never_padded() {
+        assert_eq!(target_for(&[80], 250), 80);
+        let mut state = TargetState::default();
+        let change = frame(&mut state, 1000, &[(0, 80)], 250).unwrap();
+        assert_eq!(change.target, 80);
+        assert_eq!(change.slowest, Some(0));
+        assert!(!change.capped);
+        assert_eq!(delay_for(80, change.target), 0);
+    }
+
+    #[test]
+    fn the_slowest_player_sets_the_target_and_the_rest_are_padded() {
+        assert_eq!(target_for(&[20, 95, 40], 250), 95);
+        assert_eq!(delay_for(20, 95), 75);
+        assert_eq!(delay_for(95, 95), 0);
+        assert_eq!(delay_for(120, 95), 0, "a slower player is left alone");
+    }
+
+    #[test]
+    fn a_player_above_the_cap_does_not_raise_the_target() {
+        assert_eq!(target_for(&[20, 300], 100), 100);
+        let mut state = TargetState::default();
+        let change = frame(&mut state, 1000, &[(0, 20), (1, 300)], 100).unwrap();
+        assert_eq!(change.target, 100);
+        assert_eq!(change.slowest, Some(1));
+        assert_eq!(change.slowest_ping, 300);
+        assert!(change.capped);
+        assert_eq!(delay_for(20, change.target), 80);
+        assert_eq!(delay_for(300, change.target), 0);
+    }
+
+    #[test]
+    fn the_cap_zero_is_off() {
+        assert_eq!(target_for(&[20, 95], 0), 0);
+        assert_eq!(delay_for(20, 0), 0);
+        assert_eq!(clamp_cap(-10), 0);
+        assert_eq!(clamp_cap(500), MAX_CAP_MS);
+    }
+
+    #[test]
+    fn the_target_refreshes_every_500_ms_and_after_a_clock_jump() {
+        let mut state = TargetState::default();
+        assert!(state.due(1000));
+        state.last_check_ms = 1000;
+        assert!(!state.due(1499));
+        assert!(state.due(1500));
+        // svs.time moved backwards (map restart): refresh immediately.
+        assert!(state.due(10));
+    }
+
+    #[test]
+    fn the_population_excludes_spectators_bots_and_unreadable_pings() {
+        // CS_ACTIVE, human, a usable ping, playing team.
+        assert!(is_member(CS_ACTIVE, false, 50, 0));
+        assert!(is_member(CS_ACTIVE, false, 50, 1));
+        // Spectator team.
+        assert!(!is_member(CS_ACTIVE, false, 50, TEAM_SPECTATOR));
+        // Bot.
+        assert!(!is_member(CS_ACTIVE, true, 50, 0));
+        // Still connecting (CS_CONNECTED, CS_ZOMBIE, CS_FREE, CS_PRIMED).
+        for state in [0, 1, 2, 3] {
+            assert!(!is_member(state, false, 50, 0));
+        }
+        // Unreadable ping: 0 (localhost/LAN is excluded by the same rule) and
+        // the engine's 999 sentinel.
+        assert!(!is_member(CS_ACTIVE, false, 0, 0));
+        assert!(!is_member(CS_ACTIVE, false, MIN_PING - 1, 0));
+        assert!(!is_member(CS_ACTIVE, false, PING_SENTINEL, 0));
+        assert!(is_member(CS_ACTIVE, false, PING_SENTINEL - 1, 0));
+    }
+
+    #[test]
+    fn the_deadband_keeps_a_noisy_target_in_place() {
+        let mut state = TargetState::default();
+        frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
+        assert_eq!(state.target, 100);
+        let quiet = frame(&mut state, 1500, &[(0, 50), (1, 105)], 250);
+        assert_eq!(quiet, None, "a 5 ms rise is inside the deadband");
+        assert_eq!(state.target, 100);
+        let moved = frame(&mut state, 2000, &[(0, 50), (1, 110)], 250);
+        assert_eq!(moved.unwrap().target, 110, "a 10 ms rise moves it");
+        assert_eq!(state.target, 110);
+    }
+
+    #[test]
+    fn the_ping_snapshot_refreshes_even_when_the_target_does_not_move() {
+        let mut state = TargetState::default();
+        frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
+        assert_eq!(state.latched_ping(0), 50);
+        frame(&mut state, 1500, &[(0, 54), (1, 103)], 250);
+        assert_eq!(state.target, 100, "still inside the deadband");
+        assert_eq!(
+            state.latched_ping(0),
+            54,
+            "the delay target follows the ping"
+        );
+        assert_eq!(state.latched_ping(1), 103);
+        assert_eq!(state.latched_ping(2), 0);
+    }
+
+    #[test]
+    fn a_roster_change_bypasses_the_deadband() {
+        let mut state = TargetState::default();
+        frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
+        assert_eq!(state.target, 100);
+        // A fourth player joins at 105: the target would only move 5 ms, but
+        // the member set changed, so it retargets immediately.
+        let change = frame(&mut state, 1010, &[(0, 50), (1, 100), (2, 105)], 250);
+        assert_eq!(change.unwrap().target, 105);
+        assert_eq!(state.target, 105);
+    }
+
+    #[test]
+    fn a_cap_change_bypasses_the_deadband() {
+        let mut state = TargetState::default();
+        frame(&mut state, 1000, &[(0, 104)], 100);
+        assert_eq!(state.target, 100);
+        let change = frame(&mut state, 1010, &[(0, 104)], 200);
+        assert_eq!(change.unwrap().target, 104);
+        assert_eq!(state.target, 104);
+        // The old target was 100, the new one 104: only the cap change makes
+        // this an immediate move.
+    }
+
+    #[test]
+    fn the_applied_delay_ramps_one_millisecond_per_command_both_ways() {
+        let mut state = PingEqualizeState {
+            target: 3,
+            ..Default::default()
+        };
+        assert_eq!(state.step(), 1);
+        assert_eq!(state.step(), 2);
+        assert_eq!(state.step(), 3);
+        assert_eq!(state.step(), 3);
+        state.target = 0;
+        assert_eq!(state.step(), 2);
+        assert_eq!(state.step(), 1);
+        assert_eq!(state.step(), 0);
+        assert_eq!(state.step(), 0);
+        assert_eq!(state.applied, 0);
+    }
+
+    #[test]
+    fn the_effective_ping_is_the_real_ping_plus_the_delay() {
+        let state = PingEqualizeState {
+            applied: 75,
+            target: 75,
+            ..Default::default()
+        };
+        assert_eq!(state.effective_ping(20), 95);
+        assert_eq!(PingEqualizeState::default().effective_ping(20), 20);
+    }
+
+    #[test]
+    fn stop_keeps_the_applied_delay_and_lets_it_ramp_out() {
+        let mut state = PingEqualizeState {
+            applied: 10,
+            target: 10,
+            logged: true,
+            ..Default::default()
+        };
+        state.stop();
+        assert_eq!(state.target, 0);
+        assert_eq!(state.step(), 9);
+        assert!(!state.is_idle());
+        state.clear();
+        assert!(state.is_idle());
+    }
+
+    #[test]
+    fn engaging_and_releasing_log_once_each() {
+        let mut state = PingEqualizeState::default();
+        let engaged = state.update(75, 75, 20, 95, true, true).unwrap();
+        assert_eq!(
+            engaged,
+            ClientTransition::Engaged {
+                delay: 75,
+                ping: 20,
+                target: 95
+            }
+        );
+        assert!(state.logged);
+        assert_eq!(state.update(75, 75, 20, 95, true, true), None);
+        // The target drops, but the delay is still ramping: no release yet.
+        state.target = 0;
+        state.applied = 75;
+        assert_eq!(state.update(0, 0, 20, 0, true, true), None);
+        state.applied = 0;
+        assert_eq!(
+            state.update(0, 0, 20, 0, true, true),
+            Some(ClientTransition::Released)
+        );
+        assert!(!state.logged);
+    }
+
+    #[test]
+    fn the_log_alone_previews_what_would_be_applied() {
+        let mut state = PingEqualizeState::default();
+        // Preview: effective target 0 (nothing applied), reported 75.
+        let engaged = state.update(0, 75, 20, 95, false, true).unwrap();
+        assert_eq!(
+            engaged,
+            ClientTransition::Engaged {
+                delay: 75,
+                ping: 20,
+                target: 95
+            }
+        );
+        assert_eq!(state.target, 0);
+        assert_eq!(state.applied, 0);
+        assert_eq!(
+            state.update(0, 0, 20, 0, true, true),
+            Some(ClientTransition::Released)
+        );
+    }
+
+    #[test]
+    fn a_ramping_delay_releases_before_the_preview_reengages() {
+        let mut state = PingEqualizeState::default();
+        // Engaged in preview, then a real delay was applied by enforcement.
+        state.update(0, 75, 20, 95, false, true).unwrap();
+        state.applied = 10;
+        // Enforcement is off, the preview still reports 75: the applied delay
+        // is still ramping, so there is no release yet.
+        assert_eq!(state.update(0, 75, 20, 95, false, true), None);
+        state.applied = 0;
+        assert_eq!(
+            state.update(0, 75, 20, 95, false, true),
+            Some(ClientTransition::Released)
+        );
+        // The preview reports the would-be delay again on the next frame.
+        assert!(matches!(
+            state.update(0, 75, 20, 95, false, true),
+            Some(ClientTransition::Engaged { delay: 75, .. })
+        ));
+    }
+
+    #[test]
+    fn a_preview_only_client_does_not_release_and_reengage_every_frame() {
+        let mut state = PingEqualizeState::default();
+        assert!(state.update(0, 75, 20, 95, false, true).is_some());
+        for _ in 0..5 {
+            assert_eq!(
+                state.update(0, 75, 20, 95, false, true),
+                None,
+                "a preview with no applied delay has nothing to release"
+            );
+        }
+    }
+
+    #[test]
+    fn no_edge_state_is_kept_while_the_log_is_off() {
+        let mut state = PingEqualizeState::default();
+        assert_eq!(state.update(75, 75, 20, 95, true, false), None);
+        assert!(!state.logged);
+        // Turning the log on while the client is already engaged reports it.
+        let engaged = state.update(75, 75, 20, 95, true, true);
+        assert!(engaged.is_some());
+    }
+
+    #[test]
+    fn transition_lines_match_the_documented_shape() {
+        assert_eq!(
+            target_line(
+                TargetChange {
+                    target: 110,
+                    slowest: Some(3),
+                    slowest_ping: 180,
+                    capped: true,
+                },
+                false
+            ),
+            "----- proxy-rs: pingEqualize target=110 (slowest client=3 ping=180 capped)\n"
+        );
+        assert_eq!(
+            target_line(
+                TargetChange {
+                    target: 95,
+                    slowest: Some(2),
+                    slowest_ping: 95,
+                    capped: false,
+                },
+                false
+            ),
+            "----- proxy-rs: pingEqualize target=95 (slowest client=2 ping=95)\n"
+        );
+        assert_eq!(
+            target_line(
+                TargetChange {
+                    target: 0,
+                    slowest: None,
+                    slowest_ping: 0,
+                    capped: false,
+                },
+                false
+            ),
+            "----- proxy-rs: pingEqualize target=0 (no players)\n"
+        );
+        assert_eq!(
+            client_line(
+                0,
+                ClientTransition::Engaged {
+                    delay: 75,
+                    ping: 20,
+                    target: 95
+                }
+            ),
+            "----- proxy-rs: pingEqualize client=0 delay=75 ping=20 target=95\n"
+        );
+        assert_eq!(
+            client_line(0, ClientTransition::Released),
+            "----- proxy-rs: pingEqualize client=0 delay=0 (released)\n"
+        );
+    }
+}

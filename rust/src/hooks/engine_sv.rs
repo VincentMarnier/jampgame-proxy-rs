@@ -14,16 +14,16 @@ use crate::jampgame;
 use crate::sdk::{
     CLC_MOVE, CLC_MOVE_NO_DELTA, CS_ACTIVE, EF_PLAYER_EVENT, ENTITYNUM_NONE, ENTITYNUM_WORLD,
     ERR_DROP, MAX_CLIENTS, MAX_GENTITIES, MAX_QPATH, OFFSET_CLIENT_DOWNLOAD,
-    OFFSET_CLIENT_DOWNLOAD_NAME, OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM,
+    OFFSET_CLIENT_DOWNLOAD_NAME, OFFSET_CLIENT_GAMESTATE_MESSAGE_NUM, OFFSET_CLIENT_GENTITY,
     OFFSET_CLIENT_LAST_CLIENT_COMMAND, OFFSET_CLIENT_NAME, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE,
     OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_CLIENT_NUM, OFFSET_ENTITY_NUMBER, OFFSET_GENTITY_CLIENT,
     OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS, OFFSET_GENTITY_S_ETYPE,
     OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
     OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_OOB, OFFSET_MSG_READCOUNT,
-    OFFSET_NETCHAN_REMOTE_ADDRESS, OFFSET_SHARED_ENTITY_S, OFFSET_SNAPSHOT_ENUMS_COUNT,
-    OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM, OFFSET_SV_GENTITIES,
-    OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, OFFSET_SVS_TIME, SIZEOF_CLIENT_T,
-    SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD,
+    OFFSET_NETCHAN_REMOTE_ADDRESS, OFFSET_SHARED_ENTITY_S, OFFSET_SHARED_SVFLAGS,
+    OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM,
+    OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, OFFSET_SVS_TIME,
+    SIZEOF_CLIENT_T, SIZEOF_GENTITY, SIZEOF_SV_ENTITY_T, SVC_DOWNLOAD, SVF_BOT,
 };
 use crate::state::{self, CVAR_MODEL_PATH_LENGTH};
 use crate::syscall;
@@ -182,6 +182,24 @@ pub unsafe fn client_state(cl: usize) -> i32 {
 pub unsafe fn client_ping(cl: usize) -> i32 {
     // SAFETY: caller guarantees a valid client pointer.
     unsafe { read_i32(cl + OFFSET_CLIENT_PING) }
+}
+
+/// Whether the client is a bot — the same discriminator `SV_CalcPings` uses
+/// (`cl->gentity != 0 && gentity->r.svFlags & SVF_BOT`, binary-verified at
+/// `0x8057264-0x805727d`). A client without a gentity (connecting/zombie) is
+/// not a bot in the SVF sense.
+///
+/// # Safety
+///
+/// `cl` must be a valid `client_t*`.
+pub unsafe fn is_bot(cl: usize) -> bool {
+    // SAFETY: cl is a valid client_t; gentity is a sharedEntity_t*.
+    let gentity = unsafe { read_usize(cl + OFFSET_CLIENT_GENTITY) };
+    if gentity == 0 {
+        return false;
+    }
+    // SAFETY: gentity is a valid sharedEntity_t.
+    unsafe { read_i32(gentity + OFFSET_SHARED_SVFLAGS) & SVF_BOT as i32 != 0 }
 }
 
 /// NUL-terminated bytes of a C string, or the empty slice if null.
