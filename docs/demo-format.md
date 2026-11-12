@@ -1,9 +1,10 @@
 # Server-side demo recording — format, recorder and publication evidence
 
-Status: Phases 1–4 implemented and documented (Phase 5). The document records
-what was *observed*, *read from the binaries/source* and *validated*, and
-separates that from what is still open (§10–§13 are implementation notes; the
-decisions are in `docs/decisions/0027-server-demos.md`).
+Status: Phases 1–4 implemented and documented (Phase 5); Phase 6 validation and
+release gate complete, with playback visually unverified (§14). The document
+records what was *observed*, *read from the binaries/source* and *validated*,
+and separates that from what is still open (§10–§13 are implementation notes;
+the decisions are in `docs/decisions/0027-server-demos.md`).
 
 Evidence labels used below: **SOURCE**, **STATIC**, **RUNTIME**, **TESTED**,
 **INFERRED**. See `docs/README.md`.
@@ -1172,9 +1173,12 @@ crashed process is not served even though the open set was lost.
 ### Retention and the maintenance thread
 
 `proxy-demo-maintenance` is started from `frame_sync` (module initialisation in
-practice) and stopped at shutdown. It owns every filesystem scan and `statvfs`:
-the game thread only reads an atomic free-byte value and the published name
-set. Every second it re-scans the demo directory for the `/demos` set and
+practice) only while a demo feature is enabled — `proxy_sv_enableDemoRecord`
+or `proxy_sv_enableDemoDownload` — and is stopped when both are off or at
+shutdown. With every demo cvar at its default the thread never starts, no
+directory is scanned, no sweep can run and no demo directory is created. It
+owns every filesystem scan and `statvfs`: the game thread only reads an atomic
+free-byte value and the published name set. Every second it re-scans the demo directory for the `/demos` set and
 refreshes the free-space reading (`statvfs` through
 `jampgame_free_bytes`). A sweep is requested at thread start and at each
 `GAME_INIT`; it deletes only names accepted by `DemoName::parse` whose embedded
@@ -1186,7 +1190,11 @@ touches foreign files or directories. It logs one line:
 ```
 
 `0` hours means "keep forever" (nothing is deleted). A future timestamp (clock
-adjustment) is never expired.
+adjustment) is never expired. Phase 6 soak decoys: a matching
+`20200101-…_s9.dm_26` was deleted while a matching `20400101-…_s3.dm_26` and
+`foreign.txt` stayed (`deleted 1, kept 6`), covering the forward-expiry and
+backward-skew decisions; a real `CLOCK_REALTIME` jump was not performed (the
+container lacks `CAP_SYS_TIME`).
 
 ### Size guard
 
@@ -1197,14 +1205,21 @@ per-instance resume time so the next segment number starts on the **next**
 tick — the rest of the game is not lost. The helper and its boundaries are
 unit-tested (`max_file_size_guard_threshold_is_inclusive_and_optional`).
 
-**Runtime forcing note.** Lowering the cap to `1` was attempted repeatedly
-(`artifacts/phase4-size4` reached 853,536 bytes of a 1 MiB cap). The synthetic
-test subjects are killed by bots every ~60 s (the game sets them to
-`TEAM_SPECTATOR` on death, which by the Phase 3 rule closes the segment), so no
-single segment crossed 1 MiB in the gate runs. The cap was not observed firing
-at runtime; see U-014 for the exact attempts and the proposed owner
-experiment. The close/warn/next-segment machinery is the same one the
-min-free guard exercises end-to-end below.
+**Runtime evidence (Phase 6, final build).** Synthetic subjects kept dying of
+`Server command overflow` or subject loss before 1 MiB (`artifacts/phase4-size4`
+reached 853,536 bytes). A real TaystJK client as subject, on a bot server with
+`proxy_sv_demoMaxFileMB 1` and `sv_fps 125`, crossed the cap:
+
+```
+demo recording stopped: …_s2.dm_26 (14827 frames, 1048639 bytes)
+demo segment reached proxy_sv_demoMaxFileMB 1 MB (1048639 bytes) — closed …_s2.dm_26
+demo recording started: …_s3.dm_26 (instance main, subject 7, viewer 31, …)
+```
+
+The file is 1,048,647 bytes on disk (the 1,048,639 counted when the cap fired
+plus the 8-byte `-1/-1` terminator), the next segment started on the following
+tick, and both `…_s2` and
+`…_s3` play to `DISCONNECTED` with no parse errors (U-014 resolved).
 
 ### Min-free guard
 
@@ -1292,7 +1307,7 @@ the terminator check).
 | earlier print-block delivery (Phase 4) | `print "^5Demo files from this game:\n"` then `print "^7http://127.0.0.1:29071/demos/…"` captured on a fresh client after a map change; the intermission-timed delivery is the server-log evidence above (U-016) |
 | `artifacts/phase4/demos/…` (`27792fee…`, `b7fc8e19…`, `97f7b791…`, `4c5300b9…`, `fee7c21e…`, `028afea3…`) | two generations end-to-end (full `map`, then `map_restart`), open segment 404 before its terminator, listing exactly the closed names, `Content-Length`/SHA-256 match |
 | final re-run (`7439236e…`) | intermission block lines + JSON listing (see “Intermission evidence” above); `/demos` prints the same URLs; no server-console list |
-| `artifacts/phase4-size4/demos/20261112-115603_mp_ffa3_main_s1.dm_26` | the size-cap attempt (853,536 B, subject deaths close the segment before 1 MiB) |
+| `artifacts/phase4-size4/demos/20261112-115603_mp_ffa3_main_s1.dm_26` | the Phase 4 size-cap attempt (853,536 B, subject deaths close the segment before 1 MiB); triggered in Phase 6 (§14) |
 
 Large-file load (final build, `artifacts/phase4-guards/demos/20261112-112854_mp_ffa3_main_s4.dm_26`,
 868,892 bytes): 20 simultaneous GETs gave 12×`200` (byte-identical SHA-256
@@ -1319,7 +1334,8 @@ datagram at a 2 s timeout under load).
 - **Worker pool, not a thread per connection**: four fixed workers with a
   bounded queue (8) and a `503` on overflow. The concurrency bound and the
   isolation are as specified; the thread's lifetime is not per request.
-- **Size-cap trigger not observed at runtime** (see above/U-014); unit-tested.
+- **Size cap** was not triggered in Phase 4 (see above/U-014); Phase 6 forced
+  it with a real client subject (§14).
 - **`proxy_sv_demoUrl` cannot be set with `set … http://…`** from rcon/`+set`
   (engine tokenizer). Use a cfg (`set proxy_sv_demoUrl "http://…"`); the code
   reads whatever the engine stored. `run-server.sh` writes it to its cfg
@@ -1331,3 +1347,93 @@ datagram at a 2 s timeout under load).
   instant; the log line documents the deletion.
 - No later-phase behaviour (a `/demos` web UI, disk quota accounting, auth/TLS)
   is implemented here.
+
+## 14. Phase 6 validation notes (release gate, final build)
+
+Phase 6 changed no feature behaviour: the Phase 2 no-players switch was already
+gone (a regression test now asserts no such cvar exists), and the maintenance
+thread is gated on a demo feature. The module used below is the release build
+staged as `jampgamei386.so`; `artifacts/` holds the raw evidence and is
+git-ignored.
+
+### 14.1 Regression and defaults
+
+- `cargo fmt --check`, clippy (i686, `-D warnings`), 521 tests, release build
+  (SHA-256 `8f6733cd43affae5efeeca425389e3ca6c59d3b372ae7e6b7191ede950ea7bec`)
+  — all pass. Harness note: the staged `.so` is bind-mounted into the running
+  test containers, and `scripts/build.sh` re-copies it in place. Running a
+  build while those containers are up truncates the file they have mapped and
+  every one of them dies with SIGSEGV; stop the containers before rebuilding
+  (this happened once here and is not a proxy crash).
+- All 11 demo cvars at their defaults (`0`/empty/`demos`): the dedicated server
+  logs no demo/HTTP/maintenance line, creates no `demos/` directory, refuses
+  TCP 8090, answers `getchallenge`/`getinfo` and stays at ~1.9% CPU. Enabling
+  recording or downloads is what starts the maintenance thread and, for
+  downloads, the listener.
+
+### 14.2 Ground truth — recorder vs a real following spectator
+
+`artifacts/phase6/demos/20261112-163917_mp_ffa3_main_s3.dm_26` (recorder,
+`subject 0, viewer 31`) and a real TaystJK spectator's demo
+(`/tmp/opencode/p6home/taystjk/demos/p6spec3.dm_26`, following slot 0) share
+120 ticks (411750–417700):
+
+- 0/37 `ps` fields differ on every common tick; `pm_flags = 4672`
+  (`PMF_FOLLOW`) in both; the entity-number sets are identical on all ticks;
+- the sole difference is the gamestate `clientNum` (31 = the recorder's spare
+  viewer slot vs 1 = the real spectator's own slot), which is the documented
+  identity rule, not a POV difference.
+
+### 14.3 Playback matrix (TaystJK, load-level)
+
+Every final-build file below reached `DISCONNECTED` with no truncation or
+parse error; none was visually watched (Wayland renderer, X11 capture saw
+another window) and stock 1.01 was not available:
+
+| case | file |
+| --- | --- |
+| FFA | `20261112-163719_mp_ffa3_main_s2` |
+| team (GT_TEAM) | `20261112-164337_mp_ffa3_main_s1` |
+| CTF | `20261112-164424_mp_ctf1_main_s1` |
+| stock duel | `20261112-164500_mp_duel1_main_s1` |
+| parallel duels | `20261112-164614_…_duel1_s1`, `164621_…_duel1_s1`, `164621_…_duel2_s1` |
+| parallel TFFA | `20261112-164538_…_tffa1_s1`, `164538_…_tffa2_s1` |
+| POV switch | `20261112-170744_mp_ffa3_main_s3` (`ps.clientNum` 0→1) |
+| empty/repopulate | `20261112-164722_mp_ffa3_main_s2` |
+| 32-slot watchdog/self-view | `20261112-172546_…_s1`, `172559_…_s2`, `172710_…_s3` |
+| 1 MiB cap + continuation | `20261112-173912_…_s2`, `174111_…_s3` |
+
+### 14.4 Performance and engine-state isolation
+
+GT_TEAM, 4 bots, `sv_fps 20`, 10 s windows: CPU 2.5% / 2.5% / 3.5% / 4.2% for
+0 / 1 / 2 / 4 recorders; `getinfo` 0.14–0.30 ms. With 4 recorders, segments
+were 23–121 KB over 42 s at a measured 20.0 snapshots/s; the close flush was
+126,911 bytes. Twenty concurrent HTTP GETs of an 868,892-byte demo while the
+server was busy: 16×`200` (byte-identical SHA-256) and 4×`503` (bounded
+workers/queue), `getinfo` 0.17–0.29 ms with one 2 s UDP timeout during the
+burst. The demo module does not reference `svs.snapshotEntities` or
+`svs.nextSnapshotEntities`; it reads `svs.clients` without writing it, and its
+only engine writes are the two `snapshotCounter` dedupe tokens; real clients
+kept receiving snapshots with up to four recorders.
+
+### 14.5 Soak summary
+
+Final build, port 29320: two subjects, a 4→5 switch in one file, empty close,
+repopulate, `map_restart`, full `map`, HTTP JSON/GET `200`, download off →
+refused/listener stopped → re-enabled `200`, missing directory → one
+unreadable line and no crash, min-free pause/close/resume with a new segment,
+port already in use → one bind-error line and feature off (old port refused),
+restore `200`. File handles 41 → 40 with no demo descriptor left; no stuck
+listener; retention decoys `deleted 1, kept 6` (old matching file deleted,
+future matching file and foreign file kept); the clock-step aspect is simulated
+by those embedded timestamps, not a real `CLOCK_REALTIME` jump.
+
+### 14.6 32-client corner (live)
+
+`sv_maxclients 32`, 30 bots + human: recorder `subject 3, viewer 4`; adding the
+32nd client logged `demo viewer slot 4 taken by client 4; closing …`, closed
+before writing a colliding frame, and the next segment started as a self-view
+`subject 3, viewer 3`. Both load to the end. The visual appearance stays open
+(U-015) together with switched-stream and TAB playback (U-011/U-012), RMG and
+vehicle support (U-010 items 1–2), stock 1.01 playback (U-010 item 4) and
+client receipt of the intermission block (U-016).

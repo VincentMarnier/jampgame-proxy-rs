@@ -585,6 +585,23 @@ handling for the first two cases and left the playback questions open:
   a stock client). Phase 3/4 files were loaded by the real client to completion
   without parse errors, not visually verified.
 
+### Status (Phase 6, 2026-11-12)
+
+- **1 RMG maps — open.** Unchanged: no segment on a non-null
+  `TheRandomMissionManager`.
+- **2 Vehicle playerstate — open.** Unchanged: those frames are skipped.
+- **3 Gamestate `clientNum` — resolved and exercised.** Ground truth: the
+  recorder segment and a real following spectator's demo are identical on all
+  120 common ticks (37/37 `ps` fields, same entity set, `PMF_FOLLOW`), and the
+  only difference is the gamestate `clientNum` (spare viewer 31 vs the
+  spectator's own 1). The 32-slot fallback was also exercised live (U-015).
+- **4 Playback — load-level verified on TaystJK; stock still open.** The
+  Phase 6 matrix (FFA, team, CTF, stock duel, parallel duels/TFFA, POV switch,
+  empty/repopulate, 32-slot self-view/watchdog, 1 MiB cap segment and its
+  continuation) all reached `DISCONNECTED` with no truncation or parse error.
+  Only TaystJK is installed here; stock 1.01 playback of these files is
+  untested, and none of the files was visually watched (Wayland capture).
+
 ---
 
 ## U-011 — Mid-file follow-target switch: client playback
@@ -618,7 +635,12 @@ HUD/scoreboard presentation.**
   file itself has not been played on a client yet.
 - The Phase 4 follow-up (JSON listing, intermission block) did not change the
   switch path; the owner's visual playback remains the Phase 2 moving artifact,
-  which has no mid-file switch. Still open.
+  which has no mid-file switch.
+- **Phase 6 (2026-11-12):** `artifacts/phase6/demos/20261112-170744_mp_ffa3_main_s3.dm_26`
+  contains a live switch (`demo subject switched: 0 -> 1 (left)`, decoded
+  `ps.clientNum` 0→1 at tick 2083650) and was played by TaystJK to
+  `DISCONNECTED` with no parse error. The camera re-follow and HUD were not
+  visually watched, so the visual part stays open.
 
 ### Cheapest experiment
 
@@ -660,6 +682,10 @@ missing deaths) rather than a parse error.**
   final `scores` commands (decoded: `pm_type = PM_INTERMISSION`, scoreboard
   payloads), so a demo now has a full final board even without TAB. The
   client-side TAB rendering is still unchecked.
+- Phase 6 (2026-11-12): every matrix file, including the FFA/team/CTF/duel
+  files that carry periodic `scores`, played to `DISCONNECTED` without parse
+  errors. No one pressed TAB during playback (and the client window could not
+  be captured), so the rendering question is still open.
 
 ### Cheapest experiment
 
@@ -717,10 +743,8 @@ but was the close/continue path ever seen at runtime?
 
 ### Classification
 
-**minor — the threshold decision is a pure helper with boundary tests, and the
-close/restart machinery is the same code the min-free guard exercised
-end-to-end (`docs/demo-format.md` §13). The risk is an off-by-one in the
-recorded byte count, not a lost game.**
+**resolved (Phase 6, 2026-11-12) — the close/rotate path was triggered at
+runtime; the threshold helper and its boundaries stay unit-tested.**
 
 ### Evidence so far (2026-11-12, Gate C)
 
@@ -743,6 +767,25 @@ On a real server with human players (who respawn and keep moving), set
 segment should start with the next `s<N>` number. Alternatively build a
 throwaway binary whose cap is read in bytes (not MiB) and repeat the bot run.
 
+### Resolution (Phase 6, 2026-11-12)
+
+The real-client variant of the experiment succeeded on the final build: a
+TaystJK client as subject on a bot server with `proxy_sv_demoMaxFileMB 1` and
+`sv_fps 125` produced
+
+```
+----- proxy-rs: demo recording stopped: …_s2.dm_26 (14827 frames, 1048639 bytes)
+----- proxy-rs: demo segment reached proxy_sv_demoMaxFileMB 1 MB (1048639 bytes) — closed …_s2.dm_26
+----- proxy-rs: demo recording started: …_s3.dm_26 (instance main, subject 7, viewer 31, …)
+```
+
+The closed file is 1,048,647 bytes on disk (the count when the cap fired plus
+the 8-byte `-1/-1` terminator written while closing) and is at the inclusive
+1 MiB threshold (1,048,576). Both `…_s2` and the continuation `…_s3` play to `DISCONNECTED` in
+TaystJK without parse errors. Synthetic subjects at 32 clients still die of
+`Server command overflow` before the cap, which is why the real client was
+needed; that limitation is in the capture tool, not in the recorder.
+
 ---
 
 ## U-015 — Live 32-slot server: viewer identity and POV switching
@@ -756,22 +799,31 @@ leaves and the slot is reused?
 
 ### Classification
 
-**minor — the fallback is explicit and the identity watchdog is unit-tested;
-the risk is presentation at the ragged edge, not a malformed stream.**
+**partially resolved (Phase 6, 2026-11-12) — the mechanics (spare-slot
+watchdog, self-view) are runtime-verified on a genuinely full 32-slot server
+and both files load to the end; only visual playback remains open.**
 
 ### Evidence so far
 
 - Unit tests cover `pick_viewer_slot` (highest unassigned, highest free,
   subject fallback) and `identity_lost` (a stranger on the viewer slot closes
   the segment).
-- No runtime run used 32 human clients; Phase 2–4 gate servers used
-  `sv_maxclients` 8–32 with fewer clients, so every artifact has a spare viewer
-  slot (`clientNum 31`).
-- The code path when the subject leaves on a full server: the next subject is
-  chosen. If the old subject's slot stays empty, the stream continues in the
-  same file (follow view, gamestate naming the now-empty slot); if someone
-  takes the slot, the identity check closes the segment and a new file starts
-  with the new subject.
+- Phase 6 (2026-11-12) filled the corner for real on the final build:
+  `sv_maxclients 32`, 30 bots + one human left one free slot, the recorder
+  started `subject 3, viewer 4` (follow stream); adding the 32nd client logged
+  `demo viewer slot 4 taken by client 4; closing …` and closed the segment,
+  and the next segment started `subject 3, viewer 3` (self-view) on the full
+  server. Decoded: the watchdog file has gamestate `clientNum 4` and
+  `pm_flags 4672` (`PMF_FOLLOW`); the self-view files have `clientNum 3` and
+  `pm_flags 576` (no `PMF_FOLLOW`). All play to `DISCONNECTED` in TaystJK
+  without parse errors.
+  The earlier (different-build) corner run also showed the POV change followed
+  by slot reuse (`subject switched: 0 -> 8`, then watchdog close, then a new
+  self-view file).
+- Not observed: the camera/HUD at the self-view and the watchdog switch (no
+  display capture), and a switch on a full 32-slot server where the old
+  subject's slot stays empty (the follow view naming an empty slot), which is
+  the case the code leaves open.
 
 ### Cheapest experiment
 
@@ -810,6 +862,9 @@ records the exact lines (`event=demo.intermission.line`). The timing path
   for the same block at a map start.
 - The generation is marked announced so `GAME_INIT` does not repeat it; this
   guard is code-reviewed, not observed on a client.
+- Phase 6 did not add a real-client intermission run: the soak used map
+  changes, and the playback matrix starts from recorded files, not from the
+  end-of-game block. The question stays open as stated.
 
 ### Cheapest experiment
 

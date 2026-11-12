@@ -1018,7 +1018,9 @@ without a player having recorded it client-side. The view is the followed
 player's POV (not a free camera): the lowest human player of the instance, in
 the world and not spectating. A player leaving, joining spectators or moving to
 another match switches the POV inside the same file; an empty instance closes
-it and repopulation starts a new segment.
+it and repopulation starts a new segment. All demo cvars default to off: a
+server that does not opt in has no listener, no maintenance thread and no demo
+files.
 
 `proxy_sv_enableDemoRecord 1` writes one `.dm_26` file per instance:
 
