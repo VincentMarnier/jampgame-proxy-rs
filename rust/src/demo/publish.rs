@@ -438,8 +438,22 @@ pub fn shutdown() {
     unsafe { jampgame_aligned_entry(dispatch, ENTRY_SHUTDOWN) };
 }
 
+/// The maintenance thread exists only to serve a demo feature: sampling free
+/// space and retention/scan for the recorder, or the directory scan behind
+/// `/demos`/HTTP. With every demo cvar at its default (off) nothing runs, no
+/// directory is scanned, no sweep can delete files, and no thread is started.
+fn demo_maintenance_needed(record: bool, download: bool) -> bool {
+    record || download
+}
+
 fn sync_impl() {
     if !crate::state::proxy_enabled() {
+        shutdown_impl();
+        return;
+    }
+    let record = crate::state::cvar_integer(crate::state::CVAR_DEMO_ENABLE) != 0;
+    let download = crate::state::cvar_integer(crate::state::CVAR_DEMO_DOWNLOAD) != 0;
+    if !demo_maintenance_needed(record, download) {
         shutdown_impl();
         return;
     }
@@ -646,6 +660,14 @@ mod tests {
             link_for("https://example.com/", name),
             format!("https://example.com/demos/{name}")
         );
+    }
+
+    #[test]
+    fn maintenance_runs_only_while_a_demo_feature_is_on() {
+        assert!(!demo_maintenance_needed(false, false));
+        assert!(demo_maintenance_needed(true, false));
+        assert!(demo_maintenance_needed(false, true));
+        assert!(demo_maintenance_needed(true, true));
     }
 
     #[test]

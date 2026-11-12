@@ -1539,6 +1539,18 @@ mod tests {
     }
 
     #[test]
+    fn no_empty_server_recording_switch_is_registered() {
+        // Phase 2 had a temporary `proxy_sv_demoRecordEmpty` debug cvar. Phase 3
+        // replaced it with the human-subject rule; Phase 6 removes the last
+        // trace. Nothing may let production record an empty server.
+        assert!(!PROXY_CVARS.iter().any(|(name, _)| {
+            name.to_bytes()
+                .windows(b"RecordEmpty".len())
+                .any(|window| window.eq_ignore_ascii_case(b"RecordEmpty"))
+        }));
+    }
+
+    #[test]
     fn default_cvar_values_match_proxy() {
         // The two non-zero defaults the SharedAPI logic depends on
         // (`Proxy_g_main.cpp:20-21`).
@@ -1617,6 +1629,15 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_PARALLEL_DUELS_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_DIR].1.to_bytes(), b"demos");
+        assert_eq!(PROXY_CVARS[CVAR_ENABLE_HTTP].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_HTTP_BIND].1.to_bytes(), b"127.0.0.1");
+        assert_eq!(PROXY_CVARS[CVAR_HTTP_PORT].1.to_bytes(), b"8090");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_DOWNLOAD].1.to_bytes(), b"0");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_URL].1.to_bytes(), b"");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_RETENTION_HOURS].1.to_bytes(), b"24");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_MAX_FILE_MB].1.to_bytes(), b"128");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_MIN_FREE_MB].1.to_bytes(), b"512");
+        assert_eq!(PROXY_CVARS[CVAR_DEMO_INTERMISSION_SECS].1.to_bytes(), b"3");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
