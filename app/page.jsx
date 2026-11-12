@@ -8,6 +8,14 @@ const RELEASES = `${REPO}/releases`;
 const INSTALL_QUICKSTART = `mv jampgamei386.so jampgame_original.so
 # drop the proxy in place of jampgamei386.so, then start as usual`;
 
+const DEMO_CONFIG = `set proxy_sv_enableDemoRecord 1
+set proxy_sv_demoDir demos
+set proxy_sv_enableHttp 1
+set proxy_sv_httpBind 0.0.0.0
+set proxy_sv_httpPort 8090
+set proxy_sv_enableDemoDownload 1
+set proxy_sv_demoUrl "https://demos.example.com"`;
+
 const cvars = [
   ["proxy_sv_enable", "1", "Master switch: when 0, detach every hook and forward everything to the original game module (RCON keeps working on the engine's native gate)", "core"],
   ["proxy_sv_muteMode", "1", "Mute behaviour: 0 disabled, 1 drop the player's chat and tell them, 2 silent (their own line is echoed back, nobody else receives it, no notice)", "mute"],
@@ -17,7 +25,6 @@ const cvars = [
   ["proxy_sv_enableGuidBan", "0", "File-backed ja_guid ban registry (separate file and cvar from the IP list); rcon ban <player> adds the target's GUID, addguid / removeguid / listguid manage it", "bans"],
   ["proxy_sv_guidBanFile", "proxy_guid_bans.txt", "GUID ban file path, relative to the server's working directory or absolute; ignored while proxy_sv_enableGuidBan 0", "bans"],
   ["proxy_sv_debugLog", "0", "Crash-diagnostics trace: 0 off, 1 suspicious/blocked events, 2 every client command, userinfo and lifecycle event; writes proxy_debug.log", "diagnostics"],
-  ["proxy_sv_enableRconCmdCooldown", "0", "Cooldown on RCON commands to avoid flooding", "hardening"],
   ["proxy_sv_maxCallVoteMapRestartValue", "60", "Maximum value allowed on a callvote map_restart", "votes"],
   ["proxy_sv_modelPathLength", "64", "Maximum model path length accepted from clients", "hardening"],
   ["proxy_sv_enableNetStatus", "0", "Per-player network status: netStatus / showNet print the net status table; when 0 the feature is completely inert — no collection, no computation, no table", "observability"],
@@ -56,6 +63,17 @@ const cvars = [
   ["proxy_sv_antiWallHack", "0", "Hide a player from a viewer when no line of sight reaches their body or drawn saber; uses the FOV cap's hide path, so footsteps, swings and saber hum keep playing (0 = off)", "fov"],
   ["proxy_sv_antiWallHackMargin", "0", "World-unit margin around the sampled body box for the line-of-sight test: a silhouette within that distance of a clear line stays visible, so cover-edge contacts do not pop in/out (0 = exact body box)", "fov"],
   ["proxy_sv_antiWallHackCameraRange", "100", "Maximum third-person camera setback (world units) used as the start of the line-of-sight traces; a wall behind the viewer pulls it in like the client's camera collision (100 matches the stock cg_thirdPersonRange, 0 traces from the eye)", "fov"],
+  ["proxy_sv_enableDemoRecord", "0", "Record server-side demos (.dm_26) of the game, one file per instance (main, tffaN, duelN)", "demos"],
+  ["proxy_sv_demoDir", "demos", "Output directory for recorded demos, relative to the server process or absolute", "demos"],
+  ["proxy_sv_enableHttp", "0", "Start the proxy's own HTTP listener; needs proxy_sv_enableDemoDownload, and with no route there is no socket", "demos"],
+  ["proxy_sv_httpBind", "127.0.0.1", "Demo HTTP listener bind address", "demos"],
+  ["proxy_sv_httpPort", "8090", "Demo HTTP listener port", "demos"],
+  ["proxy_sv_enableDemoDownload", "0", "Enable the demo HTTP routes, the in-game /demos command and the intermission link block", "demos"],
+  ["proxy_sv_demoUrl", "(empty)", "Public base used to build demo links (e.g. https://example.com); empty uses http://<bind>:<port>. Set it from a cfg: the engine treats // as a comment", "demos"],
+  ["proxy_sv_demoRetentionHours", "24", "Delete matching demo files older than this at each game boundary (0 = keep forever)", "demos"],
+  ["proxy_sv_demoMaxFileMB", "128", "Close a segment at this size and continue with the next segment number (0 = no cap)", "demos"],
+  ["proxy_sv_demoMinFreeMB", "512", "Pause recording and close segments while the demo filesystem has less free space (0 = off)", "demos"],
+  ["proxy_sv_demoIntermissionSecs", "3", "Seconds of intermission to record after the game ends so the final scores are in the demo, before the files close and their links are sent (0 = immediate)", "demos"],
 ];
 
 const hardening = [
@@ -75,6 +93,7 @@ const playerCommands = [
   "callvote coinflip",
   "/ignore <player>",
   "/unignore <player>",
+  "/demos",
   "netStatus",
   "showNet",
 ];
@@ -144,6 +163,7 @@ export default function Home() {
             <a href="#features">Features</a>
             <a href="#tffa">TFFA</a>
             <a href="#duels">Duels</a>
+            <a href="#demos">Demos</a>
             <a href="#build">Build</a>
           </nav>
           <a className="nav-cta" href={REPO}>
@@ -268,7 +288,7 @@ export default function Home() {
             ))}
           </ul>
 
-          <h3 className="sub">Server cvars <span className="count">47 · filterable</span></h3>
+          <h3 className="sub">Server cvars <span className="count">{cvars.length} · filterable</span></h3>
           <CvarExplorer rows={cvars} />
           <p className="note">
             Not available here: <code>proxy_sv_pingFix</code>,{" "}
@@ -375,6 +395,16 @@ export default function Home() {
                 each command so the last line survives a crash.
               </p>
             </li>
+            <li>
+              <b>Server-side demos</b>
+              <p>
+                <code>proxy_sv_enableDemoRecord</code> writes one{" "}
+                <code>.dm_26</code> per instance from the followed player&apos;s
+                POV, and the proxy&apos;s own HTTP listener serves them at{" "}
+                <code>/demos</code>. No fake client, no player-side recording,
+                and every demo cvar defaults to off.
+              </p>
+            </li>
           </ul>
           <h3 className="sub">Player commands <span className="count">tap to copy</span></h3>
           <div className="cmds">
@@ -411,7 +441,7 @@ export default function Home() {
           <div className="lifecycle" aria-label="TFFA match lifecycle">
             <div><b><i>1</i>Create</b><code>tffa_create [password]</code> opens a match, joins its smaller side and protects its teams.</div>
             <div><b><i>2</i>Join</b><code>tffa_join &lt;id&gt; [password]</code> switches mid-game; <code>tffa_join 0</code> returns to main. Without the password a protected match is spectate-only.</div>
-            <div><b><i>3</i>Fight</b>Damage, snapshots, world entities, spawns, items and the kill feed are isolated per match.</div>
+            <div><b><i>3</i>Fight</b>Damage, snapshots, world entities, spawns, items, sounds and effects, and the kill feed are isolated per match.</div>
             <div><b><i>4</i>End</b>The fraglimit is shared, with the base game&apos;s one-second damage-void delay; tied matches at the timelimit play sudden death.</div>
           </div>
           <div className="hook-grid">
@@ -446,9 +476,32 @@ export default function Home() {
           </div>
           <ul className="tight">
             <li>A round&apos;s own <code>timelimit</code> (minutes) decides unfinished courts by health + shield, random on an exact tie. <code>fraglimit 0</code> removes the per-duel kill limit, <code>timelimit 0</code> the round cap and <code>duel_fraglimit 0</code> the champion threshold.</li>
-            <li>A disconnect or an explicit <code>/team spectator</code> mid-duel gives the opponent a walkover; everyone else stays in the ladder, and bots are drafted like players. <code>team free</code> cannot take a court.</li>
+            <li>A disconnect or an explicit <code>/team spectator</code> mid-duel gives the opponent a walkover; everyone else stays in the ladder, and bots are drafted like players. When a leaver leaves an odd count, the ladder compacts: the highest-ranked survivors keep their courts and the lowest-ranked player takes the bench. <code>team free</code> cannot take a court.</li>
             <li>Opted-out spectators are marked <code>(Spec)</code>, bench players <code>(Bench)</code> and court players <code>(Duel N)</code>; one round-level message replaces the repeating time-limit notice.</li>
             <li>Setting <code>proxy_parallel_duels_enable 0</code> returns everyone to spectator and hands the map back to the stock duel tournament; its automatic pull-in, global duelist configstrings and intermission handling are suppressed while the ladder runs.</li>
+          </ul>
+        </section>
+
+        {/* ---------- demos ---------- */}
+        <section className="block" id="demos" aria-labelledby="demos-title">
+          <SectionHead id="demos-title" eyebrow="Replays" title="Demos: the server records the match" lede="With proxy_sv_enableDemoRecord 1, the proxy records its own .dm_26 demo stream — one file per instance — so a match can be reviewed without a player having recorded it client-side. Every demo cvar defaults to off: no opt-in, no listener, no files." />
+          <div className="lifecycle" aria-label="Server-side demo lifecycle">
+            <div><b><i>1</i>Record</b>One <code>.dm_26</code> per instance: <code>main</code>, <code>tffaN</code> per parallel TFFA match, <code>duelN</code> per duel court. A segment rotates on map change, an empty instance, the size cap or a free-space pause.</div>
+            <div><b><i>2</i>Follow</b>The POV is the lowest human player in the world, not a free camera; a player leaving or changing match switches the POV inside the same file.</div>
+            <div><b><i>3</i>Publish</b>The proxy hosts plain HTTP: <code>GET /demos</code> returns JSON, <code>GET /demos/&lt;file&gt;</code> downloads. In-game <code>/demos</code> prints the links, and an intermission block announces the finished files.</div>
+            <div><b><i>4</i>Keep</b>Retention deletes matching files older than 24 h at game boundaries; a 128 MB cap rotates segments, and recording pauses under 512 MB free.</div>
+          </div>
+          <div className="hook-grid">
+            <div className="hook-card"><b>No fake client</b><p>The recorder keeps its own shadow snapshot ring and encodes with the engine&apos;s own message writers, so live clients keep receiving their snapshots untouched.</p></div>
+            <div className="hook-card"><b>The instance&apos;s view</b><p>Each file carries its instance&apos;s players, entities, configstrings and the game&apos;s own TAB scoreboard in the stock 14-int layout. Chat is broadcast only.</p></div>
+            <div className="hook-card"><b>Standard demo files</b><p>Files are protocol-26 <code>.dm_26</code> demos that stock clients play. The map and its assets must be installed where the demo is watched; the file does not carry them.</p></div>
+          </div>
+          <Code title="server.cfg" text={DEMO_CONFIG}>{DEMO_CONFIG}</Code>
+          <ul className="tight">
+            <li><code>proxy_sv_demoUrl</code> must be set from a config file, not typed at the console: the engine treats <code>//</code> as a comment. When empty, links use the listener&apos;s own <code>http://&lt;bind&gt;:&lt;port&gt;</code>.</li>
+            <li>The HTTP API is plain HTTP with no built-in TLS or authentication; put a reverse proxy in front. Bind defaults to loopback, and with either download switch off the listener stops entirely — no route, no socket.</li>
+            <li>Team chat, private tells and per-client prints are never recorded. RMG/terrain maps start no segment, and a player in a vehicle is skipped for those frames.</li>
+            <li>Only finished files with the proxy&apos;s naming pattern are served; a segment still being written is <code>404</code>, and traversal or symlink escapes are rejected. With <code>sv_maxclients 32</code> there is no spare viewer slot, so the demo is a self-view.</li>
           </ul>
         </section>
 
@@ -485,6 +538,7 @@ export default function Home() {
               <a href="#features">Features</a>
               <a href="#tffa">Parallel TFFA</a>
               <a href="#duels">Parallel duels</a>
+              <a href="#demos">Server demos</a>
               <a href="#build">Build</a>
             </div>
             <div>
