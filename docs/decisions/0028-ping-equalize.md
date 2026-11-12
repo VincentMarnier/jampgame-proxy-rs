@@ -71,11 +71,18 @@ Members of both the target calculation and the padding:
 - engine `client_t.state == CS_ACTIVE`;
 - not a bot (`SV_CalcPings`' own `gentity->r.svFlags & SVF_BOT` check, now
   shared as `hooks::engine_sv::is_bot`);
-- `cl->ping` in `1..999` (`999` is the engine's "no reading" sentinel);
+- `cl->ping` in `0..999` (`999` is the engine's "no reading" sentinel). A 0 is
+  a real reading — a localhost/LAN player — not a missing one; bots, the other
+  source of a 0 in `SV_CalcPings`, are excluded by the bot check above. This is
+  the same rule D-007 adopted when the netStatus feed dropped the original's
+  `ping >= 1` gate, which had wrongly excluded zero-ping players;
 - game session team `!= TEAM_SPECTATOR` (read from the located `gclient_t`
   array, `sess.sessionTeam`).
 
-Spectators, still-connecting clients and bots are ignored and never padded.
+Spectators, still-connecting clients and bots are ignored and never padded. A
+zero-ping player is not: on a mixed LAN/WAN server they are the player who
+needs the padding the most (review correction, 2026-11-13 — the first
+implementation followed the plan's `1..999` literally and left them out).
 
 ### D-028.5 — Tracking
 
@@ -178,6 +185,12 @@ candidate".
   shapes.
 - netStatus table: `eff` column (`ping + applied delay`) after `ping`, header
   and rule pinned by a unit test; runtime parser regex updated.
+- Review correction (2026-11-13): the population admits `cl->ping == 0`
+  (localhost/LAN) and the `ps.ping` overwrite is gated on membership rather
+  than on the ping range, so a 0 ms player is padded like any other and a
+  ramping-out non-member never rewrites the game-side ping. Pinned by
+  `a_zero_ping_localhost_player_is_padded_like_any_other` and the updated
+  population test.
 - Runtime harness: `tools/runtime/a8_ping_equalize.sh` + `.gdb` (modelled on
   a3) runs two synthetic clients through the a2 protocol harness with different
   one-way delays (15 ms and 150 ms), samples both clients'

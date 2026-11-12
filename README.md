@@ -514,7 +514,9 @@ never made faster.
   out, so the number is visible on clients/mods that render it; the
   [net status](#net-status) table's `eff` column always shows it, and
   `status`/rcon `status` keep the real engine ping.
-- Spectators, connecting clients and bots are never delayed.
+- Spectators, connecting clients and bots are never delayed. A localhost/LAN
+  player whose measured ping rounds to 0 is a player like the others and is
+  delayed too (their 0 reading is not a missing one).
 - It needs `proxy_sv_enable 1` like every feature, but not
   `proxy_sv_enableNetStatus`.
 

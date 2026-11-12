@@ -23,9 +23,10 @@
 //! ## Population
 //!
 //! Members are engine `client_t`s in `CS_ACTIVE`, not bots, with a usable
-//! `cl->ping` (`1..999`; `999` is the engine's "no reading" sentinel) and a
-//! game session team other than `TEAM_SPECTATOR`. Spectators, connecting
-//! clients and bots are ignored and never padded.
+//! `cl->ping` (`0..999`; `999` is the engine's "no reading" sentinel, while a
+//! localhost/LAN 0 is a real reading) and a game session team other than
+//! `TEAM_SPECTATOR`. Spectators, connecting clients and bots are ignored and
+//! never padded.
 //!
 //! ## Tracking
 //!
@@ -96,7 +97,14 @@ pub const REFRESH_MS: i32 = 500;
 pub const TARGET_DEADBAND_MS: i32 = 10;
 
 /// Lowest `cl->ping` that counts as a reading.
-pub const MIN_PING: i32 = 1;
+///
+/// `0` is a real reading, not a missing one: a localhost/LAN player rounds to
+/// 0 ms. Bots — the other source of a 0 in `SV_CalcPings` — are already
+/// excluded by `is_bot`, so a 0 here means the fastest possible player, who
+/// must be padded the most. Only [`PING_SENTINEL`] means "no reading"; this is
+/// the rule the netStatus feed adopted when it dropped the original's
+/// `ping >= 1` gate (D-007, `hooks/netstatus.rs`).
+pub const MIN_PING: i32 = 0;
 
 /// The engine's "no reading" sentinel (`SV_CalcPings` writes `999` when the
 /// client is not active, has no gentity or has no acked frame); `cl->ping` must
@@ -163,7 +171,7 @@ pub fn delay_for(ping: i32, target: i32) -> i32 {
 }
 
 /// Whether a client belongs to the equalisation population (D-028.4): engine
-/// `CS_ACTIVE`, not a bot, a usable `cl->ping` (`1..999`) and a game session
+/// `CS_ACTIVE`, not a bot, a usable `cl->ping` (`0..999`) and a game session
 /// team other than `TEAM_SPECTATOR`. Spectators, connecting clients and bots
 /// are ignored and never padded.
 pub fn is_member(client_state: i32, bot: bool, ping: i32, session_team: i32) -> bool {
@@ -514,7 +522,10 @@ pub fn on_run_frame(now: i32) {
                     lines.push(client_line(i, transition));
                 }
             }
-            if client.applied > 0 && (MIN_PING..PING_SENTINEL).contains(&pings[i]) {
+            // Only a member has a meaningful ping to add the delay to: a
+            // non-member's slot in `pings` is 0, which is also a real reading
+            // for a localhost/LAN member, so the population is the gate here.
+            if members[i] && client.applied > 0 {
                 // SAFETY: `g_clients` is the located `gclient_t` array and `i`
                 // is below `level.maxclients`; `ps.ping` is a writable int.
                 unsafe {
@@ -535,12 +546,11 @@ pub fn on_run_frame(now: i32) {
 /// Print one log line (the engine print trap must not run under the state
 /// lock).
 fn print_line(line: &str) {
-    match std::ffi::CString::new(line) {
-        // SAFETY: engine syscall registered; text is NUL-terminated.
-        Ok(text) => unsafe { syscall::print(&text) },
-        // The line is built from numbers and static text only; this arm is
-        // unreachable but keeps the hot path panic-free.
-        Err(_) => {}
+    // The line is built from numbers and static text only, so this cannot
+    // fail; the `if let` keeps the hot path panic-free without an `expect`.
+    // SAFETY: the engine syscall is registered and `text` is NUL-terminated.
+    if let Ok(text) = std::ffi::CString::new(line) {
+        unsafe { syscall::print(&text) };
     }
 }
 
@@ -680,12 +690,27 @@ mod tests {
         for state in [0, 1, 2, 3] {
             assert!(!is_member(state, false, 50, 0));
         }
-        // Unreadable ping: 0 (localhost/LAN is excluded by the same rule) and
-        // the engine's 999 sentinel.
-        assert!(!is_member(CS_ACTIVE, false, 0, 0));
+        // A zero ping is a real reading (localhost/LAN), not a missing one:
+        // bots are excluded by the bot flag, so 0 ms must be padded the most.
+        assert!(is_member(CS_ACTIVE, false, 0, 0));
         assert!(!is_member(CS_ACTIVE, false, MIN_PING - 1, 0));
         assert!(!is_member(CS_ACTIVE, false, PING_SENTINEL, 0));
         assert!(is_member(CS_ACTIVE, false, PING_SENTINEL - 1, 0));
+    }
+
+    #[test]
+    fn a_zero_ping_localhost_player_is_padded_like_any_other() {
+        assert_eq!(target_for(&[0, 60], 250), 60);
+        assert_eq!(delay_for(0, 60), 60);
+        // A roster of only zero-ping players has nothing to equalise.
+        assert_eq!(target_for(&[0, 0], 250), 0);
+        let mut client = PingEqualizeState {
+            applied: 60,
+            target: 60,
+            ..Default::default()
+        };
+        assert_eq!(client.effective_ping(0), 60);
+        assert_eq!(client.step(), 60);
     }
 
     #[test]
