@@ -142,7 +142,6 @@ set proxy_sv_enableIgnore 1
 set proxy_sv_muteMode 2
 set proxy_sv_enableBanFile 1
 set proxy_sv_enableGuidBan 1
-set proxy_sv_enableRconCmdCooldown 1
 set proxy_sv_minJumpTime 80
 set proxy_sv_enableClientPpsLimit 1
 set proxy_sv_voidTimeNudge 1

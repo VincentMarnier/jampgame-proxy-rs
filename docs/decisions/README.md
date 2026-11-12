@@ -165,4 +165,4 @@
   cvar rename, the legacy spellings kept as registered aliases, the
   canonical-unless-default resolution rule, and why a last-write-wins alias
   cannot be built from the engine's `modificationCount`.
-- `0027-server-demos.md` — the recorder/instance model accepted in Phases 1–3 and the Phase 4 publication surface: proxy-hosted HTTP, download cvars, link base, retention and disk guards, broadcast-only demo chat, boundary announcements and `/demos`.
+- `0027-server-demos.md` — server-side demo recording and publication: the recovered `.dm_26` format (protocol 26, 49 demos, fixture, reference-client symbols), the no-fake-client recorder (shadow state, engine `MSG_*` encoders, no `svs.clients`/`svs.snapshotEntities`), `PMF_FOLLOW` and viewer identity, instances/chat/scoreboard, the built-in HTTP server (JSON `/demos`), retention and the accepted guards, the intermission block and its verification status.

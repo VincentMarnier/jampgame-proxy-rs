@@ -20,9 +20,11 @@ This directory contains knowledge derived from the original implementation and t
   per-instance configstrings/scoreboard, the chat rule, `GAME_INIT` lifecycle,
   the 16-recorder cap, gate-B artifacts and the real-client playback run) and
   the Phase 4 publication notes (proxy-hosted HTTP listener and worker model,
-  routes and path safety, served-only-when-closed rule, retention and the
-  accepted size/free-space guards, boundary announcements, `/demos`, gate-C
-  artifacts and deviations).
+  JSON `/demos` and file routes, path safety, served-only-when-closed rule,
+  retention and the accepted size/free-space guards, the intermission client
+  block, `/demos` in game, gate-C artifacts and deviations). The decisions
+  behind the feature, with their evidence level and verification status, are in
+  `decisions/0027-server-demos.md`.
 - `inventory.md` — per-feature map of the original proxy: keep/drop decision
   per D-002 and the implementation technique for each hook.
 - `ybeproxy-2026-delta.md` — the 2026 security/crash fixes of the C++ proxy

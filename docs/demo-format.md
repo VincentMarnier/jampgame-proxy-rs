@@ -1,8 +1,9 @@
-# Server-side demo recording — format and engine evidence (Phase 0)
+# Server-side demo recording — format, recorder and publication evidence
 
-Status: Phase 0 of the `proxy_sv_enableDemoRecord` plan. No recorder code yet.
-This document records what was *observed*, *read from the binaries/source* and
-*validated*, and separates that from what is still open.
+Status: Phases 1–4 implemented and documented (Phase 5). The document records
+what was *observed*, *read from the binaries/source* and *validated*, and
+separates that from what is still open (§10–§13 are implementation notes; the
+decisions are in `docs/decisions/0027-server-demos.md`).
 
 Evidence labels used below: **SOURCE**, **STATIC**, **RUNTIME**, **TESTED**,
 **INFERRED**. See `docs/README.md`.
@@ -403,13 +404,17 @@ Design points and deviations from the Phase 1 prompt, all deliberate:
   the buffer reaches the threshold or on `finish()`. `FileSink::create` uses
   `create_new` (never overwrites); terminating is explicit because `Drop`
   cannot report I/O errors.
-- **Payload length padding.** `MsgWriter` emits `ceil(bit/8)` bytes. The
-  engine's `MSG_WriteBits` sets `cursize = (bit>>3)+1`, which adds an
-  extra, uninitialised byte when the final bit lands exactly on a byte
-  boundary (the source of the four padding bytes in the Phase 0 demos). That
-  byte is not message data and the demo reader ignores it; the writer
-  deliberately does not reproduce it. The fixture's last bit is not
-  byte-aligned, so its encoded length still matches the original exactly.
+- **Payload length padding.** `MsgWriter` follows the engine's
+  `MSG_WriteBits` convention (`msg->cursize = (bit >> 3) + 1`, `msg.cpp:207`):
+  it reserves the byte the next symbol would start in, so a message whose last
+  symbol ends exactly on a byte boundary is one byte longer than the bits
+  alone. The client's `MSG_ReadByte` check depends on that byte (see the frame
+  length note in §11); without it the trailing `svc_EOF` read returns `-1`.
+  The four shipped demos that carry one extra uninitialised byte are the
+  reference client's own stack padding (`CL_Record_f` writes `msg.cursize`;
+  the byte beyond the final bit is never written), not the server's
+  convention. The fixture's last bit is not byte-aligned, so its encoded length
+  matches the original exactly.
 - **Naming timezone.** The name timestamp is **UTC** (`YYYYmmdd-HHMMSS`).
   The reference client's demos use local time, but the proxy names its own
   files and UTC avoids a dependency on the server's timezone/DST. The
@@ -487,7 +492,9 @@ The tick:
    SS_GAME`, and `svs.time >= next_tick` (`next_tick = svs.time + 1000/sv_fps`);
 2. picks the lowest client slot that is in the world, has a `gentity` and is
    not on `TEAM_SPECTATOR` (`level.clients[n].sess.sessionTeam`); a bot is a
-   valid subject, and the temporary empty-map viewer is the fallback;
+   valid subject, and the temporary empty-map viewer is the fallback.
+   **(Phase 3 supersedes this: subjects are human-only and instance-scoped,
+   §12; the empty-map viewer was removed.)**
 3. copies `level.clients[slot].ps`, ORs `PMF_FOLLOW` (0x1000), and discards the
    frame if `ps.m_iVehicleNum != 0` (vehicle PS block not implemented, U-010);
 4. bumps `sv.snapshotCounter`, pre-marks `svEntities[ps.clientNum]` (the
@@ -536,7 +543,8 @@ skipped (slot stays eligible) if the game client array is not located yet.
 
 Only when **no** eligible player is left does the segment close (`-1/-1`) and a
 later eligible player start a new file. The temporary empty-map viewer is
-never replaced mid-file.
+never replaced mid-file. **(Phase 3 scopes this per instance and removes the
+empty-map viewer; §12.)**
 
 Because the POV can move away from the slot named in the gamestate, the
 gamestate names an unused viewer slot rather than the first subject (see "The
@@ -672,11 +680,11 @@ clients as the bots joined, every one a clean 14-int layout; the file validates
 (`artifacts/demo-scoreboard/…`) also covered the 3-client board, and its live
 capture client joining showed the `cs` mirror continuing alongside.
 
-Limits: the demo has no deaths column (the stock layout), and on a
-parallel-TFFA/duel server the board is the game's global one — the per-viewer
-instance rewrites cannot apply to a stream with no viewer. The board also
+Limits: the demo has no deaths column (the stock layout), and the board
 inherits the engine's command-size caps, so a full 30-client board is
 truncated/dropped exactly as it would be for a live client.
+**(Phase 3 supersedes the instance part: the probe text is rewritten with the
+subject as the viewer, so a TFFA/duel demo carries its own board; §12.)**
 
 ### Configstrings
 
@@ -701,6 +709,10 @@ The initial gamestate carries the current values, so the mirror starts from
 - **Temporary Phase 2 debug**: `proxy_sv_demoRecordEmpty` (0) starts a
   recording with no players. It is not a README feature and **was removed in
   Phase 3** (§12); the human-subject rule replaces it.
+- The Phase 4 publication cvars (`proxy_sv_enableHttp`, `proxy_sv_httpBind`,
+  `proxy_sv_httpPort`, `proxy_sv_enableDemoDownload`, `proxy_sv_demoUrl`,
+  `proxy_sv_demoRetentionHours`, `proxy_sv_demoMaxFileMB`,
+  `proxy_sv_demoMinFreeMB`, `proxy_sv_demoIntermissionSecs`) are in §13.
 - `GAME_INIT` and `GAME_SHUTDOWN` close an open file with `-1/-1`; disabling
   the cvar or the master switch does the same. The file writer buffers 64 KiB
   and flushes at the threshold or at close.
@@ -1065,9 +1077,9 @@ DISPLAY=:0 ./original/GameData/taystjk.x86_64 \
 
 Code: `rust/src/http/{mod.rs,server.rs}` (listener lifecycle, request parsing,
 routes, static serving), `rust/src/demo/publish.rs` (generation bookkeeping,
-`/demos`, announcements, retention, free-space sampling), the recorder
+`/demos`, the intermission client block, retention, free-space sampling), the recorder
 integration in `rust/src/demo/recorder.rs` (name publication, size/min-free
-guards, console announcement), the two hooks in `rust/src/shared_api.rs`
+guards, intermission client block), the two hooks in `rust/src/shared_api.rs`
 (`demos` client command) and `rust/src/lib.rs` (per-frame sync, shutdown), and
 `csrc/syscall_shim.c` (`jampgame_free_bytes`, a `statvfs` helper because the
 struct is an ABI type).
@@ -1085,12 +1097,15 @@ switch.
 | `proxy_sv_enableHttp` | `0` | listener master |
 | `proxy_sv_httpBind` | `127.0.0.1` | bind address |
 | `proxy_sv_httpPort` | `8090` | bind port |
-| `proxy_sv_enableDemoDownload` | `0` | demo routes, `/demos`, announcements; with it off no route is enabled and the listener does not start |
+| `proxy_sv_enableDemoDownload` | `0` | demo routes, `/demos`, the intermission client block; with it off no route is enabled and the listener does not start |
 | `proxy_sv_demoUrl` | (empty) | public link base; empty uses `http://<proxy_sv_httpBind>:<proxy_sv_httpPort>` (a wildcard bind is shown as `127.0.0.1`). Must be set from a config file: the engine's command tokenizer treats `//` as a comment, so `set proxy_sv_demoUrl http://…` truncates to `http:` (quoting inside a cfg keeps it intact) |
 | `proxy_sv_demoRetentionHours` | `24` | delete matching files older than N hours at each boundary; `0` = keep forever |
 | `proxy_sv_demoMaxFileMB` | `128` | close a segment at this size and continue with the next segment number; `0` = no cap |
 | `proxy_sv_demoMinFreeMB` | `512` | stop recording while the demo filesystem has less free space; `0` = off |
-| `proxy_sv_demoIntermissionSecs` | `3` | seconds of the intermission to record after the game ends (final scores in the demo) before closing the files and printing the links; `0` = close at `BeginIntermission`. Keep it below the engine's 4 s duel / 5 s other intermission |
+| `proxy_sv_demoIntermissionSecs` | `3` | seconds of the intermission to record after the game ends (final scores in the demo) before closing the files and sending the client block; `0` = close at `BeginIntermission`. Keep it below the engine's 4 s duel / 5 s other intermission |
+
+The recording switch and output directory (`proxy_sv_enableDemoRecord`,
+`proxy_sv_demoDir`) are listed with the Phase 2 state in §11.
 
 ### Listener lifecycle
 
@@ -1221,13 +1236,17 @@ and the HTTP listing at the same time was
 `[{"name":"…","url":"http://127.0.0.1:29071/demos/…","size":92116}]`
 (`application/json`, `python3 -m json.tool` valid).
 
-### Announcements and `/demos`
+### Intermission tail, the client block and `/demos`
 
 The recorder tracks the segments of the **current generation** (reset at each
-`GAME_INIT`, full map change or `map_restart`). At a boundary it builds a
-**client console block** — a `print` broadcast, the same mechanism the
-end-game stats tables use, deliberately *not* `svsay` (no chat) and not echoed
-to the server console:
+`GAME_INIT`, full map change or `map_restart`). `BeginIntermission` starts a
+timer of `proxy_sv_demoIntermissionSecs` (default 3 s). The recorder keeps
+writing through the intermission, so the demo contains the final `scores` and
+the players at the intermission point (`ps.pm_type = PM_INTERMISSION`). When
+the timer fires, the recorder closes every segment with `-1/-1`, marks the
+generation announced, and sends a **client console block** to every connected
+client with `print` — the same mechanism the end-game stats tables use,
+deliberately *not* `svsay` (no chat) and not echoed to the server console:
 
 ```
 print "^5Demo files from this game:\n"
@@ -1235,17 +1254,10 @@ print "^7http://127.0.0.1:8090/demos/20261112-…_s1.dm_26\n"
 print "^7http://127.0.0.1:8090/demos/20261112-…_s2.dm_26\n"
 ```
 
-### Intermission tail and the client block
-
-`BeginIntermission` starts a timer of `proxy_sv_demoIntermissionSecs`
-(default 3 s). The recorder keeps writing through the intermission, so the
-demo contains the final `scores` and the players at the intermission point
-(`ps.pm_type = PM_INTERMISSION`). When the timer fires, the recorder closes
-every segment with `-1/-1`, marks the generation announced, and sends the
-block to every connected client with `print` (the end-game stats mechanism;
-never `svsay`). The block is a header, at most 12 links, then
-`... N more demo(s), type /demos`. `/demos` still lists the generation during
-the remaining intermission.
+The block is a header, at most 12 links, then `... N more demo(s), type
+/demos`. `/demos` still lists the generation during the remaining intermission
+(the files are kept until the next `GAME_INIT`, where the `announced` flag
+prevents a second block).
 
 The default 3 s stays inside the engine's minimum intermission (4 s for a duel
 between rounds, 5 s otherwise, `CheckIntermissionExit`). A larger value can
@@ -1272,14 +1284,14 @@ Generation state and the open set are process memory; they reset at
 found again by the maintenance scan, and a truncated leftover is rejected by
 the terminator check).
 
-### Gate C evidence (final build `c0eba619…`)
+### Gate C evidence (Phase 4 build `c0eba619…`; final re-run `7439236e…`)
 
 | artifact | evidence |
 | --- | --- |
 | `artifacts/phase4-final/demos/20261112-120830_mp_ffa3_main_s1.dm_26` (`165d3cff…`) | first generation closed at the boundary; GET and HEAD over HTTP: `200`, `Content-Type: application/octet-stream`, `Content-Length 5576`, byte-identical SHA-256 |
-| client capture (2026-11-12) | `print "^5Demo files from this game:\n"` then `print "^7http://127.0.0.1:29071/demos/…"` — delivered on entering the new game |
+| earlier print-block delivery (Phase 4) | `print "^5Demo files from this game:\n"` then `print "^7http://127.0.0.1:29071/demos/…"` captured on a fresh client after a map change; the intermission-timed delivery is the server-log evidence above (U-016) |
 | `artifacts/phase4/demos/…` (`27792fee…`, `b7fc8e19…`, `97f7b791…`, `4c5300b9…`, `fee7c21e…`, `028afea3…`) | two generations end-to-end (full `map`, then `map_restart`), open segment 404 before its terminator, listing exactly the closed names, `Content-Length`/SHA-256 match |
-| current run (2026-11-12) | the client block above; `/demos` prints the same URLs to the requester; no server-console list |
+| final re-run (`7439236e…`) | intermission block lines + JSON listing (see “Intermission evidence” above); `/demos` prints the same URLs; no server-console list |
 | `artifacts/phase4-size4/demos/20261112-115603_mp_ffa3_main_s1.dm_26` | the size-cap attempt (853,536 B, subject deaths close the segment before 1 MiB) |
 
 Large-file load (final build, `artifacts/phase4-guards/demos/20261112-112854_mp_ffa3_main_s4.dm_26`,
@@ -1317,5 +1329,5 @@ datagram at a 2 s timeout under load).
   resumable downloads must re-fetch.
 - **Retention runs on the maintenance thread**, not immediately at the boundary
   instant; the log line documents the deletion.
-- No Phase 5 behaviour (announcements beyond the boundary block, `/demos` web
-  UI, disk quota accounting) is implemented here.
+- No later-phase behaviour (a `/demos` web UI, disk quota accounting, auth/TLS)
+  is implemented here.

@@ -36,7 +36,6 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableGuidBan`              | 0       | file-backed `ja_guid` ban registry (separate file and cvar from the IP list); `rcon ban <player>` adds the target's GUID, `addguid`/`removeguid`/`listguid` manage it (see [GUID bans](#guid-bans)) |
 | `proxy_sv_guidBanFile`                | `proxy_guid_bans.txt` | GUID ban file path, relative to the server's working directory or absolute; ignored while `proxy_sv_enableGuidBan 0` |
 | `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
-| `proxy_sv_enableRconCmdCooldown`      | 0       | set a cooldown on RCON commands to avoid it being flooded                                       |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
 | `proxy_sv_enableNetStatus`            | 0       | compute and make accessible the players network status (`netStatus`/`showNet` commands print the [net status](#net-status) table); when `0` the feature is completely inert — no collection, no computation, no table |
@@ -80,7 +79,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableHttp`                  | 0       | start the proxy's own HTTP listener (needs `proxy_sv_enableDemoDownload`; no route → no socket) |
 | `proxy_sv_httpBind`                   | `127.0.0.1` | listener bind address |
 | `proxy_sv_httpPort`                   | 8090    | listener port |
-| `proxy_sv_enableDemoDownload`          | 0       | enable the demo HTTP routes, `/demos` and boundary announcements |
+| `proxy_sv_enableDemoDownload`          | 0       | enable the demo HTTP routes, in-game `/demos` and the intermission link block |
 | `proxy_sv_demoUrl`                    | (empty) | public base used to build demo links (e.g. `https://example.com`); empty uses `http://<proxy_sv_httpBind>:<proxy_sv_httpPort>` (wildcard bind → `127.0.0.1`). Set it from a config file: the engine treats `//` as a comment in a console `set` |
 | `proxy_sv_demoRetentionHours`          | 24      | delete matching demo files older than this at each game boundary (`0` = keep forever) |
 | `proxy_sv_demoMaxFileMB`               | 128     | close a segment at this size and continue with the next segment number (`0` = no cap) |
@@ -1015,43 +1014,108 @@ join a court with `team free` (the ladder assigns courts).
 ### Server-side demos
 
 The proxy can record the server's own demo stream, so a match can be reviewed
-without a player having recorded it client-side. `proxy_sv_enableDemoRecord 1`
-writes one Phase 1 `.dm_26` file per instance to `proxy_sv_demoDir`:
+without a player having recorded it client-side. The view is the followed
+player's POV (not a free camera): the lowest human player of the instance, in
+the world and not spectating. A player leaving, joining spectators or moving to
+another match switches the POV inside the same file; an empty instance closes
+it and repopulation starts a new segment.
+
+`proxy_sv_enableDemoRecord 1` writes one `.dm_26` file per instance:
 
 - `main` for non-instanced gametypes, `tffa<N>` per parallel TFFA match and
   `duel<N>` per parallel duel court (`N` is 1-based; `tffa1` is the main slot's
   match);
-- the POV follows the lowest human player of that instance (spectators and bots
-  are skipped, a player leaving switches the POV inside the same file);
-- a file ends with the `-1/-1` terminator and a new segment number starts after
-  a map change, a `map_restart`, an empty instance, the size guard or a
+- a segment ends with the `-1/-1` terminator and a new number starts after a
+  map change, a `map_restart`, an empty instance, the size guard or a
   free-space pause.
 
-Each file carries the instance's own players, entities, configstrings,
-scoreboard and broadcast-only chat (never team chat, `tell` or `print`).
+Each file carries the instance's own players, entities, configstrings and the
+game's own TAB scoreboard (stock 14-int layout), plus broadcast chat only
+(never team chat, private `tell` or per-client `print`). At the end of a game
+the recorder keeps the intermission for a few seconds so the final scores are
+in the demo, then closes the files.
 
-With `proxy_sv_enableHttp 1` and `proxy_sv_enableDemoDownload 1` the proxy
-serves those files itself (no external hosting): `GET /demos` returns a JSON
-array of `{name, url, size}` and `GET /demos/<file>` downloads one
-(`application/octet-stream`, `HEAD` supported). Only files with the proxy's own
-name pattern and a valid terminator are served; a segment still being written
-is `404`. The listener binds `127.0.0.1:8090` by default; set
-`proxy_sv_httpBind`/`proxy_sv_httpPort` to expose it. `proxy_sv_demoUrl` only
-changes the links shown in the boundary announcement and `/demos` (for NAT or a
-reverse proxy), and must be set from a config file because a console `set`
-treats `//` as a comment.
+#### Demo cvars
 
-At the end of a game the recorder keeps recording for
-`proxy_sv_demoIntermissionSecs` seconds of the intermission (so the demo shows
-the final scores), then closes the files and sends the finished files with
-their download links to the **clients** as console text (the same `print`
-mechanism as the end-game stats): a header, at most 12 links, then a `/demos`
-hint. Nothing is broadcast with `svsay`, and the list is not printed to the
-server console. If the intermission ends before that delay, the block is
-delivered at the start of the next game instead; players can always type
-`/demos` to get the links in their own console. Retention (`proxy_sv_demoRetentionHours`) removes only matching files
-whose timestamp is old enough; the free-space and size guards stop or rotate
-recording instead of filling the disk.
+| cvar | default | meaning |
+| --- | --- | --- |
+| `proxy_sv_enableDemoRecord` | `0` | record server-side demos |
+| `proxy_sv_demoDir` | `demos` | output directory (relative to the server process or absolute) |
+| `proxy_sv_enableHttp` | `0` | start the built-in HTTP listener |
+| `proxy_sv_httpBind` | `127.0.0.1` | listener bind address |
+| `proxy_sv_httpPort` | `8090` | listener port |
+| `proxy_sv_enableDemoDownload` | `0` | enable the demo routes, the in-game `/demos` and the intermission block |
+| `proxy_sv_demoUrl` | (empty) | public base for links; empty uses `http://<httpBind>:<httpPort>` (wildcard bind shown as `127.0.0.1`) |
+| `proxy_sv_demoRetentionHours` | `24` | delete matching files older than N hours at game boundaries; `0` = keep forever |
+| `proxy_sv_demoMaxFileMB` | `128` | rotate a segment at this size; `0` = no cap |
+| `proxy_sv_demoMinFreeMB` | `512` | pause recording while the demo filesystem has less free space; `0` = off |
+| `proxy_sv_demoIntermissionSecs` | `3` | seconds of intermission to record before closing and announcing; `0` = immediately |
+
+All proxy cvars need `proxy_sv_enable 1` (the default). A minimal config:
+
+```cfg
+set proxy_sv_enableDemoRecord 1
+set proxy_sv_demoDir demos
+set proxy_sv_enableHttp 1
+set proxy_sv_httpBind 0.0.0.0
+set proxy_sv_httpPort 8090
+set proxy_sv_enableDemoDownload 1
+set proxy_sv_demoUrl "https://demos.example.com"
+```
+
+`proxy_sv_demoUrl` must be set from a config file, not typed at the console:
+the engine treats `//` as a comment and truncates the value to `http:`.
+
+#### HTTP server
+
+The proxy hosts the server itself; there is no external-hosting mode.
+`proxy_sv_enableHttp 1` and `proxy_sv_enableDemoDownload 1` start a listener on
+`proxy_sv_httpBind:proxy_sv_httpPort` (default `127.0.0.1:8090`). With either
+download switch off there is no route and the listener is stopped entirely; a
+bind failure (port in use, permission, invalid port) logs one line and leaves
+the feature off until the cvars change, without blocking the game. It is plain
+HTTP: terminate TLS and add authentication with a reverse proxy in front of it.
+
+- `GET /demos` returns a JSON array of `{name, url, size}` for the finished,
+  non-expired demo files.
+- `GET /demos/<file>` downloads the file (`application/octet-stream`), with
+  `Content-Length`; `HEAD` returns the headers only. A segment still being
+  written is `404`.
+- `/api/...` is reserved (`501`); everything else is `404`.
+- Only files with the proxy's demo name pattern are served; traversal and
+  symlink escapes are rejected. The server uses a bounded worker pool (four
+  workers, eight queued connections, `503` when full), 8 KiB request headers,
+  request/response timeouts and closes the connection after one request (no
+  keep-alive, no `Range`).
+- The in-game `/demos` command prints the same download links to the requesting
+  player; at the end of a game the clients also receive a block with the
+  finished files and their links (header, up to 12 links, then a `/demos`
+  hint). If the map leaves before `proxy_sv_demoIntermissionSecs`, the block is
+  sent at the start of the next game instead.
+
+Retention (`proxy_sv_demoRetentionHours`) removes only matching demo files whose
+embedded timestamp is old enough, and only at game boundaries; the maintenance
+thread does the scan. The free-space and size guards stop or rotate recording
+instead of filling the disk. `0` disables each guard; retention `0` keeps files
+forever.
+
+#### Demo limitations
+
+- The recording is the subject's POV; there is no free camera.
+- Team chat is not recorded, nor are private tells or per-client prints.
+- RMG/terrain maps are not recorded (the variable gamestate tail is unsupported;
+  no segment starts on such a map).
+- A demo does not carry the map or its assets: the map must be installed on the
+  client that plays it.
+- The stock `/download` command cannot fetch demos: it serves files from the
+  engine's game filesystem, not the proxy's demo directory; use the proxy's
+  HTTP `/demos/<file>` route.
+- With `sv_maxclients 32` there is no spare viewer slot, so a demo is a
+  self-view. A POV change continues while the old subject's slot stays empty;
+  if someone reconnects there, the file closes and a new one starts with the
+  new subject.
+- A player in a vehicle is skipped for those frames (the vehicle playerstate
+  block is not implemented); recording resumes when they leave it.
 
 ## Usage
 

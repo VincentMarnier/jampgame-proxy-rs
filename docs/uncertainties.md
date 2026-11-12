@@ -564,6 +564,27 @@ handling for the first two cases and left the playback questions open:
    load the map but not capture the GL window; that limitation no longer
    applies to the release decision.
 
+### Status (Phase 5, 2026-11-12)
+
+- **1 RMG maps — open.** The encoder only emits the `int16 0` tail; with
+  `TheRandomMissionManager` non-null the recorder logs and starts no segment.
+  No RMG map was recorded or played. Experiment unchanged: load an RMG map,
+  capture the server gamestate and compare with a client recording; implement
+  the variable tail only if RMG recording is required.
+- **2 Vehicle playerstate — open.** Frames whose subject has
+  `ps.m_iVehicleNum != 0` are skipped (the previous frame stays the delta
+  base); no stream is produced that a client would misparse, but a demo of a
+  player driving a vehicle has a gap. Experiment: record a player mounting a
+  vehicle and decode/play the result, then implement the second playerstate
+  block.
+- **3 Gamestate `clientNum` — resolved.** Spare slot (highest unassigned, then
+  highest free with watchdog, then self-view); the rule is unit-tested and
+  every Phase 2–4 artifact uses `clientNum 31`. The live 32-slot corner is
+  U-015.
+- **4 Playback — owner-verified** for the Phase 2 moving artifact (TaystJK and
+  a stock client). Phase 3/4 files were loaded by the real client to completion
+  without parse errors, not visually verified.
+
 ---
 
 ## U-011 — Mid-file follow-target switch: client playback
@@ -595,6 +616,9 @@ HUD/scoreboard presentation.**
   (`0 -> 1 (left)`, 184 frames) validates; the real TaystJK client played a
   different Phase 3 file to its end without parse errors, but the switched
   file itself has not been played on a client yet.
+- The Phase 4 follow-up (JSON listing, intermission block) did not change the
+  switch path; the owner's visual playback remains the Phase 2 moving artifact,
+  which has no mid-file switch. Still open.
 
 ### Cheapest experiment
 
@@ -632,6 +656,10 @@ missing deaths) rather than a parse error.**
   `cs30`/`cs31`; all validate. A real TaystJK client played two of these files
   to completion without a parse error, but no one has pressed TAB on them
   (and the client could not be screen-captured here).
+- Phase 4 intermission evidence: the demo keeps 3 s of intermission and its
+  final `scores` commands (decoded: `pm_type = PM_INTERMISSION`, scoreboard
+  payloads), so a demo now has a full final board even without TAB. The
+  client-side TAB rendering is still unchecked.
 
 ### Cheapest experiment
 
@@ -714,3 +742,78 @@ On a real server with human players (who respawn and keep moving), set
 `demo segment reached proxy_sv_demoMaxFileMB 1 MB (…)` once and the next
 segment should start with the next `s<N>` number. Alternatively build a
 throwaway binary whose cap is read in bytes (not MiB) and repeat the bot run.
+
+---
+
+## U-015 — Live 32-slot server: viewer identity and POV switching
+
+### Question
+
+With `sv_maxclients 32` every slot can be assigned, so the recorder cannot name
+a spare viewer slot: the gamestate uses the subject's own slot (self-view, no
+`PMF_FOLLOW`). Does that play correctly, and what happens when the subject
+leaves and the slot is reused?
+
+### Classification
+
+**minor — the fallback is explicit and the identity watchdog is unit-tested;
+the risk is presentation at the ragged edge, not a malformed stream.**
+
+### Evidence so far
+
+- Unit tests cover `pick_viewer_slot` (highest unassigned, highest free,
+  subject fallback) and `identity_lost` (a stranger on the viewer slot closes
+  the segment).
+- No runtime run used 32 human clients; Phase 2–4 gate servers used
+  `sv_maxclients` 8–32 with fewer clients, so every artifact has a spare viewer
+  slot (`clientNum 31`).
+- The code path when the subject leaves on a full server: the next subject is
+  chosen. If the old subject's slot stays empty, the stream continues in the
+  same file (follow view, gamestate naming the now-empty slot); if someone
+  takes the slot, the identity check closes the segment and a new file starts
+  with the new subject.
+
+### Cheapest experiment
+
+Run a 32-slot server with 32 human clients, record through a subject leaving
+and a rejoin into the old slot, then play the files on TaystJK/stock: the
+self-view must not fuse the newcomer, and the expected segment close/restart
+must be visible in the proxy log.
+
+---
+
+## U-016 — Client receipt of the intermission demo block
+
+### Question
+
+At intermission the recorder closes the files after
+`proxy_sv_demoIntermissionSecs` and broadcasts the link block with `print`.
+Is the block visible to the players at intermission, exactly once, and does
+`/demos` still list the files during that window?
+
+### Classification
+
+**minor — the same `print` broadcast was captured in a synthetic client's
+server-message stream after a map change in Phase 4, and the server log now
+records the exact lines (`event=demo.intermission.line`). The timing path
+(intermission) and the one-shot guard have not been seen by a real client.**
+
+### Evidence so far
+
+- Phase 4 follow-up runtime: `event=demo.intermission 1 file(s) announced at
+  intermission, 2 client line(s)` followed by the header and URL; the demo file
+  closes 3 s after `BeginIntermission` and contains `PM_INTERMISSION` and the
+  final `scores`.
+- The synthetic client capture tool failed to produce a decodable stream across
+  that map restart (`illegal svc op`), so no client-side capture of the
+  intermission block exists; the `print` delivery itself was captured earlier
+  for the same block at a map start.
+- The generation is marked announced so `GAME_INIT` does not repeat it; this
+  guard is code-reviewed, not observed on a client.
+
+### Cheapest experiment
+
+On a real server, end a game with two human clients; confirm both see the block
+at intermission (console, not chat), that `/demos` lists the files during the
+remaining intermission, and that no second block appears on the next game
+start. Keep `proxy_sv_demoIntermissionSecs` below the intermission minimum.
