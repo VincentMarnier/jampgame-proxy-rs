@@ -364,6 +364,13 @@ pub fn client_command(client_num: c_int) -> bool {
         return false;
     }
 
+    // `/demos` (Phase 4): list this game's published demo files to the
+    // requester. It is not chat and never reaches the recorder's stream; the
+    // reply is one or more `print` commands, which the recorder ignores.
+    if crate::demo::publish::handle_client_command(client_num, cmd) {
+        return false;
+    }
+
     let net_status_enabled = state::with_state(|s| s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0);
     if net_status_enabled
         && (unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"netStatus".as_ptr(), 9) } == 0

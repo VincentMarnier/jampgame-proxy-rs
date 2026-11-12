@@ -676,3 +676,41 @@ change stays a one-function edit plus its unit test.
   carries the two broadcasts and not the private `tell secret-tell`.
 - Unit tests `chat_rule_is_the_copy_addressed_to_the_subject` and
   `chat_rule_records_broadcasts_but_never_team_chat`.
+
+---
+
+## U-014 — Max-file-size guard: runtime trigger not yet observed
+
+### Question
+
+`proxy_sv_demoMaxFileMB` closes a segment that reaches the cap, warns once and
+continues with the next segment number. The threshold helper is unit-tested,
+but was the close/continue path ever seen at runtime?
+
+### Classification
+
+**minor — the threshold decision is a pure helper with boundary tests, and the
+close/restart machinery is the same code the min-free guard exercised
+end-to-end (`docs/demo-format.md` §13). The risk is an off-by-one in the
+recorded byte count, not a lost game.**
+
+### Evidence so far (2026-11-12, Gate C)
+
+With the cap lowered to `1` MiB, several busy FFA runs were driven with bots
+(`sv_fps` 40–125, up to 29 bots and up to five human subjects). The largest
+single segment before the subject left was
+`artifacts/phase4-size4/demos/20261112-115603_mp_ffa3_main_s1.dm_26`
+(853,536 bytes). The synthetic subjects are killed about every 60 s; the game
+sets a dead FFA player to `TEAM_SPECTATOR`, and the Phase 3 rule closes the
+segment when its only human is spectating, so no segment reached 1 MiB. No
+`demo segment reached` line was produced, and no new segment number followed —
+i.e. the guard did not fire before the segment closed for the subject-loss
+reason.
+
+### Cheapest experiment
+
+On a real server with human players (who respawn and keep moving), set
+`proxy_sv_demoMaxFileMB 1` for one busy round; the proxy log should show
+`demo segment reached proxy_sv_demoMaxFileMB 1 MB (…)` once and the next
+segment should start with the next `s<N>` number. Alternatively build a
+throwaway binary whose cap is read in bytes (not MiB) and repeat the bot run.

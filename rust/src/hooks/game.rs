@@ -707,6 +707,11 @@ pub fn run_begin_intermission() {
     state::with_state(|s| s.tffa.intermission = true);
     unsafe { original() }
 
+    // Demo recorder: keep the intermission tail for a few seconds so the demo
+    // shows the final scores, then close and print the download links to the
+    // clients (handled by the recorder tick; see `proxy_sv_demoIntermissionSecs`).
+    crate::demo::recorder::on_begin_intermission();
+
     if !end_game_stats_enabled() {
         return;
     }

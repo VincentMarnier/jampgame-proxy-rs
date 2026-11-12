@@ -234,6 +234,20 @@ pub struct Recorder {
     next_tick: i32,
     /// One-shot log while `MAX_DEMO_RECORDERS` is reached.
     limit_logged: bool,
+    /// `proxy_sv_demoMinFreeMB` is currently exceeded: segments were closed
+    /// and no new one starts until the maintenance thread reports recovery.
+    min_free_blocked: bool,
+    /// One-shot log for the max-file-size guard in this generation.
+    size_warned: bool,
+    /// Per-instance `svs.time` before which no new segment starts (the
+    /// max-file-size guard continues on the *next* tick).
+    size_resume: Vec<(DemoInstance, i32)>,
+    /// `BeginIntermission`: when the intermission tail has been recorded long
+    /// enough to close the segments and print the links.
+    intermission_deadline: Option<i32>,
+    /// Intermission closed the segments: no new segment starts until the next
+    /// `GAME_INIT`.
+    intermission_closed: bool,
 }
 
 static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
@@ -482,13 +496,21 @@ fn read_slots(
         let spectator = connected
             && has_gentity
             && session_is_spectator(index as i32, g_clients, g_client_size);
+        // The engine's own discriminator (`SV_CalcPings`/`G_AddBot`):
+        // `gentity->r.svFlags & SVF_BOT`. Game-created bots (`addbot`) get
+        // their gentity flag but never pass through the proxy's
+        // `GAME_CLIENT_CONNECT` mirror, so the mirror alone is not enough.
+        let engine_bot = has_gentity
+            && unsafe { read_i32(gentity + crate::sdk::OFFSET_SHARED_SVFLAGS) }
+                & crate::sdk::SVF_BOT as i32
+                != 0;
         *out = ClientSlot {
             slot: index as i32,
             connected,
             in_world: state >= crate::sdk::CS_ACTIVE,
             has_gentity,
             spectator,
-            bot: bots[index],
+            bot: bots[index] || engine_bot,
             occupied: state != 0,
         };
     }
@@ -1047,6 +1069,7 @@ fn drain_chat() -> Vec<(i32, Vec<u8>)> {
 const ENTRY_TICK: c_int = 0;
 const ENTRY_GAME_INIT: c_int = 1;
 const ENTRY_GAME_SHUTDOWN: c_int = 2;
+const ENTRY_INTERMISSION: c_int = 3;
 
 unsafe extern "C" {
     /// `csrc/syscall_shim.c`: realigns the stack to the i386 ABI, then calls
@@ -1063,6 +1086,7 @@ extern "C" fn dispatch(op: c_int) {
         ENTRY_TICK => tick_impl(),
         ENTRY_GAME_INIT => game_init_impl(),
         ENTRY_GAME_SHUTDOWN => game_shutdown_impl(),
+        ENTRY_INTERMISSION => begin_intermission_impl(),
         _ => {}
     }
 }
@@ -1087,28 +1111,61 @@ pub fn on_game_shutdown() {
     aligned(ENTRY_GAME_SHUTDOWN);
 }
 
+/// `BeginIntermission`, ABI-aligned: start the intermission tail timer.
+pub fn on_begin_intermission() {
+    aligned(ENTRY_INTERMISSION);
+}
+
+fn begin_intermission_impl() {
+    with_recorder(|recorder| {
+        if recorder.instances.is_empty() {
+            return;
+        }
+        let seconds = state::cvar_integer(state::CVAR_DEMO_INTERMISSION_SECS).clamp(0, 30);
+        // SAFETY: svs.time is the server snapshot clock.
+        let now = unsafe { read_i32(vars::SVS + OFFSET_SVS_TIME) };
+        recorder.intermission_deadline = Some(now.saturating_add(seconds.saturating_mul(1000)));
+        recorder.intermission_closed = false;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-/// Close every open segment (map boundary, shutdown, master switch off). Each
-/// file gets its `-1/-1` terminator; nothing crosses a map change.
-fn close_all(recorder: &mut Recorder) {
+/// Close every open segment, keeping the per-instance segment counters (used
+/// by the disk guards, which must not restart numbering at `s1`).
+fn close_instances(recorder: &mut Recorder) {
     for entry in recorder.instances.drain(..) {
         if let Some(active) = entry.active {
             stop_active(*active);
         }
     }
-    recorder.segments.clear();
-    recorder.limit_logged = false;
 }
 
-/// `GAME_INIT`: close a previous map's files and forget timing.
+/// Close every open segment (map boundary, shutdown, master switch off). Each
+/// file gets its `-1/-1` terminator; nothing crosses a map change.
+fn close_all(recorder: &mut Recorder) {
+    close_instances(recorder);
+    recorder.segments.clear();
+    recorder.limit_logged = false;
+    recorder.intermission_deadline = None;
+    recorder.intermission_closed = false;
+}
+
+/// `GAME_INIT`: close a previous map's files, reset timing and announce the
+/// generation that just ended.
 fn game_init_impl() {
     with_recorder(|recorder| {
         recorder.next_tick = 0;
         close_all(recorder);
+        recorder.min_free_blocked = false;
+        recorder.size_warned = false;
+        recorder.size_resume.clear();
+        recorder.intermission_deadline = None;
+        recorder.intermission_closed = false;
     });
+    crate::demo::publish::on_game_init();
 }
 
 /// `GAME_SHUTDOWN`: close every open file with the `-1/-1` terminator.
@@ -1196,9 +1253,56 @@ fn tick_impl() {
             *entry = membership_of(slot, mode, &matches, &court_of);
         }
 
+        // Phase 4 disk guards. The free-space reading comes from the
+        // maintenance thread (statvfs on the game thread is D-001.1 class);
+        // it is at most one second old and every value below is a plain
+        // atomic read.
+        let min_free_mb = i64::from(state::cvar_integer(state::CVAR_DEMO_MIN_FREE_MB).max(0));
+        let free_bytes = crate::demo::publish::free_bytes();
+        let below_minimum =
+            min_free_mb > 0 && free_bytes >= 0 && free_bytes < min_free_mb * 1024 * 1024;
+        if below_minimum && !recorder.min_free_blocked {
+            recorder.min_free_blocked = true;
+            eprintln!(
+                "----- proxy-rs: demo recording paused: {free_bytes} bytes free is below proxy_sv_demoMinFreeMB {min_free_mb} MB"
+            );
+            // Keep the per-instance segment counters: resuming continues the
+            // numbering instead of colliding with the files just closed.
+            close_instances(recorder);
+        } else if !below_minimum && recorder.min_free_blocked {
+            recorder.min_free_blocked = false;
+            eprintln!(
+                "----- proxy-rs: demo recording resumed: {free_bytes} bytes free (minimum {min_free_mb} MB)"
+            );
+        }
+
+        // The boundary demo block is a `print` broadcast sent once a player is
+        // back in the world (a full map change runs `GAME_INIT` before anyone
+        // reconnects).
+        crate::demo::publish::flush_announcement(
+            slots
+                .iter()
+                .any(|slot| slot.in_world && !slot.bot && slot.connected),
+        );
+
+        // `BeginIntermission`: keep recording the intermission tail for a few
+        // seconds (final scores visible in the demo), then close and print the
+        // links to the clients who are still in intermission.
+        if let Some(deadline) = recorder.intermission_deadline {
+            if now >= deadline {
+                recorder.intermission_deadline = None;
+                recorder.intermission_closed = true;
+                close_instances(recorder);
+                crate::demo::publish::announce_intermission();
+            }
+        }
+
         // Chat commands forwarded by the proxy since the last tick, screened
         // per recorder by the one named rule.
         let chats = drain_chat();
+
+        let max_file_mb = i64::from(state::cvar_integer(state::CVAR_DEMO_MAX_FILE_MB).max(0));
+        let tick_ms = 1000 / sv_fps().max(1);
 
         // 1. Advance every open segment.
         for entry in &mut recorder.instances {
@@ -1257,17 +1361,46 @@ fn tick_impl() {
                 }
             }
             probe_scoreboard(active, now, g_entities, g_entity_size);
-            if !build_snapshot(active, now) {
+            let written = build_snapshot(active, now);
+            if !written {
                 if let Some(active) = entry.active.take() {
                     stop_active(*active);
                 }
+                continue;
+            }
+            // Max-file-size guard: close a segment that reached the cap and
+            // continue with the next segment number on the next tick.
+            if size_cap_reached(active.writer.bytes_written(), max_file_mb) {
+                let instance = entry.instance;
+                let bytes = active.writer.bytes_written();
+                let path = active.path.clone();
+                if let Some(active) = entry.active.take() {
+                    stop_active(*active);
+                }
+                if !recorder.size_warned {
+                    recorder.size_warned = true;
+                    eprintln!(
+                        "----- proxy-rs: demo segment reached proxy_sv_demoMaxFileMB {max_file_mb} MB ({bytes} bytes) — closed {}",
+                        path.display()
+                    );
+                }
+                recorder
+                    .size_resume
+                    .push((instance, now.saturating_add(tick_ms)));
             }
         }
         recorder.instances.retain(|entry| entry.active.is_some());
 
         // 2. Start a recorder for every instance that now has an eligible
-        //    human and no open segment.
+        //    human and no open segment. The min-free and size guards keep
+        //    this loop from restarting immediately.
+        if !recorder.min_free_blocked {
+            recorder.size_resume.retain(|(_, at)| *at > now);
+        }
         for slot in 0..len {
+            if recorder.min_free_blocked || recorder.intermission_closed {
+                break;
+            }
             if !slots[slot].eligible() {
                 continue;
             }
@@ -1291,6 +1424,13 @@ fn tick_impl() {
                 }
                 continue;
             }
+            if recorder
+                .size_resume
+                .iter()
+                .any(|(blocked, _)| *blocked == instance)
+            {
+                continue;
+            }
             let Some(subject) = lowest_subject(instance, slots, &membership) else {
                 continue;
             };
@@ -1309,6 +1449,11 @@ fn tick_impl() {
 }
 
 /// Next file segment number for an instance (1-based, reset at `GAME_INIT`).
+/// `proxy_sv_demoMaxFileMB` reached? `0` (or less) disables the guard.
+fn size_cap_reached(bytes: u64, max_file_mb: i64) -> bool {
+    max_file_mb > 0 && bytes >= (max_file_mb as u64) * 1024 * 1024
+}
+
 fn next_segment(segments: &mut Vec<(DemoInstance, u32)>, instance: DemoInstance) -> u32 {
     if let Some(entry) = segments.iter_mut().find(|(known, _)| *known == instance) {
         let segment = entry.1;
@@ -1465,6 +1610,11 @@ fn try_start(
         subject,
         viewer_slot
     );
+    // Phase 4: publish the name so the HTTP side keeps returning 404 until the
+    // file is terminated (see `stop_active`).
+    if let Some(file_name) = path.file_name() {
+        crate::demo::publish::opened(&file_name.to_string_lossy());
+    }
 
     Some(Active {
         writer,
@@ -1503,12 +1653,22 @@ fn setgame_payload() -> Result<Vec<u8>, super::msg::MsgError> {
 fn stop_active(mut active: Active) {
     let frames = active.writer.frames_written();
     let bytes = active.writer.bytes_written();
+    let name = active
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
     let result = active.writer.finish();
     match result {
-        Ok(()) => eprintln!(
-            "----- proxy-rs: demo recording stopped: {} ({frames} frames, {bytes} bytes)",
-            active.path.display()
-        ),
+        Ok(()) => {
+            // Only a terminated file may be served (Phase 4).
+            if let Some(name) = &name {
+                crate::demo::publish::closed(name);
+            }
+            eprintln!(
+                "----- proxy-rs: demo recording stopped: {} ({frames} frames, {bytes} bytes)",
+                active.path.display()
+            )
+        }
         Err(error) => eprintln!(
             "----- proxy-rs: demo recording stop failed: {}: {error}",
             active.path.display()
@@ -2226,6 +2386,19 @@ mod tests {
         assert!(!chat_command_for(subject, b"tchat \"team\"", subject));
         assert!(!chat_command_for(subject, b"ltchat \"team\"", subject));
         assert!(!chat_command_for(-1, b"tchat \"team\"", subject));
+    }
+
+    #[test]
+    fn max_file_size_guard_threshold_is_inclusive_and_optional() {
+        // `0` (and a negative admin value) means no cap.
+        assert!(!size_cap_reached(0, 0));
+        assert!(!size_cap_reached(u64::MAX, -1));
+        // The cap is inclusive and counted in MiB.
+        assert!(!size_cap_reached(1024 * 1024 - 1, 1));
+        assert!(size_cap_reached(1024 * 1024, 1));
+        assert!(size_cap_reached(1024 * 1024 + 1, 1));
+        assert!(!size_cap_reached(2 * 1024 * 1024 - 1, 2));
+        assert!(size_cap_reached(128 * 1024 * 1024, 128));
     }
 
     #[test]

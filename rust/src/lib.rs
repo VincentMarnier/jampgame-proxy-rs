@@ -40,6 +40,7 @@ mod engine;
 mod fov;
 mod guidban;
 mod hooks;
+mod http;
 mod ignore;
 mod instances;
 mod jampgame;
@@ -519,6 +520,10 @@ fn game_init(args: &[c_int; 12]) -> c_int {
 fn game_shutdown(args: &[c_int; 12]) -> c_int {
     // Terminate the open demo file before detaching/unloading.
     crate::demo::recorder::on_game_shutdown();
+    // Stop the publication side threads before unloading the module: both run
+    // outside the engine and must not outlive the cdylib.
+    crate::demo::publish::shutdown();
+    http::shutdown();
     // Drop the serverinfo feature bit: the engine's cvar table outlives this
     // module, and a pristine module loaded next must not keep advertising the
     // 15-int scoreboard parse.
@@ -668,6 +673,13 @@ fn update_proxy_cvars() {
     if enabled == 0 && was_enabled {
         timenudge::clear_offsets();
     }
+    // Phase 4 publication: the demo maintenance thread and the HTTP listener
+    // are reconciled here, once per frame. Both go through the C realign shim
+    // because this runs on the engine's 4-byte-aligned `vmMain` stack (D-001.1)
+    // and starting a thread/socket reaches std code that zeroes aligned stack
+    // locals. They never call back into the engine.
+    crate::demo::publish::frame_sync();
+    http::frame_sync();
 }
 
 // ---------------------------------------------------------------------------

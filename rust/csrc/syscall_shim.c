@@ -198,3 +198,25 @@ void jampgame_aligned_entry(jampgame_entry_fn f, int op)
 {
 	f(op);
 }
+
+/*
+ * Free bytes on a filesystem, for the demo disk guards (Phase 4). Written in
+ * C because `struct statvfs` is an ABI type: the Rust side must not guess its
+ * layout. Called from the demo maintenance thread (a normal std thread) and
+ * exported to Rust as `jampgame_free_bytes`.
+ */
+#include <sys/statvfs.h>
+
+long long jampgame_free_bytes(const char *path)
+	__attribute__((force_align_arg_pointer));
+
+long long jampgame_free_bytes(const char *path)
+{
+	struct statvfs info;
+
+	if (path == NULL)
+		return -1;
+	if (statvfs(path, &info) != 0)
+		return -1;
+	return (long long)info.f_bavail * (long long)info.f_frsize;
+}

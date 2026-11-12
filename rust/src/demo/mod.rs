@@ -1,17 +1,23 @@
-//! Server-side demo recording: pure-Rust file writer and gamestate encoder.
+//! Server-side demo recording: pure-Rust file writer, gamestate encoder,
+//! recorder and publication.
 //!
-//! Phase 1 of the `proxy_sv_enableDemoRecord` plan. This module has **no
-//! engine dependency**: `cargo test` exercises it on the host. The recorder
-//! core (frame ring, playerstate/entity snapshots, instance selection) is
-//! Phase 2 and lives outside this module.
+//! `file`/`gamestate`/`msg` (Phase 1) have **no engine dependency** and are
+//! exercised by `cargo test` on the host. `recorder` (Phases 2–3) owns the
+//! engine-facing frame ring and the per-instance POVs; `publish` (Phase 4)
+//! owns the generation list, retention/maintenance thread, `/demos` and
+//! announcements. The HTTP surface itself lives in `crate::http` and reads
+//! only the published configuration/open-set.
 //!
-//! Wire-format evidence: `docs/demo-format.md`; decisions: Phase 5 will add
+//! Wire-format evidence: `docs/demo-format.md` §10–§13; decisions:
 //! `docs/decisions/0027-server-demos.md`.
-#![allow(dead_code, unused_imports)] // consumed by the Phase 2 recorder
+// The Phase 1/2 modules keep a few imports and helpers for their sibling
+// modules and tests; the allow is inherited by the whole demo tree.
+#![allow(dead_code, unused_imports)]
 
 pub mod file;
 pub mod gamestate;
 pub mod msg;
+pub mod publish;
 pub mod recorder;
 
 pub(crate) mod fields;

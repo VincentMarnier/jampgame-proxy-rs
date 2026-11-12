@@ -75,6 +75,17 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_antiWallHack`               | 0       | hide a player from a viewer when no line of sight reaches any part of their body or drawn saber; uses the same hide as the FOV cap, so footsteps, swings and saber hum keep playing; `0` = off (see [Anti-wallhack](#anti-wallhack)) |
 | `proxy_sv_antiWallHackMargin`         | 0       | world-unit margin added around the sampled body box for the line-of-sight test: a player whose silhouette is within that distance of a clear line stays visible, so cover-edge contacts do not pop in/out; `0` = exact body box (see [Anti-wallhack](#anti-wallhack)) |
 | `proxy_sv_antiWallHackCameraRange`    | 100     | maximum third-person camera setback (world units) used as the start of the line-of-sight traces; a wall behind the viewer pulls it in exactly like the client's camera collision does; `100` matches the stock `cg_thirdPersonRange`, `0` traces from the player's eye (first-person-strict) |
+| `proxy_sv_enableDemoRecord`            | 0       | record server-side demos (`.dm_26`) of the game, one file per instance; see [Server-side demos](#server-side-demos) |
+| `proxy_sv_demoDir`                    | `demos` | output directory for recorded demos |
+| `proxy_sv_enableHttp`                  | 0       | start the proxy's own HTTP listener (needs `proxy_sv_enableDemoDownload`; no route → no socket) |
+| `proxy_sv_httpBind`                   | `127.0.0.1` | listener bind address |
+| `proxy_sv_httpPort`                   | 8090    | listener port |
+| `proxy_sv_enableDemoDownload`          | 0       | enable the demo HTTP routes, `/demos` and boundary announcements |
+| `proxy_sv_demoUrl`                    | (empty) | public base used to build demo links (e.g. `https://example.com`); empty uses `http://<proxy_sv_httpBind>:<proxy_sv_httpPort>` (wildcard bind → `127.0.0.1`). Set it from a config file: the engine treats `//` as a comment in a console `set` |
+| `proxy_sv_demoRetentionHours`          | 24      | delete matching demo files older than this at each game boundary (`0` = keep forever) |
+| `proxy_sv_demoMaxFileMB`               | 128     | close a segment at this size and continue with the next segment number (`0` = no cap) |
+| `proxy_sv_demoMinFreeMB`               | 512     | pause recording and close segments while the demo filesystem has less free space (`0` = off) |
+| `proxy_sv_demoIntermissionSecs`        | 3       | seconds of the intermission to record after the game ends (so the demo shows the final scores) before the files are closed and their links are sent to the clients; `0` closes immediately. Keep it below the engine's 4 s duel / 5 s other intermission |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_sabersFps`,
@@ -1000,6 +1011,47 @@ A full map change always starts a fresh ladder. The stock duel's automatic
 pull-in, its global duelist/health configstrings and its own intermission/
 win-limit handling are suppressed while the ladder runs, and players cannot
 join a court with `team free` (the ladder assigns courts).
+
+### Server-side demos
+
+The proxy can record the server's own demo stream, so a match can be reviewed
+without a player having recorded it client-side. `proxy_sv_enableDemoRecord 1`
+writes one Phase 1 `.dm_26` file per instance to `proxy_sv_demoDir`:
+
+- `main` for non-instanced gametypes, `tffa<N>` per parallel TFFA match and
+  `duel<N>` per parallel duel court (`N` is 1-based; `tffa1` is the main slot's
+  match);
+- the POV follows the lowest human player of that instance (spectators and bots
+  are skipped, a player leaving switches the POV inside the same file);
+- a file ends with the `-1/-1` terminator and a new segment number starts after
+  a map change, a `map_restart`, an empty instance, the size guard or a
+  free-space pause.
+
+Each file carries the instance's own players, entities, configstrings,
+scoreboard and broadcast-only chat (never team chat, `tell` or `print`).
+
+With `proxy_sv_enableHttp 1` and `proxy_sv_enableDemoDownload 1` the proxy
+serves those files itself (no external hosting): `GET /demos` returns a JSON
+array of `{name, url, size}` and `GET /demos/<file>` downloads one
+(`application/octet-stream`, `HEAD` supported). Only files with the proxy's own
+name pattern and a valid terminator are served; a segment still being written
+is `404`. The listener binds `127.0.0.1:8090` by default; set
+`proxy_sv_httpBind`/`proxy_sv_httpPort` to expose it. `proxy_sv_demoUrl` only
+changes the links shown in the boundary announcement and `/demos` (for NAT or a
+reverse proxy), and must be set from a config file because a console `set`
+treats `//` as a comment.
+
+At the end of a game the recorder keeps recording for
+`proxy_sv_demoIntermissionSecs` seconds of the intermission (so the demo shows
+the final scores), then closes the files and sends the finished files with
+their download links to the **clients** as console text (the same `print`
+mechanism as the end-game stats): a header, at most 12 links, then a `/demos`
+hint. Nothing is broadcast with `svsay`, and the list is not printed to the
+server console. If the intermission ends before that delay, the block is
+delivered at the start of the next game instead; players can always type
+`/demos` to get the links in their own console. Retention (`proxy_sv_demoRetentionHours`) removes only matching files
+whose timestamp is old enough; the free-space and size guards stop or rotate
+recording instead of filling the disk.
 
 ## Usage
 

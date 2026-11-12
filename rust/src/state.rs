@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 51] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 60] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -76,11 +76,20 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 51] = [
     (c"proxy_tffa_enable", c"0"),
     (c"proxy_tffa_maxMatches", c"8"),
     (c"proxy_tffa_maxGroupSize", c"12"),
-    // Phase 2 demo recording (docs/demo-format.md). The retention sweep,
-    // /demos, announcements and size/free-space guards are Phase 4 and their
-    // cvars are not registered yet.
+    // Phase 2 demo recording (docs/demo-format.md).
     (c"proxy_sv_enableDemoRecord", c"0"),
     (c"proxy_sv_demoDir", c"demos"),
+    // Phase 4 publication (docs/demo-format.md §13): HTTP surface, demo
+    // downloads, links, retention and the accepted disk guards.
+    (c"proxy_sv_enableHttp", c"0"),
+    (c"proxy_sv_httpBind", c"127.0.0.1"),
+    (c"proxy_sv_httpPort", c"8090"),
+    (c"proxy_sv_enableDemoDownload", c"0"),
+    (c"proxy_sv_demoUrl", c""),
+    (c"proxy_sv_demoRetentionHours", c"24"),
+    (c"proxy_sv_demoMaxFileMB", c"128"),
+    (c"proxy_sv_demoMinFreeMB", c"512"),
+    (c"proxy_sv_demoIntermissionSecs", c"3"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -274,6 +283,41 @@ pub const CVAR_LEGACY_TFFA_MAX_GROUP_SIZE: usize = 48;
 pub const CVAR_DEMO_ENABLE: usize = 49;
 /// `proxy_sv_demoDir`: output directory for `.dm_26` files.
 pub const CVAR_DEMO_DIR: usize = 50;
+/// `proxy_sv_enableHttp`: master switch for the proxy's own HTTP listener
+/// (`crate::http`). The listener only starts when a route is enabled as well
+/// (`proxy_sv_enableDemoDownload`), so turning downloads off really stops the
+/// socket instead of leaving an empty server bound.
+pub const CVAR_ENABLE_HTTP: usize = 51;
+/// `proxy_sv_httpBind`: address the listener binds (`127.0.0.1` by default,
+/// so nothing is exposed unless the owner opts in).
+pub const CVAR_HTTP_BIND: usize = 52;
+/// `proxy_sv_httpPort`: listener port (`8090` by default).
+pub const CVAR_HTTP_PORT: usize = 53;
+/// `proxy_sv_enableDemoDownload`: enables the `/demos` HTTP routes, the
+/// `/demos` client command and the boundary announcements.
+pub const CVAR_DEMO_DOWNLOAD: usize = 54;
+/// `proxy_sv_demoUrl`: public base used to build links (e.g.
+/// `https://example.com`). When empty the listener's own address is used
+/// (`http://<proxy_sv_httpBind>:<proxy_sv_httpPort>`, a wildcard bind shown as
+/// `127.0.0.1`). This is not an external-hosting switch: the proxy always
+/// serves the files itself.
+pub const CVAR_DEMO_URL: usize = 55;
+/// `proxy_sv_demoRetentionHours`: delete matching demo files older than this
+/// many hours at each game boundary (`0` = keep forever).
+pub const CVAR_DEMO_RETENTION_HOURS: usize = 56;
+/// `proxy_sv_demoMaxFileMB`: close a segment that reaches this size (`0` =
+/// no cap) and continue with the next segment number.
+pub const CVAR_DEMO_MAX_FILE_MB: usize = 57;
+/// `proxy_sv_demoMinFreeMB`: stop recording (and close open segments) while
+/// the demo directory's filesystem has less free space than this (`0` = off).
+pub const CVAR_DEMO_MIN_FREE_MB: usize = 58;
+/// `proxy_sv_demoIntermissionSecs`: seconds of the intermission to record
+/// after `BeginIntermission` (so the demo shows the final scores) before the
+/// segments are closed and the download links are printed to the clients.
+/// `0` closes immediately at `BeginIntermission`. The engine's intermission is
+/// at least 4 s (duel between rounds) / 5 s (other modes); a larger value may
+/// fall back to the next game start.
+pub const CVAR_DEMO_INTERMISSION_SECS: usize = 59;
 
 /// The pre-rename spelling of a canonical cvar, if it has one (D-026).
 ///
@@ -1214,6 +1258,16 @@ pub fn with_state<R>(f: impl FnOnce(&mut ProxyState) -> R) -> R {
 /// were changed, the canonical one wins.
 pub fn cvar_integer(index: usize) -> i32 {
     with_state(|s| cvar_integer_in(s, index))
+}
+
+/// The current string value of a proxy cvar (NUL-trimmed, lossy UTF-8).
+pub fn cvar_string(index: usize) -> String {
+    with_state(|s| {
+        let field = &s.cvars[index].string;
+        let len = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+        let bytes: Vec<u8> = field[..len].iter().map(|&c| c as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 /// [`cvar_integer`] for call sites that already hold the state lock.

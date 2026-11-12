@@ -824,10 +824,14 @@ the raw table id (`DemoInstance::viewer_match`).
 
 A subject is a client that is **in the world** (`client_t.state >= CS_ACTIVE`;
 a connecting client already has a `gentity`, assigned at direct connect, but
-must not count), has a `gentity`, is not on `TEAM_SPECTATOR`, and is not a bot
-(`ClientState::is_bot`, set from `GAME_CLIENT_CONNECT`). The recorder follows
-the lowest such slot of its instance. A server with only bots therefore records
-nothing.
+must not count), has a `gentity`, is not on `TEAM_SPECTATOR`, and is not a bot.
+Bot detection uses the engine's own discriminator
+(`gentity->r.svFlags & SVF_BOT`, the one `SV_CalcPings` and `G_AddBot` use),
+ORed with the proxy's `GAME_CLIENT_CONNECT` mirror: game-created bots
+(`addbot`) get the gentity flag but do not pass through the proxy's connect
+mirror (found in Phase 4 when `addbot` bots became subjects). The recorder
+follows the lowest such slot of its instance. A server with only bots
+therefore records nothing.
 
 The Phase 2 transition table is unchanged, now scoped to the instance:
 
@@ -1056,3 +1060,262 @@ DISPLAY=:0 ./original/GameData/taystjk.x86_64 \
   the `GAME_INIT` of the round transition. Carried `map_restart` rounds
   therefore do not chain one file across rounds.
 - No retention, announcements, `/demos`, disk guards (Phase 4).
+
+## 13. Phase 4 implementation notes (publication)
+
+Code: `rust/src/http/{mod.rs,server.rs}` (listener lifecycle, request parsing,
+routes, static serving), `rust/src/demo/publish.rs` (generation bookkeeping,
+`/demos`, announcements, retention, free-space sampling), the recorder
+integration in `rust/src/demo/recorder.rs` (name publication, size/min-free
+guards, console announcement), the two hooks in `rust/src/shared_api.rs`
+(`demos` client command) and `rust/src/lib.rs` (per-frame sync, shutdown), and
+`csrc/syscall_shim.c` (`jampgame_free_bytes`, a `statvfs` helper because the
+struct is an ABI type).
+
+**Owner decision (2026-11-12): the proxy hosts the HTTP server itself.** There
+is no external-hosting path: `proxy_sv_enableDemoDownload` gates the routes and
+really stops the listener when it is off. `proxy_sv_demoUrl` is only the public
+base used to build links (loopback bind/NAT/reverse proxy), never a hosting
+switch.
+
+### CVars
+
+| cvar | default | meaning |
+| --- | --- | --- |
+| `proxy_sv_enableHttp` | `0` | listener master |
+| `proxy_sv_httpBind` | `127.0.0.1` | bind address |
+| `proxy_sv_httpPort` | `8090` | bind port |
+| `proxy_sv_enableDemoDownload` | `0` | demo routes, `/demos`, announcements; with it off no route is enabled and the listener does not start |
+| `proxy_sv_demoUrl` | (empty) | public link base; empty uses `http://<proxy_sv_httpBind>:<proxy_sv_httpPort>` (a wildcard bind is shown as `127.0.0.1`). Must be set from a config file: the engine's command tokenizer treats `//` as a comment, so `set proxy_sv_demoUrl http://…` truncates to `http:` (quoting inside a cfg keeps it intact) |
+| `proxy_sv_demoRetentionHours` | `24` | delete matching files older than N hours at each boundary; `0` = keep forever |
+| `proxy_sv_demoMaxFileMB` | `128` | close a segment at this size and continue with the next segment number; `0` = no cap |
+| `proxy_sv_demoMinFreeMB` | `512` | stop recording while the demo filesystem has less free space; `0` = off |
+| `proxy_sv_demoIntermissionSecs` | `3` | seconds of the intermission to record after the game ends (final scores in the demo) before closing the files and printing the links; `0` = close at `BeginIntermission`. Keep it below the engine's 4 s duel / 5 s other intermission |
+
+### Listener lifecycle
+
+`update_proxy_cvars` runs once per `GAME_RUN_FRAME`; it ends with
+`publish::frame_sync()` and `http::frame_sync()`, both entered through the C
+realign shim (`jampgame_aligned_entry`, D-001.1) because the caller is on the
+engine's 4-byte-aligned `vmMain` stack and binding a socket/spawning a thread
+reaches std code that zeroes aligned stack locals.
+
+The listener is active when `proxy_sv_enable` + `proxy_sv_enableHttp` +
+`proxy_sv_enableDemoDownload` are on. The applied configuration is a key of
+bind/port/dir/base/retention; a change stops the old listener and starts a new
+one. A bind failure (EADDRINUSE, EACCES, invalid port) logs **one** line and
+leaves the feature off until that exact configuration changes — no retry storm,
+no crash. `GAME_SHUTDOWN` (including the `map_restart` shutdown/init pair the
+engine performs) stops the listener and the maintenance thread; `GAME_INIT`
+restarts them with fresh configuration.
+
+### Threads and the isolation rule
+
+- `proxy-demo-http`: owns the `TcpListener`, accepts with a 20 ms
+  non-blocking poll; up to 8 pending connections per worker queue; on a full
+  queue it writes `503` and closes.
+- Four `proxy-demo-http-worker` threads: the bounded worker set. This replaces
+  the literal "thread per connection" with a fixed pool of the same
+  concurrency; a request never creates an unbounded thread. Workers are
+  detached on shutdown (an in-flight body may finish while the game thread
+  continues); the listener itself is joined, so the port is free when
+  `stop()` returns.
+- The HTTP threads receive a `Config` snapshot (demo dir, link base, retention)
+  and the shared **open-segment name set**, which is proxy memory (a
+  `Mutex<BTreeSet<String>>`), never engine state. They never read `crate::state`
+  and never call an engine function.
+- Per-connection: read timeout 5 s, write timeout 15 s per chunk, request
+  header block capped at 8 KiB (`431` beyond), one request per connection
+  (`Connection: close`), no keep-alive, no `Range`. Bodies are streamed in
+  64 KiB chunks with a bounded write loop; a failed write drops the connection.
+
+### Routes
+
+| request | result |
+| --- | --- |
+| `GET /demos` (or `/demos/`) | a JSON array of `{name, url, size}` for the servable files (`application/json`); the set is pattern, not expired, closed (terminator), not open |
+| `GET /demos/<file>` | `application/octet-stream`, `Content-Length`, the file bytes; HEAD sends the headers only |
+| `HEAD /…` | same route, headers only |
+| `/api`, `/api/...` | `501 Not Implemented` (reserved) |
+| everything else / other methods | `404` / `405` (with `Allow: GET, HEAD`) |
+
+Path safety is threefold: the target is percent-decoded before routing; only a
+name accepted by `DemoName::parse` can become a `File` route (that rejects
+slashes, backslashes, `..`, NUL, unknown instances and non-sanitised maps); and
+the resolved file is `canonicalize`d and must start with the canonicalised demo
+directory, which rejects symlink escapes. The TOCTOU window between
+canonicalisation and `File::open` is accepted and documented here: an attacker
+who can already replace files inside the demo directory does not need the HTTP
+server to do it.
+
+A segment that is still being written is never served: the recorder publishes
+its name to the open set at start and removes it only after the writer appended
+the `-1/-1` terminator (`stop_active` → `publish::closed`). The HTTP side also
+requires the last 8 bytes to be `FF×8`, so a leftover truncated file from a
+crashed process is not served even though the open set was lost.
+
+### Retention and the maintenance thread
+
+`proxy-demo-maintenance` is started from `frame_sync` (module initialisation in
+practice) and stopped at shutdown. It owns every filesystem scan and `statvfs`:
+the game thread only reads an atomic free-byte value and the published name
+set. Every second it re-scans the demo directory for the `/demos` set and
+refreshes the free-space reading (`statvfs` through
+`jampgame_free_bytes`). A sweep is requested at thread start and at each
+`GAME_INIT`; it deletes only names accepted by `DemoName::parse` whose embedded
+UTC timestamp is older than the retention, skips open segments, and never
+touches foreign files or directories. It logs one line:
+
+```
+----- proxy-rs: demo retention (1h): deleted 1, kept 7 in /srv/jka/artifacts/demos
+```
+
+`0` hours means "keep forever" (nothing is deleted). A future timestamp (clock
+adjustment) is never expired.
+
+### Size guard
+
+After a successfully written frame, `size_cap_reached(bytes,
+proxy_sv_demoMaxFileMB)` (inclusive MiB comparison, `0` = off) closes the
+segment with `-1/-1`, logs the cap once per generation, and records a
+per-instance resume time so the next segment number starts on the **next**
+tick — the rest of the game is not lost. The helper and its boundaries are
+unit-tested (`max_file_size_guard_threshold_is_inclusive_and_optional`).
+
+**Runtime forcing note.** Lowering the cap to `1` was attempted repeatedly
+(`artifacts/phase4-size4` reached 853,536 bytes of a 1 MiB cap). The synthetic
+test subjects are killed by bots every ~60 s (the game sets them to
+`TEAM_SPECTATOR` on death, which by the Phase 3 rule closes the segment), so no
+single segment crossed 1 MiB in the gate runs. The cap was not observed firing
+at runtime; see U-014 for the exact attempts and the proposed owner
+experiment. The close/warn/next-segment machinery is the same one the
+min-free guard exercises end-to-end below.
+
+### Min-free guard
+
+The game thread reads `proxy_sv_demoMinFreeMB` and the maintenance thread's
+`free_bytes()` atomic each tick. When free space is below the threshold it
+closes every open segment with `-1/-1` (keeping the segment counters), logs the
+transition once, and refuses to start new segments; when space recovers it logs
+the recovery and recording resumes with the next segment number. A `0`
+threshold disables the check; an unknown reading (`-1`) never blocks.
+
+Runtime evidence (`artifacts/phase4-final`, final build): with
+`proxy_sv_demoMinFreeMB 2000000` the log shows
+`demo recording paused: … is below …`, the segment is closed, no file appears
+while blocked; resetting to `0` logs `demo recording resumed` and starts
+`…_s2`.
+
+Intermission evidence (2026-11-12, `JAMP_BOTS=4`, forced `fraglimit 1`):
+`BeginIntermission` at `t=61000`; the recording closed at `t=64000` (3 s), the
+demo's last 3 s decode with `ps.pm_type = 7` (`PM_INTERMISSION`) and carry the
+final `scores` command; the debug log shows
+
+```
+event=demo.intermission 1 file(s) announced at intermission, 2 client line(s)
+event=demo.intermission.line ^5Demo files from this game:
+event=demo.intermission.line ^7http://127.0.0.1:29071/demos/20261112-145536_mp_duel1_tffa1_s1.dm_26
+```
+
+and the HTTP listing at the same time was
+`[{"name":"…","url":"http://127.0.0.1:29071/demos/…","size":92116}]`
+(`application/json`, `python3 -m json.tool` valid).
+
+### Announcements and `/demos`
+
+The recorder tracks the segments of the **current generation** (reset at each
+`GAME_INIT`, full map change or `map_restart`). At a boundary it builds a
+**client console block** — a `print` broadcast, the same mechanism the
+end-game stats tables use, deliberately *not* `svsay` (no chat) and not echoed
+to the server console:
+
+```
+print "^5Demo files from this game:\n"
+print "^7http://127.0.0.1:8090/demos/20261112-…_s1.dm_26\n"
+print "^7http://127.0.0.1:8090/demos/20261112-…_s2.dm_26\n"
+```
+
+### Intermission tail and the client block
+
+`BeginIntermission` starts a timer of `proxy_sv_demoIntermissionSecs`
+(default 3 s). The recorder keeps writing through the intermission, so the
+demo contains the final `scores` and the players at the intermission point
+(`ps.pm_type = PM_INTERMISSION`). When the timer fires, the recorder closes
+every segment with `-1/-1`, marks the generation announced, and sends the
+block to every connected client with `print` (the end-game stats mechanism;
+never `svsay`). The block is a header, at most 12 links, then
+`... N more demo(s), type /demos`. `/demos` still lists the generation during
+the remaining intermission.
+
+The default 3 s stays inside the engine's minimum intermission (4 s for a duel
+between rounds, 5 s otherwise, `CheckIntermissionExit`). A larger value can
+miss the window: `GAME_INIT` then closes the segments and the block is queued
+for the **first player back in the world** of the next game (the
+`pending`/`flush_announcement` fallback), so links are never lost. The queue is
+gated by the two download cvars (`downloads_configured`); only the
+crash-diagnostics log (`proxy_sv_debugLog`) records the intermission detail.
+
+The link base is `proxy_sv_demoUrl` when set, otherwise the listener's own
+address (`proxy_sv_httpBind`/`proxy_sv_httpPort`, with `0.0.0.0`/`::` shown as
+`127.0.0.1`), so neither the clients nor the JSON list get bare names. A public
+host still belongs in `proxy_sv_demoUrl` for NAT/reverse-proxy setups.
+
+`/demos` (client command, intercepted in `shared_api::client_command` after the
+mute/ignore/team paths) prints the current generation's closed and still
+existing files, up to 32, with the same links; with downloads off it prints one
+line saying so. The reply is `print` commands, which the recorder never
+records; every served link is also logged server-side
+(`----- proxy-rs: /demos from client N: <link>`).
+
+Generation state and the open set are process memory; they reset at
+`GAME_SHUTDOWN` and start empty after a module reload (old files on disk are
+found again by the maintenance scan, and a truncated leftover is rejected by
+the terminator check).
+
+### Gate C evidence (final build `c0eba619…`)
+
+| artifact | evidence |
+| --- | --- |
+| `artifacts/phase4-final/demos/20261112-120830_mp_ffa3_main_s1.dm_26` (`165d3cff…`) | first generation closed at the boundary; GET and HEAD over HTTP: `200`, `Content-Type: application/octet-stream`, `Content-Length 5576`, byte-identical SHA-256 |
+| client capture (2026-11-12) | `print "^5Demo files from this game:\n"` then `print "^7http://127.0.0.1:29071/demos/…"` — delivered on entering the new game |
+| `artifacts/phase4/demos/…` (`27792fee…`, `b7fc8e19…`, `97f7b791…`, `4c5300b9…`, `fee7c21e…`, `028afea3…`) | two generations end-to-end (full `map`, then `map_restart`), open segment 404 before its terminator, listing exactly the closed names, `Content-Length`/SHA-256 match |
+| current run (2026-11-12) | the client block above; `/demos` prints the same URLs to the requester; no server-console list |
+| `artifacts/phase4-size4/demos/20261112-115603_mp_ffa3_main_s1.dm_26` | the size-cap attempt (853,536 B, subject deaths close the segment before 1 MiB) |
+
+Large-file load (final build, `artifacts/phase4-guards/demos/20261112-112854_mp_ffa3_main_s4.dm_26`,
+868,892 bytes): 20 simultaneous GETs gave 12×`200` (byte-identical SHA-256
+`e3f4e8df…`) and 8×`503` (bounded worker queue), while `getinfo` round-trips
+stayed at 0.2–0.3 ms in 13 of 15 samples (two UDP queries timed out at a 2 s
+timeout under the burst). An **unterminated leftover** from a killed process
+(`artifacts/phase4-size4/…` 853,536 B, tail not `FF×8`) produced an empty
+`/demos` listing and is refused by the same terminator check.
+
+Negative checks on the final build: `/demos/../x`, `/demos/%2e%2e%2fx`,
+a foreign name, a pattern-matching decoy without a terminator and a missing
+route all `404`; `/api/x` `501`; an oversized request line `431`; a symlink
+pointing outside the directory `404`; 8 simultaneous GETs all `200` with the
+same SHA-256; 20 simultaneous GETs give 12×`200` and 8×`503` (worker/queue
+bound, no crash); `proxy_sv_enableDemoDownload 0` closes the listener (curl
+exit 56, connection refused) and re-enabling restores it; a port already held
+by another process logs one `cannot bind … Address already in use` line and
+leaves the feature off, after which a new port works. During 30 concurrent
+downloads `getinfo` round-trips stayed at 0.2 ms in 11 of 12 samples (one lost
+datagram at a 2 s timeout under load).
+
+### Phase 4 deviations and limits
+
+- **Worker pool, not a thread per connection**: four fixed workers with a
+  bounded queue (8) and a `503` on overflow. The concurrency bound and the
+  isolation are as specified; the thread's lifetime is not per request.
+- **Size-cap trigger not observed at runtime** (see above/U-014); unit-tested.
+- **`proxy_sv_demoUrl` cannot be set with `set … http://…`** from rcon/`+set`
+  (engine tokenizer). Use a cfg (`set proxy_sv_demoUrl "http://…"`); the code
+  reads whatever the engine stored. `run-server.sh` writes it to its cfg
+  (`JAMP_URL`, default `http://127.0.0.1:$JAMP_API_PORT`).
+- **`(TFFA n)` prefix vs file label** still differ by one (Phase 3 note).
+- **No `Range`/keep-alive**, per the specification; a client that needs
+  resumable downloads must re-fetch.
+- **Retention runs on the maintenance thread**, not immediately at the boundary
+  instant; the log line documents the deletion.
+- No Phase 5 behaviour (announcements beyond the boundary block, `/demos` web
+  UI, disk quota accounting) is implemented here.
