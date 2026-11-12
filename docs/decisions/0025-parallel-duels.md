@@ -304,3 +304,18 @@ core now stamps them with the acting player's instance
 notes: D-006, 2026-11-11 round. Court isolation for these effects is therefore
 shared with TFFA and needs no duel-specific code; the live two-court listen
 remains open (bots never create split instances).
+
+## 13. Revision 2026-11-12 — cross-court landing effects
+
+Reported for TFFA and expected for duels ("when one in another instance jumps on
+sand, the landing effect is in all instances"): the landing puffs (and the
+water/acid/lava splashes) are owner-less positional temp entities built by
+`G_PlayEffect` from inside the player's own `Pmove`
+(`PM_CrashLandEffect`/`PM_WaterEvents`, `bg_pmove.c`, `QAGAME` only), so the
+snapshot filter attributed them to the world and every court saw them. The
+shared core now stamps the `EV_PLAY_EFFECT`/`EV_PLAY_EFFECT_ID`/
+`EV_PLAY_PORTAL_EFFECT_ID` family with the acting scope
+(`event_uses_construction_source`), which needs no new detour: `ClientThink_real`
+already opens the player's scope around `Pmove`. Full evidence, fix, tests and
+the live two-client matched pair: D-006, 2026-11-12 round. Duel courts get the
+same isolation with no duel-specific code.

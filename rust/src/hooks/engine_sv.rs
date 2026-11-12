@@ -1484,7 +1484,10 @@ pub unsafe extern "C" fn sv_netchan_process(cl: usize, msg: usize) -> c_int {
 /// `TffaState::sound_source`, or `s.clientNum` for `EV_ENTITY_SOUND` and the
 /// player respawn/teleport events `EV_PLAYER_TELEPORT_IN`/`OUT`) and dropped
 /// the same way; map/world sounds and `EV_GLOBAL_SOUND` broadcasts stay
-/// visible/audible everywhere.
+/// visible/audible everywhere. The owner-less positional effects
+/// (`EV_PLAY_EFFECT`/`EV_PLAY_EFFECT_ID`/`EV_PLAY_PORTAL_EFFECT_ID`, e.g. a
+/// player's landing sand puff) are attributed by the same construction stamp
+/// and dropped outside their own instance.
 ///
 /// World/static entities are always kept. Player entities (`entNum < 32`
 /// with a live client) and owned entities (missiles/sabers via
@@ -1700,15 +1703,18 @@ fn snapshot_keep(
             }
             crate::tffa::SoundAttribution::None => {}
         }
-        // Clash effects carry no usable owner on most creator paths (the
-        // saber-lock tick, a thrown-saber block, a deflect and the wall-hit
-        // flare set none at all, and `WP_SaberDoClash`'s `s.otherEntityNum2` is
-        // ambiguous with the memset zero for client 0). The construction stamp —
-        // recorded while the acting player's scope was open (`WP_SaberPositionUpdate`
-        // / `ClientThink_real` / `G_RunMissile`) — names the instance, so it is
-        // authoritative whenever it is not the world stamp. A world stamp keeps
-        // the old field-based behaviour below (`EV_SABER_BLOCK`'s
-        // `OptionalAttacker` rule).
+        // Clash and positional-effect temp entities carry no usable owner on
+        // most creator paths (the saber-lock tick, a thrown-saber block, a
+        // deflect and the wall-hit flare set none at all; `WP_SaberDoClash`'s
+        // `s.otherEntityNum2` is ambiguous with the memset zero for client 0;
+        // `G_PlayEffect`/`G_PlayEffectID` set only `s.eventParm`, which is how a
+        // player's landing/splash effect reached every instance). The
+        // construction stamp — recorded while the acting player's scope was open
+        // (`ClientThink_real`'s `Pmove`, `WP_SaberPositionUpdate` /
+        // `G_RunMissile`) — names the instance, so it is authoritative whenever
+        // it is not the world stamp. A world stamp keeps the old field-based
+        // behaviour below (`EV_SABER_BLOCK`'s `OptionalAttacker` rule, and
+        // `EventOwners::World` for the effects).
         if crate::tffa::event_uses_construction_source(event) {
             let source = sound_source[ent_num as usize];
             if source != crate::tffa::SOURCE_WORLD {
@@ -2205,6 +2211,53 @@ mod tests {
                     game.base(),
                     48
                 ));
+            }
+        }
+    }
+
+    /// Reported bug: a player's landing effect (the material puff, e.g. the
+    /// sand one) played in every instance. `PM_CrashLandEffect`
+    /// (`bg_pmove.c:3684-3724`) and `PM_WaterEvents` (`bg_pmove.c:5671-5734`)
+    /// build their effect inside the player's own `Pmove` with `G_PlayEffect`
+    /// → `G_TempEntity(EV_PLAY_EFFECT)`, which sets only `s.eventParm`. The
+    /// construction stamp names the acting player's instance, so the snapshot
+    /// keeps it there and hides it everywhere else; a world stamp (an effect
+    /// built with no scope open) keeps the old visible-everywhere behaviour.
+    #[test]
+    fn positional_effects_follow_their_construction_stamp() {
+        let (mut game, mut table) = main_player_and_viewer();
+        game.with_player(5);
+        table[5] = 1;
+        for event in [
+            crate::sdk::EV_PLAY_EFFECT,
+            crate::sdk::EV_PLAY_EFFECT_ID,
+            crate::sdk::EV_PLAY_PORTAL_EFFECT_ID,
+        ] {
+            game.with_entity(48, crate::sdk::ET_EVENTS + event);
+            let mut sounds = sound_table();
+            sounds[48] = 1;
+            assert!(
+                snapshot_keep(1, &table, &sounds, &shared_table(), game.base(), 48),
+                "event {event} stamped for instance 1 must be kept there"
+            );
+            for foreign in [0, 2] {
+                assert!(
+                    !snapshot_keep(foreign, &table, &sounds, &shared_table(), game.base(), 48),
+                    "event {event} stamped for instance 1 must be hidden in match {foreign}"
+                );
+            }
+            for viewer_match in [0, 1, 2] {
+                assert!(
+                    snapshot_keep(
+                        viewer_match,
+                        &table,
+                        &sound_table(),
+                        &shared_table(),
+                        game.base(),
+                        48
+                    ),
+                    "event {event} with a world stamp stays visible everywhere"
+                );
             }
         }
     }

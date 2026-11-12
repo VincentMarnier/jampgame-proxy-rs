@@ -44,7 +44,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
 | `proxy_sv_lockTeamsAfterXSecs`        | 0       | grace delay in seconds (`0` = off) before a TDM/CTF round's teams lock: teams stay open for that long; a join in an instance cancels its lock for the round, otherwise the even roster is capped at its size; with parallel TFFA every instance is handled per its own roster (see [Team lock](#team-lock)) |
 | `proxy_sv_teamSizeRules`              | (empty) | per-team-size `timelimit`/`fraglimit`/`capturelimit` override, reconciled as the roster changes, independent of `proxy_sv_lockTeamsAfterXSecs` (see below); with parallel TFFA it uses the per-match sizes and applies one rule only when every populated match agrees |
-| `proxy_parallel_tffas_enable`         | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/team chat isolated per match, global chat stays server-wide (see below); the pre-rename `proxy_tffa_enable` still works as an alias |
+| `proxy_parallel_tffas_enable`         | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/sounds-and-effects/team chat isolated per match, global chat stays server-wide (see below); the pre-rename `proxy_tffa_enable` still works as an alias |
 | `proxy_parallel_tffas_maxMatches`     | 8       | maximum parallel TFFA matches (alias `proxy_tffa_maxMatches`) |
 | `proxy_parallel_tffas_maxGroupSize`   | 12      | maximum players per TFFA match, both teams combined (alias `proxy_tffa_maxGroupSize`) |
 | `proxy_parallel_duels_enable`         | 0       | run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners move up and losers down between rounds, first to `duel_fraglimit` wins (see [Parallel duels](#parallel-duels)) |
@@ -913,8 +913,9 @@ chosen team. A password-protected match still answers with the
 `tffa_join <id> <password>` invite instead of fielding a team; spectating it
 stays open.
 Each match is isolated: cross-match damage is
-dropped, cross-match players (and their projectiles, sabers and kill feed)
-are hidden from snapshots, and the scoreboard lists all matches' players — so
+dropped, cross-match players (and their projectiles, sabers, kill feed, sounds
+and effects — including landing and splash puffs) are hidden from snapshots, and
+the scoreboard lists all matches' players — so
 you can see who is where — with the other matches' players grouped as
 spectators and the red/blue header plus each player's score taken from the
 viewer's own match. Global chat is server-wide; team chat (`say_team`) stays

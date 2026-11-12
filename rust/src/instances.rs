@@ -1662,11 +1662,14 @@ pub fn event_owners(event: c_int) -> EventOwners {
         EV_SIEGESPEC => EventOwners::SOwner,
         // Everything else: `EV_CLIENTJOIN`, `EV_GIVE_NEW_RANK`,
         // `EV_SET_FREE_SABER`/`EV_SET_FORCE_DISABLE`, `EV_TEAM_POWER`,
-        // `EV_SCREENSHAKE`, `EV_PLAY_EFFECT*`, `EV_GLASS_SHATTER`,
-        // `EV_MISC_MODEL_EXP`, the weapon-impact events
-        // (`EV_MISSILE_MISS`, `EV_DISRUPTOR_*_MISS/_HIT`, ...), the
-        // `EV_SABER_CLASHFLARE` hit point, and the deliberate broadcasts
-        // already handled by `sound_attribution` are owner-less world events.
+        // `EV_SCREENSHAKE`, `EV_GLASS_SHATTER`, `EV_MISC_MODEL_EXP`, the
+        // weapon-impact events (`EV_MISSILE_MISS`, `EV_DISRUPTOR_*_MISS/_HIT`,
+        // ...), the `EV_SABER_CLASHFLARE` hit point, and the deliberate
+        // broadcasts already handled by `sound_attribution` are owner-less
+        // world events. (`EV_PLAY_EFFECT*` is also owner-less, but it is
+        // attributed by its construction stamp first — see
+        // `event_uses_construction_source`; this arm is its fallback for an
+        // effect built with no scope open.)
         _ => EventOwners::World,
     }
 }
@@ -1732,9 +1735,10 @@ pub fn stamp_temp_source(te: usize) {
 /// `G_TempEntity` wrapper's stamping rule: a pending `G_Sound` handshake wins;
 /// otherwise an event that carries no reliable owner of its own takes the open
 /// acting scope — the owner-less `EV_PREDEFSOUND` force sounds (force
-/// jump/protect/absorb) and the clash-family events (see
-/// `event_uses_construction_source`) — and every other direct `G_TempEntity`
-/// call stays a world/map sound. Consumes the pending source in every case.
+/// jump/protect/absorb), the clash-family events and the positional
+/// `EV_PLAY_EFFECT*` effects (see `event_uses_construction_source`) — and every
+/// other direct `G_TempEntity` call stays a world/map sound. Consumes the
+/// pending source in every case.
 pub fn stamp_temp_source_event(te: usize, event: c_int) {
     state::with_state(|s| {
         let Some(num) = ent_num_of(s.located_game_data.g_entities, te) else {
@@ -1763,9 +1767,33 @@ pub fn stamp_temp_source_event(te: usize, event: c_int) {
 /// that zero when the attacker is client 0. The stamp, recorded while the
 /// creating player's acting scope is open, names the instance in every one of
 /// those paths.
+///
+/// `EV_PLAY_EFFECT`/`EV_PLAY_EFFECT_ID`/`EV_PLAY_PORTAL_EFFECT_ID` are the
+/// positional effects `G_PlayEffect`/`G_PlayEffectID` build (`g_utils.c:1250-1284`).
+/// They carry the effect id in `s.eventParm` and no owner field either. The
+/// reported bug — *"when one in another instance jumps on sand, the landing
+/// effect of his landing is in all instances"* — is `PM_CrashLandEffect`
+/// (`bg_pmove.c:3684-3724`, reached from `Pmove` inside `ClientThink_real`)
+/// calling `G_PlayEffect(EFFECT_LANDING_SAND, …)`; the water/lava/acid splashes
+/// (`PM_WaterEvents`, `bg_pmove.c:5671-5734`) and the other creators (turret,
+/// mine and detpack explosions, sparks, debris) have the same shape. The stamp
+/// recorded while the pmove/think/missile scope is open attributes the effect to
+/// the acting player's (or clone's) instance; an effect built with no scope open
+/// stays a world effect, visible to every instance.
 pub fn event_uses_construction_source(event: c_int) -> bool {
-    use crate::sdk::{EV_PREDEFSOUND, EV_SABER_BLOCK, EV_SABER_CLASHFLARE};
-    matches!(event, EV_PREDEFSOUND | EV_SABER_BLOCK | EV_SABER_CLASHFLARE)
+    use crate::sdk::{
+        EV_PLAY_EFFECT, EV_PLAY_EFFECT_ID, EV_PLAY_PORTAL_EFFECT_ID, EV_PREDEFSOUND,
+        EV_SABER_BLOCK, EV_SABER_CLASHFLARE,
+    };
+    matches!(
+        event,
+        EV_PREDEFSOUND
+            | EV_SABER_BLOCK
+            | EV_SABER_CLASHFLARE
+            | EV_PLAY_EFFECT
+            | EV_PLAY_EFFECT_ID
+            | EV_PLAY_PORTAL_EFFECT_ID
+    )
 }
 
 /// Pure stamping rule (unit-tested): the `G_Sound` handshake beats everything;

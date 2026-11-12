@@ -2797,7 +2797,7 @@ harness asserts every line above and exits 0.
     that stamp before the field-based rule, so the ambiguous client-0 field
     no longer decides anything when a scope was open.
 
-  Tests: `construction_source_events_are_the_owner_less_saber_clash_family`
+  Tests: `construction_source_events_are_the_owner_less_temp_events`
   and the extended `temp_stamp_prefers_the_sound_handshake_then_the_scope`
   (pure rules), plus the `snapshot_keep` fixture
   `clash_effects_follow_their_construction_stamp` (both events stamped for
@@ -2826,4 +2826,97 @@ harness asserts every line above and exits 0.
   positional effects (impact sparks, glass shards, model debris) still carry
   the world stamp and stay visible to every instance; PVS does not separate
   instances because they share the map's geometry. The optional `0` of a
-  client-0 sniper beam target is likewise still broadcast.
+  client-0 sniper beam target is likewise still broadcast. The one family that
+  did get an owner (the `G_PlayEffect`/`G_PlayEffectID` effects, i.e. landing
+  and splash puffs) is covered by the 2026-11-12 round at the end of this
+  document.
+
+- **Cross-instance landing/splash effects (2026-11-12).**
+
+  Reported for both modes: *"Found a bug in parallel TFFAs, so probably duels
+  too. When one in another instance jump on sand, there is the jump/particle
+  effect of his landing in all instances."*
+
+  **Root cause.** The landing puff is not a player entity event: `Pmove` builds it
+  server-side. `PM_CrashLandEffect` (`bg_pmove.c:3684-3724`, `#ifdef QAGAME`)
+  picks the material from `pml.groundTrace.surfaceFlags & MATERIAL_MASK` and calls
+  `G_PlayEffect(EFFECT_LANDING_MUD|SAND|DIRT|SNOW|GRAVEL, bottom,
+  groundTrace.plane.normal)`; `PM_WaterEvents` (`bg_pmove.c:5671-5734`, same
+  guard) does the same for the water/acid/lava splashes. `G_PlayEffect`
+  (`g_utils.c:1250-1260`) and `G_PlayEffectID` (`:1267-1284`) are
+  `G_TempEntity(origin, EV_PLAY_EFFECT[_ID])` plus `s.eventParm = fxID` — the temp
+  entity names no player in any owner field. `event_owners` therefore classified
+  `EV_PLAY_EFFECT*` as `EventOwners::World` and the snapshot filter kept it for
+  every viewer; PVS does not separate instances because they share the map's
+  geometry, so a landing at the same coordinates (the maps' floors) played in
+  every match.
+
+  **Binary evidence** (`original/jalinuxded_1.011/jampgamei386.so`): `G_PlayEffect`
+  `0x16e624` calls `G_TempEntity__FPfi` with event `0x44` (68) and stores the
+  effect id at `0x114` (276 = `s.eventParm`); `G_PlayEffectID` `0x16e684` is the
+  same with `0x45` (69). The player-driven call sites are in the pmove code
+  reached from `ClientThink_real` (`g_active.c:3122`, `Pmove`): `0xf6198`
+  (`PM_CrashLandEffect`, ids 15-19 selected by the material switch) and
+  `0xf9685`/`0xf96a1`/`0xf96e3` (`PM_WaterEvents`, ids 12-14). They appear in
+  `.rel.text` as `R_386_PC32` relocations to `G_PlayEffect__FiPfT2`; a plain
+  `objdump` run shows them as `call <next instruction>` because the relocations
+  are applied at load time — reading `.rel.text` is what makes these call sites
+  visible (worth remembering for other "this function has no callers" readings).
+
+  **Fix (shared instancing core, so it covers GT_TEAM TFFA and GT_DUEL alike).**
+  No new hook was needed: `ClientThink_real` already opens the acting player's
+  scope (S9, D-006.6) around `Pmove`, and the `G_TempEntity` detour already stamps
+  every construction. The effect family was added to
+  `tffa::event_uses_construction_source`:
+
+  - new pins `sdk::EV_PLAY_EFFECT` 68, `EV_PLAY_EFFECT_ID` 69,
+    `EV_PLAY_PORTAL_EFFECT_ID` 70 (enum-counted, matching the binary's `0x44`/
+    `0x45`/the enum order), with the layout-pin test;
+  - `tffa::temp_stamp_source` now stamps these events with the open acting scope
+    (the `G_Sound` handshake still wins; no scope still means `SOURCE_WORLD`), and
+    `snapshot_keep` consults the stamp before the field rule, so a scoped effect is
+    kept only in the instance that built it while a world-stamped effect keeps its
+    everywhere-visible behaviour;
+  - the same rule covers every other `G_PlayEffect`/`G_PlayEffectID` creator that
+    runs inside a scoped call (turret, mine and detpack explosions, sparks,
+    debris).
+
+  **Tests:** `construction_source_events_are_the_owner_less_temp_events` (renamed
+  and extended), the extended
+  `temp_stamp_prefers_the_sound_handshake_then_the_scope` (effects take the scope,
+  `SCOPE_NONE` stays world), the extended
+  `sdk::tests::temp_event_sound_constants_match_bg_public` pins, and the new
+  snapshot fixture
+  `positional_effects_follow_their_construction_stamp` (events 68-70 stamped for
+  instance 1: kept there, hidden in main and instance 2; a world stamp stays
+  visible to every viewer). `cargo test` 522/522, `clippy -D warnings`,
+  `fmt --check` and the i686 release build green.
+
+  **Runtime matched pair** (real `linuxjampded`, the shipped 2003 module, the
+  staged proxy, one temporary probe in `snapshot_keep` and one in
+  `stamp_temp_source_event`, both removed before the final build; not part of the
+  automated suite). Two synthetic protocol clients from
+  `tools/runtime/a2_netstatus_groundtruth.py` (both running and jump-charging on
+  `duel_starkiller_base`, the tested map with the highest snow surface share;
+  the probe read `parm=18` = `EFFECT_LANDING_SNOW`): `Alpha` sent
+  `tffa_create` and played in instance 1, `Bravo` stayed in main. Snapshot-filter
+  lines, gate on:
+
+  ```text
+  viewer=0 event=68 parm=18 stamp=0 keep=true      (142) main effect, main viewer
+  viewer=0 event=68 parm=18 stamp=1 keep=false     ( 53) instance-1 effect hidden from main
+  viewer=1 event=68 parm=18 stamp=0 keep=false     ( 49) main effect hidden from instance 1
+  viewer=1 event=68 parm=18 stamp=1 keep=true      (114) instance-1 effect, own viewer
+  ```
+
+  With the stamp bypassed by a temporary env var (the pre-fix behaviour):
+  `parm=18 stamp=255 keep=true(world)` for **both** viewers (30 and 6 events) —
+  the reported leak. The gate therefore hides each match's landing puffs from the
+  other match while keeping its own.
+
+  **Residual.** The other owner-less positional events stay as documented in the
+  2026-11-11 round (`EV_MISSILE_MISS*`, `EV_GLASS_SHATTER`,
+  `EV_MISC_MODEL_EXP`, the optional client-0 sniper-beam target); `EV_SCREENSHAKE`
+  is deliberately not covered (its player field rides `s.modelindex`). Extending
+  the same construction stamp to them is a mechanical follow-up if reported — the
+  scope and the stamp already exist.

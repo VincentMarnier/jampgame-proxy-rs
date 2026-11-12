@@ -37,6 +37,13 @@
 //!   doors, NPC chatter) and `EV_GLOBAL_SOUND` broadcasts stay audible
 //!   everywhere; item entities are per-instance clones (D-006.6), so their
 //!   `EV_ITEM_RESPAWN` drops with the clone.
+//! - effects: the owner-less positional effect temp entities
+//!   (`EV_PLAY_EFFECT`/`EV_PLAY_EFFECT_ID`/`EV_PLAY_PORTAL_EFFECT_ID`, built by
+//!   `G_PlayEffect`/`G_PlayEffectID`) are stamped like the sounds and dropped
+//!   outside their own instance, so a player's landing sand puff or splash
+//!   (`PM_CrashLandEffect`/`PM_WaterEvents` inside their `Pmove`) no longer
+//!   plays in the other instances' matches. An effect built with no acting
+//!   scope open stays a world effect, visible everywhere.
 //! - scoreboard: `G_SEND_SERVER_COMMAND` trap rewrites `scores ...` per
 //!   viewer with the per-player per-match score copies. The roster is unified
 //!   (every connected client is listed, so players can see who is in which
@@ -4947,6 +4954,19 @@ mod tests {
                 SOURCE_WORLD
             );
         }
+        // The owner-less positional effects (a player's landing sand puff, a
+        // water splash) take the open acting scope the same way.
+        for event in [
+            crate::sdk::EV_PLAY_EFFECT,
+            crate::sdk::EV_PLAY_EFFECT_ID,
+            crate::sdk::EV_PLAY_PORTAL_EFFECT_ID,
+        ] {
+            assert_eq!(temp_stamp_source(SOURCE_WORLD, event, 2), 2);
+            assert_eq!(
+                temp_stamp_source(SOURCE_WORLD, event, SCOPE_NONE),
+                SOURCE_WORLD
+            );
+        }
         // No scope (or another event) stays a world effect.
         assert_eq!(
             temp_stamp_source(SOURCE_WORLD, crate::sdk::EV_PREDEFSOUND, SCOPE_NONE),
@@ -4963,12 +4983,17 @@ mod tests {
     }
 
     #[test]
-    fn construction_source_events_are_the_owner_less_saber_clash_family() {
-        assert!(event_uses_construction_source(crate::sdk::EV_PREDEFSOUND));
-        assert!(event_uses_construction_source(crate::sdk::EV_SABER_BLOCK));
-        assert!(event_uses_construction_source(
-            crate::sdk::EV_SABER_CLASHFLARE
-        ));
+    fn construction_source_events_are_the_owner_less_temp_events() {
+        for event in [
+            crate::sdk::EV_PREDEFSOUND,
+            crate::sdk::EV_SABER_BLOCK,
+            crate::sdk::EV_SABER_CLASHFLARE,
+            crate::sdk::EV_PLAY_EFFECT,
+            crate::sdk::EV_PLAY_EFFECT_ID,
+            crate::sdk::EV_PLAY_PORTAL_EFFECT_ID,
+        ] {
+            assert!(event_uses_construction_source(event), "event {event}");
+        }
         for event in [
             crate::sdk::EV_SABER_HIT,
             crate::sdk::EV_SHIELD_HIT,

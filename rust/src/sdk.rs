@@ -659,6 +659,23 @@ pub const EV_PREDEFSOUND: i32 = 40;
 /// respawn sound (`sound/player/telein.wav`, `cg_event.c:2789`).
 pub const EV_PLAYER_TELEPORT_IN: i32 = 64;
 pub const EV_PLAYER_TELEPORT_OUT: i32 = 65;
+/// `EV_PLAY_EFFECT`/`EV_PLAY_EFFECT_ID`/`EV_PLAY_PORTAL_EFFECT_ID`
+/// (`bg_public.h` `entity_event_t`, 68-70): the positional effect temp
+/// entities `G_PlayEffect`/`G_PlayEffectID` build (`g_utils.c:1250-1284`). They
+/// carry the effect id in `s.eventParm` and name no player in any owner field,
+/// so the proxy attributes them at construction from the open acting scope
+/// (see `tffa::event_uses_construction_source`).
+///
+/// The shipped module (binary evidence): `G_PlayEffect` `0x16e624` calls
+/// `G_TempEntity(origin, 0x44)` and `G_PlayEffectID` `0x16e684` the same with
+/// `0x45`. Their player-driven call sites are inside `Pmove`:
+/// `PM_CrashLandEffect` (`bg_pmove.c:3684-3724`) passes the landing material
+/// ids 15-19 (mud/sand/dirt/snow/gravel) at `0xf6198`, and `PM_WaterEvents`
+/// (`bg_pmove.c:5671-5734`) the splash ids 12-14 at
+/// `0xf9685`/`0xf96a1`/`0xf96e3` (`.rel.text` `R_386_PC32` → `G_PlayEffect`).
+pub const EV_PLAY_EFFECT: i32 = 68;
+pub const EV_PLAY_EFFECT_ID: i32 = 69;
+pub const EV_PLAY_PORTAL_EFFECT_ID: i32 = 70;
 pub const EV_MUTE_SOUND: i32 = 74;
 pub const EV_GENERAL_SOUND: i32 = 76;
 pub const EV_GLOBAL_SOUND: i32 = 77;
@@ -1467,6 +1484,11 @@ mod tests {
         // Respawning/teleporting players (`sound/player/telein.wav`).
         assert_eq!(EV_PLAYER_TELEPORT_IN, 64);
         assert_eq!(EV_PLAYER_TELEPORT_OUT, 65);
+        // `G_PlayEffect`/`G_PlayEffectID` (`g_utils.c:1250-1284`): the
+        // owner-less positional effect family.
+        assert_eq!(EV_PLAY_EFFECT, 68);
+        assert_eq!(EV_PLAY_EFFECT_ID, 69);
+        assert_eq!(EV_PLAY_PORTAL_EFFECT_ID, 70);
         assert_eq!(EV_MUTE_SOUND, 74);
         assert_eq!(EV_GENERAL_SOUND, 76);
         assert_eq!(EV_GLOBAL_SOUND, 77);
