@@ -15,7 +15,10 @@ This directory contains knowledge derived from the original implementation and t
   pure-Rust writer/encoder notes (naming, retention, buffering, RMG refusal,
   generated tables, byte-exact fixture test) and Phase 2 recorder-core notes
   (tick hook, frame ring/scratch, `cs` mirroring, `recorder_build`, gate-A
-  artifacts and playback limitation).
+  artifacts and playback limitation) and the Phase 3 instance-manager notes
+  (one recorder per TFFA match/duel court, per-instance subjects and identity,
+  per-instance configstrings/scoreboard, the chat rule, `GAME_INIT` lifecycle,
+  the 16-recorder cap, gate-B artifacts and the real-client playback run).
 - `inventory.md` — per-feature map of the original proxy: keep/drop decision
   per D-002 and the implementation technique for each hook.
 - `ybeproxy-2026-delta.md` — the 2026 security/crash fixes of the C++ proxy

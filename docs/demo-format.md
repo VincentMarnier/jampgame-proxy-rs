@@ -526,7 +526,9 @@ stays a single valid delta chain. The switch is logged:
 ```
 
 A slot is eligible when it is connected (`>= CS_PRIMED`), has a `gentity`, and
-its `sess.sessionTeam` is not `TEAM_SPECTATOR`. The spectator check matters
+its `sess.sessionTeam` is not `TEAM_SPECTATOR`. **(Phase 3 supersedes this
+rule with "in the world" `>= CS_ACTIVE` plus human-only and instance
+membership; see §12.)** The spectator check matters
 because a spectating client's `ps` is `SpectatorClientEndFrame`'s copy of the
 player they follow (with `PMF_FOLLOW` and that player's `clientNum`): recording
 it would silently follow someone else's POV instead of switching. The check is
@@ -697,8 +699,8 @@ The initial gamestate carries the current values, so the mirror starts from
 
 - `proxy_sv_enableDemoRecord` (0), `proxy_sv_demoDir` (`demos`).
 - **Temporary Phase 2 debug**: `proxy_sv_demoRecordEmpty` (0) starts a
-  recording with no players. It is not a README feature and Phase 3 replaces
-  the start rule.
+  recording with no players. It is not a README feature and **was removed in
+  Phase 3** (§12); the human-subject rule replaces it.
 - `GAME_INIT` and `GAME_SHUTDOWN` close an open file with `-1/-1`; disabling
   the cvar or the master switch does the same. The file writer buffers 64 KiB
   and flushes at the threshold or at close.
@@ -783,11 +785,274 @@ the owner's run above is the visual confirmation.
 
 - Subject selection is the lowest eligible slot (bots included); spectators are
   skipped and the POV switches in place when the subject leaves or joins
-  spectators (see "Subject switching" above). There is still no human-only
-  rule, no per-instance configstring rewrite and no multi-segment file per
-  instance.
+  spectators (see "Subject switching" above). **(Phase 3 supersedes this with
+  human-only subjects, per-instance recorders and per-instance configstrings;
+  see §12.)**
 - One `main` segment per `GAME_INIT`; a map change/restart opens a new file.
 - Vehicle playerstate frames are discarded, not emitted (U-010).
 - RMG gamestates are refused by the Phase 1 encoder; the segment is skipped.
 - The empty-map debug cvar exists only for gate A.
 - No retention, `/demos`, announcements, size/free-space guards (Phase 4).
+
+## 12. Phase 3 implementation notes (instances and lifecycle)
+
+Code: `rust/src/demo/recorder.rs` (manager, instance view, chat, lifecycle);
+`rust/src/duel.rs` (`court_hud`, shared by the live HUD push and the recorder);
+`rust/src/instances.rs` (`cs_generation`); `rust/src/syscall.rs` (chat tap
+after the engine accepted a `G_SEND_SERVER_COMMAND`).
+
+### Instance set and ownership
+
+`Recorder` owns a `Vec<InstanceRecorder>`; each entry is one instance
+(`DemoInstance::{Main, Tffa(u8), Duel(u8)}`) plus its currently open segment.
+No instance bookkeeping was added: membership comes from the existing tables
+used by the live per-viewer path.
+
+| Gametype / feature | Instance set | Membership source |
+| --- | --- | --- |
+| No instancing (`instance_mode() == Off`) | one `main` | every connected slot |
+| Parallel TFFA (`proxy_parallel_tffas_enable`, `GT_TEAM`) | `tffa<id+1>` | `state.tffa.client_match[slot]` (written for both modes) |
+| Parallel duels (`proxy_parallel_duels_enable`, `GT_DUEL`) | `duel<court+1>` | `state.duel.courts[..court_count]`, `Court::players()` |
+
+A duel client that is benched or spectating belongs to no court and is not a
+subject; a TFFA client is always in exactly one match id (`0` = the main
+slot's match). The file label is the Phase 1 1-based label (`match 0` →
+`tffa1`, `court 0` → `duel1`); the value handed to the per-viewer rewrites is
+the raw table id (`DemoInstance::viewer_match`).
+
+### Subject per instance
+
+A subject is a client that is **in the world** (`client_t.state >= CS_ACTIVE`;
+a connecting client already has a `gentity`, assigned at direct connect, but
+must not count), has a `gentity`, is not on `TEAM_SPECTATOR`, and is not a bot
+(`ClientState::is_bot`, set from `GAME_CLIENT_CONNECT`). The recorder follows
+the lowest such slot of its instance. A server with only bots therefore records
+nothing.
+
+The Phase 2 transition table is unchanged, now scoped to the instance:
+
+- current subject still eligible → keep;
+- left / not in world / no `gentity` → switch to the instance's lowest
+  eligible slot, same file (spectator semantics: next snapshot's
+  `ps.clientNum` changes);
+- joined spectators → same switch, reason `spectator`;
+- still playing but moved to another match/court → switch, reason `moved
+  instance`;
+- no eligible slot left in the instance → close the segment (`-1/-1`);
+  repopulation opens the next segment number for that instance.
+
+### Naming and viewer identity
+
+Each recorder runs Phase 2's identity rule independently
+(`pick_viewer_slot(subject, sv_maxclients, slots)`): with
+`sv_maxclients < MAX_CLIENTS` the highest slot the server never assigns;
+otherwise the highest free slot; otherwise the subject itself (self view, no
+`PMF_FOLLOW`). The gamestate's `clientNum` is that viewer slot and
+`ps.clientNum` is the subject. A per-tick watchdog closes the segment if the
+viewer slot becomes occupied by a client other than the subject, so one
+recorder's fallback can never poison another's identity. All Phase 3 artifacts
+carry `clientNum 31`.
+
+Segments are numbered per instance and reset at `GAME_INIT`
+(`main_s1`, `main_s2`, …; `tffa1_s1`, `tffa2_s1`, …). A `map_restart` also
+starts at `s1` again because it runs `GAME_INIT`.
+
+### Per-instance visibility
+
+The recorder build is unchanged: it wraps `SV_AddEntitiesVisibleFromPoint` and
+sets `state.fov.recorder_build` for the call, so `fov::apply` returns before the
+FOV cap and the anti-wallhack traces (spectator exemption), while the existing
+instance filter still runs and compacts the build to the subject's match/court.
+No second filter was written.
+
+Evidence (entity stream of each Phase 3 file, decoded with
+`tools/demo_inspect.py`; entity `clientNum` is netfield 32, `eType` 8):
+
+- TFFA (pairs `{1,3}` and `{2,0}` from the `CS_PLAYERS` teams): `tffa1`
+  (subject 1) carries only player entity `clientNum 3`, `tffa2` (subject 2)
+  carries only `clientNum 0` — each file has exactly the other member of its
+  own match and no player of the other match.
+- Duel round 2: `duel1` (subject 2, court `{2,3}`) carries `cs30 "3|2"` and
+  only player entity 3; `duel2` (subject 0, court `{0,1}`) carries
+  `cs30 "0|1"` and only player entity 1. No court sees the other's pair.
+- The subject's own entity is deliberately pre-marked as sent (Phase 2 rule:
+  cgame regenerates the followed player), so each stream shows the partner(s),
+  not the subject.
+
+### Per-instance configstrings
+
+`instance_configstring(instance, matches, index, base)` maps the engine's
+global value to the value that instance's viewer would receive:
+
+- `CS_SERVERINFO` — the Phase 2 rule (`taystJKinfo` removed for playback);
+- `CS_PLAYERS + slot` — `instances::rewrite_cs_players_for_slot(base, slot,
+  client_match[slot], instance.viewer_match())`, i.e. the same per-viewer
+  rewrite a live client gets (TFFA demotes and prefixes outsiders, the duel
+  ladder labels courts and injects W/L);
+- `CS_SCORES1/2` — `instances::view_scores(match)` for TFFA (per-match tally),
+  `duel::court_hud(court)` for a duel court;
+- `CS_CLIENT_DUELISTS` / `CS_CLIENT_DUELHEALTHS` — `duel::court_hud(court)`;
+- every other index — the global engine value.
+
+Runtime updates are mirrored after the engine stored them (`on_set_configstring`
+in the forwarded `GAME_SET_CONFIGSTRING`), so a recorder receives the same
+values it would receive live. The volatile per-viewer entries are also
+recomputed when `instances::cs_generation()` moves (bumped by
+`refresh_cs_players_for_viewer` and `duel::push_hud`) or when the match table
+changes, so a slot that joins/leaves a match (or a court forming) reaches the
+demo even though the recorder is not a client. The live per-viewer pushes are
+untouched: the proxy still writes the real clients' configstrings.
+
+Observed per-instance values:
+
+- `tffa1` demo: `cs 1131` (slot 0) = `(TFFA 1) Two_Blue…` (the outsider,
+  demoted to team 3), its own players unprefixed; `tffa2` demo: `cs 1134` /
+  `cs 1132` = `(TFFA 0)` on main's players, its own unprefixed.
+- Duel `duel1`: `cs30 "3|2"`, `duel2`: `cs30 "0|1"`, each holding only that
+  court's pair.
+
+**Naming observation (deviation, not changed).** The live `(TFFA n)` prefix
+uses the raw match id (`(TFFA 0)` = main, `(TFFA 1)` = the first created
+match), while the Phase 1 file label is 1-based (`tffa1` = main, `tffa2` = the
+first created match). A demo named `tffa2` therefore shows `(TFFA 1)` on
+outsiders. The rewrite was reused as-is; aligning the two is a separate
+product decision (the owner may prefer `(TFFA 1)` to mean `tffa1`).
+
+### Per-instance scoreboard
+
+The Phase 2 probe is unchanged: once per second the recorder calls the game's
+`DeathmatchScoreboardMessage(subject gentity)` and its `scores` trap is
+captured instead of forwarded. The captured text now goes through the same
+per-viewer rewrite the live `G_SEND_SERVER_COMMAND` path uses, with the
+subject as viewer: `tffa::rewrite_scores_for_viewer` for a TFFA match and
+`duel::rewrite_scores_for_viewer` for a court (`main` passes the game text
+through). Identical text is still deduped, and an over-long command is dropped
+like `SV_AddServerCommand` would.
+
+### Chat
+
+**Owner decision (2026-11-12): broadcasts only.** A demo carries the
+server-wide `chat`/`lchat` line and nothing else: team chat
+(`say_team` → `tchat`/`ltchat`), a private `tell` and a per-client `print` are
+never recorded. The rule lives in one function, `recorder::chat_command_for`:
+
+- the game does not broadcast chat with `-1`; `G_Say` calls `G_SayTo` per
+  client and sends each client its own `chat` command
+  (`g_cmds.c:1550-1554`, `G_SayTo`). The demo therefore takes the copy
+  **addressed to the subject** (or a `-1` command, for a sender that uses it);
+  that copy is by construction the broadcast that player received. Team chat
+  is a different command name and is filtered by name, so it never enters the
+  stream even though the subject receives it as well.
+- a private `tell` is not a distinct command: `G_Say`'s `SAY_TELL` case wraps
+  the sender's name in `ESC '[' … ESC ']'` (`Q_COLOR_ESCAPE` = `0x19`,
+  `g_cmds.c:1601-1613`) and `Cmd_Tell_f` addresses it to the target and the
+  speaker only. A `chat`/`lchat` line whose quoted name starts with `\x19[` is
+  a tell and is excluded.
+- a per-client `print` is not a chat candidate at all.
+
+The tap runs in `syscall.rs` after the engine accepted the command (a message
+the proxy dropped for this recipient never reaches it) and appends to a bounded
+256-entry queue drained by the next recorder tick; the recorder mutex is never
+re-entered from the trap.
+
+The rule stays one function so a future owner decision (e.g. including
+localised broadcasts or spectator-team chat) is a one-function edit; the
+accepted behaviour and its rationale are recorded in `docs/uncertainties.md`
+(U-013, resolved).
+
+### Lifecycle
+
+- `GAME_INIT` (a full `map` change *and* `map_restart`) closes every open
+  segment with the `-1/-1` terminator and clears the per-instance segment
+  counters; nothing crosses a map boundary and the new map starts at `s1`.
+- `GAME_SHUTDOWN`, `proxy_sv_enableDemoRecord 0` and the proxy master switch
+  close every segment the same way.
+- The Phase 2 empty-map debug cvar (`proxy_sv_demoRecordEmpty`) was removed;
+  the human-subject rule replaces it. `PROXY_CVARS` is back to 51 entries.
+
+### Resources
+
+`MAX_DEMO_RECORDERS = 16` concurrent segments (TFFA has at most 9 instance
+slots including main; the duel ladder allows 16 courts). When a new instance
+cannot get a recorder, one log line names it and the manager continues without
+it; the flag resets once capacity is available. Per-recorder buffers (frame
+ring, two entity scratch slots, message buffer, writer buffer) are allocated at
+segment start and do not grow with the roster.
+
+### Validation artifacts (Phase 3 gate B)
+
+Build `jampgamei386.so` SHA-256
+`544849237c80c8bb71f290aadd1eeb287e86c3ccbd977372ef904b906f957986`
+(commit state: uncommitted Phase 3 work). All files pass
+`tools/demo_inspect.py --frames 1 --validate-stream` with
+`max_delta=1`, `bad_order=0`, `bad_range=0`, `bad_cs=0`, and the gamestate
+round-trip is identical.
+
+| File | SHA-256 | Evidence |
+| --- | --- | --- |
+| `artifacts/phase3-tffa/demos/20261112-101848_mp_duel1_tffa1_s1.dm_26` | `3246008a…` | main match, subject 1, 360 snapshots; entity stream only partner `clientNum 3`; `chat hello-all` once, `team-main` team chat absent; `cs` demotes the other match's players |
+| `artifacts/phase3-tffa/demos/20261112-101848_mp_duel1_tffa2_s1.dm_26` | `529cbfb2…` | created match, subject 2, 360 snapshots; only partner `clientNum 0`; same `chat` once, `team-two` team chat absent; `(TFFA 0)` on main's players |
+| `artifacts/phase3-duel/demos/20261112-094002_mp_duel1_duel1_s1.dm_26` | `ffb63912…` | round 1, one court (subject 0, partner 1); closed at the `map_restart` with `-1/-1` (143 frames) |
+| `artifacts/phase3-duel/demos/20261112-094010_mp_duel1_duel1_s1.dm_26` | `1a4108fb…` | round 2 court 1, subject 2, `cs30 "3|2"`, only entity 3 |
+| `artifacts/phase3-duel/demos/20261112-094010_mp_duel1_duel2_s1.dm_26` | `2e5b944c…` | round 2 court 2, subject 0, `cs30 "0|1"`, only entity 1 |
+| `artifacts/phase3-life/demos/20261112-094132_mp_ffa3_main_s1.dm_26` | `5d56e1af…` | `main`, subject switch `0 → 1 (left)`, same file; closed when the instance emptied |
+| `artifacts/phase3-life/demos/20261112-094152_mp_ffa3_main_s2.dm_26` | `44e4f144…` | repopulation, new segment label `main_s2`; closed at the full `map mp/ffa3` |
+| `artifacts/phase3-life/demos/20261112-094225_mp_ffa3_main_s1.dm_26` | `233aa3f0…` | new map (`checksumFeed 0x5bea9380` ≠ `0xd8e9a7d8`), counters reset to `s1` |
+| `artifacts/phase3-chat/demos/20261112-101757_mp_ffa3_main_s1.dm_26` | `28972121…` | `chat hello-broadcast` and `chat other-broadcast`; the private `tell secret-tell` is absent; no `tchat`/`print` |
+
+Log excerpts (`docker logs`): `demo recording started … (instance tffa1,
+subject 1, viewer 31)`, `(instance tffa2, subject 2, viewer 31)`, the duel
+round-2 pair `duel1`/`duel2`, `demo subject switched: 0 -> 1 (left),
+continuing …`, `demo recording stopped … (184 frames)` at the empty instance,
+and `demo recording stopped … (43 frames)` at the map change.
+
+### Playback (real client, 2026-11-12)
+
+Both a TFFA and a duel file were played by the real TaystJK client
+(`original/GameData/taystjk.x86_64`, latest-2ab07a797, `fs_game base`,
+homepath copy under `/tmp/opencode/jka-home3/base/demos`):
+
+- `p3-tffa` (= `tffa1` file): `CL_InitCGame` at 10:48:04, `DISCONNECTED` at
+  10:48:23 — 19 s for 362 snapshots at ~20 fps — then the main menu.
+- `p3-duel` (= `duel2` file): `CL_InitCGame` at 10:47:11, `DISCONNECTED` at
+  10:47:27 — 16 s for 301 snapshots at ~20 fps.
+
+Neither run logs `Demo file was truncated`, `Illegible server message`, a
+delta/read-past-end error or a parse error; the files load, decode to their
+end and return to the menu. The client renders through Wayland on this
+machine, and the session's X11 capture only sees a *different* client's
+Xwayland window, so no visual frames of this playback could be captured here.
+This is playback evidence, **not** a claim of visual verification; the owner's
+Phase 2 visual check remains the reference for presentation. Exact commands:
+
+```sh
+mkdir -p /tmp/opencode/jka-home3/base/demos
+cp <tffa-demo> /tmp/opencode/jka-home3/base/demos/p3-tffa.dm_26
+DISPLAY=:0 ./original/GameData/taystjk.x86_64 \
+  +set fs_basepath "$PWD/original/GameData" \
+  +set fs_homepath /tmp/opencode/jka-home3 +set fs_game base \
+  +set r_fullscreen 0 +set r_mode 3 +set s_initsound 0 \
+  +set logfile 2 +demo p3-tffa
+```
+
+### Phase 3 deviations and limits
+
+- **Chat is broadcast-only** (owner decision 2026-11-12, U-013). It records the
+  subject's copy of server-wide `chat`; team chat, a `tell` to the subject and
+  per-client `print` never appear, so a demo also has no chat from the moment
+  every eligible player leaves.
+- **Phase 4 disk guards accepted (not implemented)**: `proxy_sv_demoMaxFileMB`
+  128 and `proxy_sv_demoMinFreeMB` 512, accepted by the owner on 2026-11-12.
+  Phase 3 does not read them; they belong to the retention/guard phase.
+- **`(TFFA n)` prefix vs file label** differ by one (see above); the live
+  rewrite was reused unchanged.
+- **`cs30/31` in TFFA demos** carry the engine's global value when the game
+  writes them (the live TFFA path does not rewrite them either); the duel
+  instance value comes from `court_hud`.
+- **16-recorder cap**: beyond it an instance is not recorded (one log line).
+- **Vehicles and RMG** are still unsupported/refused (U-010).
+- **Duels**: a segment follows its court; when the court dissolves at a round
+  boundary the segment closes and the next formed court opens `s1` again after
+  the `GAME_INIT` of the round transition. Carried `map_restart` rounds
+  therefore do not chain one file across rounds.
+- No retention, announcements, `/demos`, disk guards (Phase 4).

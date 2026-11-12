@@ -2329,15 +2329,52 @@ pub fn refresh_all_cs_players() {
     }
 }
 
+/// The duel HUD values one court's viewers hold: the pair's frags, the
+/// `CS_CLIENT_DUELISTS` text and (when `g_showDuelHealths` is set) the
+/// `CS_CLIENT_DUELHEALTHS` text. `None` outside duel mode. An empty court
+/// reports `(0, 0)`, `"-1|-1"` and no healths, exactly like `push_hud`.
+pub fn court_hud(court: usize) -> Option<((i32, i32), String, Option<String>)> {
+    if !mode_on() {
+        return None;
+    }
+    let pair = state::with_state(|s| {
+        s.duel
+            .courts
+            .get(court)
+            .copied()
+            .and_then(|c| match (c.a, c.b) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            })
+    });
+    let show_health = cvar(c"g_showDuelHealths") >= 1;
+    Some(match pair {
+        Some((a, b)) => {
+            let scores = (pers_score(a as c_int), pers_score(b as c_int));
+            let healths = show_health.then(|| {
+                format!(
+                    "{}|{}|!",
+                    stat(a as c_int, STAT_HEALTH),
+                    stat(b as c_int, STAT_HEALTH)
+                )
+            });
+            (scores, format!("{a}|{b}"), healths)
+        }
+        None => ((0, 0), "-1|-1".to_owned(), None),
+    })
+}
+
 /// Per-viewer duel HUD: the viewer's own court pair in
 /// `CS_CLIENT_DUELISTS`, the pair's frags in `CS_SCORES1/2`, and (when
 /// `g_showDuelHealths` is set) `CS_CLIENT_DUELHEALTHS`. Everything is deduped
 /// against the last value queued, so a steady court costs nothing.
+///
+/// The demo recorder uses [`court_hud`] for the same values, so a duel demo
+/// carries its court's board and HUD.
 pub fn push_hud() {
     if !mode_on() || !state::with_state(|s| s.duel.ladder) {
         return;
     }
-    let show_health = cvar(c"g_showDuelHealths") >= 1;
     let viewers: Vec<c_int> = state::with_state(|s| {
         (0..MAX_CLIENTS as c_int)
             .filter(|v| s.clients[*v as usize].is_connected)
@@ -2345,36 +2382,8 @@ pub fn push_hud() {
     });
     for viewer in viewers {
         let vm = crate::instances::effective_match(viewer);
-        // Read the pair under the lock, then the game memory outside it: the
-        // `pers_score`/`stat` helpers take the state lock themselves.
-        let court = state::with_state(|s| {
-            s.duel
-                .courts
-                .get(vm as usize)
-                .copied()
-                .and_then(|c| match (c.a, c.b) {
-                    (Some(a), Some(b)) => Some((a, b)),
-                    _ => None,
-                })
-        });
-        let scores = match court {
-            Some((a, b)) => (pers_score(a as c_int), pers_score(b as c_int)),
-            None => (0, 0),
-        };
-        let healths = if show_health {
-            court.map(|(a, b)| {
-                format!(
-                    "{}|{}|!",
-                    stat(a as c_int, STAT_HEALTH),
-                    stat(b as c_int, STAT_HEALTH)
-                )
-            })
-        } else {
-            None
-        };
-        let duelists = match court {
-            Some((a, b)) => format!("{a}|{b}"),
-            None => "-1|-1".to_owned(),
+        let Some((scores, duelists, healths)) = court_hud(vm as usize) else {
+            continue;
         };
         let viewer_idx = viewer as usize;
         let changed_scores = state::with_state(|s| s.duel.hud_scores[viewer_idx] != scores);
@@ -2399,6 +2408,7 @@ pub fn push_hud() {
             }
         }
     }
+    crate::instances::bump_cs_generation();
 }
 
 fn announce_center(text: &str) {

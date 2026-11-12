@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 52] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 51] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -81,9 +81,6 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 52] = [
     // cvars are not registered yet.
     (c"proxy_sv_enableDemoRecord", c"0"),
     (c"proxy_sv_demoDir", c"demos"),
-    // TEMPORARY PHASE 2 DEBUG: allow the gate to record an empty map before
-    // the Phase 3 human-player start rule exists. Do not document in README.
-    (c"proxy_sv_demoRecordEmpty", c"0"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -277,9 +274,6 @@ pub const CVAR_LEGACY_TFFA_MAX_GROUP_SIZE: usize = 48;
 pub const CVAR_DEMO_ENABLE: usize = 49;
 /// `proxy_sv_demoDir`: output directory for `.dm_26` files.
 pub const CVAR_DEMO_DIR: usize = 50;
-/// TEMPORARY PHASE 2 DEBUG: start a recording with no players so the empty-map
-/// gate can be recorded. The Phase 3 human-player start rule will replace it.
-pub const CVAR_DEMO_RECORD_EMPTY: usize = 51;
 
 /// The pre-rename spelling of a canonical cvar, if it has one (D-026).
 ///
@@ -1569,7 +1563,6 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_PARALLEL_DUELS_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_ENABLE].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_DIR].1.to_bytes(), b"demos");
-        assert_eq!(PROXY_CVARS[CVAR_DEMO_RECORD_EMPTY].1.to_bytes(), b"0");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

@@ -1,7 +1,12 @@
-//! Phase 2 recorder core: the main (non-instanced) server-side demo stream.
+//! Server-side demo recorder: one stream per instance (Phase 3).
 //!
-//! Per recorded instance (Phase 2: always the main view) this module owns, in
-//! proxy memory only:
+//! A non-instanced gametype records the one server game (`main`); parallel
+//! TFFA matches and duel courts each get their own recorder and file
+//! (`tffa<N>` / `duel<N>`, 1-based). Membership comes from the existing
+//! `tffa::client_match` table (written for both modes) and the duel court
+//! list; no instance bookkeeping is duplicated here.
+//!
+//! Per recorder (proxy memory only) this module owns:
 //!
 //! - a 32-slot `clientSnapshot_t`-compatible ring used as the playerstate /
 //!   entity delta base;
@@ -17,9 +22,12 @@
 //! pointers; the `recorder_build` flag makes the FOV/anti-wallhack post-filter
 //! skip the build while the existing instance filter still runs.
 //!
-//! Phase 3 owns subject switching, segments and per-instance configstring
-//! rewrites. This module exposes the hooks they will build on: subject slot,
-//! segment start/stop, configstring mirror.
+//! Configstrings are mirrored as the *instance's* view: `CS_PLAYERS` through
+//! the existing per-viewer rewrite, `CS_SCORES1/2`/duel HUD from the match or
+//! court tables, and the `scores` probe text through the same per-viewer
+//! rewrite. Chat follows one named rule (`chat_command_for`): server-wide
+//! broadcast `chat` only; never team chat, a private `tell` or a per-client
+//! `print`.
 //!
 //! Vehicle playerstates are not emitted yet: a frame whose subject has
 //! `ps.m_iVehicleNum != 0` is discarded (the engine would write a second
@@ -33,7 +41,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::engine::{self, cvar_slots, vars};
 use crate::sdk::{
-    CS_PRIMED, CS_SERVERINFO, CS_SYSTEMINFO, MAX_CLIENTS, MAX_CONFIGSTRINGS, MAX_GENTITIES,
+    CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_PLAYERS, CS_PRIMED, CS_SCORES1, CS_SCORES2,
+    CS_SERVERINFO, CS_SYSTEMINFO, MAX_CLIENTS, MAX_CONFIGSTRINGS, MAX_GENTITIES,
     MAX_MAP_AREA_BYTES, MAX_MSGLEN, MAX_SNAPSHOT_ENTITIES, OFFSET_CLIENT_GENTITY,
     OFFSET_CLIENT_STATE, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_S, OFFSET_PS_CLIENT_NUM,
     OFFSET_PS_COMMAND_TIME, OFFSET_PS_M_I_VEHICLE_NUM, OFFSET_PS_ORIGIN, OFFSET_PS_PM_FLAGS,
@@ -44,7 +53,7 @@ use crate::sdk::{
     OFFSET_SVS_TIME, PACKET_BACKUP, PACKET_MASK, PMF_FOLLOW, SIZEOF_CLIENT_SNAPSHOT_T,
     SIZEOF_CLIENT_T, SIZEOF_PLAYER_STATE, SIZEOF_SV_ENTITY_T, SS_GAME, TEAM_SPECTATOR,
 };
-use crate::state::{self, CVAR_DEMO_DIR, CVAR_DEMO_ENABLE, CVAR_DEMO_RECORD_EMPTY};
+use crate::state::{self, CVAR_DEMO_DIR, CVAR_DEMO_ENABLE, InstanceMode};
 
 use super::file::{DEFAULT_BUFFER_BYTES, DemoName, DemoWriter, FileSink, InstanceLabel, Timestamp};
 use super::gamestate::{
@@ -62,6 +71,10 @@ const MAX_STRING_CHARS: usize = 1024;
 /// `SV_SetConfigstring`'s `maxChunkSize = MAX_STRING_CHARS - 24`.
 const CONFIGSTRING_CHUNK: usize = MAX_STRING_CHARS - 24;
 const SCRATCH_SLOTS: usize = 2;
+/// Concurrent recorders (TFFA allows 9 instances including the main slot but
+/// caps created matches at 8; the duel ladder allows 16 courts). Each recorder
+/// costs its writer buffer plus the two entity scratch slots (~1.2 MiB).
+const MAX_DEMO_RECORDERS: usize = 16;
 const MSG_BUFFER_LEN: usize = MAX_MSGLEN;
 const GENTITYNUM_BITS: c_int = 10;
 
@@ -136,7 +149,40 @@ struct DeltaBase {
     scratch_slot: usize,
 }
 
-/// One open segment (Phase 2: the main view's only file).
+/// The instance one recorder belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoInstance {
+    /// Non-instanced gametype: the one server game.
+    Main,
+    /// Parallel TFFA match id (`0` = the main slot's match).
+    Tffa(u8),
+    /// Parallel duel court index (`0` = the first court).
+    Duel(u8),
+}
+
+impl DemoInstance {
+    /// Demo file label. Phase 1 naming is 1-based (`main`, `tffa<N>`,
+    /// `duel<N>`), so TFFA match `0` and duel court `0` become `<kind>1`.
+    fn label(self) -> InstanceLabel {
+        match self {
+            DemoInstance::Main => InstanceLabel::Main,
+            DemoInstance::Tffa(id) => InstanceLabel::Tffa(u32::from(id) + 1),
+            DemoInstance::Duel(court) => InstanceLabel::Duel(u32::from(court) + 1),
+        }
+    }
+
+    /// The match/court id used by the instance tables and the per-viewer
+    /// rewrites.
+    fn viewer_match(self) -> u8 {
+        match self {
+            DemoInstance::Main => crate::instances::MAIN_MATCH,
+            DemoInstance::Tffa(id) => id,
+            DemoInstance::Duel(court) => court,
+        }
+    }
+}
+
+/// One open segment.
 struct Active {
     writer: DemoWriter<FileSink>,
     path: PathBuf,
@@ -159,21 +205,35 @@ struct Active {
     last_scoreboard: Option<Vec<u8>>,
     /// One-shot log when the loaded module has no scoreboard generator.
     scoreboard_unavailable: bool,
-    /// `None` only in the temporary empty-map debug mode.
-    subject: Option<i32>,
+    /// Followed player slot (a human client of this segment's instance).
+    subject: i32,
     /// Slot the gamestate names as "me"; see `pick_viewer_slot`.
     viewer_slot: i32,
-    /// Slot used for the synthetic no-player viewer (`subject == None`).
-    empty_slot: i32,
+    /// Instance this segment records.
+    instance: DemoInstance,
+    /// `CS_PLAYERS` round-trip state: the match table and
+    /// `instances::cs_generation()` at the last per-viewer resync.
+    membership: [u8; MAX_CLIENTS],
+    cs_generation: u32,
     last_overflow_log: i32,
+}
+
+/// One instance's recorder and its open segment.
+struct InstanceRecorder {
+    instance: DemoInstance,
+    active: Option<Box<Active>>,
 }
 
 /// Process-global recorder state. Kept out of `ProxyState` so the engine calls
 /// in a build never happen under the proxy-state mutex.
 #[derive(Default)]
 pub struct Recorder {
-    active: Option<Box<Active>>,
+    instances: Vec<InstanceRecorder>,
+    /// Next segment number per instance, reset at `GAME_INIT`.
+    segments: Vec<(DemoInstance, u32)>,
     next_tick: i32,
+    /// One-shot log while `MAX_DEMO_RECORDERS` is reached.
+    limit_logged: bool,
 }
 
 static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
@@ -322,8 +382,15 @@ fn read_configstring(index: usize) -> Vec<u8> {
 struct ClientSlot {
     slot: i32,
     connected: bool,
+    /// `state >= CS_ACTIVE`: the client has entered the world. A connecting
+    /// client already has a `gentity` (the engine assigns it at direct
+    /// connect), so it must not be treated as playing.
+    in_world: bool,
     has_gentity: bool,
     spectator: bool,
+    /// `GAME_CLIENT_CONNECT` reported a bot (`ClientState::is_bot`). Phase 3
+    /// records human POVs only.
+    bot: bool,
     /// Any engine client state but `CS_FREE`: the engine will not hand this
     /// slot to a new connection, and a demo viewer identity naming it can
     /// collide with whoever sits there.
@@ -331,12 +398,13 @@ struct ClientSlot {
 }
 
 impl ClientSlot {
-    /// In the world and playing, not spectating. A spectating client's `ps`
-    /// is `SpectatorClientEndFrame`'s copy of the player they follow (with
-    /// `PMF_FOLLOW` and that player's `clientNum`), so recording them would
-    /// silently follow someone else's POV instead of the spectator's slot.
+    /// In the world and playing, not spectating, not a bot. A spectating
+    /// client's `ps` is `SpectatorClientEndFrame`'s copy of the player they
+    /// follow (with `PMF_FOLLOW` and that player's `clientNum`), so recording
+    /// them would silently follow someone else's POV instead of the
+    /// spectator's slot.
     fn eligible(self) -> bool {
-        self.connected && self.has_gentity && !self.spectator
+        self.connected && self.in_world && self.has_gentity && !self.spectator && !self.bot
     }
 }
 
@@ -345,6 +413,8 @@ impl ClientSlot {
 enum SubjectLoss {
     Left,
     Spectator,
+    /// Still connected and playing, but no longer in this instance.
+    Moved,
 }
 
 /// What the tick does with the subject this frame.
@@ -377,8 +447,10 @@ impl ClientSlot {
     const EMPTY: Self = Self {
         slot: 0,
         connected: false,
+        in_world: false,
         has_gentity: false,
         spectator: false,
+        bot: false,
         occupied: false,
     };
 }
@@ -389,6 +461,7 @@ impl ClientSlot {
 fn read_slots(
     g_clients: usize,
     g_client_size: i32,
+    bots: &[bool; MAX_CLIENTS],
     slots: &mut [ClientSlot; MAX_CLIENTS],
 ) -> usize {
     let max = server_maxclients().min(MAX_CLIENTS);
@@ -412,38 +485,63 @@ fn read_slots(
         *out = ClientSlot {
             slot: index as i32,
             connected,
+            in_world: state >= crate::sdk::CS_ACTIVE,
             has_gentity,
             spectator,
+            bot: bots[index],
             occupied: state != 0,
         };
     }
     max
 }
 
-/// Keep the current POV, switch it to the lowest eligible player, or stop
-/// when nobody is left to follow.
+/// Whether `slot` may be the recorded POV of `instance`: Phase 2 eligibility
+/// (in the world, playing, not spectating) plus human-only and this
+/// instance's membership.
+fn eligible_in(
+    slot: &ClientSlot,
+    instance: DemoInstance,
+    membership: &[Option<DemoInstance>; MAX_CLIENTS],
+) -> bool {
+    slot.eligible() && membership.get(slot.slot as usize) == Some(&Some(instance))
+}
+
+/// Lowest eligible subject of `instance` (the recorder's rule).
+fn lowest_subject(
+    instance: DemoInstance,
+    slots: &[ClientSlot],
+    membership: &[Option<DemoInstance>; MAX_CLIENTS],
+) -> Option<i32> {
+    slots
+        .iter()
+        .find(|slot| eligible_in(slot, instance, membership))
+        .map(|slot| slot.slot)
+}
+
+/// Keep the current POV, switch it to the lowest eligible player of the same
+/// instance, or stop when nobody is left there.
 ///
 /// A spectator demo switches follow targets by changing `ps.clientNum` in the
 /// next snapshot (the engine does the same when a spectator cycles targets);
-/// the file, sequence numbers and delta base continue unchanged. `None` is the
-/// temporary empty-map viewer, which stays put because it is a gate-only mode.
-fn choose_subject(current: Option<i32>, slots: &[ClientSlot]) -> SubjectDecision {
-    let Some(current) = current else {
-        return SubjectDecision::Keep;
-    };
+/// the file, sequence numbers and delta base continue unchanged.
+fn choose_subject(
+    current: i32,
+    slots: &[ClientSlot],
+    instance: DemoInstance,
+    membership: &[Option<DemoInstance>; MAX_CLIENTS],
+) -> SubjectDecision {
     let current_slot = slots.iter().find(|slot| slot.slot == current).copied();
-    if current_slot.is_some_and(|slot| slot.eligible()) {
+    if current_slot.is_some_and(|slot| eligible_in(&slot, instance, membership)) {
         return SubjectDecision::Keep;
     }
     let reason = match current_slot {
-        Some(slot) if slot.connected && slot.has_gentity => SubjectLoss::Spectator,
-        _ => SubjectLoss::Left,
+        Some(slot) if !slot.connected || !slot.in_world || !slot.has_gentity => SubjectLoss::Left,
+        Some(slot) if slot.spectator => SubjectLoss::Spectator,
+        Some(_) => SubjectLoss::Moved,
+        None => SubjectLoss::Left,
     };
-    match slots.iter().find(|slot| slot.eligible()) {
-        Some(next) => SubjectDecision::Switch {
-            to: next.slot,
-            reason,
-        },
+    match lowest_subject(instance, slots, membership) {
+        Some(next) => SubjectDecision::Switch { to: next, reason },
         None => SubjectDecision::Stop,
     }
 }
@@ -482,50 +580,39 @@ fn pick_viewer_slot(subject_slot: i32, server_maxclients: usize, slots: &[Client
 
 /// True when the demo's viewer identity has been compromised: the slot the
 /// gamestate names as "me" is held by a client that is not the followed
-/// player. For `subject == None` (the temporary empty-map viewer) the claimed
-/// slot is `empty_slot`.
-///
-/// The tick checks this **before** building a snapshot, so a demo never
-/// contains a frame in which a stranger's entity carries the demo's
+/// player. The tick checks this **before** building a snapshot, so a demo
+/// never contains a frame in which a stranger's entity carries the demo's
 /// `clientNum`; the segment closes instead.
-fn identity_lost(
-    viewer_slot: i32,
-    subject: Option<i32>,
-    empty_slot: i32,
-    slots: &[ClientSlot],
-) -> Option<i32> {
-    let (claimed, subject) = match subject {
-        Some(subject) => (viewer_slot, Some(subject)),
-        None => (empty_slot, None),
-    };
+fn identity_lost(viewer_slot: i32, subject: i32, slots: &[ClientSlot]) -> Option<i32> {
     slots
         .iter()
-        .find(|slot| slot.slot == claimed && slot.occupied && Some(slot.slot) != subject)
+        .find(|slot| slot.slot == viewer_slot && slot.occupied && slot.slot != subject)
         .map(|slot| slot.slot)
 }
 
 /// Spectator-follow vs. self view: the engine's `PMF_FOLLOW` is only for a
 /// viewer that follows someone else. When the demo's `clientNum` is the
 /// subject itself the stream must look like a client-recorded demo.
-fn follow_mode(subject: Option<i32>, viewer_slot: i32) -> bool {
-    subject.is_some_and(|subject| subject != viewer_slot)
+fn follow_mode(subject: i32, viewer_slot: i32) -> bool {
+    subject != viewer_slot
 }
 
-fn first_free_slot() -> i32 {
-    let max = server_maxclients();
-    // SAFETY: svs.clients is the engine's client_t* array.
-    let clients = unsafe { read_usize(vars::SVS + OFFSET_SVS_CLIENTS) };
-    if clients == 0 {
-        return 0;
+/// Instance membership of one client slot.
+///
+/// `client_match` is written for both instance modes (TFFA match ids, duel
+/// court indices). In duel mode a client that is not in a court is benched or
+/// spectating and has no instance of its own.
+fn membership_of(
+    slot: usize,
+    mode: InstanceMode,
+    matches: &[u8; MAX_CLIENTS],
+    court_of: &[Option<u8>; MAX_CLIENTS],
+) -> Option<DemoInstance> {
+    match mode {
+        InstanceMode::Off => Some(DemoInstance::Main),
+        InstanceMode::Tffa => Some(DemoInstance::Tffa(matches[slot])),
+        InstanceMode::Duel => court_of[slot].map(DemoInstance::Duel),
     }
-    for slot in 0..max {
-        let client = clients + slot * SIZEOF_CLIENT_T;
-        // SAFETY: slot is inside the engine's client array.
-        if unsafe { read_i32(client + OFFSET_CLIENT_STATE) } == 0 {
-            return slot as i32;
-        }
-    }
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -583,28 +670,48 @@ fn queue_command(active: &mut Active, command: Vec<u8>) {
     active.commands.push_back((sequence, command));
 }
 
-fn observe_configstring(active: &mut Active, index: usize) {
+/// Queue one `cs <index> "<value>"` if it differs from what this demo already
+/// carries.
+fn queue_configstring(active: &mut Active, index: usize, value: Vec<u8>) {
     if index >= MAX_CONFIGSTRINGS {
         return;
     }
-    let current = recorded_configstring(index);
     let changed = match &active.configstrings[index] {
-        Some(previous) => previous != &current,
-        None => !current.is_empty(),
+        Some(previous) => previous != &value,
+        None => !value.is_empty(),
     };
     if !changed {
         return;
     }
-    let command = configstring_command(index as i32, &current);
+    let command = configstring_command(index as i32, &value);
     queue_command(active, command);
-    active.configstrings[index] = if current.is_empty() {
-        None
-    } else {
-        Some(current)
-    };
+    active.configstrings[index] = if value.is_empty() { None } else { Some(value) };
 }
 
-/// A configstring as the demo stream carries it.
+/// `CS_PLAYERS + slot` as this instance's viewer holds it: the existing
+/// per-viewer rewrite (TFFA demotes and prefixes outsiders, the duel ladder
+/// labels courts and injects W/L).
+fn cs_players_value(
+    base: &[u8],
+    slot: usize,
+    matches: &[u8; MAX_CLIENTS],
+    instance: DemoInstance,
+) -> Vec<u8> {
+    let Ok(text) = core::str::from_utf8(base) else {
+        return base.to_vec();
+    };
+    match crate::instances::rewrite_cs_players_for_slot(
+        text,
+        slot,
+        matches[slot],
+        instance.viewer_match(),
+    ) {
+        Some(value) => value.into_bytes(),
+        None => base.to_vec(),
+    }
+}
+
+/// A configstring as this instance's demo carries it.
 ///
 /// The proxy advertises `taystJKinfo` bit 7 (15-int `scores` layout) in the
 /// live serverinfo so capable cgames get deaths. A demo has one stream for
@@ -612,12 +719,99 @@ fn observe_configstring(active: &mut Active, index: usize) {
 /// the recording carries the stock layout: the key is removed from the
 /// recorded `CS_SERVERINFO` and the `scores` commands are the game's stock
 /// text. Live clients keep their advertisement untouched.
-fn recorded_configstring(index: usize) -> Vec<u8> {
-    let value = read_configstring(index);
+///
+/// Instance values come from the same per-viewer functions the live path uses:
+/// `CS_PLAYERS` through the TFFA/duel rewrite, `CS_SCORES1/2` from the match or
+/// court table, and the duel HUD from the court. `base` is the engine's global
+/// value (which the per-viewer code overrides).
+fn instance_configstring(
+    instance: DemoInstance,
+    matches: &[u8; MAX_CLIENTS],
+    index: usize,
+    base: &[u8],
+) -> Vec<u8> {
     if index as i32 == CS_SERVERINFO {
-        return crate::userinfo::without_key(&value, b"taystJKinfo");
+        return crate::userinfo::without_key(base, b"taystJKinfo");
     }
-    value
+    // Non-instanced: the engine's own values (the match table may be stale
+    // after instancing was switched off).
+    if instance == DemoInstance::Main {
+        return base.to_vec();
+    }
+    let index32 = index as i32;
+    if (CS_PLAYERS..CS_PLAYERS + MAX_CLIENTS as i32).contains(&index32) {
+        return cs_players_value(base, (index32 - CS_PLAYERS) as usize, matches, instance);
+    }
+    match instance {
+        DemoInstance::Main => base.to_vec(),
+        DemoInstance::Tffa(_) | DemoInstance::Duel(_) => {
+            if let Some((red, blue)) = instance_scores(instance) {
+                if index32 == CS_SCORES1 {
+                    return red.to_string().into_bytes();
+                }
+                if index32 == CS_SCORES2 {
+                    return blue.to_string().into_bytes();
+                }
+            }
+            if let DemoInstance::Duel(court) = instance {
+                if let Some((_, duelists, healths)) = crate::duel::court_hud(court as usize) {
+                    if index32 == CS_CLIENT_DUELISTS {
+                        return duelists.into_bytes();
+                    }
+                    if index32 == CS_CLIENT_DUELHEALTHS {
+                        if let Some(healths) = healths {
+                            return healths.into_bytes();
+                        }
+                    }
+                }
+            }
+            base.to_vec()
+        }
+    }
+}
+
+/// Per-instance `CS_SCORES1/2` pair (TFFA match tally or duel court frags).
+fn instance_scores(instance: DemoInstance) -> Option<(i32, i32)> {
+    match instance {
+        DemoInstance::Main => None,
+        DemoInstance::Tffa(id) => Some(crate::instances::view_scores(id)),
+        DemoInstance::Duel(court) => {
+            crate::duel::court_hud(court as usize).map(|(scores, _, _)| scores)
+        }
+    }
+}
+
+/// Re-emit the instance's volatile configstrings when their source changed:
+/// `CS_PLAYERS` when the match table or the proxy's per-viewer refresh
+/// generation moved, and the per-match/court scores and duel HUD every tick
+/// (cheap integer/string comparisons, deduped by `queue_configstring`).
+fn sync_instance_configstrings(active: &mut Active, matches: &[u8; MAX_CLIENTS]) {
+    let generation = crate::instances::cs_generation();
+    if active.cs_generation != generation || active.membership != *matches {
+        active.cs_generation = generation;
+        active.membership = *matches;
+        for slot in 0..MAX_CLIENTS {
+            let index = CS_PLAYERS as usize + slot;
+            let base = read_configstring(index);
+            if base.is_empty() {
+                continue;
+            }
+            let value = instance_configstring(active.instance, matches, index, &base);
+            queue_configstring(active, index, value);
+        }
+    }
+    if let Some((red, blue)) = instance_scores(active.instance) {
+        queue_configstring(active, CS_SCORES1 as usize, red.to_string().into_bytes());
+        queue_configstring(active, CS_SCORES2 as usize, blue.to_string().into_bytes());
+    }
+    if let DemoInstance::Duel(court) = active.instance {
+        if let Some((_, duelists, healths)) = crate::duel::court_hud(court as usize) {
+            queue_configstring(active, CS_CLIENT_DUELISTS as usize, duelists.into_bytes());
+            if let Some(healths) = healths {
+                queue_configstring(active, CS_CLIENT_DUELHEALTHS as usize, healths.into_bytes());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,16 +885,16 @@ pub fn capture_scoreboard_command(client: c_int, text: &[u8]) -> bool {
     probe_lock().capture(client, text)
 }
 
-/// Ask the game for its authoritative scoreboard text and queue it.
+/// Ask the game for its authoritative scoreboard text and queue it, rewritten
+/// to this instance's board with the same per-viewer function the live path
+/// uses.
 fn probe_scoreboard(active: &mut Active, now: i32, g_entities: usize, g_entity_size: i32) {
     if now < active.next_scoreboard {
         return;
     }
     active.next_scoreboard = now.saturating_add(SCOREBOARD_INTERVAL_MS);
 
-    let Some(subject) = active.subject else {
-        return;
-    };
+    let subject = active.subject;
     let Some(build) = crate::original::deathmatch_scoreboard_message() else {
         if !active.scoreboard_unavailable {
             active.scoreboard_unavailable = true;
@@ -722,6 +916,7 @@ fn probe_scoreboard(active: &mut Active, now: i32, g_entities: usize, g_entity_s
     let Some(command) = probe_lock().take() else {
         return;
     };
+    let command = instance_scores_command(active.instance, subject, &command);
     if command.len() > MAX_COMMAND_BYTES {
         // The engine would refuse it; do not put an undeliverable command in
         // the demo stream.
@@ -732,6 +927,116 @@ fn probe_scoreboard(active: &mut Active, now: i32, g_entities: usize, g_entity_s
     }
     active.last_scoreboard = Some(command.clone());
     queue_command(active, command);
+}
+
+/// Rewrite the game's global `scores ...` text for one instance's viewer.
+/// `None` (or an unparseable text) passes the original through, exactly like
+/// the live `G_SEND_SERVER_COMMAND` path.
+fn instance_scores_command(instance: DemoInstance, viewer: i32, command: &[u8]) -> Vec<u8> {
+    if instance == DemoInstance::Main {
+        return command.to_vec();
+    }
+    let trimmed = command.strip_suffix(b"\n").unwrap_or(command);
+    let Ok(text) = core::str::from_utf8(trimmed) else {
+        return command.to_vec();
+    };
+    let rewritten = match instance {
+        DemoInstance::Main => None,
+        DemoInstance::Tffa(_) => crate::tffa::rewrite_scores_for_viewer(text, viewer),
+        DemoInstance::Duel(_) => crate::duel::rewrite_scores_for_viewer(text, viewer),
+    };
+    match rewritten {
+        Some(text) => {
+            let mut out = text.into_bytes();
+            out.push(b'\n');
+            out
+        }
+        None => command.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+/// Bounded buffer of chat commands the proxy forwarded since the last tick.
+/// The recorder tick runs while the recorder mutex is held, and the trap
+/// handler must not re-enter it (a second lock would deadlock), so chat uses
+/// its own small queue.
+const MAX_PENDING_CHAT: usize = 256;
+static PENDING_CHAT: Mutex<VecDeque<(i32, Vec<u8>)>> = Mutex::new(VecDeque::new());
+
+/// The demo chat rule, deliberately in one place.
+///
+/// **Owner decision (2026-11-12): broadcasts only.** A demo carries the
+/// server-wide `chat`/`lchat` line; team chat (`tchat`/`ltchat`), a private
+/// `tell` and a per-client `print` are never recorded.
+///
+/// The game's `G_Say` does not broadcast with `-1`: it calls `G_SayTo` for
+/// every client and sends that client its own `chat` command
+/// (`g_cmds.c:1550-1554`). So the demo takes the copy **addressed to the
+/// subject** (or a `-1` command, for a sender that still uses it); that copy
+/// is by construction the broadcast that player received. Team chat is a
+/// different command name (`tchat`/`ltchat`), so it never enters the stream
+/// even though the subject also receives it; a `tell` is a `chat` line whose
+/// name carries the ``ESC '['`` marker and is excluded; a `print` is not a
+/// chat candidate at all.
+pub fn chat_command_for(recipient: c_int, text: &[u8], subject: c_int) -> bool {
+    chat_candidate(text) && !is_tell(text) && (recipient == subject || recipient < 0)
+}
+
+/// Server-wide chat commands only (the owner's "broadcasts only" rule):
+/// `tchat`/`ltchat` are the per-team variants and are deliberately absent.
+fn chat_candidate(text: &[u8]) -> bool {
+    text.starts_with(b"chat ") || text.starts_with(b"lchat ")
+}
+
+/// A private `tell` reaches the game as the same `chat` command, addressed to
+/// its target: `G_Say`'s `SAY_TELL` case wraps the sender's name in
+/// `ESC '[' … ESC ']'` (`g_cmds.c:1601-1613`, `Q_COLOR_ESCAPE` is `0x19`), and
+/// `Cmd_Tell_f` only sends it to that client and to the speaker
+/// (`g_cmds.c:1689-1695`). The bracket marker is therefore the observable that
+/// separates a tell from a broadcast `chat`/`lchat` line, and a demo must not
+/// carry it.
+fn is_tell(text: &[u8]) -> bool {
+    [b"chat \"".as_slice(), b"lchat \"".as_slice()]
+        .iter()
+        .any(|prefix| {
+            text.strip_prefix(*prefix)
+                .is_some_and(|rest| rest.starts_with(b"\x19["))
+        })
+}
+
+/// Called from `G_SEND_SERVER_COMMAND` after the engine accepted the command
+/// (so a message the proxy dropped for this recipient is never queued).
+pub fn on_server_command(recipient: c_int, text: &[u8]) {
+    if !chat_candidate(text) {
+        return;
+    }
+    if !state::proxy_enabled() || state::cvar_integer(CVAR_DEMO_ENABLE) == 0 {
+        return;
+    }
+    if crate::diagnostics::verbose_enabled() {
+        crate::diagnostics::verbose(
+            "demo.chat",
+            format!(
+                "recipient={recipient} len={} text=\"{}\"",
+                text.len(),
+                crate::diagnostics::escape_bytes(text, 256)
+            ),
+        );
+    }
+    let mut pending = PENDING_CHAT.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.len() >= MAX_PENDING_CHAT {
+        pending.pop_front();
+    }
+    pending.push_back((recipient, text.to_vec()));
+}
+
+/// Take the chat commands buffered since the last tick.
+fn drain_chat() -> Vec<(i32, Vec<u8>)> {
+    let mut pending = PENDING_CHAT.lock().unwrap_or_else(|p| p.into_inner());
+    pending.drain(..).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -786,30 +1091,38 @@ pub fn on_game_shutdown() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-/// `GAME_INIT`: close a previous map's file and forget timing.
+/// Close every open segment (map boundary, shutdown, master switch off). Each
+/// file gets its `-1/-1` terminator; nothing crosses a map change.
+fn close_all(recorder: &mut Recorder) {
+    for entry in recorder.instances.drain(..) {
+        if let Some(active) = entry.active {
+            stop_active(*active);
+        }
+    }
+    recorder.segments.clear();
+    recorder.limit_logged = false;
+}
+
+/// `GAME_INIT`: close a previous map's files and forget timing.
 fn game_init_impl() {
     with_recorder(|recorder| {
         recorder.next_tick = 0;
-        if let Some(active) = recorder.active.take() {
-            stop_active(*active);
-        }
+        close_all(recorder);
     });
 }
 
-/// `GAME_SHUTDOWN`: close the open file with the `-1/-1` terminator.
+/// `GAME_SHUTDOWN`: close every open file with the `-1/-1` terminator.
 fn game_shutdown_impl() {
     with_recorder(|recorder| {
-        if let Some(active) = recorder.active.take() {
-            stop_active(*active);
-        }
+        close_all(recorder);
         recorder.next_tick = 0;
     });
 }
 
 /// `GAME_SET_CONFIGSTRING` has been forwarded to the engine: mirror the new
-/// `sv.configstrings[index]` as the reliable `cs` command a demo client needs.
-/// Phase 3 will pass the value through the per-viewer rewrites; Phase 2 uses
-/// the engine's global value (main view).
+/// `sv.configstrings[index]` as the reliable `cs` command this instance's demo
+/// needs (the per-viewer value for `CS_PLAYERS`, `CS_SCORES1/2` and the duel
+/// HUD; the global value otherwise).
 pub fn on_set_configstring(index: i32) {
     if !state::proxy_enabled() || state::cvar_integer(CVAR_DEMO_ENABLE) == 0 {
         return;
@@ -817,9 +1130,15 @@ pub fn on_set_configstring(index: i32) {
     if index < 0 || index as usize >= MAX_CONFIGSTRINGS {
         return;
     }
+    let base = read_configstring(index as usize);
+    let matches = state::with_state(|s| s.tffa.client_match);
     with_recorder(|recorder| {
-        if let Some(active) = recorder.active.as_mut() {
-            observe_configstring(active, index as usize);
+        for entry in &mut recorder.instances {
+            let Some(active) = entry.active.as_mut() else {
+                continue;
+            };
+            let value = instance_configstring(entry.instance, &matches, index as usize, &base);
+            queue_configstring(active, index as usize, value);
         }
     });
 }
@@ -833,9 +1152,7 @@ fn tick_impl() {
     let enabled = state::proxy_enabled() && state::cvar_integer(CVAR_DEMO_ENABLE) != 0;
     with_recorder(|recorder| {
         if !enabled {
-            if let Some(active) = recorder.active.take() {
-                stop_active(*active);
-            }
+            close_all(recorder);
             return;
         }
         // SAFETY: sv is the fixed engine server_t.
@@ -847,119 +1164,188 @@ fn tick_impl() {
         if now < recorder.next_tick {
             return;
         }
-        let snapshot_msec = 1000 / sv_fps();
-        recorder.next_tick = now.saturating_add(snapshot_msec);
+        recorder.next_tick = now.saturating_add(1000 / sv_fps());
 
-        if recorder.active.is_some() {
-            let (g_clients, g_client_size, g_entities, g_entity_size) = state::with_state(|s| {
-                (
-                    s.located_game_data.g_clients,
-                    s.located_game_data.g_client_size,
-                    s.located_game_data.g_entities,
-                    s.located_game_data.g_entity_size,
-                )
-            });
-            let mut slots = [ClientSlot::EMPTY; MAX_CLIENTS];
-            let len = read_slots(g_clients, g_client_size, &mut slots);
-            let slots = &slots[..len];
+        let mode = state::instance_mode();
+        let (g_clients, g_client_size, g_entities, g_entity_size) = state::with_state(|s| {
+            (
+                s.located_game_data.g_clients,
+                s.located_game_data.g_client_size,
+                s.located_game_data.g_entities,
+                s.located_game_data.g_entity_size,
+            )
+        });
+        let (bots, matches, court_of) = state::with_state(|s| {
+            let mut bots = [false; MAX_CLIENTS];
+            for (index, client) in s.clients.iter().enumerate() {
+                bots[index] = client.is_bot;
+            }
+            let mut court_of = [None; MAX_CLIENTS];
+            for (court, entry) in s.duel.courts[..s.duel.court_count].iter().enumerate() {
+                for player in entry.players() {
+                    court_of[player as usize] = Some(court as u8);
+                }
+            }
+            (bots, s.tffa.client_match, court_of)
+        });
+        let mut slots = [ClientSlot::EMPTY; MAX_CLIENTS];
+        let len = read_slots(g_clients, g_client_size, &bots, &mut slots);
+        let slots = &slots[..len];
+        let mut membership = [None; MAX_CLIENTS];
+        for (slot, entry) in membership.iter_mut().enumerate().take(len) {
+            *entry = membership_of(slot, mode, &matches, &court_of);
+        }
+
+        // Chat commands forwarded by the proxy since the last tick, screened
+        // per recorder by the one named rule.
+        let chats = drain_chat();
+
+        // 1. Advance every open segment.
+        for entry in &mut recorder.instances {
+            let Some(active) = entry.active.as_mut() else {
+                continue;
+            };
+            let decision = choose_subject(active.subject, slots, entry.instance, &membership);
+            match decision {
+                SubjectDecision::Keep => {}
+                SubjectDecision::Stop => {
+                    if let Some(active) = entry.active.take() {
+                        stop_active(*active);
+                    }
+                    continue;
+                }
+                SubjectDecision::Switch { to, reason } => {
+                    let from = active.subject;
+                    let why = match reason {
+                        SubjectLoss::Left => "left",
+                        SubjectLoss::Spectator => "spectator",
+                        SubjectLoss::Moved => "moved instance",
+                    };
+                    eprintln!(
+                        "----- proxy-rs: demo subject switched: {from} -> {to} ({why}), continuing {}",
+                        active.path.display()
+                    );
+                    active.subject = to;
+                }
+            }
 
             // The viewer identity must never name a player other than the one
             // being followed. Checked before a snapshot is built, so no frame
             // with the collision can reach the file.
-            let intruder = recorder.active.as_ref().and_then(|active| {
-                identity_lost(active.viewer_slot, active.subject, active.empty_slot, slots)
-            });
-            if let Some(by) = intruder {
-                if let Some(active) = recorder.active.take() {
-                    eprintln!(
-                        "----- proxy-rs: demo viewer slot {} taken by client {by}; closing {}",
-                        active.viewer_slot,
-                        active.path.display()
-                    );
+            if let Some(by) = identity_lost(active.viewer_slot, active.subject, slots) {
+                eprintln!(
+                    "----- proxy-rs: demo viewer slot {} taken by client {by}; closing {}",
+                    active.viewer_slot,
+                    active.path.display()
+                );
+                if let Some(active) = entry.active.take() {
                     stop_active(*active);
                 }
-                return;
+                continue;
             }
 
-            let decision = {
-                let current = recorder.active.as_ref().and_then(|active| active.subject);
-                choose_subject(current, slots)
-            };
-            match decision {
-                SubjectDecision::Keep => {}
-                SubjectDecision::Stop => {
-                    if let Some(active) = recorder.active.take() {
-                        stop_active(*active);
+            sync_instance_configstrings(active, &matches);
+            for (recipient, text) in &chats {
+                if chat_command_for(*recipient, text, active.subject) {
+                    let mut command = text.clone();
+                    if command.last() != Some(&b'\n') {
+                        command.push(b'\n');
                     }
-                    return;
-                }
-                SubjectDecision::Switch { to, reason } => {
-                    if let Some(active) = recorder.active.as_mut() {
-                        let from = active.subject.unwrap_or(-1);
-                        let why = match reason {
-                            SubjectLoss::Left => "left",
-                            SubjectLoss::Spectator => "spectator",
-                        };
-                        eprintln!(
-                            "----- proxy-rs: demo subject switched: {from} -> {to} ({why}), continuing {}",
-                            active.path.display()
-                        );
-                        active.subject = Some(to);
+                    if command.len() <= MAX_COMMAND_BYTES {
+                        queue_command(active, command);
                     }
                 }
             }
-            if let Some(active) = recorder.active.as_mut() {
-                probe_scoreboard(active, now, g_entities, g_entity_size);
-            }
-            let failed = match recorder.active.as_mut() {
-                Some(active) => !build_snapshot(active, now),
-                None => false,
-            };
-            if failed {
-                if let Some(active) = recorder.active.take() {
+            probe_scoreboard(active, now, g_entities, g_entity_size);
+            if !build_snapshot(active, now) {
+                if let Some(active) = entry.active.take() {
                     stop_active(*active);
                 }
             }
-        } else if let Some(active) = try_start(now) {
-            recorder.active = Some(Box::new(active));
+        }
+        recorder.instances.retain(|entry| entry.active.is_some());
+
+        // 2. Start a recorder for every instance that now has an eligible
+        //    human and no open segment.
+        for slot in 0..len {
+            if !slots[slot].eligible() {
+                continue;
+            }
+            let Some(instance) = membership[slot] else {
+                continue;
+            };
+            if recorder
+                .instances
+                .iter()
+                .any(|entry| entry.instance == instance)
+            {
+                continue;
+            }
+            if recorder.instances.len() >= MAX_DEMO_RECORDERS {
+                if !recorder.limit_logged {
+                    recorder.limit_logged = true;
+                    eprintln!(
+                        "----- proxy-rs: demo recorder limit ({MAX_DEMO_RECORDERS}) reached; {} not recorded",
+                        instance.label().as_label()
+                    );
+                }
+                continue;
+            }
+            let Some(subject) = lowest_subject(instance, slots, &membership) else {
+                continue;
+            };
+            let segment = next_segment(&mut recorder.segments, instance);
+            if let Some(active) = try_start(now, instance, subject, slots, &matches, segment) {
+                recorder.instances.push(InstanceRecorder {
+                    instance,
+                    active: Some(Box::new(active)),
+                });
+            }
+        }
+        if recorder.instances.len() < MAX_DEMO_RECORDERS {
+            recorder.limit_logged = false;
         }
     });
 }
 
-fn try_start(now: i32) -> Option<Active> {
-    let (g_clients, g_client_size) = state::with_state(|s| {
-        (
-            s.located_game_data.g_clients,
-            s.located_game_data.g_client_size,
-        )
-    });
-    let mut slots = [ClientSlot::EMPTY; MAX_CLIENTS];
-    let len = read_slots(g_clients, g_client_size, &mut slots);
-    let slots = &slots[..len];
-    let subject = slots
-        .iter()
-        .find(|slot| slot.eligible())
-        .map(|slot| slot.slot);
-    let empty_mode = subject.is_none() && state::cvar_integer(CVAR_DEMO_RECORD_EMPTY) != 0;
-    if subject.is_none() && !empty_mode {
-        return None;
+/// Next file segment number for an instance (1-based, reset at `GAME_INIT`).
+fn next_segment(segments: &mut Vec<(DemoInstance, u32)>, instance: DemoInstance) -> u32 {
+    if let Some(entry) = segments.iter_mut().find(|(known, _)| *known == instance) {
+        let segment = entry.1;
+        entry.1 = entry.1.saturating_add(1);
+        segment
+    } else {
+        segments.push((instance, 2));
+        1
     }
-    let empty_slot = first_free_slot();
-    let subject_slot = subject.unwrap_or(empty_slot);
-    let viewer_slot = pick_viewer_slot(subject_slot, server_maxclients(), slots);
+}
+
+fn try_start(
+    now: i32,
+    instance: DemoInstance,
+    subject: i32,
+    slots: &[ClientSlot],
+    matches: &[u8; MAX_CLIENTS],
+    segment: u32,
+) -> Option<Active> {
+    let viewer_slot = pick_viewer_slot(subject, server_maxclients(), slots);
 
     // RMG maps have a variable gamestate tail; the Phase 1 encoder refuses
     // them (U-010) rather than writing a wrong `int16 0`.
     // SAFETY: fixed engine global; null on a normal map.
     let rmg = unsafe { read_usize(vars::THE_RANDOM_MISSION_MANAGER) } != 0;
     if rmg {
-        eprintln!("----- proxy-rs: demo recording skipped: RMG gamestate tail unsupported");
+        eprintln!(
+            "----- proxy-rs: demo recording skipped ({}): RMG gamestate tail unsupported",
+            instance.label().as_label()
+        );
         return None;
     }
 
     let configs: Vec<(u16, Vec<u8>)> = (0..MAX_CONFIGSTRINGS)
         .filter_map(|index| {
-            let value = recorded_configstring(index);
+            let base = read_configstring(index);
+            let value = instance_configstring(instance, matches, index, &base);
             (!value.is_empty()).then_some((index as u16, value))
         })
         .collect();
@@ -1001,7 +1387,10 @@ fn try_start(now: i32) -> Option<Active> {
     let gamestate = match encode_gamestate(header, &configstrings, &baselines, RmgTail::NoManager) {
         Ok(payload) => payload,
         Err(error) => {
-            eprintln!("----- proxy-rs: demo gamestate refused: {error}");
+            eprintln!(
+                "----- proxy-rs: demo gamestate refused ({}): {error}",
+                instance.label().as_label()
+            );
             return None;
         }
     };
@@ -1016,7 +1405,7 @@ fn try_start(now: i32) -> Option<Active> {
     // SAFETY: sv_mapname cvar; the value is a map path such as mp/ffa3.
     let map = map_name();
     let map = String::from_utf8_lossy(&map);
-    let name = match DemoName::new(timestamp, &map, InstanceLabel::Main, 1) {
+    let name = match DemoName::new(timestamp, &map, instance.label(), segment) {
         Ok(name) => name,
         Err(error) => {
             eprintln!("----- proxy-rs: demo name refused: {error}");
@@ -1070,11 +1459,11 @@ fn try_start(now: i32) -> Option<Active> {
     }
 
     eprintln!(
-        "----- proxy-rs: demo recording started: {} (subject {}, viewer {}, empty {}, time {now})",
+        "----- proxy-rs: demo recording started: {} (instance {}, subject {}, viewer {}, time {now})",
         path.display(),
-        subject_slot,
-        viewer_slot,
-        empty_mode
+        instance.label().as_label(),
+        subject,
+        viewer_slot
     );
 
     Some(Active {
@@ -1091,7 +1480,9 @@ fn try_start(now: i32) -> Option<Active> {
         configstrings: configstring_mirror,
         subject,
         viewer_slot,
-        empty_slot,
+        instance,
+        membership: *matches,
+        cs_generation: crate::instances::cs_generation(),
         last_overflow_log: -1000,
         next_scoreboard: 0,
         last_scoreboard: None,
@@ -1147,13 +1538,6 @@ fn copy_subject_ps(subject: i32, out: &mut [u8; SIZEOF_PLAYER_STATE]) -> bool {
     true
 }
 
-fn empty_ps(slot: i32, now: i32) -> [u8; SIZEOF_PLAYER_STATE] {
-    let mut ps = [0u8; SIZEOF_PLAYER_STATE];
-    write_i32_bytes(&mut ps, OFFSET_PS_COMMAND_TIME, now);
-    write_i32_bytes(&mut ps, OFFSET_PS_CLIENT_NUM, slot);
-    ps
-}
-
 fn build_snapshot(active: &mut Active, now: i32) -> bool {
     let sequence = active.sequence;
     let frame_index = (sequence as usize) & PACKET_MASK;
@@ -1171,15 +1555,10 @@ fn build_snapshot(active: &mut Active, now: i32) -> bool {
         .map(|index| active.frames[index].first_entity.max(0) as usize)
         .unwrap_or(0);
 
-    let mut ps = if let Some(subject) = active.subject {
-        let mut ps = [0u8; SIZEOF_PLAYER_STATE];
-        if !copy_subject_ps(subject, &mut ps) {
-            return false;
-        }
-        ps
-    } else {
-        empty_ps(active.empty_slot, now)
-    };
+    let mut ps = [0u8; SIZEOF_PLAYER_STATE];
+    if !copy_subject_ps(active.subject, &mut ps) {
+        return false;
+    }
     if follow_mode(active.subject, active.viewer_slot) {
         // SpectatorClientEndFrame: the watched player's ps with PMF_FOLLOW.
         // A self-view segment (viewer slot == subject) must stay a plain
@@ -1464,34 +1843,51 @@ mod tests {
     use super::*;
     use core::mem::{offset_of, size_of};
 
-    fn slot(slot: i32, connected: bool, has_gentity: bool, spectator: bool) -> ClientSlot {
+    fn slot(index: i32, connected: bool, has_gentity: bool, spectator: bool) -> ClientSlot {
         ClientSlot {
-            slot,
+            slot: index,
             connected,
+            in_world: connected,
             has_gentity,
             spectator,
+            bot: false,
             occupied: connected || has_gentity,
         }
     }
 
-    fn occupied(slot: i32) -> ClientSlot {
+    fn human(index: i32) -> ClientSlot {
+        slot(index, true, true, false)
+    }
+
+    fn occupied(index: i32) -> ClientSlot {
+        human(index)
+    }
+
+    fn free(index: i32) -> ClientSlot {
         ClientSlot {
-            slot,
-            connected: true,
-            has_gentity: true,
+            slot: index,
+            connected: false,
+            in_world: false,
+            has_gentity: false,
             spectator: false,
-            occupied: true,
+            bot: false,
+            occupied: false,
         }
     }
 
-    fn free(slot: i32) -> ClientSlot {
+    fn bot(index: i32) -> ClientSlot {
         ClientSlot {
-            slot,
-            connected: false,
-            has_gentity: false,
-            spectator: false,
-            occupied: false,
+            bot: true,
+            ..human(index)
         }
+    }
+
+    fn membership(pairs: &[(i32, DemoInstance)]) -> [Option<DemoInstance>; MAX_CLIENTS] {
+        let mut out = [None; MAX_CLIENTS];
+        for (slot, instance) in pairs {
+            out[*slot as usize] = Some(*instance);
+        }
+        out
     }
 
     #[test]
@@ -1529,6 +1925,46 @@ mod tests {
     }
 
     #[test]
+    fn demo_instance_labels_are_one_based() {
+        assert_eq!(DemoInstance::Main.label().as_label(), "main");
+        assert_eq!(DemoInstance::Tffa(0).label().as_label(), "tffa1");
+        assert_eq!(DemoInstance::Tffa(7).label().as_label(), "tffa8");
+        assert_eq!(DemoInstance::Duel(0).label().as_label(), "duel1");
+        assert_eq!(DemoInstance::Duel(15).label().as_label(), "duel16");
+        assert_eq!(DemoInstance::Tffa(3).viewer_match(), 3);
+        assert_eq!(DemoInstance::Duel(2).viewer_match(), 2);
+    }
+
+    #[test]
+    fn membership_comes_from_the_existing_tables() {
+        let mut matches = [0u8; MAX_CLIENTS];
+        matches[2] = 3;
+        let mut court_of = [None; MAX_CLIENTS];
+        court_of[4] = Some(2);
+        assert_eq!(
+            membership_of(5, InstanceMode::Off, &matches, &court_of),
+            Some(DemoInstance::Main)
+        );
+        assert_eq!(
+            membership_of(2, InstanceMode::Tffa, &matches, &court_of),
+            Some(DemoInstance::Tffa(3))
+        );
+        assert_eq!(
+            membership_of(0, InstanceMode::Tffa, &matches, &court_of),
+            Some(DemoInstance::Tffa(0))
+        );
+        assert_eq!(
+            membership_of(4, InstanceMode::Duel, &matches, &court_of),
+            Some(DemoInstance::Duel(2))
+        );
+        // Benched/spectating duel clients have no court.
+        assert_eq!(
+            membership_of(5, InstanceMode::Duel, &matches, &court_of),
+            None
+        );
+    }
+
+    #[test]
     fn viewer_slot_is_the_highest_unassigned_slot_when_the_server_leaves_room() {
         // 8 configured slots (0..7): 31 is the highest the server never
         // assigns.
@@ -1557,31 +1993,22 @@ mod tests {
     #[test]
     fn identity_is_lost_only_when_a_stranger_holds_the_viewer_slot() {
         // Unassigned viewer slot: fine even when every real slot is busy.
-        assert_eq!(
-            identity_lost(8, Some(1), 0, &[occupied(0), occupied(1)]),
-            None
-        );
+        assert_eq!(identity_lost(8, 1, &[occupied(0), occupied(1)]), None);
         // Someone takes the spare viewer slot: the identity is compromised.
         assert_eq!(
-            identity_lost(8, Some(1), 0, &[occupied(0), occupied(1), occupied(8)]),
+            identity_lost(8, 1, &[occupied(0), occupied(1), occupied(8)]),
             Some(8)
         );
-
         // Self view (viewer == subject): the occupant is the followed player.
-        assert_eq!(identity_lost(3, Some(3), 0, &[occupied(3)]), None);
+        assert_eq!(identity_lost(3, 3, &[occupied(3)]), None);
         // The subject moved away and a stranger now sits in the old slot.
-        assert_eq!(identity_lost(3, Some(4), 0, &[occupied(3)]), Some(3));
-
-        // Empty-map viewer claims a free slot; a client joining it is a
-        // stranger (there is no subject to follow).
-        assert_eq!(identity_lost(8, None, 2, &[occupied(2)]), Some(2));
+        assert_eq!(identity_lost(3, 4, &[occupied(3)]), Some(3));
     }
 
     #[test]
     fn follow_flag_only_when_the_viewer_follows_someone_else() {
-        assert!(follow_mode(Some(1), 8));
-        assert!(!follow_mode(Some(3), 3));
-        assert!(!follow_mode(None, 8));
+        assert!(follow_mode(1, 8));
+        assert!(!follow_mode(3, 3));
     }
 
     #[test]
@@ -1621,16 +2048,21 @@ mod tests {
 
     #[test]
     fn subject_decision_keeps_an_eligible_subject() {
-        let slots = [slot(0, true, true, false), slot(1, true, true, false)];
-        assert_eq!(choose_subject(Some(0), &slots), SubjectDecision::Keep);
+        let m = membership(&[(0, DemoInstance::Tffa(0)), (1, DemoInstance::Tffa(0))]);
+        let slots = [human(0), human(1)];
+        assert_eq!(
+            choose_subject(0, &slots, DemoInstance::Tffa(0), &m),
+            SubjectDecision::Keep
+        );
     }
 
     #[test]
     fn subject_decision_switches_when_the_subject_leaves() {
-        // Slot 0 is gone (kicked/disconnected); slot 1 is playing.
-        let slots = [slot(0, false, false, false), slot(1, true, true, false)];
+        // Slot 0 is gone (kicked/disconnected); slot 1 plays the same match.
+        let m = membership(&[(1, DemoInstance::Tffa(2))]);
+        let slots = [slot(0, false, false, false), human(1)];
         assert_eq!(
-            choose_subject(Some(0), &slots),
+            choose_subject(0, &slots, DemoInstance::Tffa(2), &m),
             SubjectDecision::Switch {
                 to: 1,
                 reason: SubjectLoss::Left
@@ -1640,14 +2072,11 @@ mod tests {
 
     #[test]
     fn subject_decision_switches_when_the_subject_spectates() {
-        // Slot 0 joined spectators; the follow target must be a playing slot.
-        let slots = [
-            slot(0, true, true, true),
-            slot(1, true, true, false),
-            slot(2, true, true, false),
-        ];
+        // Slot 0 joined spectators; slot 1 plays the same match.
+        let m = membership(&[(0, DemoInstance::Duel(0)), (1, DemoInstance::Duel(0))]);
+        let slots = [slot(0, true, true, true), human(1)];
         assert_eq!(
-            choose_subject(Some(0), &slots),
+            choose_subject(0, &slots, DemoInstance::Duel(0), &m),
             SubjectDecision::Switch {
                 to: 1,
                 reason: SubjectLoss::Spectator
@@ -1656,16 +2085,66 @@ mod tests {
     }
 
     #[test]
-    fn subject_decision_skips_spectators_when_choosing() {
-        let slots = [
-            slot(0, false, false, false),
-            slot(1, true, true, true),
-            slot(2, true, true, false),
-        ];
+    fn subject_decision_stays_inside_the_instance() {
+        // Slot 1 plays another match; slot 2 is the lowest of this one.
+        let m = membership(&[
+            (1, DemoInstance::Tffa(1)),
+            (2, DemoInstance::Tffa(0)),
+            (3, DemoInstance::Tffa(0)),
+        ]);
+        let slots = [slot(0, false, false, false), human(1), human(2), human(3)];
         assert_eq!(
-            choose_subject(Some(0), &slots),
+            choose_subject(0, &slots, DemoInstance::Tffa(0), &m),
             SubjectDecision::Switch {
                 to: 2,
+                reason: SubjectLoss::Left
+            }
+        );
+    }
+
+    #[test]
+    fn subject_decision_switches_when_the_subject_moves_instance() {
+        // Slot 0 is still playing but moved to match 1.
+        let m = membership(&[(0, DemoInstance::Tffa(1)), (1, DemoInstance::Tffa(0))]);
+        let slots = [human(0), human(1)];
+        assert_eq!(
+            choose_subject(0, &slots, DemoInstance::Tffa(0), &m),
+            SubjectDecision::Switch {
+                to: 1,
+                reason: SubjectLoss::Moved
+            }
+        );
+    }
+
+    #[test]
+    fn subject_decision_skips_bots() {
+        // Phase 3 records humans only.
+        let m = membership(&[(0, DemoInstance::Main), (1, DemoInstance::Main)]);
+        let slots = [bot(0), human(1)];
+        assert_eq!(
+            choose_subject(0, &slots, DemoInstance::Main, &m),
+            SubjectDecision::Switch {
+                to: 1,
+                reason: SubjectLoss::Moved
+            }
+        );
+        assert_eq!(
+            choose_subject(1, &slots, DemoInstance::Main, &m),
+            SubjectDecision::Keep
+        );
+    }
+
+    #[test]
+    fn subject_decision_skips_a_connecting_client() {
+        // CS_PRIMED has a gentity but is not in the world yet.
+        let m = membership(&[(0, DemoInstance::Main), (1, DemoInstance::Main)]);
+        let mut primed = slot(0, true, true, false);
+        primed.in_world = false;
+        let slots = [primed, human(1)];
+        assert_eq!(
+            choose_subject(0, &slots, DemoInstance::Main, &m),
+            SubjectDecision::Switch {
+                to: 1,
                 reason: SubjectLoss::Left
             }
         );
@@ -1674,30 +2153,97 @@ mod tests {
     #[test]
     fn subject_decision_skips_slots_without_a_gentity() {
         // A client still connecting has no gentity and no recordable ps yet.
+        let m = membership(&[(2, DemoInstance::Main)]);
         let slots = [
             slot(0, false, false, false),
             slot(1, true, false, false),
-            slot(2, true, true, false),
+            human(2),
         ];
         assert_eq!(
-            choose_subject(Some(0), &slots),
+            choose_subject(0, &slots, DemoInstance::Main, &m),
             SubjectDecision::Switch {
                 to: 2,
                 reason: SubjectLoss::Left
             }
         );
-        assert_eq!(choose_subject(Some(0), &slots[..2]), SubjectDecision::Stop);
+        assert_eq!(
+            choose_subject(0, &slots[..2], DemoInstance::Main, &m),
+            SubjectDecision::Stop
+        );
     }
 
     #[test]
-    fn subject_decision_stops_only_when_nobody_is_left() {
-        let slots = [slot(0, false, false, false), slot(1, true, true, true)];
-        assert_eq!(choose_subject(Some(0), &slots), SubjectDecision::Stop);
+    fn subject_decision_stops_only_when_the_instance_is_empty() {
+        let m = membership(&[(1, DemoInstance::Duel(3))]);
+        let slots = [slot(0, false, false, false), human(1)];
+        assert_eq!(
+            choose_subject(0, &slots, DemoInstance::Duel(2), &m),
+            SubjectDecision::Stop
+        );
     }
 
     #[test]
-    fn subject_decision_keeps_the_empty_map_viewer() {
-        assert_eq!(choose_subject(None, &[]), SubjectDecision::Keep);
+    fn chat_rule_is_the_copy_addressed_to_the_subject() {
+        let subject = 2;
+        // `G_Say` sends a per-client copy of every chat line: the subject's
+        // copy of a server broadcast is the one the demo carries, exactly once.
+        assert!(chat_command_for(subject, b"chat \"hello\"", subject));
+        assert!(chat_command_for(
+            subject,
+            b"lchat \"hello\" \"loc\"",
+            subject
+        ));
+        // A `-1` broadcast is still accepted.
+        assert!(chat_command_for(-1, b"chat \"hello\"", subject));
+        // Another client's copy is that client's, not this demo's.
+        assert!(!chat_command_for(3, b"chat \"hello\"", subject));
+        // A `tell` arrives as a `chat` addressed to its target, with the
+        // sender's name in the `ESC [` marker: never recorded.
+        assert!(!chat_command_for(
+            subject,
+            b"chat \"\x19[ChatTwo\x19]\x19: ^6psst\"",
+            subject
+        ));
+        assert!(!chat_command_for(
+            subject,
+            b"lchat \"\x19[ChatTwo\x19]\x19: ^6psst\" \"loc\" \"6\" \"psst\"",
+            subject
+        ));
+        // Never private tells or per-client prints.
+        assert!(!chat_command_for(subject, b"tell \"psst\"", subject));
+        assert!(!chat_command_for(-1, b"print hello", subject));
+        assert!(!chat_command_for(subject, b"print hello", subject));
+        assert!(!chat_command_for(subject, b"scores 1 0 0", subject));
+    }
+
+    #[test]
+    fn chat_rule_records_broadcasts_but_never_team_chat() {
+        // Owner decision (2026-11-12): broadcast only. The subject receives
+        // both commands, but `tchat`/`ltchat` must not reach the demo.
+        let subject = 2;
+        assert!(chat_command_for(subject, b"chat \"all\"", subject));
+        assert!(chat_command_for(subject, b"lchat \"all\" \"loc\"", subject));
+        assert!(!chat_command_for(subject, b"tchat \"team\"", subject));
+        assert!(!chat_command_for(subject, b"ltchat \"team\"", subject));
+        assert!(!chat_command_for(-1, b"tchat \"team\"", subject));
+    }
+
+    #[test]
+    fn segment_numbers_are_per_instance_and_reset_with_the_map() {
+        let mut segments = Vec::new();
+        assert_eq!(next_segment(&mut segments, DemoInstance::Tffa(0)), 1);
+        assert_eq!(next_segment(&mut segments, DemoInstance::Tffa(0)), 2);
+        assert_eq!(next_segment(&mut segments, DemoInstance::Tffa(1)), 1);
+        assert_eq!(next_segment(&mut segments, DemoInstance::Tffa(0)), 3);
+    }
+
+    #[test]
+    fn main_scores_command_passes_through_unchanged() {
+        let text = b"scores 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0\n";
+        assert_eq!(
+            instance_scores_command(DemoInstance::Main, 0, text),
+            text.to_vec()
+        );
     }
 
     #[test]

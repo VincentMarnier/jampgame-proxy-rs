@@ -590,7 +590,11 @@ HUD/scoreboard presentation.**
   `artifacts/subject-spectate/demos/20261111-222902_mp_ffa3_main_s1.dm_26`
   (subject forced to `TEAM_SPECTATOR`, 0→1 at 65.45 s) both validate:
   `max_delta=1`, entity order/range clean, gamestate round-trip identical.
-- No client has played a switched stream yet.
+- Phase 3 (`docs/demo-format.md` §12) repeated the switch without bots:
+  `artifacts/phase3-life/demos/20261112-094132_mp_ffa3_main_s1.dm_26`
+  (`0 -> 1 (left)`, 184 frames) validates; the real TaystJK client played a
+  different Phase 3 file to its end without parse errors, but the switched
+  file itself has not been played on a client yet.
 
 ### Cheapest experiment
 
@@ -623,7 +627,11 @@ missing deaths) rather than a parse error.**
   carries boards for 1 and 2 clients (the earlier development run also covered
   3), each a clean 14-int layout, and validates; the recorded `cs[0]` has no
   `taystJKinfo` while the live server still advertises `128`.
-- No client has opened a recorded demo and pressed TAB yet.
+- Phase 3 (`docs/demo-format.md` §12): the TFFA files carry their own board
+  text (the subject's match rewrite) and the duel files their own court
+  `cs30`/`cs31`; all validate. A real TaystJK client played two of these files
+  to completion without a parse error, but no one has pressed TAB on them
+  (and the client could not be screen-captured here).
 
 ### Cheapest experiment
 
@@ -633,3 +641,38 @@ teams update, the deaths column is absent (stock layout), and the board does
 not shift after a client joins/leaves. If deaths in demos matter, the
 alternative is to record with the 15-int layout and strip nothing, accepting
 that stock clients then misparse the board (the two cannot share one stream).
+
+
+---
+
+## U-013 — Demo chat rule
+
+### Question
+
+Which chat lines should a server-side demo carry?
+
+### Classification
+
+**resolved — owner decision, 2026-11-12: broadcasts only.**
+
+### Decision
+
+A demo carries the server-wide `chat`/`lchat` line and nothing else. Team chat
+(`say_team` → `tchat`/`ltchat`), a private `tell` and a per-client `print` are
+never recorded. The rule is isolated in `recorder::chat_command_for` so a later
+change stays a one-function edit plus its unit test.
+
+### Evidence
+
+- `G_Say`/`G_SayTo` (`g_cmds.c:1550-1554`) send chat per recipient, so the
+  subject's copy is exactly the broadcast that player received; the game sends
+  team chat under a different command name, which the filter excludes.
+- `SAY_TELL` wraps the sender's name in `\x19[…\x19` (`g_cmds.c:1601-1613`),
+  the only observable that separates a tell from a broadcast line.
+- `artifacts/phase3-tffa/demos/20261112-101848_mp_duel1_tffa1_s1.dm_26` and
+  `…_tffa2_s1.dm_26` each carry `chat hello-all` once and no `tchat`, although
+  both `say_team team-main` and `say_team team-two` were sent by players of
+  those matches; `artifacts/phase3-chat/demos/20261112-101757_mp_ffa3_main_s1.dm_26`
+  carries the two broadcasts and not the private `tell secret-tell`.
+- Unit tests `chat_rule_is_the_copy_addressed_to_the_subject` and
+  `chat_rule_records_broadcasts_but_never_team_chat`.

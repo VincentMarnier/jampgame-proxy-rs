@@ -650,9 +650,20 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
             -1
         }
     };
-    // Phase 2 demo recorder: only after the engine has stored the new value.
+    // Phase 3 demo recorder: only after the engine has stored the new value.
     if command == G_SET_CONFIGSTRING {
         crate::demo::recorder::on_set_configstring(a0);
+    }
+    // Chat for the demo streams is buffered after the proxy accepted the
+    // command (a message dropped for this recipient never reaches here); the
+    // recorder's per-tick rule decides which recipients it belongs to.
+    if command == G_SEND_SERVER_COMMAND {
+        let ptr = a1 as usize as *const core::ffi::c_char;
+        if !ptr.is_null() {
+            // SAFETY: the game passes a NUL-terminated command string.
+            let text = unsafe { CStr::from_ptr(ptr) };
+            crate::demo::recorder::on_server_command(a0, text.to_bytes());
+        }
     }
     response
 }

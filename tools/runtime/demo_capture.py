@@ -71,6 +71,8 @@ class Capture:
         self.frames = []
         self.first_gamestate_payload = None
         self.configstrings = {}
+        self.client_command_sequence = 0
+        self.last_gamestate_time = 0.0
 
     # -- OOB ------------------------------------------------------------
     def send(self, data):
@@ -121,14 +123,24 @@ class Capture:
         self.frames.append((seq, payload))
 
         # Inspect the first op byte after the leading lastClientCommand long.
+        # A gamestate message usually starts with reliable server commands, so
+        # skip those before deciding what the payload is.
         r = jp.MsgReader(payload)
         r.read_long()  # lastClientCommand
         first_op = r.read_byte()
-        if first_op in (jp.SVC_GAMESTATE, jp.SVC_SERVERCOMMAND) and self.first_gamestate_payload is None:
-            self.first_gamestate_payload = payload
+        while first_op == jp.SVC_SERVERCOMMAND:
+            r.read_long()
+            read_nul(r, 1024)
+            first_op = r.read_byte()
+        if first_op == jp.SVC_GAMESTATE:
+            # Every gamestate (connect and each map_restart) refreshes
+            # `sv_serverid`; client commands must carry the current one.
+            self.last_gamestate_time = time.monotonic()
+            if self.first_gamestate_payload is None:
+                self.first_gamestate_payload = payload
             self.parse_gamestate_prefix(payload)
             if self.verbose:
-                print(f"gamestate captured: seq={seq} payload={len(payload)} bytes")
+                print(f"gamestate: seq={seq} payload={len(payload)} bytes")
         elif self.verbose:
             print(f"message seq={seq} payload={len(payload)} first_op={first_op}")
 
@@ -187,9 +199,64 @@ class Capture:
         )
         self.send(self.netchan.transmit(encoded))
 
-    def run(self, duration):
+    def send_enter(self):
+        """One `clc_move` carrying a single zero usercmd: the first usercmd
+        makes the engine put a CS_PRIMED client into the world
+        (`SV_ClientEnterWorld`, sv_client.cpp:1761)."""
+        msg = jp.MsgWriter()
+        msg.write_long(self.server_id)
+        msg.write_long(self.netchan.incoming_sequence)
+        msg.write_long(self.server_command_sequence)
+        msg.write_byte(jp.CLC_MOVE)
+        msg.write_byte(1)  # cmdCount
+        # MSG_WriteDeltaUsercmdKey(null, zero): 1-bit "short serverTime",
+        # 8-bit delta, then the "no fields changed" bit.
+        msg.write_bits(1, 1)
+        msg.write_bits(0, 8)
+        msg.write_bits(0, 1)
+        msg.write_byte(jp.CLC_EOF)
+        payload = msg.payload()
+        encoded = jp.encode_client_payload(
+            payload,
+            self.challenge,
+            self.server_id,
+            self.netchan.incoming_sequence,
+            self.server_command_sequence,
+            self.reliable_commands[
+                self.server_command_sequence & (jp.MAX_RELIABLE_COMMANDS - 1)
+            ],
+        )
+        self.send(self.netchan.transmit(encoded))
+
+    def send_client_command(self, text):
+        """One reliable client command (`clc_clientCommand`), as
+        `CL_AddReliableCommand` sends it (`cl_input.cpp:2471`)."""
+        self.client_command_sequence += 1
+        msg = jp.MsgWriter()
+        msg.write_long(self.server_id)
+        msg.write_long(self.netchan.incoming_sequence)
+        msg.write_long(self.server_command_sequence)
+        msg.write_byte(jp.CLC_CLIENTCOMMAND)
+        msg.write_long(self.client_command_sequence)
+        msg.write_string(text)
+        msg.write_byte(jp.CLC_EOF)
+        payload = msg.payload()
+        encoded = jp.encode_client_payload(
+            payload,
+            self.challenge,
+            self.server_id,
+            self.netchan.incoming_sequence,
+            self.server_command_sequence,
+            self.reliable_commands[
+                self.server_command_sequence & (jp.MAX_RELIABLE_COMMANDS - 1)
+            ],
+        )
+        self.send(self.netchan.transmit(encoded))
+
+    def run(self, duration, commands=None, command_delay=3.0, enter=False):
         self.start()
-        deadline = time.monotonic() + duration
+        start = time.monotonic()
+        deadline = start + duration
         last_keepalive = 0.0
         while time.monotonic() < deadline:
             timeout = min(0.1, max(0.0, deadline - time.monotonic()))
@@ -200,6 +267,33 @@ class Capture:
                 except BlockingIOError:
                     continue
                 self.handle_datagram(data)
+            # First usercmd: enter the world so the client becomes a real
+            # player (a primitive capture tool would otherwise stay CS_PRIMED).
+            if enter and self.last_gamestate_time > 0.0 and time.monotonic() >= self.last_gamestate_time + 1.0:
+                self.send_enter()
+                enter = False
+                if self.verbose:
+                    print("entered the world")
+            # Reliable client commands (test control: `tffa_create`,
+            # `tffa_join`, `team red`, ...), spaced out after the gamestate.
+            commands = commands or []
+            if (
+                commands
+                and self.last_gamestate_time > 0.0
+                and self.state >= CA_CONNECTED
+                and time.monotonic() >= self.last_gamestate_time + command_delay
+            ):
+                text = commands.pop(0)
+                self.send_client_command(text)
+                # The engine's reliable-command flood gate drops a command
+                # that arrives less than one second after the previous one
+                # (`cl->nextReliableTime = svs.time + 1000`; the shipped
+                # binary keeps the block the 1.01 source has commented out —
+                # the string "client text ignored for %s" is at 0x152490), so
+                # test clients space commands above that window.
+                command_delay += 1.4
+                if self.verbose:
+                    print("client command:", text)
             now = time.monotonic()
             if self.state >= CA_CONNECTED and now - last_keepalive >= 0.2:
                 self.send_keepalive()
@@ -215,13 +309,25 @@ def main():
     ap.add_argument("--name", default="DemoCapture")
     ap.add_argument("--protocol", type=int, default=jp.PROTOCOL_VERSION)
     ap.add_argument("--qport", type=int, default=4242)
+    ap.add_argument(
+        "--command",
+        action="append",
+        default=[],
+        help="reliable client command to send after the gamestate (repeatable)",
+    )
+    ap.add_argument("--command-delay", type=float, default=3.0)
+    ap.add_argument(
+        "--enter",
+        action="store_true",
+        help="send one empty usercmd so the engine puts the client in the world",
+    )
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     cap = Capture(
         args.host, args.port, args.name, args.protocol, args.qport, args.verbose
     )
-    cap.run(args.duration)
+    cap.run(args.duration, list(args.command), args.command_delay, args.enter)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:

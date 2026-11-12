@@ -23,6 +23,8 @@
 use core::ffi::c_int;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::sdk::{
     CONTENTS_TRIGGER, CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_PLAYERS, CS_SCORES1,
     CS_SCORES2, ENTITYNUM_MAX_NORMAL, ET_EVENTS, ET_MOVER, ET_NPC, G_LINKENTITY, MAX_CLIENTS,
@@ -41,6 +43,21 @@ use crate::state;
 
 /// Match id of the implicit main TFFA.
 pub const MAIN_MATCH: u8 = 0;
+
+/// Bumped whenever per-viewer `CS_PLAYERS`/HUD values are re-pushed (match
+/// moves, duel labels, W/L). Demo recorders compare it to know when their
+/// mirrored `cs` view must be recomputed; no state is duplicated across the
+/// boundary.
+static CS_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Monotonic per-viewer configstring generation (see [`CS_GENERATION`]).
+pub fn cs_generation() -> u32 {
+    CS_GENERATION.load(Ordering::Relaxed)
+}
+
+pub(crate) fn bump_cs_generation() {
+    CS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Maximum instance slots (ids `1..=MAX_MATCHES`). Raised from 8 to 16 by
 /// D-025: the duel ladder may host up to 16 courts, while
@@ -952,6 +969,7 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
     });
     send_cs_to_client(client_num, CS_SCORES1, &red.to_string());
     send_cs_to_client(client_num, CS_SCORES2, &blue.to_string());
+    bump_cs_generation();
 }
 
 /// The `CS_PLAYERS + slot` value `viewer` must hold for every slot with a known
