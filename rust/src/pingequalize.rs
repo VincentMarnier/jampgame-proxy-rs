@@ -194,10 +194,19 @@ pub fn shift_snapshot_time(data: &mut [u8], view_ms: i32) -> bool {
         let op = data[pos];
         pos += 1;
         match op {
-            SVC_SERVER_COMMAND => match data[pos..].iter().position(|&b| b == 0) {
-                Some(n) => pos += n + 1,
-                None => return false,
-            },
+            SVC_SERVER_COMMAND => {
+                // Opcode, then the 4-byte command sequence, then the
+                // NUL-terminated command (`sv_snapshot.cpp:249-251`;
+                // `cl_parse.cpp:794-795` reads the sequence first).
+                pos += 4;
+                if pos > data.len() {
+                    return false;
+                }
+                match data[pos..].iter().position(|&b| b == 0) {
+                    Some(n) => pos += n + 1,
+                    None => return false,
+                }
+            }
             SVC_SNAPSHOT => {
                 if pos + 4 > data.len() {
                     return false;
@@ -214,13 +223,13 @@ pub fn shift_snapshot_time(data: &mut [u8], view_ms: i32) -> bool {
     false
 }
 
-/// The view shift currently applied to one client (0 = none), for the
-/// snapshot send hook.
-pub fn view_for(client_num: usize) -> i32 {
+/// Advance one client's view shift by one snapshot and return the value to
+/// apply to this snapshot (0 = none). Called from the snapshot send hook.
+pub fn view_for_snapshot(client_num: usize) -> i32 {
     state::with_state(|s| {
         s.clients
-            .get(client_num)
-            .map(|c| c.ping_equalize.view_ms)
+            .get_mut(client_num)
+            .map(|c| c.ping_equalize.step_view())
             .unwrap_or(0)
     })
 }
@@ -290,8 +299,12 @@ pub struct PingEqualizeState {
     pub applied: i32,
     /// Requested delay in ms (`0` = none), set by the frame pass.
     pub target: i32,
-    /// View half of the delay, ms: the snapshot clock shift.
+    /// View half of the delay currently applied, ms: the snapshot clock shift.
+    /// Ramped one millisecond per snapshot so the client's own clock walk
+    /// (`CL_AdjustTimeDelta`, +1/-2 ms per snapshot) can follow it.
     pub view_ms: i32,
+    /// View half the split asks for, ms.
+    pub view_target: i32,
     /// Action half of the delay, ms: the queue's target.
     pub action_ms: i32,
     /// Commands the queue currently holds on purpose.
@@ -327,7 +340,11 @@ impl PingEqualizeState {
     /// Whether the queue path must run for this client (a delay is wanted, is
     /// still in effect, or held commands are waiting).
     pub fn active(&self) -> bool {
-        self.target > 0 || self.view_ms > 0 || self.depth > 0 || self.queue.len() > 0
+        self.target > 0
+            || self.view_ms > 0
+            || self.view_target > 0
+            || self.depth > 0
+            || self.queue.len() > 0
     }
 
     /// Feed the arriving command's raw stamp and refresh the interval EMA.
@@ -371,6 +388,14 @@ impl PingEqualizeState {
             }
         }
         self.sync_applied();
+    }
+
+    /// Move the applied view shift one millisecond toward its target and
+    /// return it. Called once per snapshot sent to this client.
+    pub fn step_view(&mut self) -> i32 {
+        self.view_ms += (self.view_target - self.view_ms).signum();
+        self.sync_applied();
+        self.view_ms
     }
 
     /// Append the arriving command to the queue.
@@ -419,7 +444,7 @@ impl PingEqualizeState {
     ) -> Option<ClientTransition> {
         self.target = effective;
         let (view, action) = split(effective, self.interval_or_default());
-        self.view_ms = view;
+        self.view_target = view;
         self.action_ms = action;
         self.refresh_depth_target();
         self.sync_applied();
@@ -816,9 +841,10 @@ pub fn on_run_frame(now: i32) {
                 client.last_debug_ms = now;
                 lines.push(format!(
                     "----- proxy-rs: pingEqualize debug client={i} target={} reported={reported} \
-                     view={} action={} depth={}/{} interval={} applied={} queue={} ping={}\n",
+                     view={}/{} action={} depth={}/{} interval={} applied={} queue={} ping={}\n",
                     client.target,
                     client.view_ms,
+                    client.view_target,
                     client.action_ms,
                     client.depth,
                     client.depth_target,
@@ -1081,6 +1107,23 @@ mod tests {
     }
 
     #[test]
+    fn the_view_shift_ramps_one_millisecond_per_snapshot() {
+        let mut state = PingEqualizeState {
+            view_target: 3,
+            ..Default::default()
+        };
+        assert_eq!(state.step_view(), 1);
+        assert_eq!(state.step_view(), 2);
+        assert_eq!(state.step_view(), 3);
+        assert_eq!(state.step_view(), 3, "clamped at the target");
+        state.view_target = 0;
+        assert_eq!(state.step_view(), 2);
+        assert_eq!(state.step_view(), 1);
+        assert_eq!(state.step_view(), 0);
+        assert_eq!(state.step_view(), 0);
+    }
+
+    #[test]
     fn the_snapshot_time_is_shifted_only_in_a_snapshot_message() {
         // lastClientCommand + svc_snapshot + serverTime.
         let mut buf = [0u8; 13];
@@ -1090,16 +1133,32 @@ mod tests {
         assert!(shift_snapshot_time(&mut buf, 100));
         assert_eq!(i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]), 900);
 
-        // A reliable command before the snapshot is skipped.
+        // A reliable command before the snapshot is skipped: opcode, the
+        // 4-byte sequence (which can contain zero bytes), then the string.
         let mut buf = Vec::new();
         buf.extend_from_slice(&7i32.to_le_bytes());
         buf.push(SVC_SERVER_COMMAND);
+        buf.extend_from_slice(&1i32.to_le_bytes());
         buf.extend_from_slice(b"print \"hi\"\0");
         buf.push(SVC_SNAPSHOT);
         buf.extend_from_slice(&500i32.to_le_bytes());
         assert!(shift_snapshot_time(&mut buf, 50));
         let tail = &buf[buf.len() - 4..];
         assert_eq!(i32::from_le_bytes(tail.try_into().unwrap()), 450);
+
+        // Two commands, the second one long: still skipped exactly.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&7i32.to_le_bytes());
+        for (seq, text) in [(1i32, b"print \"a\"\0".as_slice()), (2, b"print \"bb\"\0")] {
+            buf.push(SVC_SERVER_COMMAND);
+            buf.extend_from_slice(&seq.to_le_bytes());
+            buf.extend_from_slice(text);
+        }
+        buf.push(SVC_SNAPSHOT);
+        buf.extend_from_slice(&1000i32.to_le_bytes());
+        assert!(shift_snapshot_time(&mut buf, 25));
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(i32::from_le_bytes(tail.try_into().unwrap()), 975);
 
         // A gamestate (not a snapshot), a truncated buffer and view 0 are left
         // untouched.

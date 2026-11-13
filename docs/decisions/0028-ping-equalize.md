@@ -256,11 +256,21 @@ Two consequences are handled explicitly:
   `state.clients[i].ping_equalize.view_ms` offset from `tn`/`lo`/`hi`, so
   `proxy_sv_voidTimeNudge` and the table keep reporting the client's real
   setting instead of fighting the equaliser.
-- **Engage/disengage is a clock step**, not a ramp: the view shift moves by the
-  target change at once (the target itself is deadbanded to 10 ms). The client's
-  `CL_AdjustTimeDelta` fast-adjusts deltas over 100 ms, which is the same path
-  it uses after a server stall; the queue still ramps its depth one command per
-  100 ms.
+- **The view shift ramps one millisecond per snapshot sent** (20 ms/s at
+  `sv_fps 20`), because `CL_AdjustTimeDelta` is built to walk the clock by
+  1-2 ms per snapshot: a backward step larger than 100 ms would take the
+  fast-adjust path and a step of 75 ms would be absorbed only through
+  extrapolation. With the ramp the client follows a 104 ms view shift in about
+  5 s without a hitch; the queue still ramps its depth one command per 100 ms.
+- **The message layout must be parsed exactly**: JA writes a 4-byte command
+  sequence between `svc_serverCommand` and its string
+  (`sv_snapshot.cpp:249-251`), and the first version skipped only the string,
+  so with a pending reliable command (the connect banner) the patch landed
+  inside the snapshot header and the client dropped the connection with
+  "Invalid size ... for areamask". `shift_snapshot_time` now skips the sequence
+  and is pinned by tests, and `a2`'s client parses the snapshot's area-mask
+  length so the harness fails on such a corruption instead of only a real
+  client doing so.
 
 The `ps.ping` display, the population, the tracking rules and the cvars are
 unchanged; `eff`/the scoreboard report `ping + view + action`, the effective

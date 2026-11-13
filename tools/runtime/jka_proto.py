@@ -477,6 +477,9 @@ class MsgReader:
             c -= 0x100000000
         return c
 
+    def read_bytes(self, n):
+        return bytes(self.read_bits(8) & 0xFF for _ in range(n))
+
     def read_string(self):
         out = bytearray()
         while True:

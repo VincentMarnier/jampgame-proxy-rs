@@ -501,8 +501,9 @@ never made faster.
   immediately when players join/leave/spectate or the cap changes.
 - The delay is real and split like a network path. Half of it is a **view**
   delay: the server sends each padded player's snapshots with their `serverTime`
-  shifted back, so that player's whole clock — view included — lags, exactly as
-  a slower link's would. The other half is an **action** delay: the server
+  shifted back (ramping one millisecond per snapshot, so the client's own clock
+  walk follows it), so that player's whole clock — view included — lags,
+  exactly as a slower link's would. The other half is an **action** delay: the server
   holds that many milliseconds of the player's commands in a queue and
   processes one held command per arriving one, so the game's state and its
   `ps.commandTime` are genuinely behind. Client prediction keeps working

@@ -156,13 +156,20 @@ TARGET=$(sed -n 's/.*pingEqualize target=\([0-9][0-9]*\).*/\1/p' "$LOG" | tail -
 }
 delay_expected=$((TARGET - ping0_before))
 [ "$delay_expected" -ge 0 ] || delay_expected=0
-shift_expected=$((shift0_before - delay_expected))
-echo "== target=$TARGET fast ping=$ping0_before expected delay=$delay_expected expected shift=$shift_expected =="
+# D-028.9 splits the delay: the action (queue) half reaches ps.commandTime
+# directly, the view half is a snapshot-clock shift the *client's* clock walk
+# absorbs. The gdb stalls during sampling make the client extrapolate and undo
+# part of that absorption, so the sampled shift must show at least the action
+# half and at most the full delay; the full delay is pinned by the ps.ping
+# check below (the proxy's own applied value).
+action_expected=$((delay_expected / 2))
+shift_at_least=$((shift0_before - delay_expected))
+shift_at_most=$((shift0_before - action_expected + 20))
+echo "== target=$TARGET fast ping=$ping0_before delay=$delay_expected action~$action_expected shift expected in [$shift_at_least..$shift_at_most] =="
 
 fail=0
-delta=$((shift0_after - shift_expected))
-if [ "$delta" -gt 25 ] || [ "$delta" -lt -25 ]; then
-  echo "== fast client shift $shift0_after is not the expected $shift_expected: FAIL ==" >&2
+if [ "$shift0_after" -lt "$shift_at_least" ] || [ "$shift0_after" -gt "$shift_at_most" ]; then
+  echo "== fast client shift $shift0_after is outside [$shift_at_least..$shift_at_most]: FAIL ==" >&2
   fail=1
 fi
 eff_delta=$((ping0_after - TARGET))

@@ -302,6 +302,17 @@ class ClientModel:
                 server_time = msg.read_long()
                 delta_num = msg.read_byte()
                 snap_flags = msg.read_byte()
+                # CL_ParseSnapshot reads a byte count, then that many area
+                # mask bytes (cl_parse.cpp:268-270). A count above
+                # MAX_MAP_AREA_BYTES means the message was corrupted in
+                # flight; the stock client overflows, a modern one drops the
+                # connection, so fail here where the cause is visible.
+                area_bytes = msg.read_byte()
+                if not 1 <= area_bytes <= 32:
+                    raise RuntimeError(
+                        "snapshot areamask size %d (message corrupted)" % area_bytes
+                    )
+                msg.read_bytes(area_bytes)
                 self.snap = (server_time, self.server_message_sequence, snap_flags)
                 self.new_snapshots = True
                 self.snapshots.append(

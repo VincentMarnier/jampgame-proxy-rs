@@ -1666,7 +1666,7 @@ pub unsafe extern "C" fn sv_send_message_to_client(msg: usize, cl: usize) {
     if msg != 0 && cl != 0 {
         let slot = client_num_from_addr(cl);
         if slot < MAX_CLIENTS {
-            let view = crate::pingequalize::view_for(slot);
+            let view = crate::pingequalize::view_for_snapshot(slot);
             if view > 0 {
                 // SAFETY: msg is the engine's live message buffer.
                 unsafe { shift_snapshot_message(msg, view) };
