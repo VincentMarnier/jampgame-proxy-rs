@@ -197,6 +197,75 @@ The display (D-028.3), population (D-028.4), tracking (D-028.5) and cvars
 (D-028.7) are unchanged. `applied` (ms) is now `depth x interval`, so the
 `eff` column and the scoreboard value report the delay actually in effect.
 
+### D-028.9 — Split the delay: view clock + action queue (2026-11-13)
+
+The queue-only mechanism hit a hard client limit at high frame rates. A
+real-client run with `proxy_sv_pingEqualize 150` showed the lagometer overlay
+("Connection Interrupted", `cg_draw.c:5030`) flashing several times a second.
+The diagnostic line (log level 2) showed why:
+
+```text
+pingEqualize debug client=2 target=150 reported=150 view=0 action=0 depth=48/48
+interval=2 applied=96 queue=48 ping=0
+```
+
+The client creates one usercmd **per rendered frame**, so at 500 commands/s
+(`interval = 2 ms`, the `fps` column's 200 is the packet rate) its
+`CMD_BACKUP = 64` replay ring covers only 128 ms. The requested 150 ms needs
+75 commands, hits `MAX_DEPTH = 48`, delivers 96 ms, and even that leaves the
+ring almost full. `CG_DrawDisconnect` draws its overlay exactly when
+`current - 63 > snap->ps.commandTime`, and `CG_PredictPlayerState` stops
+predicting at the same boundary ("exceeded PACKET_BACKUP on commands"). Raising
+`com_maxfps 125` made the flashing stop, which confirmed the ring — but a
+client-side requirement is not acceptable for this feature.
+
+A real connection of the same round trip does not spend the ring: the client's
+own clock is shifted by the one-way delay (`CL_AdjustTimeDelta` derives it from
+`snap.serverTime`), so its view lags and its command stamps lag with it, and
+the replay depth stays at the in-flight commands. The server can reproduce that
+without touching the client: shift the **snapshot time** it sends.
+
+The delay is therefore split in two halves:
+
+- **View half** — `SV_SendMessageToClient` (0x8058c84) is detoured, and the
+  snapshot's `serverTime` is reduced by `view_ms` before the message is
+  fragmented and sent (`pingequalize::shift_snapshot_time`). The client's clock
+  — and its view — then lag by `view_ms`, and its command stamps follow. This
+  costs no replay-ring depth. The parser walks only the message shapes the
+  engine actually produces: `lastClientCommand` (4 bytes), zero or more
+  `svc_serverCommand` + string entries, then `svc_snapshot` + the 4-byte time.
+  A gamestate, a mapchange or anything unrecognised is left untouched.
+- **Action half** — the existing command queue, sized to `action_ms`. Only this
+  half is paid for out of the client's ring, so
+  `action_ms <= RING_SAFE_FRAMES (48) * interval - AHEAD_MS (50)`, and the view
+  half takes the rest. A 150 ms delay at 500 commands/s becomes view 104 /
+  action 46 (the 48-frame budget minus one snapshot interval); at 50 commands/s
+  it is 75/75 like a real link.
+
+`split(delay, interval)` is a pure function (`pingequalize::split`), pinned by
+unit tests. The frame pass sets `view_ms`/`action_ms` from the deadbanded
+target; `depth_target` derives from `action_ms`; `applied` (the displayed
+effective delay) is `view_ms + depth * interval`.
+
+Two consequences are handled explicitly:
+
+- **The `timeNudge` estimator must subtract the view shift.** Shifting the
+  snapshot time is indistinguishable, from the server's side, from a client
+  clock nudge of `+view_ms` (`cl_timeNudge` does exactly the same thing to the
+  stamped clock). `hooks::netstatus::compute` removes the
+  `state.clients[i].ping_equalize.view_ms` offset from `tn`/`lo`/`hi`, so
+  `proxy_sv_voidTimeNudge` and the table keep reporting the client's real
+  setting instead of fighting the equaliser.
+- **Engage/disengage is a clock step**, not a ramp: the view shift moves by the
+  target change at once (the target itself is deadbanded to 10 ms). The client's
+  `CL_AdjustTimeDelta` fast-adjusts deltas over 100 ms, which is the same path
+  it uses after a server stall; the queue still ramps its depth one command per
+  100 ms.
+
+The `ps.ping` display, the population, the tracking rules and the cvars are
+unchanged; `eff`/the scoreboard report `ping + view + action`, the effective
+round trip.
+
 ## Evidence (verified before implementation)
 
 - The shift path exists and is validated: `rust/src/hooks/netstatus.rs`
@@ -235,6 +304,15 @@ The display (D-028.3), population (D-028.4), tracking (D-028.5) and cvars
   shapes.
 - netStatus table: `eff` column (`ping + applied delay`) after `ping`, header
   and rule pinned by a unit test; runtime parser regex updated.
+- Real-client test of the queue-only mechanism (2026-11-13): with the delay at
+  150 ms and a 500 commands/s client, `depth` capped at 48 (96 ms delivered)
+  and the lagometer overlay flashed; `com_maxfps 125` removed it, confirming
+  the 64-command ring (D-028.9).
+- Split mechanism, synthetic check (2026-11-13): with `view` 51 / `action` 51,
+  the fast client's newest command stamp moved from -61 ms to -107 ms relative
+  to `level.time` (the view shift reached the client's clock) while the queue
+  gap stayed at 66 ms (the action half only), and `ps.ping` read
+  `ping + view + action`.
 - Real-client test (2026-11-13), and the finding that changed the mechanism:
   with the stamp-shift implementation the `eff` column read 150 ms as designed,
   but movement stuttered. Root cause and fix in D-028.8 (the snapshot's
@@ -295,7 +373,8 @@ The display (D-028.3), population (D-028.4), tracking (D-028.5) and cvars
 3. **A real client at the cap** must behave like a natural high-ping
    connection (smooth, no rubber-banding) and must not log "exceeded
    PACKET_BACKUP on commands". The first run disproved the stamp-shift
-   mechanism (D-028.8); the queue mechanism needs the same run again.
+   mechanism (D-028.8), the second found the ring limit of the queue-only
+   mechanism (D-028.9); the split mechanism is the run in progress.
 4. **The 32-snapshot average** at `sv_fps 10` (window ~3.2 s) with the 500 ms
    refresh and the 10 ms deadband is assumed smooth enough; a noisy server may
    still retarget on roster changes, which is intentional.

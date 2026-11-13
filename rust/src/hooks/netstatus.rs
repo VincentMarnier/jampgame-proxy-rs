@@ -624,13 +624,24 @@ fn compute(client_num: usize, now: i32, msg_interval: f32, bias_floor: f32) -> O
     state::with_state(|s| {
         let ns = &mut s.clients[client_num].netstatus;
         let records: Vec<_> = ns.records().copied().collect();
-        let est = netstatus_est::estimate(
+        let mut est = netstatus_est::estimate(
             &records,
             now,
             frame_msec,
             Some(msg_interval).filter(|v| *v > 0.0),
             bias_floor,
         )?;
+        // D-028.9: the view half of the ping-equalisation delay shifts the
+        // client's snapshot clock — and therefore its command stamps — back by
+        // `view_ms`. The estimator is a clock comparison, so the server removes
+        // the offset it applied itself before reporting a `cl_timeNudge`.
+        let view = s.clients[client_num].ping_equalize.view_ms;
+        if view != 0 {
+            let shift = view as f32;
+            est.tn -= shift;
+            est.lo -= shift;
+            est.hi -= shift;
+        }
         if est.step {
             // keep the post-step half so the new value shows within ~2 s
             ns.keep_last(est.samples / 2);

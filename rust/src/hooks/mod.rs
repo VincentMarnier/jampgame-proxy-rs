@@ -125,6 +125,11 @@ engine_trampoline!(
     23,
     unsafe extern "C" fn()
 );
+engine_trampoline!(
+    engine_hook_original_sv_send_message_to_client,
+    24,
+    unsafe extern "C" fn(usize, usize)
+);
 
 game_trampoline!(
     game_hook_original_g_damage,
@@ -385,6 +390,7 @@ pub unsafe fn attach_all() {
         engine_sv::msg_read_bits as usize,
         engine_sv::sv_send_client_snapshot as usize,
         engine_sv::sv_send_client_messages as usize,
+        engine_sv::sv_send_message_to_client as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine

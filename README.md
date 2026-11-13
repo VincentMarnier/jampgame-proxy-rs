@@ -499,19 +499,27 @@ never made faster.
 - The target refreshes at most every 500 ms from the engine's ping (already an
   average), moves only when it changes by at least 10 ms, and retargets
   immediately when players join/leave/spectate or the cap changes.
-- The delay is real: the server **holds** the player's commands in a queue and
-  processes one held command per arriving one, so the game's state (and its
-  `ps.commandTime`) is genuinely that many commands behind, exactly like a
-  slower link. Client prediction keeps working because the state and its clock
-  agree; shifting the command timestamps instead would make the client replay
-  moves the server had already applied (the first attempt did, and a real
-  client felt it immediately).
-- The queue depth is the delay rounded to the player's command interval
-  (`delay / interval`), and it moves at most one command per 100 ms: engaging
-  or disengaging skips (or catches up) one command at a time, never a burst.
-  Setting `proxy_sv_pingEqualize 0` drains the queue instead of jumping the
-  clock forward; `proxy_sv_enable 0` detaches the hook layer and drops the
-  queues, as with every feature behind the master switch.
+- The delay is real and split like a network path. Half of it is a **view**
+  delay: the server sends each padded player's snapshots with their `serverTime`
+  shifted back, so that player's whole clock — view included — lags, exactly as
+  a slower link's would. The other half is an **action** delay: the server
+  holds that many milliseconds of the player's commands in a queue and
+  processes one held command per arriving one, so the game's state and its
+  `ps.commandTime` are genuinely behind. Client prediction keeps working
+  because the state and its clock agree; shifting only the command timestamps
+  would make the client replay moves the server had already applied (the first
+  attempt did, and a real client felt it immediately).
+- Only the action half is paid for out of the client's 64-command prediction
+  buffer, so it is capped at `48 x the player's command interval - 50 ms` and
+  the view half takes the rest. That keeps a 500-commands-per-second client
+  (whose 64-frame buffer is only 128 ms) inside its ring; without the split,
+  the lagometer flashes "Connection Interrupted".
+- The queue depth is the action half rounded to the command interval, and it
+  moves at most one command per 100 ms: engaging or disengaging skips (or
+  catches up) one command at a time, never a burst. Setting
+  `proxy_sv_pingEqualize 0` drains the queue and removes the view shift;
+  `proxy_sv_enable 0` detaches the hook layer and drops the queues, as with
+  every feature behind the master switch.
 - Only the **input** path is equalised. Snapshots are still sent to each player
   as soon as their bandwidth allows, so a low-ping player's view stays fresher
   than a natural high-pinger's; the equaliser does not hide that difference.

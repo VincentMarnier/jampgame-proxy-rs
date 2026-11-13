@@ -28,6 +28,7 @@ SVS_CLIENTS_PTR = 0x83121EC
 SIZEOF_CLIENT_T = 332920
 OFFSET_CLIENT_STATE = 0
 OFFSET_CLIENT_PING = 234532
+OFFSET_CLIENT_LAST_USERCMD = 132128
 CS_ACTIVE = 4
 
 
@@ -38,6 +39,8 @@ def rd32(addr):
 shifts = []
 pings = []
 engine_pings = []
+newest = []
+gaps = []
 
 
 class SendMessagesBreakpoint(gdb.Breakpoint):
@@ -49,9 +52,13 @@ class SendMessagesBreakpoint(gdb.Breakpoint):
             if rd32(engine_cl + OFFSET_CLIENT_STATE) == CS_ACTIVE:
                 now = rd32(level + OFFSET_LEVEL_TIME)
                 ps = clients + slot * SIZEOF_GCLIENT
-                shifts.append(rd32(ps) - now)
+                cmd = rd32(ps)
+                last = rd32(engine_cl + OFFSET_CLIENT_LAST_USERCMD)
+                shifts.append(cmd - now)
                 pings.append(rd32(ps + OFFSET_PS_PING))
                 engine_pings.append(rd32(engine_cl + OFFSET_CLIENT_PING))
+                newest.append(last - now)
+                gaps.append(last - cmd)
         return len(shifts) >= want
 
 
@@ -66,9 +73,11 @@ gdb.execute('continue')
 bp.delete()
 if shifts:
     print('SUMMARY client%d n=%d shift_median=%d shift_min=%d shift_max=%d '
-          'ping_median=%d engine_ping_median=%d' % (
+          'ping_median=%d engine_ping_median=%d newest_median=%d gap_median=%d '
+          'gap_min=%d gap_max=%d' % (
               slot, len(shifts), median(shifts), min(shifts), max(shifts),
-              median(pings), median(engine_pings)))
+              median(pings), median(engine_pings), median(newest),
+              median(gaps), min(gaps), max(gaps)))
 else:
     print('SUMMARY client%d no samples (not CS_ACTIVE?)' % slot)
 gdb.execute('detach')

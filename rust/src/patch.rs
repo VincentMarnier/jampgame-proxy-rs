@@ -705,7 +705,7 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `qfalse` (drop) before the pristine body decodes it.
 /// `SV_SendClientMessages` is the Phase 2 demo recorder's tick: run the
 /// pristine per-frame snapshot loop, then the recorder's own build.
-pub static ENGINE_HOOKS: [Hook; 24] = [
+pub static ENGINE_HOOKS: [Hook; 25] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -812,6 +812,13 @@ pub static ENGINE_HOOKS: [Hook; 24] = [
     Hook::new(
         "SV_SendClientMessages",
         crate::engine::functions::SV_SEND_CLIENT_MESSAGES,
+        false,
+    ),
+    // D-028.9: shift the snapshot clock for a ping-equalised client (the view
+    // half of the delay) before the message is fragmented and sent.
+    Hook::new(
+        "SV_SendMessageToClient",
+        crate::engine::functions::SV_SEND_MESSAGE_TO_CLIENT,
         false,
     ),
 ];

@@ -80,7 +80,7 @@
 //! `proxy_sv_pingEqualize 0` it previews what the maximum supported cap would
 //! apply (the log appends `(preview)`).
 
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::hooks::engine_sv::{clients_base, is_bot, read_i32, write_i32};
 use crate::sdk::{
@@ -140,6 +140,90 @@ pub const DEFAULT_INTERVAL_MS: i32 = 20;
 /// At most this many held commands are released in one usercmd call. A queue
 /// that is catching up drains at this rate instead of bursting.
 pub const MAX_RELEASES: usize = 4;
+
+/// Frames of the client's 64-command replay ring that the action delay may
+/// use. The rest is headroom for the commands the client creates between
+/// snapshots and for jitter.
+pub const RING_SAFE_FRAMES: i32 = 48;
+
+/// Time a client predicts ahead of the snapshot it renders (one `sv_fps`
+/// interval at the default 20), reserved inside [`RING_SAFE_FRAMES`].
+pub const AHEAD_MS: i32 = 50;
+
+/// `svc_serverCommand` and `svc_snapshot` in a server message
+/// (`codemp/qcommon/qcommon.h:243-252`; JA's enum, not Q3's).
+const SVC_SERVER_COMMAND: u8 = 5;
+const SVC_SNAPSHOT: u8 = 7;
+
+/// Split a delay into its **view** and **action** halves.
+///
+/// The view half is applied by shifting the client's snapshot clock back, so
+/// the client's whole clock (and its view) lags; the action half holds that
+/// many milliseconds of commands in the queue. Only the action half is paid
+/// for out of the client's 64-command replay ring, so it is capped by the ring
+/// budget (`RING_SAFE_FRAMES` intervals minus one snapshot interval) and by
+/// half the delay. The view half takes the rest.
+///
+/// A real connection of the same round trip has its clock shifted by the
+/// one-way delay and its commands held by the other half; this reproduces
+/// that, and keeps the queue inside the ring at any frame rate.
+pub fn split(delay_ms: i32, interval_ms: i32) -> (i32, i32) {
+    let delay = delay_ms.max(0);
+    if delay == 0 {
+        return (0, 0);
+    }
+    let interval = interval_ms.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS);
+    let budget = (RING_SAFE_FRAMES * interval - AHEAD_MS).max(0);
+    let action = (delay / 2).min(budget);
+    (delay - action, action)
+}
+
+/// Subtract `view_ms` from the `serverTime` of a snapshot message, in place.
+///
+/// A normal server message is `lastClientCommand` (4 bytes), then zero or more
+/// `svc_serverCommand` + NUL-terminated string entries, then `svc_snapshot` +
+/// the 4-byte server time (`sv_snapshot.cpp:746-796`). Anything else (a
+/// gamestate, a final message, a truncated buffer) is left alone, so a
+/// layout the parser does not recognise can never corrupt a message.
+pub fn shift_snapshot_time(data: &mut [u8], view_ms: i32) -> bool {
+    if view_ms <= 0 || data.len() < 5 {
+        return false;
+    }
+    let mut pos = 4; // `lastClientCommand`
+    while pos < data.len() {
+        let op = data[pos];
+        pos += 1;
+        match op {
+            SVC_SERVER_COMMAND => match data[pos..].iter().position(|&b| b == 0) {
+                Some(n) => pos += n + 1,
+                None => return false,
+            },
+            SVC_SNAPSHOT => {
+                if pos + 4 > data.len() {
+                    return false;
+                }
+                let time =
+                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let shifted = time.saturating_sub(view_ms);
+                data[pos..pos + 4].copy_from_slice(&shifted.to_le_bytes());
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The view shift currently applied to one client (0 = none), for the
+/// snapshot send hook.
+pub fn view_for(client_num: usize) -> i32 {
+    state::with_state(|s| {
+        s.clients
+            .get(client_num)
+            .map(|c| c.ping_equalize.view_ms)
+            .unwrap_or(0)
+    })
+}
 
 /// A small FIFO of usercmds waiting to be processed, oldest first.
 #[derive(Debug, Clone, Copy)]
@@ -206,6 +290,10 @@ pub struct PingEqualizeState {
     pub applied: i32,
     /// Requested delay in ms (`0` = none), set by the frame pass.
     pub target: i32,
+    /// View half of the delay, ms: the snapshot clock shift.
+    pub view_ms: i32,
+    /// Action half of the delay, ms: the queue's target.
+    pub action_ms: i32,
     /// Commands the queue currently holds on purpose.
     pub depth: i32,
     /// Commands the requested delay needs.
@@ -216,6 +304,8 @@ pub struct PingEqualizeState {
     pub last_stamp: i32,
     /// `svs.time` of the last depth step (`0` = none).
     pub last_step_ms: i32,
+    /// `svs.time` of the last diagnostic line (`0` = none).
+    pub last_debug_ms: i32,
     /// Log edge: an engage line was emitted and no release line yet.
     pub logged: bool,
     /// A real (non-preview) delay has been applied since the last release;
@@ -237,7 +327,7 @@ impl PingEqualizeState {
     /// Whether the queue path must run for this client (a delay is wanted, is
     /// still in effect, or held commands are waiting).
     pub fn active(&self) -> bool {
-        self.target > 0 || self.depth > 0 || self.queue.len() > 0
+        self.target > 0 || self.view_ms > 0 || self.depth > 0 || self.queue.len() > 0
     }
 
     /// Feed the arriving command's raw stamp and refresh the interval EMA.
@@ -258,10 +348,10 @@ impl PingEqualizeState {
     /// Recompute how many commands the requested delay needs.
     pub fn refresh_depth_target(&mut self) {
         let interval = self.interval_or_default();
-        self.depth_target = if self.target <= 0 {
+        self.depth_target = if self.action_ms <= 0 {
             0
         } else {
-            ((self.target + interval / 2) / interval).clamp(1, MAX_DEPTH)
+            ((self.action_ms + interval / 2) / interval).clamp(1, MAX_DEPTH)
         };
     }
 
@@ -303,11 +393,12 @@ impl PingEqualizeState {
     }
 
     fn sync_applied(&mut self) {
-        self.applied = if self.depth > 0 {
+        let action = if self.depth > 0 {
             self.depth * self.interval_or_default()
         } else {
             0
         };
+        self.applied = self.view_ms.saturating_add(action);
     }
 
     /// Update the target (and the log edge) for one frame. `reported` is the
@@ -327,7 +418,11 @@ impl PingEqualizeState {
         log: bool,
     ) -> Option<ClientTransition> {
         self.target = effective;
+        let (view, action) = split(effective, self.interval_or_default());
+        self.view_ms = view;
+        self.action_ms = action;
         self.refresh_depth_target();
+        self.sync_applied();
         if self.applied > 0 {
             self.applied_seen = true;
         }
@@ -395,7 +490,7 @@ impl PingEqualizeState {
 // ---------------------------------------------------------------------------
 
 static CAP_MS: AtomicI32 = AtomicI32::new(0);
-static LOG: AtomicBool = AtomicBool::new(false);
+static LOG: AtomicI32 = AtomicI32::new(0);
 
 /// The configured cap in milliseconds (`0` = off). Already clamped.
 pub fn cap_ms() -> i32 {
@@ -404,6 +499,11 @@ pub fn cap_ms() -> i32 {
 
 /// Whether transitions are logged (`proxy_sv_pingEqualizeLog`).
 pub fn logging() -> bool {
+    log_level() >= 1
+}
+
+/// Diagnostic level (`2` adds the once-per-second per-client state line).
+pub fn log_level() -> i32 {
     LOG.load(Ordering::Relaxed)
 }
 
@@ -419,7 +519,7 @@ pub fn clamp_cap(cap: i32) -> i32 {
 /// held commands instead of dropping them (D-028.8).
 pub fn set_config(cap: i32, log: i32) {
     CAP_MS.store(clamp_cap(cap), Ordering::Relaxed);
-    LOG.store(log != 0, Ordering::Relaxed);
+    LOG.store(log.max(0), Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +700,7 @@ pub fn clear_offsets() {
 pub fn on_run_frame(now: i32) {
     let cap = cap_ms();
     let log = logging();
+    let log_level = log_level();
     let idle = state::with_state(|s| s.clients.iter().all(|c| c.ping_equalize.is_idle()));
     if idle && cap == 0 && !log {
         return;
@@ -709,6 +810,23 @@ pub fn on_run_frame(now: i32) {
                         client.effective_ping(pings[i]),
                     );
                 }
+            }
+            // Diagnostic level 2: the queue state once per second per client.
+            if log_level >= 2 && client.active() && now.wrapping_sub(client.last_debug_ms) >= 1000 {
+                client.last_debug_ms = now;
+                lines.push(format!(
+                    "----- proxy-rs: pingEqualize debug client={i} target={} reported={reported} \
+                     view={} action={} depth={}/{} interval={} applied={} queue={} ping={}\n",
+                    client.target,
+                    client.view_ms,
+                    client.action_ms,
+                    client.depth,
+                    client.depth_target,
+                    client.interval,
+                    client.applied,
+                    client.queue.len(),
+                    latched,
+                ));
             }
         }
     });
@@ -948,12 +1066,63 @@ mod tests {
     }
 
     #[test]
+    fn the_delay_is_split_between_the_view_clock_and_the_action_queue() {
+        // 500 commands/s (2 ms): the ring allows 48 commands minus one
+        // snapshot interval, and the view carries the rest.
+        let (view, action) = split(150, 2);
+        assert_eq!(action, RING_SAFE_FRAMES * 2 - AHEAD_MS);
+        assert_eq!(view + action, 150);
+        // 50 commands/s (20 ms): the ring is large in time, so half and half.
+        assert_eq!(split(150, 20), (75, 75));
+        // Off, and intervals at the clamp floor.
+        assert_eq!(split(0, 20), (0, 0));
+        assert_eq!(split(150, 0), (150, 0));
+        assert_eq!(split(150, 1000), (75, 75));
+    }
+
+    #[test]
+    fn the_snapshot_time_is_shifted_only_in_a_snapshot_message() {
+        // lastClientCommand + svc_snapshot + serverTime.
+        let mut buf = [0u8; 13];
+        buf[3] = 1;
+        buf[4] = SVC_SNAPSHOT;
+        buf[5..9].copy_from_slice(&1000i32.to_le_bytes());
+        assert!(shift_snapshot_time(&mut buf, 100));
+        assert_eq!(i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]), 900);
+
+        // A reliable command before the snapshot is skipped.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&7i32.to_le_bytes());
+        buf.push(SVC_SERVER_COMMAND);
+        buf.extend_from_slice(b"print \"hi\"\0");
+        buf.push(SVC_SNAPSHOT);
+        buf.extend_from_slice(&500i32.to_le_bytes());
+        assert!(shift_snapshot_time(&mut buf, 50));
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(i32::from_le_bytes(tail.try_into().unwrap()), 450);
+
+        // A gamestate (not a snapshot), a truncated buffer and view 0 are left
+        // untouched.
+        let mut other = [0u8; 13];
+        other[4] = 2; // svc_gamestate, not a snapshot
+        assert!(!shift_snapshot_time(&mut other, 100));
+        assert_eq!(other[5..9], [0, 0, 0, 0]);
+        let mut short = [0u8; 6];
+        short[4] = SVC_SNAPSHOT;
+        assert!(!shift_snapshot_time(&mut short, 100));
+        let mut untouched = [0u8; 13];
+        untouched[4] = SVC_SNAPSHOT;
+        assert!(!shift_snapshot_time(&mut untouched, 0));
+    }
+
+    #[test]
     fn the_queue_depth_rounds_the_delay_to_the_client_interval() {
         let mut state = PingEqualizeState::default();
         state.observe_stamp(1000);
         state.observe_stamp(1020);
         assert_eq!(state.interval, 20);
         state.target = 100;
+        state.action_ms = 100;
         state.refresh_depth_target();
         assert_eq!(state.depth_target, 5, "100 ms at one command per 20 ms");
         // One depth step per RAMP_STEP_MS, never a whole queue at once.
@@ -998,6 +1167,7 @@ mod tests {
         let mut state = PingEqualizeState {
             interval: 20,
             target: 60,
+            action_ms: 60,
             ..Default::default()
         };
         state.refresh_depth_target();
@@ -1079,11 +1249,10 @@ mod tests {
         );
         assert!(state.logged);
         assert_eq!(state.update(75, 75, 20, 95, true, true), None);
-        // The target drops, but the delay is still ramping: no release yet.
-        state.target = 0;
-        state.applied = 75;
+        // The target drops, but the queue is still draining: no release yet.
+        state.depth = 4; // 4 x 20 ms held
         assert_eq!(state.update(0, 0, 20, 0, true, true), None);
-        state.applied = 0;
+        state.depth = 0;
         assert_eq!(
             state.update(0, 0, 20, 0, true, true),
             Some(ClientTransition::Released)
@@ -1117,11 +1286,11 @@ mod tests {
         let mut state = PingEqualizeState::default();
         // Engaged in preview, then a real delay was applied by enforcement.
         state.update(0, 75, 20, 95, false, true).unwrap();
-        state.applied = 10;
+        state.depth = 1; // 20 ms of held commands still draining
         // Enforcement is off, the preview still reports 75: the applied delay
-        // is still ramping, so there is no release yet.
+        // is still draining, so there is no release yet.
         assert_eq!(state.update(0, 75, 20, 95, false, true), None);
-        state.applied = 0;
+        state.depth = 0;
         assert_eq!(
             state.update(0, 75, 20, 95, false, true),
             Some(ClientTransition::Released)
