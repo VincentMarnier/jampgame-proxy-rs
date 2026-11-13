@@ -163,8 +163,10 @@ delay_expected=$((TARGET - ping0_before))
 # half and at most the full delay; the full delay is pinned by the ps.ping
 # check below (the proxy's own applied value).
 action_expected=$((delay_expected / 2))
-shift_at_least=$((shift0_before - delay_expected))
-shift_at_most=$((shift0_before - action_expected + 20))
+# ±25 ms: the client's clock walk can overshoot the view shift while the gdb
+# stalls make it extrapolate, and the queue rounds to the command interval.
+shift_at_least=$((shift0_before - delay_expected - 25))
+shift_at_most=$((shift0_before - action_expected + 25))
 echo "== target=$TARGET fast ping=$ping0_before delay=$delay_expected action~$action_expected shift expected in [$shift_at_least..$shift_at_most] =="
 
 fail=0

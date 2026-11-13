@@ -227,14 +227,19 @@ without touching the client: shift the **snapshot time** it sends.
 
 The delay is therefore split in two halves:
 
-- **View half** — `SV_SendMessageToClient` (0x8058c84) is detoured, and the
-  snapshot's `serverTime` is reduced by `view_ms` before the message is
-  fragmented and sent (`pingequalize::shift_snapshot_time`). The client's clock
-  — and its view — then lag by `view_ms`, and its command stamps follow. This
-  costs no replay-ring depth. The parser walks only the message shapes the
-  engine actually produces: `lastClientCommand` (4 bytes), zero or more
-  `svc_serverCommand` + string entries, then `svc_snapshot` + the 4-byte time.
-  A gamestate, a mapchange or anything unrecognised is left untouched.
+- **View half** — the `call SV_WriteSnapshotToClient` inside the pristine
+  `SV_SendClientSnapshot` (0x8058e9c, target 0x8058034) is retargeted to a stub
+  that writes `svs.time - view_ms` for the duration of that call and restores
+  it afterwards. The snapshot is built with the shifted time, so the client's
+  clock — and its view — lag by `view_ms`, and its command stamps follow; this
+  costs no replay-ring depth. `SV_SendMessageToClient` then records
+  `frames[].messageSent` from the restored value, so the engine's ping stays
+  the real network ping. The message is never parsed or rewritten: the engine
+  Huffman-compresses it before the send hook, and rewriting the encoded stream
+  corrupted it (the client dropped with "Invalid size ... for areamask"). The
+  static writer is called through `engine_fn!`: a constant `transmute` compiles
+  to a PC-relative call based on the .so's link-time base, which under ASLR
+  lands at `base + address` (observed as a jump to `0xfcb41034` and a SIGSEGV).
 - **Action half** — the existing command queue, sized to `action_ms`. Only this
   half is paid for out of the client's ring, so
   `action_ms <= RING_SAFE_FRAMES (48) * interval - AHEAD_MS (50)`, and the view
@@ -262,15 +267,13 @@ Two consequences are handled explicitly:
   fast-adjust path and a step of 75 ms would be absorbed only through
   extrapolation. With the ramp the client follows a 104 ms view shift in about
   5 s without a hitch; the queue still ramps its depth one command per 100 ms.
-- **The message layout must be parsed exactly**: JA writes a 4-byte command
-  sequence between `svc_serverCommand` and its string
-  (`sv_snapshot.cpp:249-251`), and the first version skipped only the string,
-  so with a pending reliable command (the connect banner) the patch landed
-  inside the snapshot header and the client dropped the connection with
-  "Invalid size ... for areamask". `shift_snapshot_time` now skips the sequence
-  and is pinned by tests, and `a2`'s client parses the snapshot's area-mask
-  length so the harness fails on such a corruption instead of only a real
-  client doing so.
+- **The harness now parses the snapshot header** (server time, delta, flags,
+  area-mask length), so a corrupted snapshot fails `a2`/`a8` instead of only a
+  real client; that check is what caught the first view-half attempts. `a8`'s
+  shift assertion accepts any shift between the action half and the full
+  delay, because the gdb stalls during sampling make the client extrapolate and
+  undo part of the view absorption; the full applied value is pinned by the
+  `ps.ping` check.
 
 The `ps.ping` display, the population, the tracking rules and the cvars are
 unchanged; `eff`/the scoreboard report `ping + view + action`, the effective
@@ -323,7 +326,13 @@ round trip.
   to `level.time` (the view shift reached the client's clock) while the queue
   gap stayed at 66 ms (the action half only), and `ps.ping` read
   `ping + view + action`.
-- Real-client test (2026-11-13), and the finding that changed the mechanism:
+- Real-client run with the final mechanism (2026-11-13, 500 commands/s,
+  `proxy_sv_pingEqualize 150`): smooth, no lagometer overlay, no
+  "exceeded PACKET_BACKUP on commands"; `/netStatus` read `eff` 150 and the
+  server log showed `view` ramping to 104 with `action` 46. The two earlier
+  real-client runs produced the findings behind D-028.8 and D-028.9.
+- Earlier real-client test (2026-11-13), and the finding that changed the
+  mechanism:
   with the stamp-shift implementation the `eff` column read 150 ms as designed,
   but movement stuttered. Root cause and fix in D-028.8 (the snapshot's
   `ps.commandTime` no longer matched the state it described, so cgame replayed
@@ -380,11 +389,10 @@ round trip.
 2. **The 64-command replay window** is the documented limit at high
    `cl_maxpackets`; measure the actual threshold on a real TaystJK client
    before recommending any cap above 250.
-3. **A real client at the cap** must behave like a natural high-ping
-   connection (smooth, no rubber-banding) and must not log "exceeded
-   PACKET_BACKUP on commands". The first run disproved the stamp-shift
-   mechanism (D-028.8), the second found the ring limit of the queue-only
-   mechanism (D-028.9); the split mechanism is the run in progress.
+3. **A real client at the cap**: validated at 150 ms on 2026-11-13 (smooth,
+   no overlay, no PACKET_BACKUP). The 250 ms cap was not exercised on a real
+   client; the action half is auto-capped by the ring, but the view half's
+   250 ms is worth one run before recommending it.
 4. **The 32-snapshot average** at `sv_fps 10` (window ~3.2 s) with the 500 ms
    refresh and the 10 ms deadband is assumed smooth enough; a noisy server may
    still retarget on roster changes, which is intentional.

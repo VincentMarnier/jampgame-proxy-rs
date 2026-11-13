@@ -537,7 +537,8 @@ never made faster.
   `proxy_sv_enableNetStatus`.
 
 `proxy_sv_pingEqualizeLog 1` logs target changes and per-player
-engage/release transitions:
+engage/release transitions; `2` adds a once-per-second per-player diagnostic
+line (`view`/`action` split, queue depth, command interval, applied delay):
 
 ```text
 ----- proxy-rs: pingEqualize target=110 (slowest client=3 ping=180 capped)
