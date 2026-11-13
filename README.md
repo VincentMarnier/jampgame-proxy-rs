@@ -491,6 +491,10 @@ never made faster.
   (or a LAN-only match) the target is their own ping and nobody is delayed. A
   player slower than the cap does not raise the target: everyone else is
   pulled to the cap and that player keeps their own ping.
+- The target is per game instance: with [parallel TFFA matches](#parallel-tffa-matches)
+  or [parallel duels](#parallel-duels) each match equalises its own roster, so
+  a slow player in one match never delays another (the main match is one
+  roster; with those features off the whole server is one roster).
 - `cap` is the cvar value in milliseconds, clamped to `0..=250`. The limit is
   the client's prediction window: it can only replay its last 64 usercmds, and
   beyond that its prediction freezes ("exceeded PACKET_BACKUP on commands").

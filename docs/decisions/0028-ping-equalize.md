@@ -279,6 +279,36 @@ The `ps.ping` display, the population, the tracking rules and the cvars are
 unchanged; `eff`/the scoreboard report `ping + view + action`, the effective
 round trip.
 
+### D-028.10 — Target per parallel match (2026-11-13)
+
+The target was computed over every in-game player on the server. With the
+parallel TFFA matches (D-006) and the parallel duel ladder (D-025) that is
+wrong: a slow player in one match raised the target of every other match, so a
+match full of low-ping players was padded to a stranger's ping.
+
+The target is now tracked **per instance**, using the shared instancing core's
+`client_match` table (the same one D-006/D-025 use for damage, visibility,
+sounds and scores):
+
+- `TargetState` holds one `MatchTarget` per slot (`TOTAL_MATCH_SLOTS` = 17:
+  the main match plus 16 parallel matches). Each slot keeps its own member set,
+  ping snapshot, 500 ms refresh, 10 ms deadband, roster-change bypass and cap
+  comparison, so the rules of D-028.1/D-028.5 apply to a match's own roster.
+- A client's match is `instances`' `client_match[client]` (0 for the main match,
+  and for everyone while the parallel features are off). Each member is counted
+  in exactly one slot, so a slow player in match 2 cannot move match 0's target.
+- The log's target line carries `match=<slot>` (`target=110 match=2 …`), and
+  the level-2 debug line carries the client's `match`.
+- The cap (`proxy_sv_pingEqualize`) stays a server-wide cvar; a match whose
+  slowest player is above it is pulled to the cap exactly as before.
+- With the parallel features off every client is in slot 0, so the behaviour is
+  byte-for-byte the previous one (one roster for the whole server).
+
+Unit tests pin the per-match independence: two matches with different pings get
+different targets, a change in one retargets only that one, a lone match keeps
+its own ping as the target, and an all-slot-0 table reproduces the global
+behaviour.
+
 ## Evidence (verified before implementation)
 
 - The shift path exists and is validated: `rust/src/hooks/netstatus.rs`

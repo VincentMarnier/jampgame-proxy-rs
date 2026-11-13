@@ -34,6 +34,15 @@
 //! `TEAM_SPECTATOR`. Spectators, connecting clients and bots are ignored and
 //! never padded.
 //!
+//! ## Per parallel match
+//!
+//! The target is computed **per instance**, using the instancing core's
+//! `client_match` table (slot `0` is the main match — everyone while the
+//! parallel features are off). Each parallel TFFA/duel match equalises its own
+//! roster, so a slow player in one match never pads the players of another;
+//! a match with a single player has nothing to equalise. The cap stays a
+//! server-wide cvar.
+//!
 //! ## Tracking
 //!
 //! The target is recomputed from `cl->ping` at most every
@@ -83,6 +92,7 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::hooks::engine_sv::{clients_base, is_bot, read_i32, write_i32};
+use crate::instances::TOTAL_MATCH_SLOTS;
 use crate::sdk::{
     CS_ACTIVE, MAX_CLIENTS, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE, OFFSET_GCLIENT_PS,
     OFFSET_GCLIENT_SESS, OFFSET_LEVEL_MAXCLIENTS, OFFSET_PS_PING, OFFSET_SESS_SESSION_TEAM,
@@ -549,6 +559,9 @@ pub enum ClientTransition {
 /// One logged target change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetChange {
+    /// Parallel match the change belongs to (`0` = the main match; when the
+    /// parallel features are off every player is in match `0`).
+    pub match_id: u8,
     pub target: i32,
     /// Engine slot of the slowest member (`None` when the roster is empty).
     pub slowest: Option<usize>,
@@ -558,10 +571,11 @@ pub struct TargetChange {
     pub capped: bool,
 }
 
-/// The global target state: member set, the ping snapshot it was computed
-/// from, and the refresh/deadband bookkeeping.
+/// One parallel match's target state: member set, the ping snapshot it was
+/// computed from, and the refresh/deadband bookkeeping. Slot `0` is the main
+/// match — everyone when the parallel-match features are off.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TargetState {
+pub struct MatchTarget {
     pub target: i32,
     /// Member mask used by the last computation.
     pub members: [bool; MAX_CLIENTS],
@@ -573,7 +587,7 @@ pub struct TargetState {
     pub cap: i32,
 }
 
-impl TargetState {
+impl MatchTarget {
     /// Whether a recomputation is due (also true after the engine clock goes
     /// backwards, e.g. a map restart).
     pub fn due(&self, now: i32) -> bool {
@@ -591,6 +605,7 @@ impl TargetState {
     /// Returns the new target only when it moved, for the transition log.
     pub fn observe(
         &mut self,
+        match_id: u8,
         now: i32,
         members: &[bool; MAX_CLIENTS],
         pings: &[i32; MAX_CLIENTS],
@@ -632,11 +647,68 @@ impl TargetState {
         }
         self.target = new_target;
         Some(TargetChange {
+            match_id,
             target: new_target,
             slowest,
             slowest_ping,
             capped: slowest.is_some() && slowest_ping > cap,
         })
+    }
+}
+
+/// Per-match target tracking: the main match (slot `0`) plus every parallel
+/// TFFA/duel match. Each match equalises its own roster, so a slow player in
+/// one match does not pad the players of another (D-028.10).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TargetState {
+    pub slots: [MatchTarget; TOTAL_MATCH_SLOTS],
+}
+
+impl TargetState {
+    /// The target a client of `match_id` is padded toward (`0` = none).
+    pub fn target_of(&self, match_id: u8) -> i32 {
+        self.slots
+            .get(match_id as usize)
+            .map(|slot| slot.target)
+            .unwrap_or(0)
+    }
+
+    /// The latched ping of one client in its match from the last refresh.
+    pub fn latched_ping(&self, match_id: u8, client_num: usize) -> i32 {
+        self.slots
+            .get(match_id as usize)
+            .map(|slot| slot.latched_ping(client_num))
+            .unwrap_or(0)
+    }
+
+    /// Recompute every match that is due; push one change per match whose
+    /// target moved (for the transition log).
+    ///
+    /// `member_match[i]` is client `i`'s match (`u8::MAX` for a non-member),
+    /// so a match's roster is exactly its own members: a slow player in match
+    /// `2` never raises match `0`'s target.
+    pub fn observe_all(
+        &mut self,
+        now: i32,
+        cap: i32,
+        member_match: &[u8; MAX_CLIENTS],
+        pings: &[i32; MAX_CLIENTS],
+        changes: &mut Vec<TargetChange>,
+    ) {
+        let mut members = [false; MAX_CLIENTS];
+        let mut slot_pings = [0i32; MAX_CLIENTS];
+        for match_id in 0..TOTAL_MATCH_SLOTS {
+            for i in 0..MAX_CLIENTS {
+                let member = member_match[i] == match_id as u8;
+                members[i] = member;
+                slot_pings[i] = if member { pings[i] } else { 0 };
+            }
+            if let Some(change) =
+                self.slots[match_id].observe(match_id as u8, now, &members, &slot_pings, cap)
+            {
+                changes.push(change);
+            }
+        }
     }
 }
 
@@ -712,7 +784,11 @@ pub fn on_run_frame(now: i32) {
         0
     };
 
-    let mut members = [false; MAX_CLIENTS];
+    // Each client's parallel match (the instancing core; all `0` when the
+    // parallel-match features are off).
+    let matches: [u8; MAX_CLIENTS] = state::with_state(|s| s.tffa.client_match);
+
+    let mut member_match = [u8::MAX; MAX_CLIENTS];
     let mut pings = [0i32; MAX_CLIENTS];
     for i in 0..maxclients {
         let engine_cl = engine_clients + i * SIZEOF_CLIENT_T;
@@ -734,27 +810,34 @@ pub fn on_run_frame(now: i32) {
         if !is_member(client_state, bot, ping, team) {
             continue;
         }
-        members[i] = true;
+        member_match[i] = matches[i].min(TOTAL_MATCH_SLOTS as u8 - 1);
         pings[i] = ping;
     }
 
     let mut lines: Vec<String> = Vec::new();
     state::with_state(|s| {
-        if let Some(change) = s
-            .ping_equalize
-            .observe(now, &members, &pings, computation_cap)
-        {
-            if log {
+        let mut changes: Vec<TargetChange> = Vec::new();
+        s.ping_equalize
+            .observe_all(now, computation_cap, &member_match, &pings, &mut changes);
+        if log {
+            for change in changes {
                 lines.push(target_line(change, !enforce));
             }
         }
-        let target = s.ping_equalize.target;
         // The per-client delay uses the ping snapshot of the last refresh, so
         // the 500 ms/deadband rule also smooths the delay target. The display
         // value below uses this frame's fresh reading, as D-028.3 specifies.
         for i in 0..maxclients {
-            let latched = s.ping_equalize.latched_ping(i);
-            let reported = if members[i] {
+            let slot = member_match[i];
+            let (target, latched) = if slot == u8::MAX {
+                (0, 0)
+            } else {
+                (
+                    s.ping_equalize.target_of(slot),
+                    s.ping_equalize.latched_ping(slot, i),
+                )
+            };
+            let reported = if slot != u8::MAX {
                 delay_for(latched, target)
             } else {
                 0
@@ -776,7 +859,7 @@ pub fn on_run_frame(now: i32) {
             // Only a member has a meaningful ping to add the delay to: a
             // non-member's slot in `pings` is 0, which is also a real reading
             // for a localhost/LAN member, so the population is the gate here.
-            if members[i] && client.applied > 0 {
+            if slot != u8::MAX && client.applied > 0 {
                 // SAFETY: `g_clients` is the located `gclient_t` array and `i`
                 // is below `level.maxclients`; `ps.ping` is a writable int.
                 unsafe {
@@ -790,7 +873,7 @@ pub fn on_run_frame(now: i32) {
             if log_level >= 2 && client.active() && now.wrapping_sub(client.last_debug_ms) >= 1000 {
                 client.last_debug_ms = now;
                 lines.push(format!(
-                    "----- proxy-rs: pingEqualize debug client={i} target={} reported={reported} \
+                    "----- proxy-rs: pingEqualize debug client={i} match={slot} target={} reported={reported} \
                      view={}/{} action={} depth={}/{} interval={} applied={} queue={} ping={}\n",
                     client.target,
                     client.view_ms,
@@ -827,14 +910,15 @@ fn target_line(change: TargetChange, preview: bool) -> String {
     let suffix = if preview { " (preview)" } else { "" };
     match change.slowest {
         Some(client) => format!(
-            "----- proxy-rs: pingEqualize target={} (slowest client={client} ping={}{}){suffix}\n",
+            "----- proxy-rs: pingEqualize target={} match={} (slowest client={client} ping={}{}){suffix}\n",
             change.target,
+            change.match_id,
             change.slowest_ping,
             if change.capped { " capped" } else { "" }
         ),
         None => format!(
-            "----- proxy-rs: pingEqualize target={} (no players){suffix}\n",
-            change.target
+            "----- proxy-rs: pingEqualize target={} match={} (no players){suffix}\n",
+            change.target, change.match_id
         ),
     }
 }
@@ -859,19 +943,35 @@ fn client_line(client_num: usize, transition: ClientTransition) -> String {
 mod tests {
     use super::*;
 
+    fn frame_all(
+        state: &mut TargetState,
+        now: i32,
+        entries: &[(u8, usize, i32)],
+        cap: i32,
+    ) -> Vec<TargetChange> {
+        let mut member_match = [u8::MAX; MAX_CLIENTS];
+        let mut pings = [0i32; MAX_CLIENTS];
+        for &(match_id, client, ping) in entries {
+            member_match[client] = match_id;
+            pings[client] = ping;
+        }
+        let mut changes = Vec::new();
+        state.observe_all(now, cap, &member_match, &pings, &mut changes);
+        changes
+    }
+
+    /// One frame with every entry in the main match (slot 0).
     fn frame(
         state: &mut TargetState,
         now: i32,
         entries: &[(usize, i32)],
         cap: i32,
     ) -> Option<TargetChange> {
-        let mut members = [false; MAX_CLIENTS];
-        let mut pings = [0i32; MAX_CLIENTS];
-        for &(client, ping) in entries {
-            members[client] = true;
-            pings[client] = ping;
-        }
-        state.observe(now, &members, &pings, cap)
+        let entries: Vec<(u8, usize, i32)> = entries
+            .iter()
+            .map(|&(client, ping)| (0, client, ping))
+            .collect();
+        frame_all(state, now, &entries, cap).into_iter().next()
     }
 
     #[test]
@@ -938,12 +1038,12 @@ mod tests {
     #[test]
     fn the_target_refreshes_every_500_ms_and_after_a_clock_jump() {
         let mut state = TargetState::default();
-        assert!(state.due(1000));
-        state.last_check_ms = 1000;
-        assert!(!state.due(1499));
-        assert!(state.due(1500));
+        assert!(state.slots[0].due(1000));
+        state.slots[0].last_check_ms = 1000;
+        assert!(!state.slots[0].due(1499));
+        assert!(state.slots[0].due(1500));
         // svs.time moved backwards (map restart): refresh immediately.
-        assert!(state.due(10));
+        assert!(state.slots[0].due(10));
     }
 
     #[test]
@@ -985,51 +1085,51 @@ mod tests {
     fn the_deadband_keeps_a_noisy_target_in_place() {
         let mut state = TargetState::default();
         frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
-        assert_eq!(state.target, 100);
+        assert_eq!(state.slots[0].target, 100);
         let quiet = frame(&mut state, 1500, &[(0, 50), (1, 105)], 250);
         assert_eq!(quiet, None, "a 5 ms rise is inside the deadband");
-        assert_eq!(state.target, 100);
+        assert_eq!(state.slots[0].target, 100);
         let moved = frame(&mut state, 2000, &[(0, 50), (1, 110)], 250);
         assert_eq!(moved.unwrap().target, 110, "a 10 ms rise moves it");
-        assert_eq!(state.target, 110);
+        assert_eq!(state.slots[0].target, 110);
     }
 
     #[test]
     fn the_ping_snapshot_refreshes_even_when_the_target_does_not_move() {
         let mut state = TargetState::default();
         frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
-        assert_eq!(state.latched_ping(0), 50);
+        assert_eq!(state.slots[0].latched_ping(0), 50);
         frame(&mut state, 1500, &[(0, 54), (1, 103)], 250);
-        assert_eq!(state.target, 100, "still inside the deadband");
+        assert_eq!(state.slots[0].target, 100, "still inside the deadband");
         assert_eq!(
-            state.latched_ping(0),
+            state.slots[0].latched_ping(0),
             54,
             "the delay target follows the ping"
         );
-        assert_eq!(state.latched_ping(1), 103);
-        assert_eq!(state.latched_ping(2), 0);
+        assert_eq!(state.slots[0].latched_ping(1), 103);
+        assert_eq!(state.slots[0].latched_ping(2), 0);
     }
 
     #[test]
     fn a_roster_change_bypasses_the_deadband() {
         let mut state = TargetState::default();
         frame(&mut state, 1000, &[(0, 50), (1, 100)], 250);
-        assert_eq!(state.target, 100);
+        assert_eq!(state.slots[0].target, 100);
         // A fourth player joins at 105: the target would only move 5 ms, but
         // the member set changed, so it retargets immediately.
         let change = frame(&mut state, 1010, &[(0, 50), (1, 100), (2, 105)], 250);
         assert_eq!(change.unwrap().target, 105);
-        assert_eq!(state.target, 105);
+        assert_eq!(state.slots[0].target, 105);
     }
 
     #[test]
     fn a_cap_change_bypasses_the_deadband() {
         let mut state = TargetState::default();
         frame(&mut state, 1000, &[(0, 104)], 100);
-        assert_eq!(state.target, 100);
+        assert_eq!(state.slots[0].target, 100);
         let change = frame(&mut state, 1010, &[(0, 104)], 200);
         assert_eq!(change.unwrap().target, 104);
-        assert_eq!(state.target, 104);
+        assert_eq!(state.slots[0].target, 104);
         // The old target was 100, the new one 104: only the cap change makes
         // this an immediate move.
     }
@@ -1284,10 +1384,65 @@ mod tests {
     }
 
     #[test]
+    fn each_parallel_match_equalises_its_own_roster() {
+        let mut state = TargetState::default();
+        let changes = frame_all(
+            &mut state,
+            1000,
+            &[(0, 0, 40), (0, 1, 55), (2, 2, 120), (2, 3, 90)],
+            250,
+        );
+        assert_eq!(changes.len(), 2, "one change per match");
+        assert_eq!(state.slots[0].target, 55);
+        assert_eq!(state.slots[2].target, 120);
+        // The slow player in match 2 never pads the main match.
+        assert_eq!(delay_for(40, state.slots[0].target), 15);
+        assert_eq!(delay_for(90, state.slots[2].target), 30);
+        // A change in one match retargets only that match.
+        let changes = frame_all(
+            &mut state,
+            2000,
+            &[(0, 0, 40), (0, 1, 55), (2, 2, 140), (2, 3, 90)],
+            250,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].match_id, 2);
+        assert_eq!(state.slots[0].target, 55);
+        assert_eq!(state.slots[2].target, 140);
+    }
+
+    #[test]
+    fn the_parallel_matches_are_independent_with_the_cap() {
+        let mut state = TargetState::default();
+        frame_all(
+            &mut state,
+            1000,
+            &[(0, 0, 30), (1, 1, 400), (1, 2, 60)],
+            100,
+        );
+        // Match 0 is alone at 30: its target is its own ping.
+        assert_eq!(state.slots[0].target, 30);
+        // Match 1 is capped at 100, leaving its 400 ms player alone.
+        assert_eq!(state.slots[1].target, 100);
+    }
+
+    #[test]
+    fn the_main_match_is_slot_zero_when_the_parallel_features_are_off() {
+        // `client_match` is 0 for every client while the parallel features are
+        // off, so the whole server is one roster: the old behaviour.
+        let mut state = TargetState::default();
+        let changes = frame_all(&mut state, 1000, &[(0, 0, 30), (0, 1, 80)], 250);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].match_id, 0);
+        assert_eq!(state.slots[0].target, 80);
+    }
+
+    #[test]
     fn transition_lines_match_the_documented_shape() {
         assert_eq!(
             target_line(
                 TargetChange {
+                    match_id: 0,
                     target: 110,
                     slowest: Some(3),
                     slowest_ping: 180,
@@ -1295,11 +1450,12 @@ mod tests {
                 },
                 false
             ),
-            "----- proxy-rs: pingEqualize target=110 (slowest client=3 ping=180 capped)\n"
+            "----- proxy-rs: pingEqualize target=110 match=0 (slowest client=3 ping=180 capped)\n"
         );
         assert_eq!(
             target_line(
                 TargetChange {
+                    match_id: 2,
                     target: 95,
                     slowest: Some(2),
                     slowest_ping: 95,
@@ -1307,11 +1463,12 @@ mod tests {
                 },
                 false
             ),
-            "----- proxy-rs: pingEqualize target=95 (slowest client=2 ping=95)\n"
+            "----- proxy-rs: pingEqualize target=95 match=2 (slowest client=2 ping=95)\n"
         );
         assert_eq!(
             target_line(
                 TargetChange {
+                    match_id: 0,
                     target: 0,
                     slowest: None,
                     slowest_ping: 0,
@@ -1319,7 +1476,7 @@ mod tests {
                 },
                 false
             ),
-            "----- proxy-rs: pingEqualize target=0 (no players)\n"
+            "----- proxy-rs: pingEqualize target=0 match=0 (no players)\n"
         );
         assert_eq!(
             client_line(
