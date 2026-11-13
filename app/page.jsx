@@ -46,6 +46,8 @@ const cvars = [
   ["proxy_sv_voidTimeNudge", "0", "Neutralise a player's non-zero cl_timeNudge on the server: when the estimated range clears 0 by the configured margin, shift their usercmds' clock by the estimated setting", "network"],
   ["proxy_sv_voidTimeNudgeLog", "0", "Log cl_timeNudge non-zero / back-to-zero transitions; works on its own (reports the shift without applying it)", "network"],
   ["proxy_sv_timeNudgeMargin", "2", "Margin (ms) added to the cl_timeNudge estimate's confidence range and required between that range and 0: a range must clear 0 by the margin to count as non-zero, so [0.3..6.1] with 2 stays consistent with 0; 0 reports the statistical interval alone", "network"],
+  ["proxy_sv_pingEqualize", "0", "Cap (ms) on the server-side delay added to the fastest players' inbound moves so everyone plays at the slowest player's ping; 0 = off, clamped to 250", "network"],
+  ["proxy_sv_pingEqualizeLog", "0", "Log ping-equalisation target changes and per-player engage/release transitions; works on its own (previews what the maximum supported cap would apply)", "network"],
   ["proxy_sv_antiMacro", "0", "Freeze a movement or attack channel while a burst of reversals runs faster than a hand can (movement every 1-3 commands or frame-exact wait holds); the view verdict is report-only unless proxy_sv_antiMacroView is on, and the player is never told", "hardening"],
   ["proxy_sv_antiMacroLog", "0", "1 logs anti-macro lock/release transitions, 2 adds the statistics of locked channels, 3 the statistics of every channel with a reversal; works on its own", "diagnostics"],
   ["proxy_sv_antiMacroView", "0", "0 computes and logs the view verdict but never freezes yaw/pitch (hand mouse wiggles are not reliably separable at the wire level); non-zero freezes a locked view", "hardening"],
@@ -342,11 +344,21 @@ export default function Home() {
             <li>
               <b>Network tools</b>
               <p>
-                <code>netStatus</code> prints ping, RTT, jitter, FPS, packets/s,
-                estimated <code>cl_timeNudge</code>, snaps and rate. Optional: a
-                per-client packet-rate limiter and neutralising a non-zero{" "}
-                <code>cl_timeNudge</code>, both with a tunable FPS margin,
-                packet tolerance and time-nudge margin.
+                <code>netStatus</code> prints ping and effective ping, RTT,
+                jitter, FPS, packets/s, estimated <code>cl_timeNudge</code>,
+                snaps and rate. Optional: a per-client packet-rate limiter and
+                neutralising a non-zero <code>cl_timeNudge</code>, both with a
+                tunable FPS margin, packet tolerance and time-nudge margin.
+              </p>
+            </li>
+            <li>
+              <b>Ping equalisation</b>
+              <p>
+                <code>proxy_sv_pingEqualize</code> delays the fastest
+                players&apos; inbound moves so everyone plays at the slowest
+                player&apos;s ping, up to a 250 ms cap. The delay is split
+                between the client&apos;s view clock and a command queue so
+                prediction stays smooth; only the input path is padded.
               </p>
             </li>
             <li>

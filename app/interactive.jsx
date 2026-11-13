@@ -96,7 +96,7 @@ export function CvarExplorer({ rows }) {
           <input
             id={inputId}
             type="search"
-            placeholder="Filter cvars — try “demo”, “duel”, “tffa”…"
+            placeholder="Filter cvars — try “demo”, “duel”, “ping”…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             autoComplete="off"
@@ -141,7 +141,7 @@ export function CvarExplorer({ rows }) {
           </table>
         ) : (
           <p className="empty-state">
-            No cvar matches “{query}”. Try “demo”, “duel”, “tffa” or “net”.
+            No cvar matches “{query}”. Try “demo”, “duel”, “ping” or “net”.
           </p>
         )}
       </div>
