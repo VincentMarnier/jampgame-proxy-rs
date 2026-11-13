@@ -344,9 +344,11 @@ static FEED_WAS_OFF: AtomicBool = AtomicBool::new(false);
 /// `proxy_sv_voidTimeNudge` is on, the cmd's `serverTime` is shifted by the
 /// client's estimated `cl_timeNudge` first (D-015, `crate::timenudge`), so the
 /// game processes the move on the neutral clock. While
-/// `proxy_sv_pingEqualize` is on (D-028, `crate::pingequalize`), the cmd's
-/// stamp is shifted back by the client's applied delay, so a fast player's
-/// moves are processed as late as the slowest player's.
+/// `proxy_sv_pingEqualize` is on (D-028, `crate::pingequalize`), the arriving
+/// command is queued and the game is given the oldest held one instead, so a
+/// fast player's moves are processed as late as the slowest player's with
+/// their original stamps (the state and `ps.commandTime` stay consistent, so
+/// client prediction keeps working — D-028.8).
 ///
 /// The estimator is fed the client's **raw** stamp: correcting the value the
 /// estimator sees would make it converge to "no nudge" and switch itself off.
@@ -368,54 +370,90 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     }
 
     let voiding = timenudge::enabled();
-    let (feed, nudge_offset, equalize_offset, macro_events, macro_log) = state::with_state(|s| {
-        let feed = feed_enabled_in(s);
-        // One ramp step per usercmd; the target is refreshed at packet start.
-        let nudge_offset = if feed && voiding {
-            s.clients[client_num].nudge_void.step()
-        } else {
-            0
-        };
-        // Ping equalisation (D-028) does not depend on the estimator feed: it
-        // ramps from `cl->ping` (refreshed by the frame pass) and must keep
-        // stepping while it ramps out after the cap is set to 0.
-        let equalize_offset = s.clients[client_num].ping_equalize.step();
-        // Anti-macro guard: observes the raw command every time it is on, so
-        // `proxy_sv_antiMacroLog` reports what the guard would freeze; only
-        // `proxy_sv_antiMacro` rewrites the command. The engine's duplicate
-        // filter above this call site means each command is seen once.
-        let anti_macro = s.cvars[CVAR_ANTI_MACRO].integer != 0;
-        let anti_macro_view = s.cvars[CVAR_ANTI_MACRO_VIEW].integer != 0;
-        let log_level = s.cvars[CVAR_ANTI_MACRO_LOG].integer;
-        let events = if anti_macro || log_level != 0 {
-            let thresholds = crate::macroguard::Thresholds::from_cvars(
-                s.cvars[CVAR_ANTI_MACRO_MIN_REVERSALS].integer,
-                s.cvars[CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS].integer,
-                s.cvars[CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS].integer,
-                s.cvars[CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS].integer,
-                s.cvars[CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS].integer,
-                s.cvars[CVAR_ANTI_MACRO_VIEW_STEP_PERCENT].integer,
-                s.cvars[CVAR_ANTI_MACRO_VIEW_MIN_SWING].integer,
-            );
-            // SAFETY: cmd is the engine's usercmd buffer for this call.
-            crate::macroguard::process_with_view(
-                &mut s.clients[client_num].macro_guard,
-                unsafe { &mut *cmd },
-                anti_macro,
-                anti_macro_view,
-                log_level,
-                &thresholds,
-            )
-        } else {
-            // Inert while off; drop any state a previous enable left behind.
-            let guard = &mut s.clients[client_num].macro_guard;
-            if guard.is_active() {
-                *guard = crate::macroguard::MacroState::default();
+    let (feed, nudge_offset, equalizing, raw, mut released, released_n, macro_events, macro_log) =
+        state::with_state(|s| {
+            let feed = feed_enabled_in(s);
+            // One ramp step per usercmd; the target is refreshed at packet start.
+            let nudge_offset = if feed && voiding {
+                s.clients[client_num].nudge_void.step()
+            } else {
+                0
+            };
+            // Anti-macro guard: observes the raw command every time it is on, so
+            // `proxy_sv_antiMacroLog` reports what the guard would freeze; only
+            // `proxy_sv_antiMacro` rewrites the command. The engine's duplicate
+            // filter above this call site means each command is seen once.
+            let anti_macro = s.cvars[CVAR_ANTI_MACRO].integer != 0;
+            let anti_macro_view = s.cvars[CVAR_ANTI_MACRO_VIEW].integer != 0;
+            let log_level = s.cvars[CVAR_ANTI_MACRO_LOG].integer;
+            let events = if anti_macro || log_level != 0 {
+                let thresholds = crate::macroguard::Thresholds::from_cvars(
+                    s.cvars[CVAR_ANTI_MACRO_MIN_REVERSALS].integer,
+                    s.cvars[CVAR_ANTI_MACRO_AXIS_MAX_MEAN_CMDS].integer,
+                    s.cvars[CVAR_ANTI_MACRO_VIEW_MAX_MEAN_MS].integer,
+                    s.cvars[CVAR_ANTI_MACRO_ATTACK_MAX_MEAN_MS].integer,
+                    s.cvars[CVAR_ANTI_MACRO_MAX_HOLD_SPREAD_MS].integer,
+                    s.cvars[CVAR_ANTI_MACRO_VIEW_STEP_PERCENT].integer,
+                    s.cvars[CVAR_ANTI_MACRO_VIEW_MIN_SWING].integer,
+                );
+                // SAFETY: cmd is the engine's usercmd buffer for this call.
+                crate::macroguard::process_with_view(
+                    &mut s.clients[client_num].macro_guard,
+                    unsafe { &mut *cmd },
+                    anti_macro,
+                    anti_macro_view,
+                    log_level,
+                    &thresholds,
+                )
+            } else {
+                // Inert while off; drop any state a previous enable left behind.
+                let guard = &mut s.clients[client_num].macro_guard;
+                if guard.is_active() {
+                    *guard = crate::macroguard::MacroState::default();
+                }
+                crate::macroguard::Events::default()
+            };
+            // D-028.8: the delay holds commands instead of shifting their stamps.
+            // Queue the arriving (macro-processed) command, then release the
+            // oldest one the delay still owes. The game receives an older stamp
+            // with its original value, so `ps.commandTime` matches the state it
+            // describes and the client's prediction replay stays consistent.
+            // Safe off the estimator feed: it reads `cl->ping`, refreshed by the
+            // frame pass, and must keep draining after the cap is set to 0.
+            // SAFETY: engine memory layer initialised; plain int field.
+            let now = unsafe { svs_time() };
+            // SAFETY: cmd is the engine's usercmd buffer.
+            let raw = unsafe { (*cmd).server_time };
+            let equalize = &mut s.clients[client_num].ping_equalize;
+            equalize.observe_stamp(raw);
+            let active = equalize.active();
+            let mut released = [Usercmd::default(); crate::pingequalize::MAX_RELEASES];
+            let mut released_n = 0;
+            if active {
+                // SAFETY: cmd is the engine's usercmd buffer, valid for this call.
+                equalize.enqueue(unsafe { *cmd });
+                equalize.ramp(now);
+                for slot in released.iter_mut().take(equalize.release_budget()) {
+                    match equalize.pop() {
+                        Some(held) => {
+                            *slot = held;
+                            released_n += 1;
+                        }
+                        None => break,
+                    }
+                }
             }
-            crate::macroguard::Events::default()
-        };
-        (feed, nudge_offset, equalize_offset, events, log_level)
-    });
+            (
+                feed,
+                nudge_offset,
+                active,
+                raw,
+                released,
+                released_n,
+                events,
+                log_level,
+            )
+        });
     let nudge_offset = if !feed {
         FEED_WAS_OFF.store(true, Ordering::Relaxed);
         0
@@ -425,34 +463,53 @@ pub unsafe extern "C" fn sv_client_think_stub(cl: usize, cmd: *mut Usercmd) {
     } else {
         nudge_offset
     };
-    // The timeNudge correction is positive (it undoes the client's negative
-    // nudge); the ping-equalisation delay shifts the stamp back (D-028.2).
-    let offset = nudge_offset.wrapping_sub(equalize_offset);
 
-    // SAFETY: cmd is the engine's usercmd buffer.
-    let original = unsafe { (*cmd).server_time };
-    if offset != 0 {
-        // SAFETY: cmd is the engine's usercmd buffer, valid for this call.
-        unsafe { (*cmd).server_time = original.wrapping_add(offset) };
-    }
-
-    // SAFETY: engine function at the fixed table; args from the engine loop.
-    unsafe { engine::sv_client_think(cl, cmd as usize) };
-
-    if offset != 0 {
-        // Restore the engine's buffer and, more importantly, the stamp the
-        // pristine `SV_UserMove` compares the next packet's `cl_packetdup`
-        // copies against. The game already read the adjusted value through
-        // `trap_GetUsercmd` inside `SV_ClientThink`.
-        // SAFETY: cmd and cl are valid as above.
-        unsafe {
-            (*cmd).server_time = original;
-            write_i32(cl + OFFSET_CLIENT_LAST_USERCMD, original);
+    if equalizing {
+        // Release the held commands oldest first. For each one the engine
+        // stores it in `cl->lastUsercmd` and calls the game, which reads the
+        // released stamp through `trap_GetUsercmd` — the delayed command, as
+        // intended.
+        for held in released.iter_mut().take(released_n) {
+            // The timeNudge correction is positive (it undoes the client's
+            // negative nudge); the delay itself is the queue, not a stamp
+            // offset.
+            if nudge_offset != 0 {
+                held.server_time = held.server_time.wrapping_add(nudge_offset);
+            }
+            // SAFETY: engine function at the fixed table; `held` is an entry of
+            // the local array, which outlives the call.
+            unsafe { engine::sv_client_think(cl, held as *mut Usercmd as usize) };
+        }
+        // The engine's `cl_packetdup` filter compares the client's own stamps
+        // against `cl->lastUsercmd` before this stub; keep it on the newest
+        // command seen, including one still held in the queue.
+        // SAFETY: cl is a valid client_t; serverTime is a plain int.
+        unsafe { write_i32(cl + OFFSET_CLIENT_LAST_USERCMD, raw) };
+    } else {
+        // No delay for this client: the D-015 in-place nudge shift only.
+        // SAFETY: cmd is the engine's usercmd buffer.
+        let original = unsafe { (*cmd).server_time };
+        if nudge_offset != 0 {
+            // SAFETY: cmd is the engine's usercmd buffer, valid for this call.
+            unsafe { (*cmd).server_time = original.wrapping_add(nudge_offset) };
+        }
+        // SAFETY: engine function at the fixed table; args from the engine loop.
+        unsafe { engine::sv_client_think(cl, cmd as usize) };
+        if nudge_offset != 0 {
+            // Restore the engine's buffer and the stamp the pristine
+            // `SV_UserMove` compares the next packet's `cl_packetdup` copies
+            // against. The game already read the adjusted value through
+            // `trap_GetUsercmd` inside `SV_ClientThink`.
+            // SAFETY: cmd and cl are valid as above.
+            unsafe {
+                (*cmd).server_time = original;
+                write_i32(cl + OFFSET_CLIENT_LAST_USERCMD, original);
+            }
         }
     }
 
     if feed {
-        feed_cmd(client_num, original);
+        feed_cmd(client_num, raw);
     }
 
     if macro_events.any() {

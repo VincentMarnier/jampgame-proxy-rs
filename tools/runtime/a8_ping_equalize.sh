@@ -132,7 +132,9 @@ drift=$((ping0_before - engine0_before))
 
 echo "== enabling proxy_sv_pingEqualize $CAP at runtime =="
 rcon "proxy_sv_pingEqualize $CAP"
-# Target refresh + the 1 ms/command ramp (up to 200 ms at 30 cmd/s).
+# Target refresh + the depth ramp (one command per 100 ms; the queue rounds
+# the delay to the client's command interval, D-028.8, so the tolerance below
+# is one command interval wide).
 sleep 10
 
 AFTER=$(sample)
@@ -159,12 +161,12 @@ echo "== target=$TARGET fast ping=$ping0_before expected delay=$delay_expected e
 
 fail=0
 delta=$((shift0_after - shift_expected))
-if [ "$delta" -gt 20 ] || [ "$delta" -lt -20 ]; then
+if [ "$delta" -gt 25 ] || [ "$delta" -lt -25 ]; then
   echo "== fast client shift $shift0_after is not the expected $shift_expected: FAIL ==" >&2
   fail=1
 fi
 eff_delta=$((ping0_after - TARGET))
-if [ "$eff_delta" -gt 15 ] || [ "$eff_delta" -lt -15 ]; then
+if [ "$eff_delta" -gt 25 ] || [ "$eff_delta" -lt -25 ]; then
   echo "== fast client ps.ping $ping0_after does not read the target $TARGET: FAIL ==" >&2
   fail=1
 fi
@@ -191,7 +193,7 @@ release0=$(printf '%s\n' "$RELEASED" | grep 'client0 ')
 }
 shift0_released=$(field "$release0" shift_median 0)
 release_delta=$((shift0_released - shift0_before))
-if [ "$release_delta" -gt 15 ] || [ "$release_delta" -lt -15 ]; then
+if [ "$release_delta" -gt 20 ] || [ "$release_delta" -lt -20 ]; then
   echo "== fast client did not return to its natural shift ($shift0_before -> $shift0_released): FAIL ==" >&2
   fail=1
 fi

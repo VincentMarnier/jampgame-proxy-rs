@@ -33,17 +33,20 @@ one-player roster targets that player's own ping (or `0`), so nobody is padded
 
 ### D-028.2 — Inbound commands only
 
-The delay is a negative offset on `ucmd.serverTime` in the existing
-`sv_client_think_stub` (the retargeted `call SV_ClientThink` inside
-`SV_UserMove`, D-015.2, patch `CALL_SV_CLIENT_THINK` at `0x804e891`). The game's
-`ps.commandTime` then trails `level.time` by the delay, exactly what a slower
-network path produces: pmove integrates the same `msec` per command, the server
-processes the moves later. No engine network or snapshot-path change.
+The delay is applied in the existing `sv_client_think_stub` (the retargeted
+`call SV_ClientThink` inside `SV_UserMove`, D-015.2, patch
+`CALL_SV_CLIENT_THINK` at `0x804e891`), inbound only: no engine network or
+snapshot-path change.
 
-The stub composes the total shift as `timenudge_offset - applied_equalize_delay`
-(the timeNudge correction stays positive). The estimator continues to receive
-the **raw** stamp, and `cl->lastUsercmd.serverTime` is restored after the call,
-so the engine's `cl_packetdup` duplicate filter keeps comparing client stamps.
+**Mechanism superseded by D-028.8.** The first implementation shifted
+`ucmd.serverTime` back by the delay (a negative offset composed with the
+timeNudge correction). The scope decision (inbound only) is unchanged, but the
+shift itself was wrong for a real client: it desynchronises `ps.commandTime`
+from the state, and client prediction replays already-applied moves. The stub
+now holds commands in a queue and hands the game an older one; the estimator
+still receives the **raw** stamp, and `cl->lastUsercmd.serverTime` is restored
+to the newest raw stamp after the call, so the engine's `cl_packetdup`
+duplicate filter keeps comparing client stamps.
 
 ### D-028.3 — Display
 
@@ -91,7 +94,8 @@ value is a 32-snapshot average, `SV_CalcPings`). It moves only when it differs
 by at least `TARGET_DEADBAND_MS = 10`. A change of the member set (join, leave,
 spectator, return to play) retargets immediately, bypassing the deadband; a cap
 change retargets immediately too (added so an admin change is not held back by
-the deadband). The 1 ms-per-usercmd ramp still applies to the per-client delay.
+the deadband). The per-client queue depth ramps one command per 100 ms
+(D-028.8).
 
 The member pings are latched at each recomputation and the per-client delay
 target is derived from that snapshot, so the 500 ms/deadband rule also smooths
@@ -100,16 +104,15 @@ and pings.
 
 ### D-028.6 — Ramp and off semantics
 
-Every client's applied delay moves 1 ms per usercmd, both ways, exactly like
-the `cl_timeNudge` void (D-015.3). A jump would trip the game's `msec < 1`
-guard or produce one oversized movement frame (`g_active.c:2023-2028`).
+**Superseded by D-028.8.** The 1 ms-per-usercmd ramp belonged to the stamp-shift
+mechanism; the queue ramps its depth one command per 100 ms instead. The off
+semantics below are unchanged:
 
-- `proxy_sv_pingEqualize 0` sets every target to 0 and ramps the delay away
-  instead of snapping the clock forward.
-- `proxy_sv_enable 0` detaches the hook layer immediately (no more stub); the
-  cleared per-client state means the one following command sees the raw stamp,
-  producing one oversized `msec` clamped to 200 by the game. This is the same
-  documented consequence as every feature behind the master switch.
+- `proxy_sv_pingEqualize 0` sets every target to 0; the depth ramps down and
+  the held commands drain instead of the clock jumping forward.
+- `proxy_sv_enable 0` detaches the hook layer immediately (no more stub) and
+  drops the queues; the one following command is processed immediately. This
+  is the same documented consequence as every feature behind the master switch.
 
 ### D-028.7 — Cvars
 
@@ -146,6 +149,53 @@ would-be delay again, turning the cap off while the log stays on produces a
 `(released)` line followed by a preview engage line on the next frame; the log
 thus distinguishes "the real delay ended" from "the preview still sees a
 candidate".
+
+### D-028.8 — Delay the processing, not the stamp (2026-11-13)
+
+The first implementation rewrote `ucmd.serverTime` by `-delay` (the D-015
+`cl_timeNudge` technique). A **real-client** test on the shipped client showed
+`eff = 150` in the netStatus table as designed, but movement was not a smooth
+delay: it stuttered and rubber-banded.
+
+Cause (engine+cgame source, and the reason the synthetic harness missed it):
+`SV_ClientThink` applies the move immediately, but the snapshot then carries a
+`ps` whose state already includes those moves while `ps.commandTime` claims it
+is 150 ms older. `CG_PredictPlayerState` starts from `cg->snap->ps` and replays
+every command with `cmd.serverTime > snap->ps.commandTime`
+(`cg_predict.c:1170-1180`), so the client re-applies ~150 ms of commands on top
+of an already-current position; the next snapshot snaps it back. Constant
+overshoot and correction. A1–A8 used protocol-only clients with no cgame
+prediction, so they could not see it.
+
+The delay is now a **per-client FIFO of usercmds**:
+
+- every arriving command (after the anti-macro guard) is queued;
+- the stub releases the oldest held command(s) instead of the arriving one:
+  `queue.len() - depth`, at most `MAX_RELEASES` (4) per call, so a catching-up
+  queue drains at a bounded rate;
+- the game therefore processes a command with its **original** stamp one queue
+  interval later; `ps.commandTime` and the state stay consistent, exactly like
+  a slower link, and the client's prediction replay covers only commands the
+  server has not applied yet;
+- the queue depth is `round(delay / command_interval)`, where the interval is
+  an EMA of the client's own stamp spacing (clamped 1..100 ms), and it moves at
+  most one command per `RAMP_STEP_MS` (100 ms). Each step holds or drains one
+  command, i.e. a pause/catch-up of one command interval — never a burst and
+  never the whole delay at once;
+- `MAX_DEPTH` is 48 commands and the queue holds 64; a full queue drops its
+  oldest entry. The delivered delay is quantised to the client's command
+  interval (8–33 ms), so "150 ms" means the nearest command count;
+- the timeNudge correction is applied to the **released** command's stamp (it
+  is a per-command clock correction, not a delay); `cl->lastUsercmd.serverTime`
+  is set to the newest raw stamp seen, so `SV_UserMove`'s `cl_packetdup` filter
+  keeps working and held commands are not re-delivered;
+- commands are only released when new ones arrive, so a client that stops
+  sending has nothing to process (as on a real link); connect, disconnect,
+  `GAME_INIT` and the master switch drop the queue.
+
+The display (D-028.3), population (D-028.4), tracking (D-028.5) and cvars
+(D-028.7) are unchanged. `applied` (ms) is now `depth x interval`, so the
+`eff` column and the scoreboard value report the delay actually in effect.
 
 ## Evidence (verified before implementation)
 
@@ -185,6 +235,16 @@ candidate".
   shapes.
 - netStatus table: `eff` column (`ping + applied delay`) after `ping`, header
   and rule pinned by a unit test; runtime parser regex updated.
+- Real-client test (2026-11-13), and the finding that changed the mechanism:
+  with the stamp-shift implementation the `eff` column read 150 ms as designed,
+  but movement stuttered. Root cause and fix in D-028.8 (the snapshot's
+  `ps.commandTime` no longer matched the state it described, so cgame replayed
+  already-applied moves). The queue mechanism is pinned by
+  `the_queue_depth_rounds_the_delay_to_the_client_interval`,
+  `the_queue_holds_commands_and_releases_the_oldest`,
+  `a_steady_queue_holds_the_delay_and_processes_one_command_per_arrival` and
+  `disabling_ramps_the_depth_down_and_drains_the_queue`; the real-client retest
+  is the immediate next step.
 - Review correction (2026-11-13): the population admits `cl->ping == 0`
   (localhost/LAN) and the `ps.ping` overwrite is gated on membership rather
   than on the ping range, so a 0 ms player is padded like any other and a
@@ -233,12 +293,16 @@ candidate".
    `cl_maxpackets`; measure the actual threshold on a real TaystJK client
    before recommending any cap above 250.
 3. **A real client at the cap** must behave like a natural high-ping
-   connection (no extra artefacts beyond prediction correction) and must not
-   log "exceeded PACKET_BACKUP on commands". This needs one real-client run.
+   connection (smooth, no rubber-banding) and must not log "exceeded
+   PACKET_BACKUP on commands". The first run disproved the stamp-shift
+   mechanism (D-028.8); the queue mechanism needs the same run again.
 4. **The 32-snapshot average** at `sv_fps 10` (window ~3.2 s) with the 500 ms
    refresh and the 10 ms deadband is assumed smooth enough; a noisy server may
    still retarget on roster changes, which is intentional.
 5. `cl->ping` includes the client's ack wait, so "equalised ping" is equality
    of the engine metric (the scoreboard number), not a true one-way delay.
+6. The delivered delay is quantised to the client's command interval
+   (8-33 ms at 125-30 commands/s) and rounded to the nearest command, so two
+   players can differ by up to half an interval (D-028.8).
 6. The log-only preview uses the maximum supported cap; this is an
    interpretation of "works without enforcement", not a planned value.

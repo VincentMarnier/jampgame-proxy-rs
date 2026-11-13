@@ -1169,8 +1169,8 @@ pub struct ClientEntry {
     /// `cl_timeNudge` neutralisation (`crate::timenudge`, D-015): the applied
     /// usercmd `serverTime` shift, its ramp target and the log edge.
     pub nudge_void: crate::timenudge::VoidState,
-    /// Ping equalisation (`crate::pingequalize`, D-028): the delay applied to
-    /// this client's inbound usercmds, its ramp target and the log edge.
+    /// Ping equalisation (`crate::pingequalize`, D-028): the queue of held
+    /// inbound usercmds, its depth/target and the log edge.
     pub ping_equalize: crate::pingequalize::PingEqualizeState,
     pub last_time_net_status: i32,
     /// Monotonic packet-identity counter for the cmdStats feed: bumped once

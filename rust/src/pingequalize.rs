@@ -1,19 +1,25 @@
 //! Server-side ping equalisation (`proxy_sv_pingEqualize`,
 //! `proxy_sv_pingEqualizeLog`) — D-028.
 //!
-//! A player's usercmd `serverTime` is a stamp on the client's clock; the server
-//! processes the move when it arrives, so the game's `ps.commandTime` trails
-//! `level.time` by the network delay. The 1 ms-per-usercmd clock correction
-//! already exists for `cl_timeNudge` (D-015, [`crate::timenudge`]): the
-//! retargeted `call SV_ClientThink` inside `SV_UserMove` rewrites the stamp
-//! before the game reads it.
+//! A player's usercmd `serverTime` is a stamp on the client's clock, and the
+//! server processes the move when it arrives. To make everyone play at the same
+//! **effective** latency, the proxy therefore has to make the game process a
+//! fast player's commands later: it **holds usercmds in a per-client queue** and
+//! hands the game the oldest held command when a newer one arrives. The target
+//! is the slowest in-game player's `cl->ping`, capped by
+//! `proxy_sv_pingEqualize`; a faster player's queue is sized to `target - ping`.
+//! A player already slower than the target (or than the cap) is left alone: the
+//! server can only add delay, never remove it.
 //!
-//! Ping equalisation reuses that path to make every player in a match play at
-//! the same **effective** latency: the target is the slowest in-game player's
-//! `cl->ping`, capped by `proxy_sv_pingEqualize`, and every faster player's
-//! inbound commands are shifted *back* by `target - ping`. A player already
-//! slower than the target (or than the cap) is left alone: the server can only
-//! add delay, never remove it.
+//! The delay must **not** be implemented by rewriting `serverTime` (the D-015
+//! `cl_timeNudge` path): processing the move now while stamping it in the past
+//! desynchronises `ps.commandTime` from the state it describes, and
+//! `CG_PredictPlayerState` then replays commands the server has already applied
+//! (`cg_predict.c:1170-1180`) — the client overshoots and snaps back every
+//! snapshot. A real high-ping connection has no such mismatch, and neither does
+//! the queue: the state and `ps.commandTime` both refer to the released command.
+//! The first implementation shifted the stamp and a real-client test showed the
+//! result (D-028.8).
 //!
 //! What is equalised is the input path: the game processes a fast player's
 //! moves as late as a slow player's, so both see the same age on the world
@@ -34,19 +40,18 @@
 //! [`REFRESH_MS`] (the engine's own value is a 32-snapshot average,
 //! `SV_CalcPings`, so it is already smooth) and moves only when it differs by
 //! at least [`TARGET_DEADBAND_MS`]. A change of the member set (join, leave,
-//! spectator, return to play) or of the configured cap retargets immediately;
-//! the 1 ms-per-usercmd ramp still applies to the per-client delay.
+//! spectator, return to play) or of the configured cap retargets immediately.
 //!
-//! ## Ramp and off semantics
+//! ## Queue ramp and off semantics
 //!
-//! Every client's applied delay moves by 1 ms per usercmd, exactly like the
-//! `cl_timeNudge` void: a jump would trip the game's `msec < 1` guard or
-//! produce one oversized movement frame (`g_active.c:2023-2028`). Setting
-//! `proxy_sv_pingEqualize` to `0` sets every target to `0` and lets the delay
-//! ramp out instead of snapping the clock forward. `proxy_sv_enable 0` detaches
-//! the hook layer immediately (the one following command sees the raw stamp,
-//! one oversized `msec` clamped to 200 by the game) — the same consequence as
-//! every other feature behind the master switch.
+//! The delay is quantised to the client's own command interval (the queue depth
+//! is `target / interval`), and the depth moves at most one command per
+//! [`RAMP_STEP_MS`]: each step holds or releases one command, i.e. a pause or
+//! catch-up of one command interval, never a burst. Setting
+//! `proxy_sv_pingEqualize` to `0` sets every target to `0`; the depth ramps down
+//! and the held commands drain instead of the clock jumping forward.
+//! `proxy_sv_enable 0` detaches the hook layer immediately and clears the
+//! queues (as for every feature behind the master switch).
 //!
 //! ## Display
 //!
@@ -61,12 +66,14 @@
 //!
 //! ## Cap
 //!
-//! The cap is clamped to `0..=250` ms. A client can only replay its last
-//! `CMD_BACKUP = 64` usercmds; when the snapshot's `ps.commandTime` falls
-//! behind that window, `CG_PredictPlayerState` freezes prediction ("exceeded
-//! PACKET_BACKUP on commands"). At `cl_maxpackets 125` that window is about
-//! 512 ms *including* the round trip, so 250 ms leaves margin at every packet
-//! rate. Do not raise it without a real-client measurement.
+//! The cap is clamped to `0..=250` ms. The client replays commands from
+//! `ps.commandTime` to its latest one, so the queue depth is part of a window
+//! the client only backs with `CMD_BACKUP = 64` usercmds; when the snapshot's
+//! `ps.commandTime` falls behind that window, `CG_PredictPlayerState` freezes
+//! prediction ("exceeded PACKET_BACKUP on commands"). At `cl_maxpackets 125`
+//! that window is about 512 ms *including* the round trip, so 250 ms leaves
+//! margin at every packet rate. Do not raise it without a real-client
+//! measurement.
 //!
 //! `proxy_sv_pingEqualizeLog 1` logs target changes and per-client
 //! engage/release transitions. It works without enforcement: with
@@ -79,7 +86,7 @@ use crate::hooks::engine_sv::{clients_base, is_bot, read_i32, write_i32};
 use crate::sdk::{
     CS_ACTIVE, MAX_CLIENTS, OFFSET_CLIENT_PING, OFFSET_CLIENT_STATE, OFFSET_GCLIENT_PS,
     OFFSET_GCLIENT_SESS, OFFSET_LEVEL_MAXCLIENTS, OFFSET_PS_PING, OFFSET_SESS_SESSION_TEAM,
-    SIZEOF_CLIENT_T, SIZEOF_GCLIENT, TEAM_SPECTATOR,
+    SIZEOF_CLIENT_T, SIZEOF_GCLIENT, TEAM_SPECTATOR, Usercmd,
 };
 use crate::state;
 use crate::syscall;
@@ -111,6 +118,278 @@ pub const MIN_PING: i32 = 0;
 /// stay strictly below it.
 pub const PING_SENTINEL: i32 = 999;
 
+/// Deepest delay, in commands. The client can only replay its last
+/// `CMD_BACKUP` = 64 commands, so this stays well below that.
+pub const MAX_DEPTH: i32 = 48;
+
+/// Queue capacity, in commands (`MAX_DEPTH` plus room for a burst).
+pub const QUEUE_CAP: usize = 64;
+
+/// The depth moves at most one command per this many milliseconds of server
+/// time: each step holds (or releases) one command, a pause/burst of one
+/// command interval, so a target change never fires a whole queue at once.
+pub const RAMP_STEP_MS: i32 = 100;
+
+/// Bounds of the measured per-client command interval (ms).
+pub const MIN_INTERVAL_MS: i32 = 1;
+pub const MAX_INTERVAL_MS: i32 = 100;
+
+/// Command interval assumed until two commands have been seen.
+pub const DEFAULT_INTERVAL_MS: i32 = 20;
+
+/// At most this many held commands are released in one usercmd call. A queue
+/// that is catching up drains at this rate instead of bursting.
+pub const MAX_RELEASES: usize = 4;
+
+/// A small FIFO of usercmds waiting to be processed, oldest first.
+#[derive(Debug, Clone, Copy)]
+pub struct CmdQueue {
+    buf: [Usercmd; QUEUE_CAP],
+    head: usize,
+    len: usize,
+}
+
+impl Default for CmdQueue {
+    fn default() -> Self {
+        Self {
+            buf: [Usercmd::default(); QUEUE_CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl CmdQueue {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Append a command. A full queue drops its oldest entry (a burst larger
+    /// than the delay can hold), exactly like a link that buffers and loses.
+    pub fn push(&mut self, cmd: Usercmd) {
+        if self.len == QUEUE_CAP {
+            self.head = (self.head + 1) % QUEUE_CAP;
+            self.len -= 1;
+        }
+        let at = (self.head + self.len) % QUEUE_CAP;
+        self.buf[at] = cmd;
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<Usercmd> {
+        if self.len == 0 {
+            return None;
+        }
+        let cmd = self.buf[self.head];
+        self.head = (self.head + 1) % QUEUE_CAP;
+        self.len -= 1;
+        Some(cmd)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-client delay state
+// ---------------------------------------------------------------------------
+
+/// Per-client ping-equalisation state.
+///
+/// The delay is implemented by **holding usercmds**, not by shifting their
+/// stamps: the queue keeps `depth` commands, and each arriving command releases
+/// the oldest held one. The game therefore processes a command one queue
+/// interval later, with its original stamp, so the state and
+/// `ps.commandTime` stay consistent and client prediction keeps working — a
+/// stamp shift would make the client replay moves the server had already
+/// applied.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PingEqualizeState {
+    /// Delay currently in effect, in ms (`depth x interval`; `0` = none).
+    pub applied: i32,
+    /// Requested delay in ms (`0` = none), set by the frame pass.
+    pub target: i32,
+    /// Commands the queue currently holds on purpose.
+    pub depth: i32,
+    /// Commands the requested delay needs.
+    pub depth_target: i32,
+    /// Measured command interval (EMA), ms.
+    pub interval: i32,
+    /// Last raw stamp seen (`0` = none).
+    pub last_stamp: i32,
+    /// `svs.time` of the last depth step (`0` = none).
+    pub last_step_ms: i32,
+    /// Log edge: an engage line was emitted and no release line yet.
+    pub logged: bool,
+    /// A real (non-preview) delay has been applied since the last release;
+    /// distinguishes "the applied delay ended" from a preview-only edge.
+    pub applied_seen: bool,
+    /// Commands waiting to be processed, oldest first.
+    pub queue: CmdQueue,
+}
+
+impl PingEqualizeState {
+    fn interval_or_default(&self) -> i32 {
+        if self.interval > 0 {
+            self.interval
+        } else {
+            DEFAULT_INTERVAL_MS
+        }
+    }
+
+    /// Whether the queue path must run for this client (a delay is wanted, is
+    /// still in effect, or held commands are waiting).
+    pub fn active(&self) -> bool {
+        self.target > 0 || self.depth > 0 || self.queue.len() > 0
+    }
+
+    /// Feed the arriving command's raw stamp and refresh the interval EMA.
+    pub fn observe_stamp(&mut self, stamp: i32) {
+        if self.last_stamp != 0 {
+            let delta = stamp.wrapping_sub(self.last_stamp);
+            if (MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&delta) {
+                let prev = self.interval_or_default();
+                self.interval = (prev * 7 + delta) / 8;
+            }
+        } else {
+            self.interval = DEFAULT_INTERVAL_MS;
+        }
+        self.last_stamp = stamp;
+        self.refresh_depth_target();
+    }
+
+    /// Recompute how many commands the requested delay needs.
+    pub fn refresh_depth_target(&mut self) {
+        let interval = self.interval_or_default();
+        self.depth_target = if self.target <= 0 {
+            0
+        } else {
+            ((self.target + interval / 2) / interval).clamp(1, MAX_DEPTH)
+        };
+    }
+
+    /// Move the depth at most one command toward its target per
+    /// [`RAMP_STEP_MS`], and refresh the reported delay.
+    pub fn ramp(&mut self, now: i32) {
+        if self.depth == self.depth_target {
+            self.last_step_ms = now;
+        } else if self.last_step_ms == 0
+            || !(0..RAMP_STEP_MS).contains(&now.wrapping_sub(self.last_step_ms))
+        {
+            self.last_step_ms = now;
+            if self.depth < self.depth_target {
+                self.depth += 1;
+            } else {
+                self.depth -= 1;
+            }
+        }
+        self.sync_applied();
+    }
+
+    /// Append the arriving command to the queue.
+    pub fn enqueue(&mut self, cmd: Usercmd) {
+        self.queue.push(cmd);
+    }
+
+    /// How many held commands this call should release (bounded by
+    /// [`MAX_RELEASES`]).
+    pub fn release_budget(&self) -> usize {
+        let held = self.depth.max(0) as usize;
+        self.queue.len().saturating_sub(held).min(MAX_RELEASES)
+    }
+
+    /// Pop the oldest held command.
+    pub fn pop(&mut self) -> Option<Usercmd> {
+        let cmd = self.queue.pop();
+        self.sync_applied();
+        cmd
+    }
+
+    fn sync_applied(&mut self) {
+        self.applied = if self.depth > 0 {
+            self.depth * self.interval_or_default()
+        } else {
+            0
+        };
+    }
+
+    /// Update the target (and the log edge) for one frame. `reported` is the
+    /// delay the feature would apply (differs from `effective` only in the
+    /// log-only preview, where `effective` is `0`).
+    ///
+    /// The engage line is emitted once the first commands are actually held;
+    /// the release line only once the queue has drained, so a spectator or a
+    /// disabled cap is reported when the client really stops being delayed.
+    pub fn update(
+        &mut self,
+        effective: i32,
+        reported: i32,
+        ping: i32,
+        global_target: i32,
+        enforce: bool,
+        log: bool,
+    ) -> Option<ClientTransition> {
+        self.target = effective;
+        self.refresh_depth_target();
+        if self.applied > 0 {
+            self.applied_seen = true;
+        }
+        let engaged = if enforce { effective > 0 } else { reported > 0 };
+        let was = self.logged;
+        // While merely previewing (enforcement off), the frame where a real
+        // applied delay finishes draining is still a release, even though the
+        // preview immediately reports a would-be delay again. A preview that
+        // never applied a delay has nothing to release.
+        let preview_released =
+            log && !enforce && effective == 0 && self.applied == 0 && was && self.applied_seen;
+        let transition = if preview_released {
+            Some(ClientTransition::Released)
+        } else if log && engaged && !was {
+            Some(ClientTransition::Engaged {
+                delay: self.applied.max(reported),
+                ping,
+                target: global_target,
+            })
+        } else if log && !engaged && self.applied == 0 && was {
+            Some(ClientTransition::Released)
+        } else {
+            None
+        };
+        if matches!(transition, Some(ClientTransition::Released)) {
+            self.applied_seen = false;
+        }
+        // Keep the edge while a previously engaged client drains.
+        self.logged = if preview_released {
+            false
+        } else {
+            log && (engaged || (was && self.applied > 0))
+        };
+        transition
+    }
+
+    /// Whether the client has nothing to do (empty queue, no ramp pending).
+    pub fn is_idle(&self) -> bool {
+        self.applied == 0
+            && self.target == 0
+            && self.depth == 0
+            && self.queue.len() == 0
+            && !self.logged
+    }
+
+    /// Stop applying the delay: the depth ramps down and the queue drains.
+    pub fn stop(&mut self) {
+        self.target = 0;
+    }
+
+    /// Forget everything (connect/disconnect, `GAME_INIT`, master switch). The
+    /// held commands are dropped: a fresh client starts from a fresh clock.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The ping the scoreboard should report while this delay is applied.
+    pub fn effective_ping(&self, ping: i32) -> i32 {
+        ping.saturating_add(self.applied)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cvar mirror (set once per `GAME_RUN_FRAME` by `update_proxy_cvars`)
 // ---------------------------------------------------------------------------
@@ -136,8 +415,8 @@ pub fn clamp_cap(cap: i32) -> i32 {
 /// Mirror the cvars into lock-free atomics.
 ///
 /// Turning the cap to `0` does **not** clear the applied delays: the targets
-/// are set to `0` by the next [`on_run_frame`] and the 1 ms-per-usercmd ramp
-/// brings them down (D-028.6).
+/// are set to `0` by the next [`on_run_frame`], and the depth ramp drains the
+/// held commands instead of dropping them (D-028.8).
 pub fn set_config(cap: i32, log: i32) {
     CAP_MS.store(clamp_cap(cap), Ordering::Relaxed);
     LOG.store(log != 0, Ordering::Relaxed);
@@ -179,110 +458,6 @@ pub fn is_member(client_state: i32, bot: bool, ping: i32, session_team: i32) -> 
         && !bot
         && (MIN_PING..PING_SENTINEL).contains(&ping)
         && session_team != TEAM_SPECTATOR
-}
-
-// ---------------------------------------------------------------------------
-// Per-client delay state
-// ---------------------------------------------------------------------------
-
-/// Per-client ping-equalisation state.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PingEqualizeState {
-    /// Delay currently applied to this client's usercmds (`0` = none).
-    pub applied: i32,
-    /// Delay [`step`](Self::step) moves toward.
-    pub target: i32,
-    /// Log edge: an engage line was emitted and no release line yet.
-    pub logged: bool,
-    /// A real (non-preview) delay has been applied since the last release;
-    /// distinguishes "the applied delay ended" from a preview-only edge.
-    pub applied_seen: bool,
-}
-
-impl PingEqualizeState {
-    /// Move the applied delay one millisecond toward the target and return it.
-    ///
-    /// The 1 ms step bounds the per-command `msec` change to ±1 (see the module
-    /// docs); a client that stopped producing commands leaves the delay where
-    /// it was, which is correct because its clock has not moved either.
-    pub fn step(&mut self) -> i32 {
-        self.applied += (self.target - self.applied).signum();
-        self.applied
-    }
-
-    /// Update the target (and the log edge) for one frame. `reported` is the
-    /// delay the feature would apply (differs from `effective` only in the
-    /// log-only preview, where `effective` is `0`).
-    ///
-    /// The engage line reports the target delay; the release line is emitted
-    /// only once the applied delay has ramped all the way to `0`, so a
-    /// spectator or a disabled cap is reported when the client really stops
-    /// being delayed.
-    pub fn update(
-        &mut self,
-        effective: i32,
-        reported: i32,
-        ping: i32,
-        global_target: i32,
-        enforce: bool,
-        log: bool,
-    ) -> Option<ClientTransition> {
-        self.target = effective;
-        if self.applied > 0 {
-            self.applied_seen = true;
-        }
-        let engaged = if enforce { effective > 0 } else { reported > 0 };
-        let was = self.logged;
-        // While merely previewing (enforcement off), the frame where a real
-        // applied delay finishes ramping out is still a release, even though
-        // the preview immediately reports a would-be delay again. A preview
-        // that never applied a delay has nothing to release.
-        let preview_released =
-            log && !enforce && effective == 0 && self.applied == 0 && was && self.applied_seen;
-        let transition = if preview_released {
-            Some(ClientTransition::Released)
-        } else if log && engaged && !was {
-            Some(ClientTransition::Engaged {
-                delay: effective.max(reported),
-                ping,
-                target: global_target,
-            })
-        } else if log && !engaged && self.applied == 0 && was {
-            Some(ClientTransition::Released)
-        } else {
-            None
-        };
-        if matches!(transition, Some(ClientTransition::Released)) {
-            self.applied_seen = false;
-        }
-        // Keep the edge while a previously engaged client ramps out.
-        self.logged = if preview_released {
-            false
-        } else {
-            log && (engaged || (was && self.applied > 0))
-        };
-        transition
-    }
-
-    /// Whether the client has nothing to do (idle state, no ramp pending).
-    pub fn is_idle(&self) -> bool {
-        self.applied == 0 && self.target == 0 && !self.logged
-    }
-
-    /// Stop applying the delay: the next usercmds ramp it out.
-    pub fn stop(&mut self) {
-        self.target = 0;
-    }
-
-    /// Forget everything (connect/disconnect, `GAME_INIT`, master switch).
-    pub fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    /// The ping the scoreboard should report while this delay is applied.
-    pub fn effective_ping(&self, ping: i32) -> i32 {
-        ping.saturating_add(self.applied)
-    }
 }
 
 /// One logged per-client transition.
@@ -415,7 +590,7 @@ pub fn clear_offsets() {
 }
 
 /// Per-`GAME_RUN_FRAME` pass (after the pristine forward, before the engine
-/// builds the snapshots): refresh the target, update every client's ramp
+/// builds the snapshots): refresh the target, update every client's queue
 /// target, and write the effective ping into the game-side player state.
 ///
 /// # Safety
@@ -511,8 +686,8 @@ pub fn on_run_frame(now: i32) {
             let effective = if enforce { reported } else { 0 };
             let client = &mut s.clients[i].ping_equalize;
             if !enforce {
-                // D-028.6: a cap of 0 ramps the delay away instead of snapping
-                // the clock forward.
+                // D-028.8: a cap of 0 drains the queue instead of dropping
+                // the held commands.
                 client.stop();
             }
             if let Some(transition) =
@@ -704,13 +879,12 @@ mod tests {
         assert_eq!(delay_for(0, 60), 60);
         // A roster of only zero-ping players has nothing to equalise.
         assert_eq!(target_for(&[0, 0], 250), 0);
-        let mut client = PingEqualizeState {
+        let client = PingEqualizeState {
             applied: 60,
             target: 60,
             ..Default::default()
         };
         assert_eq!(client.effective_ping(0), 60);
-        assert_eq!(client.step(), 60);
     }
 
     #[test]
@@ -766,22 +940,118 @@ mod tests {
         // this an immediate move.
     }
 
+    fn cmd(stamp: i32) -> Usercmd {
+        Usercmd {
+            server_time: stamp,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn the_applied_delay_ramps_one_millisecond_per_command_both_ways() {
+    fn the_queue_depth_rounds_the_delay_to_the_client_interval() {
+        let mut state = PingEqualizeState::default();
+        state.observe_stamp(1000);
+        state.observe_stamp(1020);
+        assert_eq!(state.interval, 20);
+        state.target = 100;
+        state.refresh_depth_target();
+        assert_eq!(state.depth_target, 5, "100 ms at one command per 20 ms");
+        // One depth step per RAMP_STEP_MS, never a whole queue at once.
+        state.ramp(1000);
+        assert_eq!((state.depth, state.applied), (1, 20));
+        state.ramp(1050);
+        assert_eq!((state.depth, state.applied), (1, 20), "not due yet");
+        state.ramp(1100);
+        assert_eq!((state.depth, state.applied), (2, 40));
+    }
+
+    #[test]
+    fn the_queue_holds_commands_and_releases_the_oldest() {
         let mut state = PingEqualizeState {
-            target: 3,
+            interval: 20,
+            target: 60,
+            depth: 3,
+            depth_target: 3,
+            last_step_ms: 1,
             ..Default::default()
         };
-        assert_eq!(state.step(), 1);
-        assert_eq!(state.step(), 2);
-        assert_eq!(state.step(), 3);
-        assert_eq!(state.step(), 3);
-        state.target = 0;
-        assert_eq!(state.step(), 2);
-        assert_eq!(state.step(), 1);
-        assert_eq!(state.step(), 0);
-        assert_eq!(state.step(), 0);
-        assert_eq!(state.applied, 0);
+        for stamp in [1000, 1020, 1040] {
+            state.enqueue(cmd(stamp));
+            assert_eq!(state.release_budget(), 0, "the queue is filling");
+        }
+        assert_eq!(state.queue.len(), 3);
+        state.enqueue(cmd(1060));
+        assert_eq!(state.release_budget(), 1);
+        assert_eq!(state.pop().unwrap().server_time, 1000, "oldest first");
+        assert_eq!(state.queue.len(), 3);
+        assert!(state.active(), "the held commands keep the path running");
+
+        // A full queue drops its oldest entry instead of growing unbounded.
+        for stamp in (0..QUEUE_CAP).map(|i| 2000 + i as i32 * 20) {
+            state.queue.push(cmd(stamp));
+        }
+        assert_eq!(state.queue.len(), QUEUE_CAP);
+    }
+
+    #[test]
+    fn a_steady_queue_holds_the_delay_and_processes_one_command_per_arrival() {
+        let mut state = PingEqualizeState {
+            interval: 20,
+            target: 60,
+            ..Default::default()
+        };
+        state.refresh_depth_target();
+        state.depth = 3;
+        state.last_step_ms = 1;
+        let mut released = Vec::new();
+        let mut sent = Vec::new();
+        for k in 0..10 {
+            let stamp = 1000 + k * 20;
+            state.enqueue(cmd(stamp));
+            state.ramp(1_000_000); // steady: depth == depth_target, no step
+            for _ in 0..state.release_budget() {
+                if let Some(held) = state.pop() {
+                    released.push(held.server_time);
+                }
+            }
+            sent.push(stamp);
+        }
+        // The first three commands build the delay; every later arrival
+        // releases exactly one, so the game is always `depth` commands behind.
+        assert_eq!(released, sent[..7]);
+        assert_eq!(state.queue.len(), 3);
+        assert_eq!(state.applied, 60);
+    }
+
+    #[test]
+    fn disabling_ramps_the_depth_down_and_drains_the_queue() {
+        let mut state = PingEqualizeState {
+            interval: 20,
+            target: 60,
+            depth: 3,
+            depth_target: 3,
+            applied: 60,
+            last_step_ms: 1,
+            logged: true,
+            ..Default::default()
+        };
+        for stamp in [1000, 1020, 1040] {
+            state.enqueue(cmd(stamp));
+        }
+        state.stop();
+        state.refresh_depth_target();
+        assert_eq!(state.depth_target, 0);
+        state.ramp(10);
+        assert_eq!(state.depth, 3, "a step waits RAMP_STEP_MS");
+        state.ramp(200);
+        assert_eq!(state.depth, 2);
+        assert_eq!(state.applied, 40);
+        assert_eq!(state.release_budget(), 1, "the held command drains");
+        assert_eq!(state.pop().unwrap().server_time, 1000);
+        assert!(!state.is_idle(), "the log edge is still set");
+        state.clear();
+        assert!(state.is_idle());
+        assert_eq!(state.queue.len(), 0);
     }
 
     #[test]
@@ -793,22 +1063,6 @@ mod tests {
         };
         assert_eq!(state.effective_ping(20), 95);
         assert_eq!(PingEqualizeState::default().effective_ping(20), 20);
-    }
-
-    #[test]
-    fn stop_keeps_the_applied_delay_and_lets_it_ramp_out() {
-        let mut state = PingEqualizeState {
-            applied: 10,
-            target: 10,
-            logged: true,
-            ..Default::default()
-        };
-        state.stop();
-        assert_eq!(state.target, 0);
-        assert_eq!(state.step(), 9);
-        assert!(!state.is_idle());
-        state.clear();
-        assert!(state.is_idle());
     }
 
     #[test]
