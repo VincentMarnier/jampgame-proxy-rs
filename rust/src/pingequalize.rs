@@ -150,11 +150,6 @@ pub const RING_SAFE_FRAMES: i32 = 48;
 /// interval at the default 20), reserved inside [`RING_SAFE_FRAMES`].
 pub const AHEAD_MS: i32 = 50;
 
-/// `svc_serverCommand` and `svc_snapshot` in a server message
-/// (`codemp/qcommon/qcommon.h:243-252`; JA's enum, not Q3's).
-const SVC_SERVER_COMMAND: u8 = 5;
-const SVC_SNAPSHOT: u8 = 7;
-
 /// Split a delay into its **view** and **action** halves.
 ///
 /// The view half is applied by shifting the client's snapshot clock back, so
@@ -178,53 +173,8 @@ pub fn split(delay_ms: i32, interval_ms: i32) -> (i32, i32) {
     (delay - action, action)
 }
 
-/// Subtract `view_ms` from the `serverTime` of a snapshot message, in place.
-///
-/// A normal server message is `lastClientCommand` (4 bytes), then zero or more
-/// `svc_serverCommand` + NUL-terminated string entries, then `svc_snapshot` +
-/// the 4-byte server time (`sv_snapshot.cpp:746-796`). Anything else (a
-/// gamestate, a final message, a truncated buffer) is left alone, so a
-/// layout the parser does not recognise can never corrupt a message.
-pub fn shift_snapshot_time(data: &mut [u8], view_ms: i32) -> bool {
-    if view_ms <= 0 || data.len() < 5 {
-        return false;
-    }
-    let mut pos = 4; // `lastClientCommand`
-    while pos < data.len() {
-        let op = data[pos];
-        pos += 1;
-        match op {
-            SVC_SERVER_COMMAND => {
-                // Opcode, then the 4-byte command sequence, then the
-                // NUL-terminated command (`sv_snapshot.cpp:249-251`;
-                // `cl_parse.cpp:794-795` reads the sequence first).
-                pos += 4;
-                if pos > data.len() {
-                    return false;
-                }
-                match data[pos..].iter().position(|&b| b == 0) {
-                    Some(n) => pos += n + 1,
-                    None => return false,
-                }
-            }
-            SVC_SNAPSHOT => {
-                if pos + 4 > data.len() {
-                    return false;
-                }
-                let time =
-                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                let shifted = time.saturating_sub(view_ms);
-                data[pos..pos + 4].copy_from_slice(&shifted.to_le_bytes());
-                return true;
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
 /// Advance one client's view shift by one snapshot and return the value to
-/// apply to this snapshot (0 = none). Called from the snapshot send hook.
+/// apply to this snapshot (0 = none). Called from the snapshot writer stub.
 pub fn view_for_snapshot(client_num: usize) -> i32 {
     state::with_state(|s| {
         s.clients
@@ -1121,57 +1071,6 @@ mod tests {
         assert_eq!(state.step_view(), 1);
         assert_eq!(state.step_view(), 0);
         assert_eq!(state.step_view(), 0);
-    }
-
-    #[test]
-    fn the_snapshot_time_is_shifted_only_in_a_snapshot_message() {
-        // lastClientCommand + svc_snapshot + serverTime.
-        let mut buf = [0u8; 13];
-        buf[3] = 1;
-        buf[4] = SVC_SNAPSHOT;
-        buf[5..9].copy_from_slice(&1000i32.to_le_bytes());
-        assert!(shift_snapshot_time(&mut buf, 100));
-        assert_eq!(i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]), 900);
-
-        // A reliable command before the snapshot is skipped: opcode, the
-        // 4-byte sequence (which can contain zero bytes), then the string.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&7i32.to_le_bytes());
-        buf.push(SVC_SERVER_COMMAND);
-        buf.extend_from_slice(&1i32.to_le_bytes());
-        buf.extend_from_slice(b"print \"hi\"\0");
-        buf.push(SVC_SNAPSHOT);
-        buf.extend_from_slice(&500i32.to_le_bytes());
-        assert!(shift_snapshot_time(&mut buf, 50));
-        let tail = &buf[buf.len() - 4..];
-        assert_eq!(i32::from_le_bytes(tail.try_into().unwrap()), 450);
-
-        // Two commands, the second one long: still skipped exactly.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&7i32.to_le_bytes());
-        for (seq, text) in [(1i32, b"print \"a\"\0".as_slice()), (2, b"print \"bb\"\0")] {
-            buf.push(SVC_SERVER_COMMAND);
-            buf.extend_from_slice(&seq.to_le_bytes());
-            buf.extend_from_slice(text);
-        }
-        buf.push(SVC_SNAPSHOT);
-        buf.extend_from_slice(&1000i32.to_le_bytes());
-        assert!(shift_snapshot_time(&mut buf, 25));
-        let tail = &buf[buf.len() - 4..];
-        assert_eq!(i32::from_le_bytes(tail.try_into().unwrap()), 975);
-
-        // A gamestate (not a snapshot), a truncated buffer and view 0 are left
-        // untouched.
-        let mut other = [0u8; 13];
-        other[4] = 2; // svc_gamestate, not a snapshot
-        assert!(!shift_snapshot_time(&mut other, 100));
-        assert_eq!(other[5..9], [0, 0, 0, 0]);
-        let mut short = [0u8; 6];
-        short[4] = SVC_SNAPSHOT;
-        assert!(!shift_snapshot_time(&mut short, 100));
-        let mut untouched = [0u8; 13];
-        untouched[4] = SVC_SNAPSHOT;
-        assert!(!shift_snapshot_time(&mut untouched, 0));
     }
 
     #[test]

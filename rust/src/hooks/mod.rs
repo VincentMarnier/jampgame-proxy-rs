@@ -125,11 +125,6 @@ engine_trampoline!(
     23,
     unsafe extern "C" fn()
 );
-engine_trampoline!(
-    engine_hook_original_sv_send_message_to_client,
-    24,
-    unsafe extern "C" fn(usize, usize)
-);
 
 game_trampoline!(
     game_hook_original_g_damage,
@@ -362,6 +357,12 @@ pub unsafe fn attach_all() {
             patch::CALL_SV_CLIENT_THINK,
             netstatus::sv_client_think_stub as usize,
         );
+        // D-028.9: retarget `call SV_WriteSnapshotToClient`, which shifts
+        // `svs.time` for the snapshot build (the view half of the delay).
+        patch::retarget_call_tracked(
+            patch::CALL_SV_WRITE_SNAPSHOT,
+            engine_sv::sv_write_snapshot_stub as usize,
+        );
     }
 
     // Engine detours.
@@ -390,7 +391,6 @@ pub unsafe fn attach_all() {
         engine_sv::msg_read_bits as usize,
         engine_sv::sv_send_client_snapshot as usize,
         engine_sv::sv_send_client_messages as usize,
-        engine_sv::sv_send_message_to_client as usize,
     ];
     for (hook, wrapper) in patch::ENGINE_HOOKS.iter().zip(&engine_wrappers) {
         // SAFETY: hook addresses are version-swept; wrappers match the engine

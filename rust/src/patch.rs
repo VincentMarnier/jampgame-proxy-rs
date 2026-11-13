@@ -705,7 +705,7 @@ pub unsafe fn jcc_to_jmp(addr: usize) {
 /// `qfalse` (drop) before the pristine body decodes it.
 /// `SV_SendClientMessages` is the Phase 2 demo recorder's tick: run the
 /// pristine per-frame snapshot loop, then the recorder's own build.
-pub static ENGINE_HOOKS: [Hook; 25] = [
+pub static ENGINE_HOOKS: [Hook; 24] = [
     Hook::new("SVC_Status", crate::engine::functions::SVC_STATUS, false),
     Hook::new("SVC_Info", crate::engine::functions::SVC_INFO, false),
     Hook::new(
@@ -814,13 +814,6 @@ pub static ENGINE_HOOKS: [Hook; 25] = [
         crate::engine::functions::SV_SEND_CLIENT_MESSAGES,
         false,
     ),
-    // D-028.9: shift the snapshot clock for a ping-equalised client (the view
-    // half of the delay) before the message is fragmented and sent.
-    Hook::new(
-        "SV_SendMessageToClient",
-        crate::engine::functions::SV_SEND_MESSAGE_TO_CLIENT,
-        false,
-    ),
 ];
 
 /// Game-module detours (rebased), mirroring `jampgameHookEntries`
@@ -909,6 +902,14 @@ pub static GAME_HOOKS: [Hook; 25] = [
 /// that calls the original `SV_ClientThink` and then feeds the cmd stats
 /// (D-002.1 technique 3, `docs/inventory.md` → "Players net status").
 pub const CALL_SV_CLIENT_THINK: usize = 0x0804_e891;
+
+/// The `call SV_WriteSnapshotToClient` inside the pristine
+/// `SV_SendClientSnapshot` (0x8058e9c, target 0x8058034 — objdump-verified).
+/// Retargeted to a proxy stub that shifts `svs.time` for the duration of the
+/// snapshot build, so the snapshot's time carries the client's view delay
+/// (D-028.9). The call site is the only place where that time is still plain
+/// bytes: the message is Huffman-compressed afterwards.
+pub const CALL_SV_WRITE_SNAPSHOT: usize = 0x0805_8e9c;
 
 /// The `call vsprintf` inside the engine's `Com_Printf` (0x8072cca, target
 /// `vsprintf@plt` — objdump-verified). Retargeted to the proxy's `vsnprintf`

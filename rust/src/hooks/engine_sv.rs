@@ -19,7 +19,7 @@ use crate::sdk::{
     OFFSET_CLIENT_USERINFO, OFFSET_ENTITY_CLIENT_NUM, OFFSET_ENTITY_NUMBER, OFFSET_GENTITY_CLIENT,
     OFFSET_GENTITY_R_OWNER, OFFSET_GENTITY_S, OFFSET_GENTITY_S_EFLAGS, OFFSET_GENTITY_S_ETYPE,
     OFFSET_GENTITY_S_OTHER_ENTITY_NUM, OFFSET_GENTITY_S_OTHER_ENTITY_NUM2, OFFSET_GENTITY_S_OWNER,
-    OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_DATA, OFFSET_MSG_OOB, OFFSET_MSG_READCOUNT,
+    OFFSET_MSG_BIT, OFFSET_MSG_CURSIZE, OFFSET_MSG_OOB, OFFSET_MSG_READCOUNT,
     OFFSET_NETCHAN_REMOTE_ADDRESS, OFFSET_SHARED_ENTITY_S, OFFSET_SHARED_SVFLAGS,
     OFFSET_SNAPSHOT_ENUMS_COUNT, OFFSET_SNAPSHOT_ENUMS_LIST, OFFSET_SNAPSHOT_FRAME_PS_CLIENT_NUM,
     OFFSET_SV_GENTITIES, OFFSET_SV_GENTITY_SIZE, OFFSET_SV_SV_ENTITIES, OFFSET_SVS_TIME,
@@ -1648,59 +1648,48 @@ pub unsafe extern "C" fn sv_send_client_messages() {
     crate::demo::recorder::on_sv_send_client_messages();
 }
 
-/// `void SV_SendMessageToClient(msg_t*, client_t*)` (`0x8058c84`): shift the
-/// snapshot's `serverTime` back by the client's view delay before the message
-/// is fragmented and sent (D-028.9).
+/// `void SV_WriteSnapshotToClient(client_t*, msg_t*)` (`0x8058034`, static):
+/// build the snapshot with `svs.time` shifted back by the client's view delay
+/// (D-028.9).
 ///
-/// The client derives its whole clock from the snapshot time
-/// (`CL_AdjustTimeDelta`), so shifting it makes the client's view — and the
-/// stamps of its own commands — lag by the same amount, exactly like the
-/// one-way delay of a slower link. That is what keeps the delay out of the
-/// client's 64-command prediction ring.
+/// The engine writes the snapshot's time from `svs.time` inside this function,
+/// before the message is compressed and fragmented; shifting the global for
+/// the duration of the call is the only point where the time is still plain
+/// bytes. `SV_SendMessageToClient` then records `frames[].messageSent` from
+/// the restored value, so the engine's ping stays the real network ping.
 ///
-/// # Safety
-///
-/// Entered from the engine's snapshot send path with a live `msg_t*` and
-/// `client_t*`.
-pub unsafe extern "C" fn sv_send_message_to_client(msg: usize, cl: usize) {
-    if msg != 0 && cl != 0 {
-        let slot = client_num_from_addr(cl);
-        if slot < MAX_CLIENTS {
-            let view = crate::pingequalize::view_for_snapshot(slot);
-            if view > 0 {
-                // SAFETY: msg is the engine's live message buffer.
-                unsafe { shift_snapshot_message(msg, view) };
-            }
-        }
-    }
-    let original = original_call(crate::hooks::engine_hook_original_sv_send_message_to_client);
-    // SAFETY: trampoline attached at GAME_INIT; args forwarded unchanged.
-    unsafe { original(msg, cl) };
-}
-
-/// Patch the snapshot server time in a live `msg_t`, if the message is a
-/// snapshot (see [`crate::pingequalize::shift_snapshot_time`]).
+/// Reached through the retargeted `call SV_WriteSnapshotToClient` inside
+/// `SV_SendClientSnapshot` (0x8058e9c, target `0x8058034`, objdump-verified).
 ///
 /// # Safety
 ///
-/// `msg` must be a valid `msg_t*` whose `data` holds `cursize` bytes.
-unsafe fn shift_snapshot_message(msg: usize, view: i32) {
-    // SAFETY: caller guarantees a live msg_t; both fields are plain.
-    let cursize = unsafe { read_i32(msg + OFFSET_MSG_CURSIZE) };
-    // Larger than any legal message buffer: not ours to touch.
-    const MAX_MSG: i32 = 0x1_0000;
-    if !(5..=MAX_MSG).contains(&cursize) {
+/// Entered from the engine's snapshot build with a live `client_t*`/`msg_t*`.
+pub unsafe extern "C" fn sv_write_snapshot_stub(client: usize, msg: usize) {
+    let slot = if client != 0 {
+        client_num_from_addr(client)
+    } else {
+        MAX_CLIENTS
+    };
+    let view = if slot < MAX_CLIENTS {
+        crate::pingequalize::view_for_snapshot(slot)
+    } else {
+        0
+    };
+    if view == 0 {
+        // SAFETY: live engine pointers, prototype above.
+        unsafe { crate::engine::sv_write_snapshot_to_client(client, msg) };
         return;
     }
-    // SAFETY: `data` points at the engine's message bytes.
-    let data = unsafe { read_usize(msg + OFFSET_MSG_DATA) };
-    if data == 0 {
-        return;
-    }
-    // SAFETY: the engine owns `cursize` bytes at `data`; the slice does not
-    // outlive this call and is only written by the patcher.
-    let buf = unsafe { core::slice::from_raw_parts_mut(data as *mut u8, cursize as usize) };
-    crate::pingequalize::shift_snapshot_time(buf, view);
+    let time_addr = crate::engine::vars::SVS + crate::sdk::OFFSET_SVS_TIME;
+    // SAFETY: `svs.time` is a plain int at the validated server-static address.
+    let now = unsafe { read_i32(time_addr) };
+    // SAFETY: as above; the engine is single-threaded here.
+    unsafe { write_i32(time_addr, now.wrapping_sub(view)) };
+    // SAFETY: live engine pointers, prototype above.
+    unsafe { crate::engine::sv_write_snapshot_to_client(client, msg) };
+    // SAFETY: as above; restore the real server time for everything that reads
+    // it after the snapshot (frames[].messageSent, ping calculation).
+    unsafe { write_i32(time_addr, now) };
 }
 
 /// Snapshot predicate for one entity number (pure given the match tables).

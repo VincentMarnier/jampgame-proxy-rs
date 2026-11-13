@@ -71,7 +71,9 @@ pub mod functions {
     /// `void SV_Frame(int msec)` (`0x8057844`), reference only.
     pub const SV_FRAME: usize = 0x0805_7844;
     /// `static void SV_WriteSnapshotToClient(client_t*, msg_t*)`
-    /// (`0x8058034`), reference only (the recorder replicates its layout).
+    /// (`0x8058034`): the snapshot build that writes `svs.time` into the
+    /// message. Called through the retargeted call site for D-028.9; the demo
+    /// recorder replicates its layout.
     pub const SV_WRITE_SNAPSHOT_TO_CLIENT: usize = 0x0805_8034;
     /// `static void SV_EmitPacketEntities(clientSnapshot_t *from,
     /// clientSnapshot_t *to, msg_t *msg)` (`0x8057e64`), reference only.
@@ -721,6 +723,23 @@ pub unsafe fn sv_send_client_game_state(cl: usize) {
         functions::SV_SEND_CLIENT_GAME_STATE
     );
     unsafe { f(cl) };
+}
+
+/// `void SV_WriteSnapshotToClient(client_t*, msg_t*)` (0x8058034, static in
+/// the shipped engine): build one client's snapshot message. Called through
+/// the retargeted call site inside `SV_SendClientSnapshot` (D-028.9).
+///
+/// # Safety
+///
+/// `cl`/`msg` must be the live engine pointers from the snapshot build.
+#[allow(dead_code)] // called through the hook stub's engine_fn wrapper
+pub unsafe fn sv_write_snapshot_to_client(cl: usize, msg: usize) {
+    // SAFETY: pointer from the fixed engine table (static function address).
+    let f: unsafe extern "C" fn(usize, usize) = engine_fn!(
+        unsafe extern "C" fn(usize, usize),
+        functions::SV_WRITE_SNAPSHOT_TO_CLIENT
+    );
+    unsafe { f(cl, msg) };
 }
 
 /// `void SV_SendMessageToClient(msg_t*, client_t*)` (0x8058c84).

@@ -309,8 +309,10 @@ class ClientModel:
                 # connection, so fail here where the cause is visible.
                 area_bytes = msg.read_byte()
                 if not 1 <= area_bytes <= 32:
+                    off = max(0, (msg.bit >> 3) - 1)
                     raise RuntimeError(
-                        "snapshot areamask size %d (message corrupted)" % area_bytes
+                        "snapshot areamask size %d (message corrupted) at %d, "
+                        "payload=%s" % (area_bytes, off, payload[:off + 8].hex())
                     )
                 msg.read_bytes(area_bytes)
                 self.snap = (server_time, self.server_message_sequence, snap_flags)
