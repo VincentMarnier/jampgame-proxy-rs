@@ -11,12 +11,13 @@
 //! (the pristine world), courts 2..C in the created clone slots.
 
 use core::ffi::{CStr, c_int};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::original;
 use crate::sdk::{
     CON_CONNECTED, CS_CLIENT_DUELHEALTHS, CS_CLIENT_DUELISTS, CS_SCORES1, CS_SCORES2, EXEC_APPEND,
-    MAX_CLIENTS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS,
+    MAX_CLIENTS, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_PS, OFFSET_GCLIENT_SESS,
     OFFSET_GENTITY_CLIENT, OFFSET_LEVEL_SORTED_CLIENTS, OFFSET_LEVEL_TIME, OFFSET_PERS_CONNECTED,
     OFFSET_PS_PERSISTANT, OFFSET_PS_STATS, OFFSET_SESS_LOSSES, OFFSET_SESS_SESSION_TEAM,
     OFFSET_SESS_WINS, OFFSET_SHARED_SVFLAGS, PERS_SCORE, SIZEOF_GENTITY, STAT_ARMOR, STAT_HEALTH,
@@ -886,6 +887,32 @@ fn roster_contains(client_num: u8) -> bool {
     roster().contains(&client_num)
 }
 
+/// The client the ladder lets into the arena while it waits for a second
+/// willing player: exactly one willing player is online, no round is running.
+///
+/// Regular duel spawns the first player as soon as they connect (the stock
+/// `CheckTournament` → `AddTournamentPlayer` pull); the ladder keeps that so
+/// the first player warms up on the map instead of standing in spectator until
+/// someone else joins. Court assignment still happens when the round forms
+/// (D-025 §6).
+fn lone_waiting_player_id() -> Option<u8> {
+    let waiting = state::with_state(|s| s.duel.ladder && s.duel.phase == DuelPhase::Idle);
+    if !waiting {
+        return None;
+    }
+    match roster().as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+/// Whether `client_num` is that lone waiting player.
+fn lone_waiting_player(client_num: c_int) -> bool {
+    u8::try_from(client_num)
+        .ok()
+        .is_some_and(|id| lone_waiting_player_id() == Some(id))
+}
+
 fn court_of(client_num: u8) -> Option<usize> {
     state::with_state(|s| {
         s.duel
@@ -984,6 +1011,13 @@ pub fn on_client_begin(client_num: c_int) {
     });
     if playing && in_court {
         queue_spawn(id);
+        return;
+    }
+    // The lone waiting player is already where the ladder wants them: the
+    // stock pull may have spawned them (or a carried round left them
+    // `TEAM_FREE`), and `start_round`/`drain_spawns` keep that body when a
+    // partner arrives. Do not park them just because they have no court yet.
+    if lone_waiting_player(client_num) {
         return;
     }
     // Not a court player: the base game's GT_DUEL cap may have begun one or
@@ -1127,6 +1161,9 @@ pub fn on_game_init(restart: bool) {
                 s.duel.carry_round = false;
                 s.duel.pending_courts.clear();
                 s.duel.pending_queue.clear();
+                // A fresh ladder (first start, champion, admin restart, map
+                // change) waits from scratch, so its waiting line is new.
+                s.duel.waiting_roster = None;
             }
         });
     }
@@ -1253,6 +1290,16 @@ fn start_round() {
     if courts.is_empty() {
         return;
     }
+    // Fresh duel: zero the per-duel score on court entry. `drain_spawns` does
+    // this for the players it spawns, but the lone player waiting in the arena
+    // (regular-duel warm-up) keeps the body the stock pull gave them, so the
+    // reset has to happen here too (a warm-up suicide can leave a negative
+    // score).
+    for court in courts.iter() {
+        for player in court.players() {
+            crate::instances::reset_game_scores(player as c_int);
+        }
+    }
     let now = level_time();
     state::with_state(|s| {
         // A fresh ladder clears the standings and the champion; a carried
@@ -1277,6 +1324,8 @@ fn start_round() {
         s.duel.seed = seed;
         s.duel.round_start = now;
         s.duel.round_clock_started = true;
+        // A round formed: the next wait is a new episode and gets its own line.
+        s.duel.waiting_roster = None;
         s.duel.resolved_at = [0; MAX_COURTS];
         s.duel.restart_pending = false;
         s.duel.carry_round = false;
@@ -1336,10 +1385,15 @@ fn park_non_court_players() {
     if !ladder_on() {
         return;
     }
+    // The lone waiting player is in the arena on purpose (the regular-duel
+    // warm-up); everyone else without a court stays out of it.
+    let lobby = lone_waiting_player_id();
     let non_court: Vec<c_int> = state::with_state(|s| {
         (0..MAX_CLIENTS as c_int)
             .filter(|&cn| {
-                s.clients[cn as usize].is_connected && court_of_locked(s, cn as u8).is_none()
+                s.clients[cn as usize].is_connected
+                    && court_of_locked(s, cn as u8).is_none()
+                    && lobby != Some(cn as u8)
             })
             .collect()
     });
@@ -1398,6 +1452,12 @@ pub fn on_frame_start() {
     if turned_on {
         seed_all_willing();
         take_over_stock_duel();
+        let roster = roster();
+        // The turn-on line below already states the wait when fewer than two
+        // players are here; record that roster size so the idle branch does not
+        // repeat the line on the same frame (a later roster change re-announces
+        // once).
+        let waiting = (roster.len() < 2).then_some(roster.len());
         state::with_state(|s| {
             s.duel.ladder = true;
             s.duel.phase = DuelPhase::Idle;
@@ -1405,9 +1465,9 @@ pub fn on_frame_start() {
             s.duel.courts = [Court::default(); MAX_COURTS];
             s.duel.court_count = 0;
             s.duel.queue.clear();
+            s.duel.waiting_roster = waiting;
             s.tffa.client_match = [crate::instances::MAIN_MATCH; MAX_CLIENTS];
         });
-        let roster = roster();
         let names = client_names();
         let players: Vec<String> = roster.iter().map(|&c| name_label(&names, c)).collect();
         if players.len() >= 2 {
@@ -1476,14 +1536,30 @@ pub fn on_frame_start() {
         }
     }
     if phase == DuelPhase::Idle && !pending {
-        if roster().len() >= 2 {
+        let roster = roster();
+        if roster.len() >= 2 {
             start_round();
         } else {
-            let now = svs_time();
-            let due = state::with_state(|s| now.wrapping_sub(s.duel.last_roster_check) >= 5000);
-            if due {
-                state::with_state(|s| s.duel.last_roster_check = now);
-                announce("Parallel duels: waiting for at least two willing players.");
+            // One line per waiting state, not a timer: when the wait begins or
+            // the waiting roster changes size (a partner connects, a player
+            // leaves). A lone player looking for a partner is told once per
+            // change instead of every five seconds. The `map_restart` settle
+            // burst is skipped: clients reconnect in it (roster 0 → 1 → 2) and
+            // a round follows straight away, so those interim sizes are not a
+            // wait a player needs to hear about.
+            let (changed, burst) = state::with_state(|s| {
+                (
+                    s.duel.waiting_roster != Some(roster.len()),
+                    s.tffa.restart_burst,
+                )
+            });
+            if changed {
+                state::with_state(|s| s.duel.waiting_roster = Some(roster.len()));
+                // An empty roster has nobody to tell (the last willing player
+                // just opted out); the line is for the players who are here.
+                if !burst && !roster.is_empty() {
+                    announce("Parallel duels: waiting for at least two willing players.");
+                }
             }
         }
     }
@@ -1900,6 +1976,7 @@ pub fn on_console_command(text: &[u8]) -> Option<RestartKind> {
             s.duel.losses = [0; MAX_CLIENTS];
             s.duel.champion = None;
             s.duel.queue.clear();
+            s.duel.waiting_roster = None;
         }
     });
     Some(kind)
@@ -1912,14 +1989,71 @@ pub enum SetTeamVerdict {
     Refuse,
 }
 
+/// Client whose explicit `team` (or `join`) client command is being forwarded
+/// to the game's own `ClientCommand`, or `-1` when no such forward is in
+/// flight. Set only around the synchronous forward (`GAME_CLIENT_COMMAND`).
+///
+/// The `SetTeam` detour cannot tell a player's request from the game's own
+/// automatic pull by its arguments alone: `AddTournamentPlayer` calls
+/// `SetTeam(ent, "f")` from `CheckTournament` **every frame** while fewer than
+/// two players are in the arena (`g_main.c:2955-2965`), and a lone player
+/// waiting for a ladder partner is exactly that case. The notice below is
+/// therefore only sent for the request this marker records.
+static TEAM_COMMAND_CLIENT: AtomicI32 = AtomicI32::new(-1);
+
+/// Open the explicit-team-request scope for the client command about to be
+/// forwarded. Returns the previous value to hand back to
+/// [`end_team_command`] (nesting-safe).
+pub fn begin_team_command(client_num: c_int) -> i32 {
+    if !ladder_on() || !command_is_team_request() {
+        return TEAM_COMMAND_CLIENT.load(Ordering::Relaxed);
+    }
+    TEAM_COMMAND_CLIENT.swap(client_num, Ordering::Relaxed)
+}
+
+/// Close a scope opened by [`begin_team_command`].
+pub fn end_team_command(previous: i32) {
+    TEAM_COMMAND_CLIENT.store(previous, Ordering::Relaxed);
+}
+
+/// Read the forwarded command's name from the engine argv table and check it
+/// with [`is_team_command`].
+fn command_is_team_request() -> bool {
+    let mut cmd = [0u8; MAX_TOKEN_CHARS];
+    // SAFETY: engine syscall registered; buffer writable.
+    unsafe { syscall::argv(0, &mut cmd) };
+    let end = cmd.iter().position(|&b| b == 0).unwrap_or(cmd.len());
+    is_team_command(&cmd[..end])
+}
+
+/// The client commands a player uses to ask for a team. `join` is the proxy's
+/// spelling of the same request (base JKA has no `join` arm; it is claimed
+/// before the game sees it when the proxy handles it).
+fn is_team_command(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"team") || name.eq_ignore_ascii_case(b"join")
+}
+
+/// Consume the explicit-request marker for `client_num`: true once per
+/// forwarded team command, so a second `SetTeam` call inside that command
+/// cannot repeat the notice.
+fn take_explicit_team_request(client_num: c_int) -> bool {
+    TEAM_COMMAND_CLIENT
+        .compare_exchange(client_num, -1, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 /// Own every `SetTeam` request while the ladder runs.
 ///
 /// - A spectator request is allowed; it joins the ladder if the client is not
 ///   on a court (willing), or leaves it if they are (the opponent gets a
 ///   walkover next frame).
-/// - A team/`free` join is refused: the ladder assigns courts, and refusing
-///   here also neutralises the game's own `AddTournamentPlayer`, which calls
-///   `SetTeam(ent, "f")` (`g_main.c:1226-1275`).
+/// - While the ladder waits for a second willing player, that lone player may
+///   enter the arena like regular duel (the stock `AddTournamentPlayer` pull
+///   and a manual `/team` both land here). They warm up on the map until the
+///   round forms.
+/// - Any other team/`free` join is refused: the ladder assigns courts, and
+///   refusing here also neutralises the game's own `AddTournamentPlayer` while
+///   a round runs (it calls `SetTeam(ent, "f")`, `g_main.c:1226-1275`).
 pub fn on_set_team_request(ent: usize, team: &CStr) -> Option<SetTeamVerdict> {
     if !ladder_on() || ent == 0 {
         return None;
@@ -1937,10 +2071,20 @@ pub fn on_set_team_request(ent: usize, team: &CStr) -> Option<SetTeamVerdict> {
     );
     if !spectator {
         if let Some(cn) = slot {
-            tell(
-                cn,
-                "Parallel duels assign courts automatically; use team spectator to leave.",
-            );
+            // The first player of a ladder waits in the arena, as in regular
+            // duel: the stock pull (or their own `/team`) is let through.
+            if lone_waiting_player(cn) {
+                return Some(SetTeamVerdict::Allow);
+            }
+            // Only answer a player's own `/team` request: the game's per-frame
+            // `AddTournamentPlayer` pull lands here too, and telling a lone
+            // player about it every frame is the spam this marker avoids.
+            if take_explicit_team_request(cn) {
+                tell(
+                    cn,
+                    "Parallel duels assign courts automatically; use team spectator to leave.",
+                );
+            }
         }
         return Some(SetTeamVerdict::Refuse);
     }
@@ -2448,6 +2592,27 @@ mod tests {
         assert!(should_seed_on_connect(false, false, false));
         assert!(should_seed_on_connect(false, true, true));
         assert!(!should_seed_on_connect(false, true, false));
+    }
+
+    #[test]
+    fn team_command_spellings_are_recognised() {
+        assert!(is_team_command(b"team"));
+        assert!(is_team_command(b"TEAM"));
+        assert!(is_team_command(b"join"));
+        assert!(!is_team_command(b""));
+        assert!(!is_team_command(b"say_team"));
+        assert!(!is_team_command(b"follow1"));
+        assert!(!is_team_command(b"team_foo"));
+    }
+
+    #[test]
+    fn only_the_explicit_client_consumes_the_notice() {
+        TEAM_COMMAND_CLIENT.store(3, Ordering::Relaxed);
+        assert!(!take_explicit_team_request(4));
+        assert!(take_explicit_team_request(3));
+        // A second `SetTeam` inside the same command must stay quiet.
+        assert!(!take_explicit_team_request(3));
+        TEAM_COMMAND_CLIENT.store(-1, Ordering::Relaxed);
     }
 
     #[test]

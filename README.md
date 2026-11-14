@@ -1069,7 +1069,10 @@ With `proxy_parallel_duels_enable 1` (`GT_DUEL` only), the map runs several
 1v1 duels at once. Every connected player (and bot) is willing by default and
 is shuffled into courts: court 1 plays in the main world, the others in
 their own instance, so courts neither see, hit, hear nor collide with each
-other. Each court plays one duel to the server's `fraglimit`; the round ends
+other. While only one willing player is online, that player waits in the arena
+as in regular duel (they spawn and can warm up on the map until a partner
+arrives), and the first round forms as soon as a second player joins. Each
+court plays one duel to the server's `fraglimit`; the round ends
 when every court is decided, the stock intermission shows the board, and a real
 `map_restart` carries the ladder into the next round: winners move up a court,
 losers move down, the top winner and bottom loser stay, and with an odd roster
@@ -1094,8 +1097,10 @@ own round restart carries the ladder. Setting the cvar back to `0` returns
 everyone to spectator and hands the map back to the stock duel tournament.
 A full map change always starts a fresh ladder. The stock duel's automatic
 pull-in, its global duelist/health configstrings and its own intermission/
-win-limit handling are suppressed while the ladder runs, and players cannot
-join a court with `team free` (the ladder assigns courts).
+win-limit handling are suppressed while the ladder runs, except that the pull
+still spawns the one player waiting alone. Players cannot join a court with
+`team free` (the ladder assigns courts); the lone waiting player is the only
+one let into the arena that way.
 
 ### Server-side demos
 

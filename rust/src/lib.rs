@@ -349,7 +349,13 @@ pub unsafe extern "C" fn vmMain(
             // the player who issued the command, so the `G_SEND_SERVER_COMMAND`
             // trap can drop it for the recipients that ignore them (D-016).
             let previous_sender = ignore::begin_sender(a0);
+            // A player's `/team` reaches the game's own `ClientCommand` here
+            // (`Cmd_Team_f`); mark it so the duel ladder's `SetTeam` gate can
+            // tell it from the game's per-frame `AddTournamentPlayer` pull
+            // (D-025 §6).
+            let previous_team_command = duel::begin_team_command(a0);
             let response = forward(command, &args);
+            duel::end_team_command(previous_team_command);
             ignore::end_sender(previous_sender);
             if let Some(previous) = previous_shadow {
                 mute::end_shadow_scope(previous);

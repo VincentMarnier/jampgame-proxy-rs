@@ -1079,8 +1079,12 @@ pub struct DuelState {
     /// Per-court `level.time` at which the court's duel was decided (the 1 s
     /// void-damage window before both players move to spectator).
     pub resolved_at: [i32; crate::duel::MAX_COURTS],
-    /// `svs.time` when the ladder last poked the roster (waiting message).
-    pub last_roster_check: i32,
+    /// The roster size the "waiting for at least two willing players" line was
+    /// last announced for, or `None` when a round is running (or the ladder is
+    /// off). The line is emitted when the wait starts and whenever the waiting
+    /// roster changes size, never on a timer: a lone player looking for a
+    /// partner is told once per change instead of every five seconds.
+    pub waiting_roster: Option<usize>,
     /// Players waiting to be spawned into their court, drained a few per frame
     /// after the `map_restart` burst (D-006.12 deferral).
     pub spawn_pending: Vec<u8>,
@@ -1130,7 +1134,7 @@ impl Default for DuelState {
             restart_pending: false,
             round_clock_started: false,
             carried_at: 0,
-            last_roster_check: 0,
+            waiting_roster: None,
             hud_duelists: core::array::from_fn(|_| String::new()),
             hud_healths: core::array::from_fn(|_| String::new()),
             hud_scores: [(i32::MIN, i32::MIN); MAX_CLIENTS],

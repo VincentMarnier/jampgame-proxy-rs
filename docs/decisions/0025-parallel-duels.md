@@ -49,7 +49,8 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
     the queue, front of the queue → bottom court. A full roster queues only the
     odd player (or the capacity surplus).
 11. **Automatic start** with the cvar and two willing players; enabling
-    mid-duel takes over immediately.
+    mid-duel takes over immediately. The first player waits in the arena
+    meanwhile, as in regular duel (§6).
 12. **Cvar off (or a gametype/map change) tears the ladder down** and returns
     everyone to spectator, so the stock duel tournament resumes.
 13. **Willingness is proxy-side**: a connecting client is willing by default
@@ -60,7 +61,8 @@ One cvar: `proxy_parallel_duels_enable` (default `0`). No commands.
     is refused and never removes anyone. The ladder's own trampoline moves
     never change the flag. An opted-out player is labelled `(Spec)` on the
     scoreboard/team overlay; a bench player is `(Bench)` and a court player
-    `(Duel N)`.
+    `(Duel N)`. The one exception to "`team free` is refused" is the lone
+    waiting player of §6, who may enter the arena to warm up.
 14. **Mid-duel leaver → walkover win.**
 15. **Bots are drafted like players.**
 16. **Court count** = what the map can host, up to `floor(willing/2)` and 16;
@@ -106,7 +108,7 @@ viewer into `CS_PLAYERS` `w`/`l`, which keeps `DuelLimitHit` inert.
 | `LogExit` `0x881d4` | ends the map at fraglimit/duel/timelimit | swallow `"Kill limit hit."`, `""` (`fraglimit 1`), `"Duel limit hit."`, `"Timelimit hit."` |
 | `CheckIntermissionExit` `0x882e4` | 2 s loser removal, 4 s `ExitLevel` | no-op; the proxy owns the 4 s board and its restart |
 | `AdjustTournamentScores` `0x86f44` | +1 win/loss on the top two | no-op; standings are proxy-side |
-| `AddTournamentPlayer` `0x86924` | pulls a spectator in | neutralised by the `TEAM_FREE` gate on `SetTeam` |
+| `AddTournamentPlayer` `0x86924` | pulls a spectator in | neutralised by the `TEAM_FREE` gate on `SetTeam`, except the lone waiting player (§6) |
 | `CheckTournament` `0x89194` | global `CS_CLIENT_DUELISTS`/`HEALTHS`, pull-in | configstrings dropped; per-viewer values sent |
 | `ClientDisconnect` duel block `g_client.c:3882` | zeroes the partner's score, bumps `sess.wins` | restored after the pristine call; proxy walkover |
 | `player_die` suicide credit `g_combat.c:2494` | credits `sortedClients[0..1]`'s partner | moved to the court opponent after the pristine call |
@@ -140,10 +142,65 @@ userinfo key, `ClientUserinfoChanged` and `ClientBegin` (and so `ClientSpawn`)
 directly, bypassing the tournament cap. This is the only deviation from the
 approved plan.
 
-`SetTeam` still gets the `TEAM_FREE` gate: while the ladder is on, a
-non-spectator request is refused (the game's `AddTournamentPlayer` calls
+`SetTeam` still gets the `TEAM_FREE` gate: while the ladder runs, a
+non-spectator request from anyone but the lone waiting player of the next
+paragraph is refused (the game's `AddTournamentPlayer` calls
 `SetTeam(ent, "f")`), and a spectator request is allowed (it joins the ladder if
 the client is not on a court, or leaves it — with a walkover — if it is).
+
+**The refusal notice answers the player, not the game.** The gate also has to
+tell a player why `/team red` does nothing, but `AddTournamentPlayer` reaches
+the same wrapper with the same argument: `CheckTournament` retries it on every
+frame while `level.numPlayingClients < 2` (`g_main.c:2955-2965`), so a lone
+player waiting for a ladder partner was answered once per frame (measured:
+97 notices in 6 s at `sv_fps 20`, A10). `GAME_CLIENT_COMMAND` now marks the
+client whose `team`/`join` command is being forwarded (`duel::begin_team_command`,
+set only around the synchronous `forward`, nesting-safe like
+`ignore::begin_sender`), and `on_set_team_request` sends the notice only when
+that marker names the refused client, consuming it so one command can print at
+most once. The refusal itself is unchanged: the game's automatic pull for any
+client the ladder did not draft is still neutralised, it just stays silent.
+
+**The first player waits in the arena (regular-duel behaviour).** With exactly
+one willing player online and no round running, the `SetTeam` gate lets that
+player through (`duel::lone_waiting_player`): both the game's own
+`AddTournamentPlayer` pull and a manual `/team` land in the pristine body, so
+`ClientBegin`/`ClientSpawn` spawn them at a duel spawn point exactly as base JA
+does while it waits for a second duelist (the shipped binary connects a duel
+client as a spectator and pulls it in on the next frame — that pull is the one
+the gate used to refuse). `park_non_court_players` exempts that one client
+(everyone else without a court is still parked in spectator), and the
+exemption ends the moment the round forms: `start_round` assigns the courts,
+and `drain_spawns` leaves a body that is already in the arena in place (a
+reconnect that carried `TEAM_FREE` behaves the same). The gates that remain
+closed are the other clients: a non-willing spectator or a late joiner typing
+`team f` is refused while the ladder runs.
+
+Two details follow from that warm-up:
+
+- A fresh round zeroes the per-duel score of every court player in
+  `start_round` (not only the ones `drain_spawns` spawns), so a warm-up death
+  does not carry the stock `GT_DUEL` self-kill penalty (the `-1`
+  `AddScore(attacker, -1)` fallback when there is no partner) into the duel.
+- The stock `Cmd_Team_f` still refuses a `TEAM_FREE` player ("Cannot switch
+  teams in Duel"), so a warming-up player's own team commands are as inert as
+  in regular duel; the lobby pull, not a client command, is what puts them
+  there.
+
+A10 covers it with three synthetic clients: the first is `TEAM_FREE` (`t=0`)
+while alone, the round forms when the second connects (both `t=0`), the late
+third stays `t=3`, and only its explicit `team f` produces the refusal notice.
+
+**The waiting line is state-driven, not a timer.** The ladder's
+"Parallel duels: waiting for at least two willing players." line used to repeat
+every 5 s (`last_roster_check`), so a lone player was reminded continuously
+(measured: 2 lines in a 9.5 s run, and the old code would keep going). It is
+now announced when the wait begins (the turn-on line already states it) and
+whenever the **waiting roster changes size** (`DuelState::waiting_roster`), and
+it is skipped during the `map_restart` reconnect burst, whose roster sequence
+(0 → 1 → 2) leads straight into a round. A new round sets the marker back to
+`None`, so the next wait is a new episode. Same A10 run after the change: one
+waiting line, no court-assignment notices while alone.
 
 ## 7. Bots
 
