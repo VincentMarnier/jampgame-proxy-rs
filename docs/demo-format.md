@@ -1156,11 +1156,48 @@ restarts them with fresh configuration.
 
 | request | result |
 | --- | --- |
-| `GET /demos` (or `/demos/`) | a JSON array of `{name, url, size}` for the servable files (`application/json`); the set is pattern, not expired, closed (terminator), not open |
+| `GET /demos` (or `/demos/`) | a JSON array of `{name, url, size, metadata}` for the servable files (`application/json`); the set is pattern, not expired, closed (terminator), not open |
 | `GET /demos/<file>` | `application/octet-stream`, `Content-Length`, the file bytes; HEAD sends the headers only |
 | `HEAD /…` | same route, headers only |
 | `/api`, `/api/...` | `501 Not Implemented` (reserved) |
 | everything else / other methods | `404` / `405` (with `Allow: GET, HEAD`) |
+
+`metadata` is decoded from the closed file itself, so it covers demos written
+before the feature and files copied into the directory; it is `null` when the
+stream cannot be read. The object is (D-029):
+
+```json
+{
+  "map": "mp/ffa3",
+  "gametype": 0,
+  "players": [
+    {"num": 2, "name": "Desann", "team": 0, "score": 20}
+  ],
+  "teamScores": {"red": 2, "blue": 1},
+  "durationMs": 68984,
+  "snapshots": 8624
+}
+```
+
+- `map` / `gametype`: `CS_SERVERINFO`'s `mapname` and `g_gametype` from the
+  gamestate (or the latest `cs 0`).
+- `players`: the last `scores` command joined with the latest `CS_PLAYERS`
+  infos, in board order. Spectators (`t = 3`) are excluded; team gametypes
+  keep only RED/BLUE. `score` is the board int; names keep their colour
+  codes.
+- `teamScores`: the last `scores` header's RED/BLUE totals, only for
+  `GT_TEAM`/`GT_SIEGE`/`GT_CTF`/`GT_CTY` (duel courts use `CS_SCORES1/2`,
+  FFA has no teams).
+- `durationMs`: last minus first snapshot `serverTime` for this segment, not
+  the whole match clock (a size-capped rotation starts a new file; the base
+  1.01 game module does not publish `CS_LEVEL_START_TIME` here).
+- `snapshots`: number of `svc_snapshot` messages.
+
+The scan walks the container and message ops but stops at each snapshot's
+`serverTime` and at the gamestate's first baseline, so it needs neither the
+entity nor the playerstate field tables. It runs on the HTTP worker threads
+and caches results by path, size and mtime. See D-029 for the evidence and the
+safety bounds.
 
 Path safety is threefold: the target is percent-decoded before routing; only a
 name accepted by `DemoName::parse` can become a `File` route (that rejects

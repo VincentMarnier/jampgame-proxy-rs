@@ -16,6 +16,7 @@
 
 pub mod file;
 pub mod gamestate;
+pub mod meta;
 pub mod msg;
 pub mod publish;
 pub mod recorder;
@@ -30,4 +31,5 @@ pub use gamestate::{
     Baseline, ConfigString, ENTITY_STATE_SIZE, GamestateError, GamestateHeader, MAX_CONFIGSTRINGS,
     MAX_GENTITIES, RmgTail, encode_gamestate,
 };
-pub use msg::{BIG_INFO_STRING, MsgError, MsgWriter};
+pub use meta::{DemoMetadata, DemoPlayer, TeamScores};
+pub use msg::{BIG_INFO_STRING, MsgError, MsgReader, MsgWriter};

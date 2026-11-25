@@ -1,13 +1,16 @@
-//! Pure-Rust port of the `MSG_*` write path needed by the demo encoder.
+//! Pure-Rust port of the `MSG_*` write and read paths needed by the demo
+//! modules.
 //!
 //! `MSG_WriteBits` (see `docs/demo-format.md` §2) writes the low `bits & 7`
 //! bits raw (LSB first) and every following whole byte as a symbol of the
 //! **static** `msg_hData` Huffman tree. The tree is preloaded once by
 //! `MSG_initHuffman`; `MSG_WriteBits` only walks it (`Huff_offsetTransmit` does
 //! not call `Huff_addRef`), so the embedded code table is enough and there is
-//! no state to carry between messages.
+//! no state to carry between messages. The demo metadata reader walks the same
+//! static tree in the other direction ([`MsgReader`]).
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use super::fields::HUFFMAN_CODES;
 
@@ -162,9 +165,207 @@ impl MsgWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read path
+// ---------------------------------------------------------------------------
+
+/// One node of the static decoding tree. The tree is built from
+/// [`HUFFMAN_CODES`]: `bit 0` of a code is the first transmitted bit, so child
+/// 0/1 is entered with bit 0/1 of the cursor.
+#[derive(Default)]
+struct HuffNode {
+    child: [Option<u16>; 2],
+    symbol: Option<u8>,
+}
+
+struct HuffDecoder {
+    nodes: Vec<HuffNode>,
+}
+
+impl HuffDecoder {
+    fn build() -> Self {
+        let mut nodes = vec![HuffNode::default()];
+        for (symbol, &(code, len)) in HUFFMAN_CODES.iter().enumerate() {
+            let mut node = 0usize;
+            for bit in 0..usize::from(len) {
+                let branch = usize::from((code >> bit) & 1);
+                let next = match nodes[node].child[branch] {
+                    Some(next) => usize::from(next),
+                    None => {
+                        nodes.push(HuffNode::default());
+                        let next = nodes.len() - 1;
+                        nodes[node].child[branch] = Some(next as u16);
+                        next
+                    }
+                };
+                node = next;
+            }
+            nodes[node].symbol = Some(symbol as u8);
+        }
+        Self { nodes }
+    }
+
+    fn symbol(&self, next_bit: impl FnMut() -> Option<u32>) -> Option<u8> {
+        let mut next_bit = next_bit;
+        let mut node = 0usize;
+        for _ in 0..16 {
+            let branch = next_bit()? as usize;
+            let next = self.nodes[node].child[branch]?;
+            node = usize::from(next);
+            if let Some(symbol) = self.nodes[node].symbol {
+                return Some(symbol);
+            }
+        }
+        None
+    }
+}
+
+fn decoder() -> &'static HuffDecoder {
+    static DECODER: OnceLock<HuffDecoder> = OnceLock::new();
+    DECODER.get_or_init(HuffDecoder::build)
+}
+
+/// A `msg_t` reader for the demo metadata scan.
+///
+/// It mirrors `MSG_ReadBits`: the low `bits & 7` bits are raw (LSB first) and
+/// each following byte is one symbol of the static Huffman tree. Every read
+/// returns `None` on the end of the payload, so a truncated or foreign file
+/// cannot panic the HTTP thread. It does not need the `readcount`/`cursize`
+/// convention: the demo container already gives each payload its exact length.
+pub struct MsgReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> MsgReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    /// The consumed bit offset (`msg->bit`).
+    pub fn bit(&self) -> usize {
+        self.bit
+    }
+
+    fn get_bit(&mut self) -> Option<u32> {
+        let index = self.bit >> 3;
+        let byte = *self.data.get(index)?;
+        let bit = u32::from((byte >> (self.bit & 7)) & 1);
+        self.bit += 1;
+        Some(bit)
+    }
+
+    fn read_symbol(&mut self) -> Option<u8> {
+        let data = self.data;
+        let mut bit = self.bit;
+        let symbol = decoder().symbol(|| {
+            let index = bit >> 3;
+            let byte = *data.get(index)?;
+            let value = u32::from((byte >> (bit & 7)) & 1);
+            bit += 1;
+            Some(value)
+        })?;
+        self.bit = bit;
+        Some(symbol)
+    }
+
+    /// `MSG_ReadBits` (the non-OOB form).
+    pub fn read_bits(&mut self, bits: i32) -> Option<u32> {
+        if !(1..=32).contains(&bits) {
+            return None;
+        }
+        let bits = bits as u32;
+        let raw = bits & 7;
+        let mut value = 0u64;
+        for index in 0..raw {
+            value |= u64::from(self.get_bit()?) << index;
+        }
+        let mut shift = raw;
+        let mut remaining = bits - raw;
+        while remaining > 0 {
+            value |= u64::from(self.read_symbol()?) << shift;
+            shift += 8;
+            remaining = remaining.saturating_sub(8);
+        }
+        Some(value as u32)
+    }
+
+    /// `MSG_ReadByte`.
+    pub fn read_byte(&mut self) -> Option<u8> {
+        self.read_bits(8).map(|value| value as u8)
+    }
+
+    /// `MSG_ReadShort` as the signed 16-bit wire value.
+    pub fn read_short(&mut self) -> Option<i16> {
+        self.read_bits(16).map(|value| value as i16)
+    }
+
+    /// `MSG_ReadLong` as the signed 32-bit wire value.
+    pub fn read_long(&mut self) -> Option<i32> {
+        self.read_bits(32).map(|value| value as i32)
+    }
+
+    /// `MSG_ReadData` / consume `bits` bits without keeping them.
+    pub fn skip_bits(&mut self, bits: i32) -> Option<()> {
+        let mut remaining = bits;
+        while remaining > 0 {
+            let chunk = remaining.min(32);
+            self.read_bits(chunk)?;
+            remaining -= chunk;
+        }
+        Some(())
+    }
+
+    /// `MSG_ReadString`/`MSG_ReadBigString`: bytes up to the NUL (or `max`).
+    pub fn read_string(&mut self, max: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        while out.len() + 1 < max {
+            let byte = self.read_byte()?;
+            if byte == 0 {
+                return Some(out);
+            }
+            out.push(byte);
+        }
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_round_trips_writer_values() {
+        let mut writer = MsgWriter::new();
+        writer.write_long(0x1234_5678).unwrap();
+        writer.write_byte(0).unwrap();
+        writer.write_short(0xfffe).unwrap();
+        writer
+            .write_string(b"n\\viper\\model\\luke/default")
+            .unwrap();
+        let payload = writer.into_payload();
+
+        let mut reader = MsgReader::new(&payload);
+        assert_eq!(reader.read_long(), Some(0x1234_5678));
+        assert_eq!(reader.read_byte(), Some(0));
+        assert_eq!(reader.read_short(), Some(-2));
+        assert_eq!(
+            reader.read_string(1024).as_deref(),
+            Some(&b"n\\viper\\model\\luke/default"[..])
+        );
+    }
+
+    #[test]
+    fn reader_covers_all_symbols_and_rejects_truncation() {
+        for value in 0..=255u8 {
+            let mut writer = MsgWriter::new();
+            writer.write_byte(value).unwrap();
+            let mut reader = MsgReader::new(writer.payload());
+            assert_eq!(reader.read_byte(), Some(value));
+        }
+        assert_eq!(MsgReader::new(&[]).read_long(), None);
+        assert_eq!(MsgReader::new(&[]).read_byte(), None);
+    }
 
     #[test]
     fn huffman_table_covers_all_symbols_and_is_prefix_free() {

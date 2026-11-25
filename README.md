@@ -1192,8 +1192,10 @@ bind failure (port in use, permission, invalid port) logs one line and leaves
 the feature off until the cvars change, without blocking the game. It is plain
 HTTP: terminate TLS and add authentication with a reverse proxy in front of it.
 
-- `GET /demos` returns a JSON array of `{name, url, size}` for the finished,
-  non-expired demo files.
+- `GET /demos` returns a JSON array of `{name, url, size, metadata}` for the
+  finished, non-expired demo files. `metadata` reports the map, gametype,
+  final players and scores, team scores and the segment's duration, decoded
+  from each file (or `null` when it cannot be read).
 - `GET /demos/<file>` downloads the file (`application/octet-stream`), with
   `Content-Length`; `HEAD` returns the headers only. A segment still being
   written is `404`.

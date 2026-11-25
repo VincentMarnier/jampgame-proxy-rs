@@ -20,7 +20,7 @@
 //! so a symlink escape is rejected). The TOCTOU window between canonicalising
 //! and opening is accepted and documented in `docs/demo-format.md` §13.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::demo::file::{DemoName, Retention, Timestamp};
+use crate::demo::meta::{self, DemoMetadata};
 
 /// Concurrent response workers.
 pub const WORKERS: usize = 4;
@@ -370,12 +371,22 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// The names `/demos` returns and `/demos/<file>` may serve: pattern-matching,
-/// closed (terminator present), not open, not expired, with their sizes.
-fn servable_names(config: &Config) -> Vec<(String, u64)> {
+/// One servable file: its name, size and the metadata parsed from its bytes
+/// (`None` when the file has no readable stream, e.g. a truncated leftover).
+#[derive(Debug, Clone)]
+struct Servable {
+    name: String,
+    size: u64,
+    metadata: Option<DemoMetadata>,
+}
+
+/// The files `/demos` returns and `/demos/<file>` may serve: pattern-matching,
+/// closed (terminator present), not open, not expired, with their sizes and the
+/// metadata decoded from the closed stream.
+fn servable_files(config: &Config) -> Vec<Servable> {
     let now = Timestamp::now().ok();
     let retention = Retention::new(config.retention_hours);
-    let mut names = BTreeSet::new();
+    let mut names = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(&config.dir) else {
         return Vec::new();
     };
@@ -404,37 +415,96 @@ fn servable_names(config: &Config) -> Vec<(String, u64)> {
             continue;
         }
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        names.insert((name, size));
+        names.insert(name, (size, path));
     }
-    names.into_iter().take(MAX_LISTED_FILES).collect()
+    names
+        .into_iter()
+        .take(MAX_LISTED_FILES)
+        .map(|(name, (size, path))| Servable {
+            metadata: meta::read_cached(&path, size),
+            name,
+            size,
+        })
+        .collect()
 }
 
 fn listing_body(config: &Config) -> Vec<u8> {
-    let entries = servable_names(config);
+    let entries = servable_files(config);
     json_listing(&entries, &config.base_url).into_bytes()
 }
 
-/// `GET /demos` payload: a JSON array of `{name, url, size}`.
-fn json_listing(entries: &[(String, u64)], base: &str) -> String {
+/// `GET /demos` payload: a JSON array of
+/// `{name, url, size, metadata}`, where `metadata` is `null` when the file
+/// could not be decoded.
+fn json_listing(entries: &[Servable], base: &str) -> String {
     let mut out = String::from("[");
-    for (index, (name, size)) in entries.iter().enumerate() {
+    for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
         let url = if base.is_empty() {
-            format!("/demos/{name}")
+            format!("/demos/{}", entry.name)
         } else {
-            format!("{base}/demos/{name}")
+            format!("{base}/demos/{}", entry.name)
         };
         out.push_str(&format!(
-            "{{\"name\":\"{}\",\"url\":\"{}\",\"size\":{}}}",
-            json_escape(name),
+            "{{\"name\":\"{}\",\"url\":\"{}\",\"size\":{},\"metadata\":",
+            json_escape(&entry.name),
             json_escape(&url),
-            size
+            entry.size
         ));
+        match &entry.metadata {
+            Some(metadata) => push_metadata(&mut out, metadata),
+            None => out.push_str("null"),
+        }
+        out.push('}');
     }
     out.push_str("]\n");
     out
+}
+
+fn push_metadata(out: &mut String, metadata: &DemoMetadata) {
+    out.push_str("{\"map\":");
+    match &metadata.map {
+        Some(map) => push_json_string(out, map),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"gametype\":");
+    match metadata.gametype {
+        Some(gametype) => out.push_str(&gametype.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"players\":[");
+    for (index, player) in metadata.players.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"num\":{},\"name\":\"{}\",\"team\":{},\"score\":{}}}",
+            player.num,
+            json_escape(&player.name),
+            player.team,
+            player.score
+        ));
+    }
+    out.push_str("],\"teamScores\":");
+    match metadata.team_scores {
+        Some(scores) => out.push_str(&format!(
+            "{{\"red\":{},\"blue\":{}}}",
+            scores.red, scores.blue
+        )),
+        None => out.push_str("null"),
+    }
+    out.push_str(&format!(
+        ",\"durationMs\":{},\"snapshots\":{}}}",
+        metadata.duration_ms, metadata.snapshots
+    ));
+}
+
+fn push_json_string(out: &mut String, text: &str) {
+    out.push('"');
+    out.push_str(&json_escape(text));
+    out.push('"');
 }
 
 fn json_escape(text: &str) -> String {
@@ -744,15 +814,43 @@ mod tests {
     }
 
     #[test]
-    fn json_listing_is_an_array_of_name_url_size() {
+    fn json_listing_is_an_array_of_name_url_size_and_metadata() {
         let entries = vec![
-            ("20260101-000000_mp_ffa3_main_s1.dm_26".to_string(), 1234u64),
-            ("20260101-000001_mp_ffa3_tffa2_s1.dm_26".to_string(), 42u64),
+            Servable {
+                name: "20260101-000000_mp_ffa3_main_s1.dm_26".to_string(),
+                size: 1234,
+                metadata: Some(DemoMetadata {
+                    map: Some("mp/ffa3".to_string()),
+                    gametype: Some(6),
+                    players: vec![
+                        crate::demo::meta::DemoPlayer {
+                            num: 0,
+                            name: "a\"b".to_string(),
+                            team: 1,
+                            score: 5,
+                        },
+                        crate::demo::meta::DemoPlayer {
+                            num: 1,
+                            name: "Bob".to_string(),
+                            team: 2,
+                            score: 3,
+                        },
+                    ],
+                    team_scores: Some(crate::demo::meta::TeamScores { red: 2, blue: 1 }),
+                    duration_ms: 30_000,
+                    snapshots: 2,
+                }),
+            },
+            Servable {
+                name: "20260101-000001_mp_ffa3_tffa2_s1.dm_26".to_string(),
+                size: 42,
+                metadata: None,
+            },
         ];
         let body = json_listing(&entries, "https://example.com");
         assert_eq!(
             body,
-            "[{\"name\":\"20260101-000000_mp_ffa3_main_s1.dm_26\",\"url\":\"https://example.com/demos/20260101-000000_mp_ffa3_main_s1.dm_26\",\"size\":1234},{\"name\":\"20260101-000001_mp_ffa3_tffa2_s1.dm_26\",\"url\":\"https://example.com/demos/20260101-000001_mp_ffa3_tffa2_s1.dm_26\",\"size\":42}]\n"
+            "[{\"name\":\"20260101-000000_mp_ffa3_main_s1.dm_26\",\"url\":\"https://example.com/demos/20260101-000000_mp_ffa3_main_s1.dm_26\",\"size\":1234,\"metadata\":{\"map\":\"mp/ffa3\",\"gametype\":6,\"players\":[{\"num\":0,\"name\":\"a\\\"b\",\"team\":1,\"score\":5},{\"num\":1,\"name\":\"Bob\",\"team\":2,\"score\":3}],\"teamScores\":{\"red\":2,\"blue\":1},\"durationMs\":30000,\"snapshots\":2}},{\"name\":\"20260101-000001_mp_ffa3_tffa2_s1.dm_26\",\"url\":\"https://example.com/demos/20260101-000001_mp_ffa3_tffa2_s1.dm_26\",\"size\":42,\"metadata\":null}]\n"
         );
         assert_eq!(json_listing(&[], "https://example.com"), "[]\n");
         assert_eq!(json_escape("a\"b\\c\td"), "a\\\"b\\\\c\\td");
@@ -827,6 +925,29 @@ mod tests {
         server.stop();
         let refused = Client::connect(addr);
         assert!(refused.is_err(), "listener still bound after stop");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn listing_reports_metadata_for_a_recorded_stream() {
+        let root = std::env::var_os("JAMP_REPO_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
+        let bytes =
+            std::fs::read(root.join("tests/fixtures/demo/server-ffa3-phase0.dm_26")).unwrap();
+        let dir = temp_dir("metadata");
+        let name = fresh_name(3);
+        std::fs::write(dir.join(&name), &bytes).unwrap();
+
+        let mut server = Server::start("127.0.0.1", 0, config(&dir)).unwrap();
+        let addr = server.local_addr();
+        let listing = http_get(addr, "GET /demos HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(listing.starts_with("HTTP/1.1 200 OK"), "{listing}");
+        assert!(
+            listing.contains("\"metadata\":{\"map\":\"mp/ffa3\",\"gametype\":0,\"players\":[]"),
+            "{listing}"
+        );
+        server.stop();
         std::fs::remove_dir_all(&dir).ok();
     }
 

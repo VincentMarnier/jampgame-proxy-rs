@@ -175,3 +175,8 @@
   ping (the stock cgame does not draw it), `eff` netStatus column,
   `proxy_sv_pingEqualizeLog` preview when off, the prediction-window cap
   rationale and the open real-client measurement.
+- `0029-demo-listing-metadata.md` — `/demos` metadata: map, gametype,
+  final players (score/team/ping), team scores and segment duration, decoded
+  from the closed demo by a bit-level `MsgReader` (the inverse of the
+  Phase 1 writer) that stops before the snapshot bodies; the HTTP-side cache,
+  the spectator/team filters, and the limits (segment time, no match clock).
