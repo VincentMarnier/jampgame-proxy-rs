@@ -154,7 +154,8 @@ the same wrapper with the same argument: `CheckTournament` retries it on every
 frame while `level.numPlayingClients < 2` (`g_main.c:2955-2965`), so a lone
 player waiting for a ladder partner was answered once per frame (measured:
 97 notices in 6 s at `sv_fps 20`, A10). `GAME_CLIENT_COMMAND` now marks the
-client whose `team`/`join` command is being forwarded (`duel::begin_team_command`,
+client whose `team` command is being forwarded (the `join` alias was removed
+2026-11-25; `duel::begin_team_command`,
 set only around the synchronous `forward`, nesting-safe like
 `ignore::begin_sender`), and `on_set_team_request` sends the notice only when
 that marker names the refused client, consuming it so one command can print at

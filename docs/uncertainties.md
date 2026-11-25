@@ -836,6 +836,10 @@ must be visible in the proxy log.
 
 ## U-016 — Client receipt of the intermission demo block
 
+**Moot — 2026-11-25: the block was removed (D-027 §10).** The question is kept
+as history; no client receipt of the block is needed any more, and the in-game
+`/demos` command it mentioned no longer exists either.
+
 ### Question
 
 At intermission the recorder closes the files after

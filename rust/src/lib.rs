@@ -778,8 +778,8 @@ mod tests {
     /// client's commands once the master switch is turned back on; before this
     /// was fixed, a client that joined during a disabled window stayed "not
     /// connected" forever, so every command it issued was dropped silently —
-    /// the TAB `score` request (empty scoreboard) and `netStatus`/`showNet`
-    /// (no output) included.
+    /// the TAB `score` request (empty scoreboard) and `netStatus` (no output)
+    /// included.
     #[test]
     fn client_mirror_survives_a_disabled_master_switch() {
         let _guard = state::TEST_STATE_LOCK

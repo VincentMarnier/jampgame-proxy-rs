@@ -6,10 +6,9 @@ Scenario (D-006, the follow-spectate join):
 - `Alpha` creates match 1 (open) and is playing there.
 - `Bravo` creates match 2 with the password `hunter2`.
 - `Charlie` (spectator in main) follows `Alpha`, `Delta` follows `Bravo`.
-- `Charlie` sends `join red` (the proxy's spelling for clients without a
-  base `join` command): must travel into match 1 and play there. A second
-  `join blue` right after is refused by the base 5-second team-switch debounce,
-  which the proxy reproduces for that spelling.
+- `Charlie` sends `team red`: must travel into match 1 and play there. A
+  second `team blue` right after is refused by the base 5-second team-switch
+  debounce.
 - `Delta` sends `team red`: match 2 is protected, so the `SetTeam` password
   gate must answer with the `tffa_join 2 <password>` invite (and Delta must not
   be put on main's red team). `tffa_join 2 hunter2` then unlocks it and a
@@ -260,8 +259,8 @@ def run(*, port, engine, gamedata, artifacts, duration):
             (5.0, "follow1", lambda now: charlie.send_command("follow Alpha", now)),
             (5.2, "follow2", lambda now: delta.send_command("follow Bravo", now)),
             (7.5, "list-before", lambda now: alpha.send_command("tffa_list", now)),
-            (8.5, "charlie-join", lambda now: charlie.send_command("join red", now)),
-            (9.5, "charlie-retry", lambda now: charlie.send_command("join blue", now)),
+            (8.5, "charlie-join", lambda now: charlie.send_command("team red", now)),
+            (9.5, "charlie-retry", lambda now: charlie.send_command("team blue", now)),
             (9.0, "delta-join", lambda now: delta.send_command("team red", now)),
             (11.0, "list-mid", lambda now: alpha.send_command("tffa_list", now)),
             (

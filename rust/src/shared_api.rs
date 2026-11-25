@@ -5,7 +5,7 @@
 //! - String helpers (`Q_stricmpn`, `Info_*`, `ConcatArgs`) come from the
 //!   *original game module* (`jampgame.functions.*`), exactly as the original
 //!   proxy does, so edge-case semantics are the game's, not ours.
-//! - `netStatus`/`showNet` are intercepted here and handled by
+//! - `netStatus` is intercepted here and handled by
 //!   `crate::hooks::netstatus` (D-001.2 lifted).
 
 use core::ffi::{CStr, c_char, c_int};
@@ -95,6 +95,84 @@ pub unsafe fn get_usercmd(_client_num: c_int, ucmd: *mut Usercmd) {
 // vmMain event dispatch (export table — events the engine sends the proxy)
 // ---------------------------------------------------------------------------
 
+/// One player command shown in the join notice: its usage and a short
+/// explanation.
+type PlayerCommand = (&'static str, &'static str);
+
+/// The proxy commands a player may run on this server, given the current
+/// configuration. Only enabled features are listed, so the join notice never
+/// advertises a command that only answers "disabled".
+fn player_commands() -> Vec<PlayerCommand> {
+    player_commands_for(
+        crate::ignore::enabled(),
+        state::team_mode(),
+        state::cvar_integer(CVAR_ENABLE_NET_STATUS) != 0,
+    )
+}
+
+/// [`player_commands`] over plain feature flags, so the list, its ordering and
+/// its wording are unit-tested without an engine or a loaded configuration.
+fn player_commands_for(ignore: bool, team: bool, net_status: bool) -> Vec<PlayerCommand> {
+    let mut commands = Vec::new();
+    if ignore {
+        commands.push(("/ignore <player>", "hide that player's chat from you"));
+        commands.push(("/unignore <player>", "show that player's chat again"));
+    }
+    if team {
+        commands.push(("/tffa_create [password]", "open a parallel TFFA match"));
+        commands.push((
+            "/tffa_join <id> [password]",
+            "join or unlock a parallel TFFA match",
+        ));
+        commands.push(("/tffa_list", "list the parallel TFFA matches"));
+    }
+    if net_status {
+        commands.push(("/netStatus", "show every player's network status"));
+    }
+    commands.push(("/callvote coinflip", "start a coin-flip vote"));
+    commands
+}
+
+/// Width of the join block's top and bottom rules, in characters.
+const JOIN_RULE_WIDTH: usize = 64;
+
+/// The console lines of the join notice, framed as one block: a rule, the
+/// proxy banner, the demo download hint when its feature is on, then one line
+/// per available player command with its explanation, and a closing rule. Pure
+/// over its inputs so the content is unit-tested without an engine.
+fn join_lines(version: &str, demo_page: Option<&str>, commands: &[PlayerCommand]) -> Vec<String> {
+    let mut content = vec![format!("^5jampgame-proxy-rs (^7{version}^5)")];
+    if let Some(page) = demo_page {
+        content.push(format!("^5Demos: ^7browse and download them at ^7{page}"));
+    }
+    if !commands.is_empty() {
+        content.push("^5Client commands:".to_string());
+        for (command, description) in commands {
+            content.push(format!("^7  {command} ^5- ^7{description}"));
+        }
+    }
+
+    let rule = format!("^5+{}", "-".repeat(JOIN_RULE_WIDTH));
+    let mut lines = Vec::with_capacity(content.len() + 2);
+    lines.push(rule.clone());
+    for line in content {
+        lines.push(format!("^5|^7 {line}"));
+    }
+    lines.push(rule);
+    lines
+}
+
+/// Send one console line to a client (`print`, never chat).
+fn send_join_line(client_num: c_int, line: &str) {
+    let text = line.replace('"', "'");
+    let Ok(command) = CString::new(format!("print \"{text}\n\"")) else {
+        return;
+    };
+    // SAFETY: engine syscall registered; `command` is NUL-terminated and the
+    // engine copies it during the call.
+    unsafe { syscall::send_server_command(client_num, &command) };
+}
+
 /// `Proxy_SharedAPI_ClientConnect` (`Proxy_SharedAPI.cpp:38-45`): announce the
 /// proxy to first-time non-bot connects.
 pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
@@ -117,19 +195,16 @@ pub fn client_connect(client_num: c_int, first_time: bool, is_bot: bool) {
         crate::pingequalize::reset_client(client_num as usize);
     }
     if first_time && !is_bot {
-        // Same shape as the original proxy's
+        // Same banner shape as the original proxy's
         // `va("print \"^5%s (^7%s^5)^7\n\"", JAMPGAMEPROXY_NAME, VERSION)`, with
         // the name renamed to `jampgame-proxy-rs` and the version taken from the
-        // crate (`Cargo.toml`) so releases only bump it in one place.
-        let banner = CString::new(format!(
-            "print \"^5jampgame-proxy-rs (^7{}^5)^7\n\"",
-            crate::VERSION
-        ))
-        .expect("static banner contains no interior NUL");
-        // SAFETY: `banner` is a NUL-terminated C string that outlives the call;
-        // the engine syscall pointer is registered.
-        unsafe {
-            syscall::send_server_command(client_num, &banner);
+        // crate (`Cargo.toml`) so releases only bump it in one place. Two more
+        // lines follow: the demo page URL while downloads are on, and the proxy
+        // commands available on this server.
+        let demo_page = crate::demo::publish::downloads_page();
+        let commands = player_commands();
+        for line in join_lines(crate::VERSION, demo_page.as_deref(), &commands) {
+            send_join_line(client_num, &line);
         }
     }
 }
@@ -369,17 +444,9 @@ pub fn client_command(client_num: c_int) -> bool {
         return false;
     }
 
-    // `/demos` (Phase 4): list this game's published demo files to the
-    // requester. It is not chat and never reaches the recorder's stream; the
-    // reply is one or more `print` commands, which the recorder ignores.
-    if crate::demo::publish::handle_client_command(client_num, cmd) {
-        return false;
-    }
-
     let net_status_enabled = state::with_state(|s| s.cvars[CVAR_ENABLE_NET_STATUS].integer != 0);
     if net_status_enabled
-        && (unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"netStatus".as_ptr(), 9) } == 0
-            || unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"showNet".as_ptr(), 7) } == 0)
+        && unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"netStatus".as_ptr(), 9) } == 0
     {
         crate::hooks::netstatus::client_command_net_status(client_num);
         return false;
@@ -864,8 +931,9 @@ fn client_netname(client_num: c_int) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clientkick_max_slot, command_line_too_long, connect_userinfo_sanitized,
-        forcepowers_is_valid, gc_command_denied, get_usercmd, vote_value_out_of_range,
+        JOIN_RULE_WIDTH, clientkick_max_slot, command_line_too_long, connect_userinfo_sanitized,
+        forcepowers_is_valid, gc_command_denied, get_usercmd, join_lines, player_commands_for,
+        vote_value_out_of_range,
     };
     use crate::sdk::{FP_LEVITATION, ROLL, Usercmd};
 
@@ -875,6 +943,108 @@ mod tests {
     fn connect_sanitiser_skips_bots_only() {
         assert!(connect_userinfo_sanitized(false));
         assert!(!connect_userinfo_sanitized(true));
+    }
+
+    /// The join notice is framed as one block and keeps the version line, the
+    /// demo page only when downloads are on, and only the commands it was
+    /// given.
+    #[test]
+    fn join_notice_banner_demo_page_and_commands() {
+        let lines = join_lines(
+            "9.9.9",
+            Some("https://example.com/demos"),
+            &[("/ignore <player>", "hide that player's chat from you")],
+        );
+        let rule = format!("^5+{}", "-".repeat(JOIN_RULE_WIDTH));
+        assert_eq!(lines[0], rule);
+        assert_eq!(lines[1], "^5|^7 ^5jampgame-proxy-rs (^79.9.9^5)");
+        assert_eq!(
+            lines[2],
+            "^5|^7 ^5Demos: ^7browse and download them at ^7https://example.com/demos"
+        );
+        assert_eq!(lines[3], "^5|^7 ^5Client commands:");
+        assert_eq!(
+            lines[4],
+            "^5|^7 ^7  /ignore <player> ^5- ^7hide that player's chat from you"
+        );
+        assert_eq!(lines[5], rule);
+    }
+
+    /// One command per line, each with its own explanation, inside the frame.
+    #[test]
+    fn join_notice_puts_one_command_on_each_line() {
+        let commands = [("/a", "does A"), ("/bb <x>", "does B")];
+        let lines = join_lines("9.9.9", None, &commands);
+        assert!(lines[0].starts_with("^5+"), "top rule");
+        assert_eq!(lines[1], "^5|^7 ^5jampgame-proxy-rs (^79.9.9^5)");
+        assert_eq!(lines[2], "^5|^7 ^5Client commands:");
+        assert_eq!(lines[3], "^5|^7 ^7  /a ^5- ^7does A");
+        assert_eq!(lines[4], "^5|^7 ^7  /bb <x> ^5- ^7does B");
+        assert!(lines[5].starts_with("^5+"), "bottom rule");
+        assert_eq!(lines.len(), 2 + 2 + commands.len());
+    }
+
+    /// Only enabled features contribute commands; the coin flip is always
+    /// available while the proxy is on.
+    #[test]
+    fn join_command_list_follows_the_enabled_features() {
+        assert_eq!(
+            player_commands_for(false, false, false),
+            vec![("/callvote coinflip", "start a coin-flip vote")]
+        );
+        assert_eq!(
+            player_commands_for(true, true, true),
+            vec![
+                ("/ignore <player>", "hide that player's chat from you"),
+                ("/unignore <player>", "show that player's chat again"),
+                ("/tffa_create [password]", "open a parallel TFFA match"),
+                (
+                    "/tffa_join <id> [password]",
+                    "join or unlock a parallel TFFA match"
+                ),
+                ("/tffa_list", "list the parallel TFFA matches"),
+                ("/netStatus", "show every player's network status"),
+                ("/callvote coinflip", "start a coin-flip vote"),
+            ]
+        );
+        assert_eq!(
+            player_commands_for(false, true, false),
+            vec![
+                ("/tffa_create [password]", "open a parallel TFFA match"),
+                (
+                    "/tffa_join <id> [password]",
+                    "join or unlock a parallel TFFA match"
+                ),
+                ("/tffa_list", "list the parallel TFFA matches"),
+                ("/callvote coinflip", "start a coin-flip vote"),
+            ]
+        );
+        assert_eq!(
+            player_commands_for(true, false, false),
+            vec![
+                ("/ignore <player>", "hide that player's chat from you"),
+                ("/unignore <player>", "show that player's chat again"),
+                ("/callvote coinflip", "start a coin-flip vote"),
+            ]
+        );
+    }
+
+    #[test]
+    fn join_notice_omits_the_demo_hint_and_command_line_when_empty() {
+        let lines = join_lines("9.9.9", None, &[]);
+        let rule = format!("^5+{}", "-".repeat(JOIN_RULE_WIDTH));
+        assert_eq!(
+            lines,
+            vec![
+                rule.clone(),
+                "^5|^7 ^5jampgame-proxy-rs (^79.9.9^5)".to_string(),
+                rule,
+            ]
+        );
+
+        let lines = join_lines("9.9.9", Some("http://127.0.0.1:8090/demos"), &[]);
+        assert_eq!(lines.len(), 4, "demo hint without a command line, framed");
+        assert!(lines[2].contains("http://127.0.0.1:8090/demos"));
     }
 
     /// 11-01 F1: the whole command line (name, one separating space, then the

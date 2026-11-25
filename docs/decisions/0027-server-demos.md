@@ -240,11 +240,12 @@ traversal/encoded traversal/foreign/decoy `404`, `/api` `501`, oversized
 `431`, symlink `404`, 8 concurrent `200`, 20 concurrent → 12×`200` + 8×`503`,
 disable → connection refused, port in use → feature off.
 
-**Decision — `/demos` client command.** The in-game command (intercepted in
-`shared_api::client_command`) prints the current generation's closed, still
-existing files with their links, up to 32, or one “downloads disabled” line.
-It is a `print`, so it is never recorded. **RUNTIME** verified server-side (the link log); no clean client capture of
-the in-game reply was obtained with the synthetic tool.
+**Decision — `/demos` client command.** The in-game command was removed on
+2026-11-25 (see §10). Historically it listed the current generation's closed,
+still existing files with their links (later, the page URL and a count), as a
+`print` that the recorder never recorded; only the HTTP listing serves demos
+now. **RUNTIME** verified server-side (the link log) at the time; no clean
+client capture of the in-game reply was obtained with the synthetic tool.
 
 **Decision — retention and accepted guards.**
 `proxy_sv_demoRetentionHours` (24; `0` = keep forever) sweeps the demo
@@ -271,18 +272,14 @@ regression suite also asserts that no `proxy_sv_demoRecordEmpty`-style
 recording switch is registered: production cannot record an empty server (a
 human subject is required).
 
-**Decision — intermission and the client block.** `BeginIntermission` starts
+**Decision — intermission.** `BeginIntermission` starts
 `proxy_sv_demoIntermissionSecs` (3 s, `0` = immediate). The recorder keeps
 writing through the intermission so the demo shows the final `scores` and the
-intermission screen (`ps.pm_type = PM_INTERMISSION`), then closes the segments
-and sends the links to the clients with `print` (console text, the end-game
-stats mechanism, never `svsay`, never the server console): header, at most 12
-links, then a `/demos` hint. The generation is marked announced so the next
-`GAME_INIT` does not repeat it; if the map leaves before the timer, the block
-is queued for the next game start. **RUNTIME** verified server-side and in the
-demo (`pm_type 7` for the last 3 s, final `scores` present, debug lines
-`demo.intermission`); the synthetic capture tool did not produce a clean client
-stream across that map restart, so client receipt is open (U-016).
+intermission screen (`ps.pm_type = PM_INTERMISSION`), then closes the segments.
+Nothing is printed to the clients at the boundary. **RUNTIME** verified
+server-side and in the demo (`pm_type 7` for the last 3 s, final `scores`
+present). *(Amended 2026-11-25: the end-of-game client link block is removed;
+see §10.)*
 
 ## 6. Phase 6 validation and release gate
 
@@ -398,8 +395,8 @@ line, next segment, both playable.
 - **Still open (none blocks a feature-complete release, but they are not
   verified):** RMG maps and vehicle playerstate (U-010 items 1–2), visual
   playback of switched/32-slot/scoreboard streams (U-011, U-012, U-015 visual),
-  stock 1.01 playback (U-010 item 4), client receipt of the intermission block
-  (U-016).
+  stock 1.01 playback (U-010 item 4). U-016 became moot on 2026-11-25 when the
+  intermission client block was removed (§10).
 
 ## 7. Owner decisions recorded
 
@@ -410,9 +407,12 @@ line, next segment, both playable.
 4. Chat in demos is broadcast-only (U-013 resolved).
 5. Guards accepted: retention 24 h, max file 128 MB, min free 512 MB (`0`
    disables each; retention `0` = keep forever).
-6. End of game: record 3 s of intermission by default, then send the client
-   block; fallback to the next game start if the intermission is shorter.
-7. `/demos`: JSON over HTTP, links in game.
+6. End of game: record 3 s of intermission by default, then close the files.
+   (Originally the clients then received a link block; removed 2026-11-25,
+   §10.)
+7. `/demos`: JSON over HTTP only. The join notice points at the page URL;
+   per-file links are never printed, and the in-game `/demos` command was
+   removed (amended 2026-11-25, §10).
 
 ## 8. Recorded limitations
 
@@ -447,3 +447,34 @@ line, next segment, both playable.
   resumes.
 - A console `set` of a URL is unsafe (`//` comment); `run-server.sh` writes the
   value into an exec'ed cfg.
+
+## 10. Amendment — 2026-11-25: no demo URL printed, join notice instead
+
+**Owner decision.** Demo file URLs must no longer be printed to players. The
+end-of-game/intermission client block is removed, and the in-game `/demos`
+command is gone entirely: the demo page URL
+(`<proxy_sv_demoUrl>/demos`, or the listener's own address) is mentioned once in
+the join notice. Per-file links are returned only by the HTTP listing.
+
+**Join notice.** The first-time, non-bot `ClientConnect` banner is a framed
+block: a top rule, the version line, then
+
+1. while `proxy_sv_enableDemoDownload` (and `proxy_sv_enableHttp`) are on:
+   `Demos: browse and download them at <page>`;
+2. `Client commands:` followed by one line per command available on this
+   server, each with a short explanation: `/ignore`/`/unignore`,
+   `/tffa_create`/`/tffa_join`/`/tffa_list`, `/netStatus` and
+   `/callvote coinflip`, each present only while its feature is enabled;
+
+and a closing rule. The lines are sent as `print` (console text, never chat),
+one reliable command each, and are not repeated on the reconnect after a map
+change (`first_time` is false). `/netStatus` shows every connected player's
+row, so its join description says so.
+
+**Code.** `rust/src/demo/publish.rs` (`page_url`, `downloads_page`, open-set
+publication only; the generation list, `/demos` handler and scan are gone),
+`rust/src/shared_api.rs` (`player_commands`, `join_lines`, `send_join_line`;
+the `/demos` interception is removed from `client_command`),
+`rust/src/demo/recorder.rs` (the intermission timer now only closes segments).
+Unit tests cover the page URL and the join notice's conditional lines. This
+amendment is source- and unit-test-verified; no live-client capture was taken.

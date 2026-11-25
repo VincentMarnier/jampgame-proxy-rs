@@ -124,7 +124,8 @@ already — while the name keeps its trailing position). `rtt` is the round trip
 the standard deviation of the per-packet RTT samples over the window, `pps`
 the observed packets per second (never `cl_maxpackets`, which the server
 cannot see).
-`netStatus` and `showNet` share the table. Kept from the original: the
+`netStatus` is the command (the `showNet` alias was removed 2026-11-25). Kept
+from the original: the
 ≤1012-byte `print "..."` chunking, name escaping (`"`/`\`/newline), the 500 ms
 rate limit, the `gentity->r.svFlags & SVF_BOT` bot exclusion (R-022
 deviation), and zero-ping localhost/LAN players staying included.
@@ -142,7 +143,7 @@ which is what `tools/runtime/a2_netstatus_groundtruth.py` now does.
 
 With `proxy_sv_enableNetStatus 0` nothing runs: the per-cmd feed, the
 per-packet record work in the `SV_ExecuteClientMessage` wrapper, the
-`netStatus`/`showNet` handler and every estimator computation are all gated
+`netStatus` handler and every estimator computation are all gated
 on the cvar. The only remaining cost is one cvar mirror read per usercmd
 message. The off→on edge resets every window (see D-007.7), so nothing stale
 is shown after re-enabling.

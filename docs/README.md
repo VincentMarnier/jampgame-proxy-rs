@@ -21,8 +21,8 @@ This directory contains knowledge derived from the original implementation and t
   the 16-recorder cap, gate-B artifacts and the real-client playback run) and
   the Phase 4 publication notes (proxy-hosted HTTP listener and worker model,
   JSON `/demos` and file routes, path safety, served-only-when-closed rule,
-  retention and the accepted size/free-space guards, the intermission client
-  block, `/demos` in game, gate-C artifacts and deviations). The decisions
+  retention and the accepted size/free-space guards, the join-time download
+  and player-command notice, gate-C artifacts and deviations). The decisions
   behind the feature, with their evidence level and verification status, are in
   `decisions/0027-server-demos.md`.
 - `inventory.md` — per-feature map of the original proxy: keep/drop decision

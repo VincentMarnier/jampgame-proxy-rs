@@ -39,12 +39,13 @@ There is no TFFA gametype in base JKA, and the engine/game own a single
 `fraglimit`, global end = pristine `timelimit` path untouched.
 `client_match[n]` (`0` = lobby) in `ProxyState.tffa`,
 fresh per map. Commands via `GAME_CLIENT_COMMAND`: `tffa_create |
-tffa_join <id> | tffa_list | tffa`.
+tffa_join <id> | tffa_list`.
 `tffa_join 0` selects the always-active main match (id 0) and is the way
 back to the main game (its `enabled()` gate is skipped the same way, so a
 match can be left after the cvar/gametype changed under it). *Amended
 2026-11-05: the separate `tffa_leave` command was removed; `tffa_join 0`
-covers it.*
+covers it. Amended 2026-11-25: the bare `tffa` alias was removed; use
+`tffa_list`.*
 
 ### D-006.2 — Damage gating in the existing wrappers
 
@@ -1532,7 +1533,7 @@ A follow-spectating client already *sees* the followed player's instance
 the `scores` header and the scoreboard are all built for it. Its own
 `client_match`, however, still names the instance it is assigned to (main, or
 the match it left), so an explicit `/team red`/`/team blue` — what the Join
-buttons and `/join red` mean to a player — was resolved by pristine `SetTeam`
+buttons mean to a player — was resolved by pristine `SetTeam`
 against the **wrong** match: it put the spectator on main's red team (or their
 old match's) and dropped them out of what they were watching. Reported as:
 *people who spectate a TFFA instance should join that very same TFFA.*
@@ -1563,7 +1564,9 @@ to the protected match as a spectator, so `tffa_join <id> <password>` in place
 takes the `already in` branch (`authenticate_here`), records `pass_ok` and the
 next `/team red|blue` plays there. This is exactly the requested flow.
 
-**`/join` spelling.** Base JKA has no client-side `join` command: the engine
+**`/join` spelling.** *(Removed 2026-11-25: only the game's own `team` command
+is accepted; the `join` alias no longer exists.)* Base JKA has no client-side
+`join` command: the engine
 forwards an unknown console line to the server, and the game module's
 `ClientCommand` has no `join` arm, so `/join red` was a no-op there. While
 parallel TFFA is enabled the proxy now accepts `join red|blue|r|b|free|f` as

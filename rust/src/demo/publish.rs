@@ -1,23 +1,23 @@
-//! Phase 4 publication: generation bookkeeping, `/demos`, boundary
-//! announcements, retention and the disk guards.
+//! Phase 4 publication: the join-time download hint, retention and the disk
+//! guards.
 //!
 //! Two rules shape this module:
 //!
-//! - **The game thread never touches the filesystem.** Directory scans,
-//!   retention deletion and `statvfs` run on a maintenance thread started
-//!   through the C realign shim (`jampgame_aligned_entry`, D-001.1)); the game
-//!   thread only reads an atomic free-space value and a published name set.
+//! - **The game thread never touches the filesystem.** Retention deletion and
+//!   `statvfs` run on a maintenance thread started through the C realign shim
+//!   (`jampgame_aligned_entry`, D-001.1)); the game thread only reads an atomic
+//!   free-space value and publishes the open name set.
 //! - **The HTTP thread never reads proxy or engine state.** It receives the
 //!   demo directory, the link base, the retention window and the shared
 //!   open-segment set as a plain configuration snapshot (see `crate::http`).
 //!
 //! The recorder calls [`opened`]/[`closed`] for every segment and
-//! [`on_game_init`] at each game boundary; the boundary queues a `print` block
-//! with the finished files and their download links for the clients (console
-//! text like the end-game stats, never `svsay`), sent once a player is back in
-//! the world.
+//! [`on_game_init`] at each game boundary. Finished files are never printed to
+//! the clients: the game only points players at the `/demos` page (see
+//! [`downloads_page`] and the join notice in `crate::shared_api`), and the
+//! per-file links are served by the HTTP listing only.
 
-use core::ffi::{CStr, c_int};
+use core::ffi::c_int;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -25,42 +25,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::file::{DemoName, Retention, Timestamp};
-
-/// Maximum number of file lines in one boundary announcement block. The
-/// trailer ("use /demos") is added on top when there are more.
-pub const ANNOUNCEMENT_FILE_LINES: usize = 12;
-/// Maximum number of files listed by the `/demos` client command.
-pub const DEMOS_COMMAND_LINES: usize = 32;
-
-/// One segment of the current game generation.
-#[derive(Debug, Clone)]
-struct Entry {
-    name: String,
-    closed: bool,
-}
-
-#[derive(Default)]
-struct State {
-    /// Segments started since the last `GAME_INIT`, in start order.
-    files: Vec<Entry>,
-    /// Matching demo files the maintenance thread last saw on disk (not
-    /// expired), plus files this generation just closed. `/demos` lists the
-    /// intersection with `files`.
-    existing: BTreeSet<String>,
-    /// Client block waiting for a player to be back in the world (a full map
-    /// change runs `GAME_INIT` before anyone reconnects).
-    pending: Vec<String>,
-    /// The generation was already announced at intermission; `GAME_INIT` must
-    /// not announce it a second time.
-    announced: bool,
-}
-
-static STATE: Mutex<State> = Mutex::new(State {
-    files: Vec::new(),
-    existing: BTreeSet::new(),
-    pending: Vec::new(),
-    announced: false,
-});
 
 /// Names of the segments that are still open (the HTTP side never serves
 /// them). Shared with the listener as plain proxy memory, never engine data.
@@ -100,17 +64,16 @@ pub fn free_bytes() -> i64 {
 }
 
 /// Whether the two download cvars are on. This is the configuration check the
-/// boundary uses: `GAME_INIT` runs on the way from a shutdown to a fresh
-/// session, and the master-switch atomic there is not what decides whether
-/// downloads were configured.
+/// join hint uses: it must reflect what the operator configured, not whether a
+/// socket happens to be up at that instant.
 fn downloads_configured() -> bool {
     crate::state::cvar_integer(crate::state::CVAR_ENABLE_HTTP) != 0
         && crate::state::cvar_integer(crate::state::CVAR_DEMO_DOWNLOAD) != 0
 }
 
 /// Whether downloads are enabled for a request: the proxy is on, the HTTP
-/// master switch is on and the demo download switch is on. The listener,
-/// `/demos` and the announcement delivery follow this rule.
+/// master switch is on and the demo download switch is on. The listener and
+/// the join-time hint follow this rule.
 pub fn downloads_enabled() -> bool {
     crate::state::proxy_enabled() && downloads_configured()
 }
@@ -118,7 +81,7 @@ pub fn downloads_enabled() -> bool {
 /// The public base for a link (`proxy_sv_demoUrl`), trailing slashes removed.
 ///
 /// When the cvar is empty the listener's own address is used instead, so the
-/// console and `/demos` print real URLs rather than bare file names:
+/// join hint shows a real URL rather than a bare path:
 /// `http://<httpBind>:<httpPort>`, with a wildcard bind (`0.0.0.0`, `::`)
 /// shown as `127.0.0.1` for the local operator. A public host still belongs in
 /// `proxy_sv_demoUrl` (NAT/reverse proxy).
@@ -149,15 +112,26 @@ pub(crate) fn link_base() -> String {
     )
 }
 
-/// The link shown for `file_name`: `<base>/demos/<name>`, or the bare name
-/// when no public base is configured.
-pub fn link_for(base: &str, file_name: &str) -> String {
+/// The demo page URL (`<base>/demos`) the join hint points at. Empty when no
+/// public base is configured (an invalid listener port has no reachable page).
+pub fn page_url(base: &str) -> String {
     let base = base.trim().trim_end_matches('/');
     if base.is_empty() {
-        file_name.to_string()
+        String::new()
     } else {
-        format!("{base}/demos/{file_name}")
+        format!("{base}/demos")
     }
+}
+
+/// The demo page URL for the join hint, or `None` while downloads are off or
+/// the listener has no usable base. Pure enough to unit-test: it reads only the
+/// proxy cvars, never engine state.
+pub fn downloads_page() -> Option<String> {
+    if !downloads_enabled() {
+        return None;
+    }
+    let page = clean_link(&page_url(&link_base()));
+    (!page.is_empty()).then_some(page)
 }
 
 /// Drop anything that would break a `print`/`svsay` quoted argument.
@@ -165,23 +139,6 @@ fn clean_link(link: &str) -> String {
     link.chars()
         .filter(|c| *c != '"' && *c != '\r' && *c != '\n' && *c != '\\')
         .collect()
-}
-
-/// The `print` lines of one boundary block for the clients: a header, at most
-/// [`ANNOUNCEMENT_FILE_LINES`] download links, then a `/demos` hint when
-/// truncated. Pure so the cap and the link shape are unit-tested.
-pub fn announcement_lines(names: &[String], base: &str) -> Vec<String> {
-    let mut lines = vec!["^5Demo files from this game:".to_string()];
-    for name in names.iter().take(ANNOUNCEMENT_FILE_LINES) {
-        lines.push(format!("^7{}", clean_link(&link_for(base, name))));
-    }
-    if names.len() > ANNOUNCEMENT_FILE_LINES {
-        lines.push(format!(
-            "^7... {} more demo(s), type /demos",
-            names.len() - ANNOUNCEMENT_FILE_LINES
-        ));
-    }
-    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -194,11 +151,6 @@ pub fn opened(file_name: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(file_name.to_string());
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    state.files.push(Entry {
-        name: file_name.to_string(),
-        closed: false,
-    });
 }
 
 /// A segment is closed **and terminated**: it may now be served.
@@ -207,197 +159,12 @@ pub fn closed(file_name: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(file_name);
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(entry) = state.files.iter_mut().find(|e| e.name == file_name) {
-        entry.closed = true;
-    } else {
-        state.files.push(Entry {
-            name: file_name.to_string(),
-            closed: true,
-        });
-    }
-    // We just wrote it; it exists even if the next scan has not run yet.
-    state.existing.insert(file_name.to_string());
 }
 
-/// `GAME_INIT`: announce the generation that just ended, start a new one and
-/// schedule the retention sweep.
+/// `GAME_INIT`: schedule the retention sweep. Finished files are not
+/// announced; their links live in the HTTP listing.
 pub fn on_game_init() {
-    let base = link_base();
-    let print_block = downloads_configured();
-    let (names, lines) = {
-        let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-        let closed: Vec<String> = state
-            .files
-            .iter()
-            .filter(|e| e.closed)
-            .map(|e| e.name.clone())
-            .collect();
-        // Already printed at intermission: clear the generation without a
-        // second block at the next game start.
-        let lines = if print_block && !state.announced {
-            announcement_lines(&closed, &base)
-        } else {
-            Vec::new()
-        };
-        state.files.clear();
-        state.announced = false;
-        state.pending = lines.clone();
-        (closed, lines)
-    };
-    // The directory scan may not have seen them yet; closed segments are
-    // already in `existing` (see `closed`).
     SWEEP.store(true, Ordering::Relaxed);
-    if !names.is_empty() {
-        // Console output stays out of the way: the file block goes to the
-        // clients as `print` commands (like the end-game stats); this detail
-        // line is only for the crash-diagnostics log.
-        crate::diagnostics::verbose(
-            "demo.boundary",
-            format!(
-                "{} file(s) closed, {} client line(s) queued",
-                names.len(),
-                lines.len()
-            ),
-        );
-    }
-}
-
-/// Send the queued boundary block to the clients once someone is back in the
-/// world. It is a `print` broadcast (console text, exactly like the end-game
-/// stats tables), never `svsay`: the demo list does not go to the server
-/// console and is not chat.
-pub fn flush_announcement(any_in_world: bool) {
-    if !any_in_world || !downloads_enabled() {
-        return;
-    }
-    let lines = {
-        let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-        core::mem::take(&mut state.pending)
-    };
-    for line in lines {
-        let text = line.replace('"', "'");
-        let Ok(command) = std::ffi::CString::new(format!("print \"{text}\n\"")) else {
-            continue;
-        };
-        // SAFETY: engine syscall registered; `command` is NUL-terminated and
-        // the engine copies it during the call. `-1` broadcasts to every
-        // connected client, like the stats' global table.
-        unsafe { crate::syscall::send_server_command(-1, &command) };
-    }
-}
-
-/// `BeginIntermission` + `proxy_sv_demoIntermissionSecs`: the intermission
-/// tail has been recorded, the recorder closed its segments, and the clients
-/// are still in the intermission screen. Print the block to them now (console
-/// text, like the stats) and mark the generation announced so `GAME_INIT` does
-/// not repeat it. `/demos` keeps listing the files until the next game.
-pub fn announce_intermission() {
-    let base = link_base();
-    let print_block = downloads_configured();
-    let (lines, names) = {
-        let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-        let names: Vec<String> = state
-            .files
-            .iter()
-            .filter(|e| e.closed)
-            .map(|e| e.name.clone())
-            .collect();
-        state.announced = true;
-        let lines = if print_block {
-            announcement_lines(&names, &base)
-        } else {
-            Vec::new()
-        };
-        (lines, names)
-    };
-    if names.is_empty() {
-        return;
-    }
-    crate::diagnostics::verbose(
-        "demo.intermission",
-        format!(
-            "{} file(s) announced at intermission, {} client line(s)",
-            names.len(),
-            lines.len()
-        ),
-    );
-    for line in &lines {
-        crate::diagnostics::verbose("demo.intermission.line", line.clone());
-    }
-    for line in lines {
-        let text = line.replace('"', "'");
-        let Ok(command) = std::ffi::CString::new(format!("print \"{text}\n\"")) else {
-            continue;
-        };
-        // SAFETY: engine syscall registered; the command is NUL-terminated and
-        // the engine copies it. `-1` is every connected client; at
-        // intermission they are all still connected.
-        unsafe { crate::syscall::send_server_command(-1, &command) };
-    }
-}
-
-/// `/demos`: list the current generation's closed, still existing files to
-/// the requester. Returns `false` when the command is not ours.
-pub fn handle_client_command(client_num: c_int, command: &[u8]) -> bool {
-    if !command.eq_ignore_ascii_case(b"demos") {
-        return false;
-    }
-    if !downloads_enabled() {
-        print_line(
-            client_num,
-            "^5Demos: ^7demo downloads are disabled on this server.\n",
-        );
-        return true;
-    }
-    let base = link_base();
-    let names = {
-        let state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-        let mut names: Vec<String> = state
-            .files
-            .iter()
-            .filter(|e| e.closed && state.existing.contains(&e.name))
-            .map(|e| e.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    };
-    if names.is_empty() {
-        print_line(client_num, "^5Demos: ^7none recorded for this game yet.\n");
-        return true;
-    }
-    print_line(client_num, "^5Demos for this game:\n");
-    for name in names.iter().take(DEMOS_COMMAND_LINES) {
-        let link = clean_link(&link_for(&base, name));
-        // Operational trace: the game side cannot be inspected from a client
-        // capture reliably (the tool's netchan state after a client command),
-        // so the served links are logged here.
-        eprintln!(
-            "----- proxy-rs: /demos from client {client_num}: {link} ({} available)",
-            names.len()
-        );
-        print_line(client_num, &format!("^7{link}\n"));
-    }
-    if names.len() > DEMOS_COMMAND_LINES {
-        print_line(
-            client_num,
-            &format!(
-                "^7… and {} more (see /demos on the web).\n",
-                names.len() - DEMOS_COMMAND_LINES
-            ),
-        );
-    }
-    true
-}
-
-fn print_line(client_num: c_int, text: &str) {
-    let cleaned = text.replace('"', "'");
-    let Ok(command) = std::ffi::CString::new(format!("print \"{cleaned}\"")) else {
-        return;
-    };
-    // SAFETY: engine syscall registered; the command outlives the call.
-    unsafe { crate::syscall::send_server_command(client_num, &command) };
 }
 
 // ---------------------------------------------------------------------------
@@ -439,9 +206,9 @@ pub fn shutdown() {
 }
 
 /// The maintenance thread exists only to serve a demo feature: sampling free
-/// space and retention/scan for the recorder, or the directory scan behind
-/// `/demos`/HTTP. With every demo cvar at its default (off) nothing runs, no
-/// directory is scanned, no sweep can delete files, and no thread is started.
+/// space and sweeping retention for the recorder, or sampling free space for
+/// the HTTP listener. With every demo cvar at its default (off) nothing runs,
+/// no sweep can delete files, and no thread is started.
 fn demo_maintenance_needed(record: bool, download: bool) -> bool {
     record || download
 }
@@ -519,7 +286,7 @@ fn shutdown_impl() {
 }
 
 fn maintenance_loop() {
-    let mut last_scan = Instant::now() - Duration::from_secs(10);
+    let mut last_sample = Instant::now() - Duration::from_secs(10);
     loop {
         if STOP.load(Ordering::Relaxed) {
             return;
@@ -529,9 +296,8 @@ fn maintenance_loop() {
             if SWEEP.swap(false, Ordering::Relaxed) {
                 sweep(&config);
             }
-            if last_scan.elapsed() >= Duration::from_secs(1) {
-                last_scan = Instant::now();
-                scan(&config);
+            if last_sample.elapsed() >= Duration::from_secs(1) {
+                last_sample = Instant::now();
                 FREE_BYTES.store(free_bytes_of(&config.dir), Ordering::Relaxed);
             }
         }
@@ -543,32 +309,6 @@ fn maintenance_loop() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-}
-
-/// Recount the matching, not-yet-expired demo files (the set `/demos` and the
-/// HTTP listing intersect with).
-fn scan(config: &MaintenanceConfig) {
-    let now = Timestamp::now().ok();
-    let retention = Retention::new(config.retention_hours);
-    let mut names = BTreeSet::new();
-    let Ok(entries) = std::fs::read_dir(&config.dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if DemoName::parse(&name).is_none() {
-            continue;
-        }
-        let expired = match now {
-            Some(now) => retention.is_expired(&name, now),
-            None => false,
-        };
-        if expired {
-            continue;
-        }
-        names.insert(name);
-    }
-    STATE.lock().unwrap_or_else(|p| p.into_inner()).existing = names;
 }
 
 /// Delete matching, expired, **closed** files. Foreign names are never
@@ -649,17 +389,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn links_use_the_public_base_or_the_bare_name() {
-        let name = "20260101-000000_mp_ffa3_main_s1.dm_26";
-        assert_eq!(link_for("", name), name);
+    fn the_demo_page_url_is_built_from_the_public_base() {
+        assert_eq!(page_url("https://example.com"), "https://example.com/demos");
         assert_eq!(
-            link_for("https://example.com", name),
-            format!("https://example.com/demos/{name}")
+            page_url("https://example.com/"),
+            "https://example.com/demos"
         );
-        assert_eq!(
-            link_for("https://example.com/", name),
-            format!("https://example.com/demos/{name}")
-        );
+        assert_eq!(page_url("  "), "");
     }
 
     #[test]
@@ -678,37 +414,16 @@ mod tests {
         assert_eq!(local_base("10.0.0.5", 8080), "http://10.0.0.5:8080");
         assert_eq!(local_base("::1", 8080), "http://[::1]:8080");
         assert_eq!(local_base("0.0.0.0", 0), "");
-        let name = "20260101-000000_mp_ffa3_main_s1.dm_26";
         assert_eq!(
-            link_for(&local_base("0.0.0.0", 8090), name),
-            format!("http://127.0.0.1:8090/demos/{name}")
+            page_url(&local_base("0.0.0.0", 8090)),
+            "http://127.0.0.1:8090/demos"
         );
     }
 
     #[test]
-    fn announcement_caps_at_twelve_links_plus_header_and_trailer() {
-        let names: Vec<String> = (1..=14)
-            .map(|n| format!("20260101-000000_mp_ffa3_main_s{n}.dm_26"))
-            .collect();
-        let lines = announcement_lines(&names, "https://example.com");
-        assert_eq!(lines.len(), 1 + ANNOUNCEMENT_FILE_LINES + 1);
-        assert!(lines[0].starts_with("^5Demo files"));
-        assert!(lines[1].starts_with("^7https://example.com/demos/"));
-        assert!(lines[13].contains("2 more demo(s)"));
-
-        let lines = announcement_lines(&names[..3], "http://127.0.0.1:8090");
-        assert_eq!(lines.len(), 4);
-        assert!(lines[1].starts_with("^7http://127.0.0.1:8090/demos/"));
-        assert!(!lines.iter().any(|l| l.contains("more demo")));
-    }
-
-    #[test]
-    fn links_cannot_break_out_of_a_quoted_command() {
-        let lines = announcement_lines(
-            &["20260101-000000_mp_ffa3_main_s1.dm_26".to_string()],
-            "https://example.com/\"evil\\",
-        );
-        assert!(!lines[1].contains('"'));
-        assert!(!lines[1].contains('\\'));
+    fn the_page_link_cannot_break_out_of_a_quoted_command() {
+        let page = clean_link(&page_url("https://example.com/\"evil\\"));
+        assert!(!page.contains('"'));
+        assert!(!page.contains('\\'));
     }
 }

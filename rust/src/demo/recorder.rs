@@ -1153,8 +1153,7 @@ fn close_all(recorder: &mut Recorder) {
     recorder.intermission_closed = false;
 }
 
-/// `GAME_INIT`: close a previous map's files, reset timing and announce the
-/// generation that just ended.
+/// `GAME_INIT`: close a previous map's files and reset timing.
 fn game_init_impl() {
     with_recorder(|recorder| {
         recorder.next_tick = 0;
@@ -1276,24 +1275,15 @@ fn tick_impl() {
             );
         }
 
-        // The boundary demo block is a `print` broadcast sent once a player is
-        // back in the world (a full map change runs `GAME_INIT` before anyone
-        // reconnects).
-        crate::demo::publish::flush_announcement(
-            slots
-                .iter()
-                .any(|slot| slot.in_world && !slot.bot && slot.connected),
-        );
-
         // `BeginIntermission`: keep recording the intermission tail for a few
-        // seconds (final scores visible in the demo), then close and print the
-        // links to the clients who are still in intermission.
+        // seconds (final scores visible in the demo), then close the files.
+        // Nothing is printed to the clients: the join notice points them at the
+        // `/demos` page.
         if let Some(deadline) = recorder.intermission_deadline {
             if now >= deadline {
                 recorder.intermission_deadline = None;
                 recorder.intermission_closed = true;
                 close_instances(recorder);
-                crate::demo::publish::announce_intermission();
             }
         }
 

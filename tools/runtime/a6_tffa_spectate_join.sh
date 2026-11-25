@@ -1,5 +1,5 @@
 #!/bin/sh
-# A6: end-to-end check of `/join red` from a spectator watching a TFFA instance.
+# A6: end-to-end check of `/team red` from a spectator watching a TFFA instance.
 #
 # Runs linuxjampded + the Rust proxy in the i386 runtime container with four
 # synthetic JA MP clients (the A2 protocol client). Two matches are created,

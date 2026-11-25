@@ -2549,16 +2549,9 @@ pub fn handle_client_command(client_num: c_int) -> bool {
     let name = &cmd[..end];
     if !name.starts_with(b"tffa") {
         // A team request from a follow-spectating client names the instance it
-        // is **watching** (`/join red` on TFFA 2 must join TFFA 2, not the
-        // match its own `client_match` still points at). `join` reaches a JKA
-        // server as an unknown client command (the engine forwards it; the
-        // pristine `ClientCommand` has no such arm), so the proxy spells it
-        // out as the same request.
-        return if name == b"team" || name == b"join" {
-            join_spectated_instance(client_num, name == b"join")
-        } else {
-            false
-        };
+        // is **watching** (`/team red` on TFFA 2 must join TFFA 2, not the
+        // match its own `client_match` still points at).
+        return name == b"team" && join_spectated_instance(client_num);
     }
     // tffa commands work even when the feature gate (gametype) is off so
     // players get a helpful message instead of an unknown-command.
@@ -2576,10 +2569,6 @@ pub fn handle_client_command(client_num: c_int) -> bool {
         return true;
     }
     if name == b"tffa_list" {
-        cmd_list(client_num);
-        return true;
-    }
-    if name == b"tffa" {
         cmd_list(client_num);
         return true;
     }
@@ -2654,8 +2643,8 @@ fn spectated_join(
     }
 }
 
-/// Run the join request the client sent (`team red|blue|free`, or the same
-/// with `join`) in the instance it is spectating.
+/// Run the `team red|blue|free` request in the instance the client is
+/// spectating.
 ///
 /// A follow-spectating client sees the followed player's instance
 /// (`effective_match`, D-006.6 follow round) but its own `client_match` still
@@ -2666,18 +2655,17 @@ fn spectated_join(
 /// answers through the existing `SetTeam` password gate with the
 /// `tffa_join <id> <password>` invite.
 ///
-/// Returns true when the command was consumed (progress was refused or the
-/// `join` spelling was handled here); false lets the engine's `team` path
-/// continue, now in the watched instance.
-fn join_spectated_instance(client_num: c_int, alias: bool) -> bool {
+/// Returns true when the command was consumed (progress was refused); false
+/// lets the engine's `team` path continue, now in the watched instance.
+fn join_spectated_instance(client_num: c_int) -> bool {
     let mut arg = [0u8; 16];
     let len = cmd_arg(1, &mut arg);
-    let Some(team) = join_team_arg(&arg[..len]) else {
+    if join_team_arg(&arg[..len]).is_none() {
         // Bare `team`, `team spectator`, `team score(board)` and follow
         // requests are not a playing-team join and keep their pristine
         // behaviour.
         return false;
-    };
+    }
     if !enabled() {
         return false;
     }
@@ -2686,16 +2674,7 @@ fn join_spectated_instance(client_num: c_int, alias: bool) -> bool {
     let main_origin = state::with_state(|s| s.tffa.main_origin);
 
     if watched == runtime {
-        if !alias {
-            return false;
-        }
-        // `join` is not a base game command: run the request the game's
-        // `Cmd_Team_f` would run, through the same `SetTeam` wrapper (caps and
-        // password gate included) and inside the client's acting scope.
-        let previous = open_client_scope(client_num);
-        crate::teamlock::request_team(client_num, team);
-        close_acting_scope(previous);
-        return true;
+        return false;
     }
 
     let (watched_active, watched_ending) = state::with_state(|s| {
@@ -2757,14 +2736,8 @@ fn join_spectated_instance(client_num: c_int, alias: bool) -> bool {
                 client_num,
                 &format!("print \"Moved to match {identity} (the match you are spectating).\n\""),
             );
-            if alias {
-                let previous = open_client_scope(client_num);
-                crate::teamlock::request_team(client_num, team);
-                close_acting_scope(previous);
-                true
-            } else {
-                false
-            }
+            // The engine's own `team` path continues in the new instance.
+            false
         }
     }
 }
@@ -5445,7 +5418,7 @@ mod tests {
         assert_eq!(join_target(i32::MIN, 8), None);
     }
 
-    /// `/join red` from a spectator watching another instance: the move goes to
+    /// `/team red` from a spectator watching another instance: the move goes to
     /// the watched game, never to the match the client is assigned to. Main is
     /// accepted as a destination (a promoted game keeps its own identity), and
     /// a created match is checked with the same active/ending/full rules

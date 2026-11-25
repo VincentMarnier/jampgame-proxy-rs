@@ -2026,11 +2026,9 @@ fn command_is_team_request() -> bool {
     is_team_command(&cmd[..end])
 }
 
-/// The client commands a player uses to ask for a team. `join` is the proxy's
-/// spelling of the same request (base JKA has no `join` arm; it is claimed
-/// before the game sees it when the proxy handles it).
+/// The client command a player uses to ask for a team.
 fn is_team_command(name: &[u8]) -> bool {
-    name.eq_ignore_ascii_case(b"team") || name.eq_ignore_ascii_case(b"join")
+    name.eq_ignore_ascii_case(b"team")
 }
 
 /// Consume the explicit-request marker for `client_num`: true once per
@@ -2598,7 +2596,7 @@ mod tests {
     fn team_command_spellings_are_recognised() {
         assert!(is_team_command(b"team"));
         assert!(is_team_command(b"TEAM"));
-        assert!(is_team_command(b"join"));
+        assert!(!is_team_command(b"join"));
         assert!(!is_team_command(b""));
         assert!(!is_team_command(b"say_team"));
         assert!(!is_team_command(b"follow1"));

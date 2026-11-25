@@ -165,7 +165,7 @@
   cvar rename, the legacy spellings kept as registered aliases, the
   canonical-unless-default resolution rule, and why a last-write-wins alias
   cannot be built from the engine's `modificationCount`.
-- `0027-server-demos.md` — server-side demo recording and publication: the recovered `.dm_26` format (protocol 26, 49 demos, fixture, reference-client symbols), the no-fake-client recorder (shadow state, engine `MSG_*` encoders, no `svs.clients`/`svs.snapshotEntities`), `PMF_FOLLOW` and viewer identity, instances/chat/scoreboard, the built-in HTTP server (JSON `/demos`), retention and the accepted guards, the intermission block and its verification status.
+- `0027-server-demos.md` — server-side demo recording and publication: the recovered `.dm_26` format (protocol 26, 49 demos, fixture, reference-client symbols), the no-fake-client recorder (shadow state, engine `MSG_*` encoders, no `svs.clients`/`svs.snapshotEntities`), `PMF_FOLLOW` and viewer identity, instances/chat/scoreboard, the built-in HTTP server (JSON `/demos`), retention and the accepted guards, the join-time download hint and player-command notice (the intermission link block and the in-game `/demos` command were removed, D-027 §10), and the verification status.
 - `0028-ping-equalize.md` — ping equalisation (`proxy_sv_pingEqualize`): the
   slowest in-game player's `cl->ping` as the target (capped at 0..=250 ms), a
   negative `serverTime` offset composed with the D-015 timeNudge shift so fast

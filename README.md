@@ -38,7 +38,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_debugLog`                   | 0       | crash-diagnostics trace: `0` off, `1` suspicious/blocked events, `2` every client command/userinfo/lifecycle event; writes `proxy_debug.log` (see [Crash diagnostics](#crash-diagnostics)) |
 | `proxy_sv_maxCallVoteMapRestartValue` | 60      | maximum value allowed on a `callvote map_restart`                                               |
 | `proxy_sv_modelPathLength`            | 64      | maximum model path length accepted from clients                                                 |
-| `proxy_sv_enableNetStatus`            | 0       | compute and make accessible the players network status (`netStatus`/`showNet` commands print the [net status](#net-status) table); when `0` the feature is completely inert — no collection, no computation, no table |
+| `proxy_sv_enableNetStatus`            | 0       | compute and make accessible each player's network status (`netStatus` prints the [net status](#net-status) table); when `0` the feature is completely inert — no collection, no computation, no table |
 | `proxy_sv_enableEndGameStats`         | 1       | print the personal/global/best-player stats tables at the end of a game                         |
 | `proxy_sv_antiHpTeller`               | 0       | prevents HP tellers usage                                                                       |
 | `proxy_sv_minJumpTime`                | 0       | minimum time (in ms) a player should be allowed to jump (anti low-jump scripting)               |
@@ -81,18 +81,41 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_sv_enableHttp`                  | 0       | start the proxy's own HTTP listener (needs `proxy_sv_enableDemoDownload`; no route → no socket) |
 | `proxy_sv_httpBind`                   | `127.0.0.1` | listener bind address |
 | `proxy_sv_httpPort`                   | 8090    | listener port |
-| `proxy_sv_enableDemoDownload`          | 0       | enable the demo HTTP routes, in-game `/demos` and the intermission link block |
+| `proxy_sv_enableDemoDownload`          | 0       | enable the demo HTTP routes and the join-time download hint |
 | `proxy_sv_demoUrl`                    | (empty) | public base used to build demo links (e.g. `https://example.com`); empty uses `http://<proxy_sv_httpBind>:<proxy_sv_httpPort>` (wildcard bind → `127.0.0.1`). Set it from a config file: the engine treats `//` as a comment in a console `set` |
 | `proxy_sv_demoRetentionHours`          | 24      | delete matching demo files older than this at each game boundary (`0` = keep forever) |
 | `proxy_sv_demoMaxFileMB`               | 128     | close a segment at this size and continue with the next segment number (`0` = no cap) |
 | `proxy_sv_demoMinFreeMB`               | 512     | pause recording and close segments while the demo filesystem has less free space (`0` = off) |
-| `proxy_sv_demoIntermissionSecs`        | 3       | seconds of the intermission to record after the game ends (so the demo shows the final scores) before the files are closed and their links are sent to the clients; `0` closes immediately. Keep it below the engine's 4 s duel / 5 s other intermission |
+| `proxy_sv_demoIntermissionSecs`        | 3       | seconds of the intermission to record after the game ends (so the demo shows the final scores) before the files are closed; `0` closes immediately. Keep it below the engine's 4 s duel / 5 s other intermission |
 
 Note: this Rust version deliberately drops some cvars present in the original
 C++ proxy (`proxy_sv_pingFix`, `proxy_sv_sabersFps`,
 `proxy_sv_disableKillCmd`). `proxy_sv_antiWallHack` is supported again, but by a
 new implementation that reuses the FOV cap's hide path (D-023), not the
 original origin-moving one.
+
+### Join message
+
+The first time a player connects, the proxy prints one framed block in that
+player's console: a rule, its version, then (while
+`proxy_sv_enableDemoDownload` is on) the demo page URL
+(`<proxy_sv_demoUrl>/demos`, or the listener's own address), then each proxy
+command available on that server on its own line with a short explanation,
+only while its feature is enabled, and a closing rule.
+
+- `/ignore <player>` — hide that player's chat from you
+- `/unignore <player>` — show that player's chat again
+- `/tffa_create [password]` — open a parallel TFFA match
+- `/tffa_join <id> [password]` — join or unlock a parallel TFFA match
+- `/tffa_list` — list the parallel TFFA matches
+- `/netStatus` — show every player's network status
+- `/callvote coinflip` — start a coin-flip vote
+
+This is console text (`print`), never chat, and a reconnect after a map change
+does not repeat it.
+
+Demo file URLs are never printed in game: the download hint only names the page
+where the finished files are listed.
 
 ### Player mute
 
@@ -352,8 +375,9 @@ installed client-side. Two limits are worth knowing:
 
 ### Net status
 
-With `proxy_sv_enableNetStatus 1`, the `netStatus` and `showNet` commands print
-a per-player table (rate-limited to once per 500 ms, bots excluded):
+With `proxy_sv_enableNetStatus 1`, the `netStatus` command prints
+one table row for every connected player to the requesting client (rate-limited
+to once per 500 ms, bots excluded):
 
 ```text
 ping  eff    rtt   jit  fps packets/s     timeNudge snaps   rate name
@@ -991,8 +1015,7 @@ auto-join, `g_teamAutoJoin`) balance the match being joined rather than
 the whole server, so one match's sides stay even.
 Spectating follows the same rule: a spectator who watches a player of another
 match (the game's own `follow`/`follownext`) and then types `/team red` or
-`/team blue` (or `/join red`/`/join blue`, which the proxy accepts as the same
-request while parallel TFFA is on) joins **that** match, not the one they were
+`/team blue` joins **that** match, not the one they were
 assigned to — they are moved there as a spectator first and then put on the
 chosen team. A password-protected match still answers with the
 `tffa_join <id> <password>` invite instead of fielding a team; spectating it
@@ -1137,7 +1160,7 @@ in the demo, then closes the files.
 | `proxy_sv_enableHttp` | `0` | start the built-in HTTP listener |
 | `proxy_sv_httpBind` | `127.0.0.1` | listener bind address |
 | `proxy_sv_httpPort` | `8090` | listener port |
-| `proxy_sv_enableDemoDownload` | `0` | enable the demo routes, the in-game `/demos` and the intermission block |
+| `proxy_sv_enableDemoDownload` | `0` | enable the demo routes and the join-time download hint |
 | `proxy_sv_demoUrl` | (empty) | public base for links; empty uses `http://<httpBind>:<httpPort>` (wildcard bind shown as `127.0.0.1`) |
 | `proxy_sv_demoRetentionHours` | `24` | delete matching files older than N hours at game boundaries; `0` = keep forever |
 | `proxy_sv_demoMaxFileMB` | `128` | rotate a segment at this size; `0` = no cap |
@@ -1180,11 +1203,9 @@ HTTP: terminate TLS and add authentication with a reverse proxy in front of it.
   workers, eight queued connections, `503` when full), 8 KiB request headers,
   request/response timeouts and closes the connection after one request (no
   keep-alive, no `Range`).
-- The in-game `/demos` command prints the same download links to the requesting
-  player; at the end of a game the clients also receive a block with the
-  finished files and their links (header, up to 12 links, then a `/demos`
-  hint). If the map leaves before `proxy_sv_demoIntermissionSecs`, the block is
-  sent at the start of the next game instead.
+- Demo file URLs are never printed in game. A first-time player gets the demo
+  page URL once on join (see [Join message](#join-message)); the per-file
+  download links live only in the `/demos` HTTP listing.
 
 Retention (`proxy_sv_demoRetentionHours`) removes only matching demo files whose
 embedded timestamp is old enough, and only at game boundaries; the maintenance
