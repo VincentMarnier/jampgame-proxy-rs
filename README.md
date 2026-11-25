@@ -47,6 +47,7 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_parallel_tffas_enable`         | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/sounds-and-effects/team chat isolated per match, global chat stays server-wide (see below); the pre-rename `proxy_tffa_enable` still works as an alias |
 | `proxy_parallel_tffas_maxMatches`     | 8       | maximum parallel TFFA matches (alias `proxy_tffa_maxMatches`) |
 | `proxy_parallel_tffas_maxGroupSize`   | 12      | maximum players per TFFA match, both teams combined (alias `proxy_tffa_maxGroupSize`) |
+| `proxy_sv_coinflip`                   | 1       | allow the `/callvote coinflip` vote; when `0` the game rejects the unknown vote name and the join notice omits it |
 | `proxy_sv_teamShuffle`                | 0       | allow the `callvote shuffle <players per team>` vote: it sends everyone to spectator, opens a 30 s `/ready` window, then spreads the ready players over equal-team games (parallel TFFA when enabled, the main game otherwise); see [Team shuffle](#team-shuffle) |
 | `proxy_sv_teamShuffleMinTeamSize`     | 2       | smallest team a shuffle may create; with the default `2` a shuffle never makes a 1v1, and too few ready players simply stay spectators |
 | `proxy_parallel_duels_enable`         | 0       | run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners move up and losers down between rounds, first to `duel_fraglimit` wins (see [Parallel duels](#parallel-duels)) |
@@ -187,8 +188,10 @@ votes yes. When the vote passes, the server announces `Heads` or `Tails` to
 everyone in chat through `svsay` (as `Server: Coin flip: Heads!`). The side is
 drawn from `/dev/urandom`, with a clock/counter fallback if that device is
 unavailable. The usual vote rules apply (`g_allowVote`, one vote at a time,
-the caller's vote limit, and no spectator votes outside duel). Like every proxy
-feature it needs `proxy_sv_enable 1`.
+the caller's vote limit, and no spectator votes outside duel). The feature is
+enabled by default; set `proxy_sv_coinflip 0` to turn the vote off (the join
+notice then omits it). Like every proxy feature it also needs
+`proxy_sv_enable 1`.
 
 
 ### IP bans
@@ -1093,9 +1096,11 @@ coverage is never traded for match count.
 With `proxy_sv_teamShuffle 1`, any player may call
 `callvote shuffle <players per team>` on a team gametype (`GT_TEAM` or
 `GT_CTF`). The vote is a normal yes/no vote; when it passes, everyone is sent
-to spectator and a 30-second window starts. A centre message and a console
-line invite players to type `/ready`; only the players who do (and are still
-connected) are placed.
+to spectator and a 30-second window starts. A centre MOTD stays on screen for
+the whole window — title, `/ready` invitation, team limit, ready count and a
+live countdown — and a console line also invites players to type `/ready`;
+only the players who do (and are still connected) are placed. The proxy's join
+notice lists the vote when the feature is on.
 
 Each game gets two equally sized teams, never larger than the vote's number
 and never smaller than `proxy_sv_teamShuffleMinTeamSize` (default `2`, so no

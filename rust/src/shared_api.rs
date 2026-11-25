@@ -107,12 +107,20 @@ fn player_commands() -> Vec<PlayerCommand> {
         crate::ignore::enabled(),
         state::team_mode(),
         state::cvar_integer(CVAR_ENABLE_NET_STATUS) != 0,
+        crate::shuffle::available(),
+        crate::coinflip::enabled(),
     )
 }
 
 /// [`player_commands`] over plain feature flags, so the list, its ordering and
 /// its wording are unit-tested without an engine or a loaded configuration.
-fn player_commands_for(ignore: bool, team: bool, net_status: bool) -> Vec<PlayerCommand> {
+fn player_commands_for(
+    ignore: bool,
+    team: bool,
+    net_status: bool,
+    shuffle: bool,
+    coinflip: bool,
+) -> Vec<PlayerCommand> {
     let mut commands = Vec::new();
     if ignore {
         commands.push(("/ignore <player>", "hide that player's chat from you"));
@@ -129,7 +137,15 @@ fn player_commands_for(ignore: bool, team: bool, net_status: bool) -> Vec<Player
     if net_status {
         commands.push(("/netStatus", "show every player's network status"));
     }
-    commands.push(("/callvote coinflip", "start a coin-flip vote"));
+    if coinflip {
+        commands.push(("/callvote coinflip", "start a coin-flip vote"));
+    }
+    if shuffle {
+        commands.push((
+            "/callvote shuffle <players per team>",
+            "shuffle everyone into balanced teams",
+        ));
+    }
     commands
 }
 
@@ -990,16 +1006,13 @@ mod tests {
         assert_eq!(lines.len(), 2 + 2 + commands.len());
     }
 
-    /// Only enabled features contribute commands; the coin flip is always
-    /// available while the proxy is on.
+    /// Only enabled features contribute commands; each vote/command is shown
+    /// only when its own switch is on.
     #[test]
     fn join_command_list_follows_the_enabled_features() {
+        assert!(player_commands_for(false, false, false, false, false).is_empty());
         assert_eq!(
-            player_commands_for(false, false, false),
-            vec![("/callvote coinflip", "start a coin-flip vote")]
-        );
-        assert_eq!(
-            player_commands_for(true, true, true),
+            player_commands_for(true, true, true, false, false),
             vec![
                 ("/ignore <player>", "hide that player's chat from you"),
                 ("/unignore <player>", "show that player's chat again"),
@@ -1010,11 +1023,10 @@ mod tests {
                 ),
                 ("/tffa_list", "list the parallel TFFA matches"),
                 ("/netStatus", "show every player's network status"),
-                ("/callvote coinflip", "start a coin-flip vote"),
             ]
         );
         assert_eq!(
-            player_commands_for(false, true, false),
+            player_commands_for(false, true, false, false, false),
             vec![
                 ("/tffa_create [password]", "open a parallel TFFA match"),
                 (
@@ -1022,16 +1034,32 @@ mod tests {
                     "join or unlock a parallel TFFA match"
                 ),
                 ("/tffa_list", "list the parallel TFFA matches"),
-                ("/callvote coinflip", "start a coin-flip vote"),
             ]
         );
         assert_eq!(
-            player_commands_for(true, false, false),
+            player_commands_for(true, false, false, false, false),
             vec![
                 ("/ignore <player>", "hide that player's chat from you"),
                 ("/unignore <player>", "show that player's chat again"),
-                ("/callvote coinflip", "start a coin-flip vote"),
             ]
+        );
+        assert_eq!(
+            player_commands_for(false, false, true, false, false),
+            vec![("/netStatus", "show every player's network status")]
+        );
+        assert_eq!(
+            player_commands_for(false, false, false, true, true),
+            vec![
+                ("/callvote coinflip", "start a coin-flip vote"),
+                (
+                    "/callvote shuffle <players per team>",
+                    "shuffle everyone into balanced teams"
+                ),
+            ]
+        );
+        assert_eq!(
+            player_commands_for(false, false, false, false, true),
+            vec![("/callvote coinflip", "start a coin-flip vote")]
         );
     }
 

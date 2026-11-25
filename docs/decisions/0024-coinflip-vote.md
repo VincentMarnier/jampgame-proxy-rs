@@ -48,6 +48,10 @@ Paths are relative to the source trees named by `AGENTS.md` unless stated.
 
 ## Decision
 
+0. `proxy_sv_coinflip` (default `1`) enables the vote. When `0`,
+   `callvote coinflip` is not claimed and the join notice omits it. A vote
+   already running when the cvar is turned off is dropped at execution with a
+   cancel line instead of flipping.
 1. `callvote coinflip` is claimed in `GAME_CLIENT_COMMAND` before the pristine
    `ClientCommand`; the proxy starts the vote itself and forwards nothing.
 2. The start path mirrors the game's checks in the same order (`g_allowVote`,
@@ -87,8 +91,9 @@ Paths are relative to the source trees named by `AGENTS.md` unless stated.
 - The proxy's own `set_configstring` call goes straight to the engine, so the
   `votes::on_configstring` slot-address snapshot does not run for a coinflip.
   That snapshot only protects `clientkick` votes, so it is not needed here.
-- While `proxy_sv_enable` is `0`, `callvote coinflip` is not claimed and the
-  game answers its usual "Invalid vote string".
+- While `proxy_sv_enable` is `0` or `proxy_sv_coinflip` is `0`,
+  `callvote coinflip` is not claimed and the game answers its usual "Invalid
+  vote string"; the join notice lists the vote only when both are on.
 - Refusal messages are English proxy lines, not the game's localized
   `MP_SVGAME` strings.
 

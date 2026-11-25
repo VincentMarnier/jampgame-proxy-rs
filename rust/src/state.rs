@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 64] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 65] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -97,6 +97,8 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 64] = [
     // and its `/ready` window.
     (c"proxy_sv_teamShuffle", c"0"),
     (c"proxy_sv_teamShuffleMinTeamSize", c"2"),
+    // `callvote coinflip`: 0 off, non-zero allows the proxy's coin-flip vote.
+    (c"proxy_sv_coinflip", c"1"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -345,6 +347,10 @@ pub const CVAR_TEAM_SHUFFLE: usize = 62;
 /// (default `2`, i.e. 2v2). A bigger minimum prevents the vote from forming
 /// tiny games; when fewer players are ready, they stay spectators.
 pub const CVAR_TEAM_SHUFFLE_MIN_TEAM_SIZE: usize = 63;
+/// `proxy_sv_coinflip`: allow the proxy's `callvote coinflip` (`crate::coinflip`).
+/// Defaults to `1` (the vote was unconditional before this cvar); `0` leaves
+/// the unknown vote name to the pristine game, which rejects it.
+pub const CVAR_COINFLIP: usize = 64;
 
 /// The pre-rename spelling of a canonical cvar, if it has one (D-026).
 ///
@@ -1686,6 +1692,7 @@ mod tests {
             PROXY_CVARS[CVAR_TEAM_SHUFFLE_MIN_TEAM_SIZE].1.to_bytes(),
             b"2"
         );
+        assert_eq!(PROXY_CVARS[CVAR_COINFLIP].1.to_bytes(), b"1");
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 

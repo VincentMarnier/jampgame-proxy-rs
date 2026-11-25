@@ -34,6 +34,10 @@ const VOTE_COMMAND: &str = "proxy_teamshuffle";
 pub(crate) const READY_WINDOW_MS: u32 = 30_000;
 /// How long before the deadline the last countdown line is printed.
 const WARN_AT_MS: u32 = 10_000;
+/// How often the centre MOTD is refreshed, so it stays on screen and its
+/// countdown/ready count stay current (the cgame hides a centre print after a
+/// few seconds, `cg_centertime`).
+const CENTER_REFRESH_MS: u32 = 1_000;
 /// Largest team a shuffle can form (`MAX_CLIENTS / 2`).
 const MAX_TEAM_SIZE: usize = MAX_CLIENTS / 2;
 
@@ -48,6 +52,8 @@ pub struct ShuffleState {
     pub max_team: u8,
     /// The 10 s warning has been printed.
     pub warned: bool,
+    /// When the centre MOTD is due next (`Sys_Milliseconds`, wrap-aware).
+    pub next_center_ms: u32,
     /// Clients that typed `/ready` for this window.
     pub ready: [bool; MAX_CLIENTS],
     /// A passed vote is waiting for the next frame to start its window.
@@ -61,6 +67,7 @@ impl Default for ShuffleState {
             deadline_ms: 0,
             max_team: 0,
             warned: false,
+            next_center_ms: 0,
             ready: [false; MAX_CLIENTS],
             pending_start: None,
         }
@@ -82,6 +89,11 @@ fn allowed() -> bool {
     // command or frame hook).
     let gametype = unsafe { syscall::cvar_variable_integer_value(c"g_gametype") };
     gametype == GT_TEAM || gametype == GT_CTF
+}
+
+/// Whether the join notice should advertise the shuffle vote on this server.
+pub(crate) fn available() -> bool {
+    allowed()
 }
 
 /// `proxy_sv_teamShuffleMinTeamSize`, clamped to something a team can be.
@@ -219,6 +231,11 @@ enum Tick {
     None,
     Start(u8),
     Warn,
+    Center {
+        remaining_secs: u32,
+        ready: usize,
+        max_team: u8,
+    },
     Cancel(&'static str),
     Finish {
         ready: [bool; MAX_CLIENTS],
@@ -263,6 +280,16 @@ pub fn on_run_frame_post() {
             s.shuffle.warned = true;
             return Tick::Warn;
         }
+        if deadline_reached(now, s.shuffle.next_center_ms) {
+            s.shuffle.next_center_ms = now.wrapping_add(CENTER_REFRESH_MS);
+            let ready = s.shuffle.ready.iter().filter(|ready| **ready).count();
+            let remaining_secs = remaining_ms(now, s.shuffle.deadline_ms).div_ceil(1_000);
+            return Tick::Center {
+                remaining_secs,
+                ready,
+                max_team: s.shuffle.max_team,
+            };
+        }
         Tick::None
     });
 
@@ -272,7 +299,15 @@ pub fn on_run_frame_post() {
         Tick::Warn => {
             crate::votes::send_print(-1, "^3[Team Shuffle]^7 10 seconds left to type ^3/ready^7.")
         }
-        Tick::Cancel(text) => crate::votes::send_print(-1, &format!("^3[Team Shuffle]^7 {text}")),
+        Tick::Center {
+            remaining_secs,
+            ready,
+            max_team,
+        } => center_all(&shuffle_motd(max_team, ready, remaining_secs)),
+        Tick::Cancel(text) => {
+            crate::votes::send_print(-1, &format!("^3[Team Shuffle]^7 {text}"));
+            center_all(&format!("^5TEAM SHUFFLE CANCELED\n^7{text}"));
+        }
         Tick::Finish { ready, max_team } => finish(&ready, max_team),
     }
 }
@@ -303,6 +338,7 @@ fn begin_ready(size: u8) {
             -1,
             "^3[Team Shuffle]^7 canceled: the team-size limits changed while the vote ran.",
         );
+        center_all("^5TEAM SHUFFLE CANCELED\n^7The team-size limits changed.");
         return;
     }
     if state::with_state(|s| s.tffa.intermission) {
@@ -311,6 +347,7 @@ fn begin_ready(size: u8) {
             -1,
             "^3[Team Shuffle]^7 canceled: the map is ending. Everyone stays a spectator.",
         );
+        center_all("^5TEAM SHUFFLE CANCELED\n^7The map is ending.");
         return;
     }
 
@@ -321,10 +358,13 @@ fn begin_ready(size: u8) {
         s.shuffle.active = true;
         s.shuffle.deadline_ms = now.wrapping_add(READY_WINDOW_MS);
         s.shuffle.max_team = size as u8;
+        s.shuffle.next_center_ms = now.wrapping_add(CENTER_REFRESH_MS);
     });
 
-    center_all(&format!(
-        "TEAM SHUFFLE: type /ready within 30 seconds to be placed in a team (up to {size} per team)."
+    center_all(&shuffle_motd(
+        size as u8,
+        0,
+        READY_WINDOW_MS.div_ceil(1_000),
     ));
     crate::votes::send_print(
         -1,
@@ -377,7 +417,11 @@ fn handle_ready(client_num: c_int) {
             &format!("You are ready ({ready} players ready). Waiting for the shuffle."),
         );
     }
-    center_one(client_num, "READY - wait for the shuffle to begin.");
+    let (max_team, remaining_secs) = state::with_state(|s| {
+        let left = remaining_ms(syscall::milliseconds(), s.shuffle.deadline_ms).div_ceil(1_000);
+        (s.shuffle.max_team, left)
+    });
+    center_one(client_num, &shuffle_motd(max_team, ready, remaining_secs));
 }
 
 /// End the window: place the ready players in games of equal teams.
@@ -387,6 +431,7 @@ fn finish(ready: &[bool; MAX_CLIENTS], max_team: u8) {
             -1,
             "^3[Team Shuffle]^7 canceled: the map is ending. Everyone stays a spectator.",
         );
+        center_all("^5TEAM SHUFFLE CANCELED\n^7The map is ending.");
         return;
     }
 
@@ -418,6 +463,10 @@ fn finish(ready: &[bool; MAX_CLIENTS], max_team: u8) {
                 min * 2
             ),
         );
+        center_all(&format!(
+            "^5TEAM SHUFFLE\n^7Not enough ready players\n^7At least ^3{}^7 are needed for a game.",
+            min * 2
+        ));
         return;
     }
 
@@ -610,8 +659,7 @@ fn announce_result(placed: &[(c_int, u8, i32)], plan: &[usize], ready_count: usi
         ),
     );
     center_all(&format!(
-        "TEAM SHUFFLE COMPLETE: {} players in {} match(es): {sizes}.",
-        total_placed,
+        "^5TEAM SHUFFLE COMPLETE\n^7{total_placed} players in {} match(es)\n^7{sizes}",
         plan.len()
     ));
     eprintln!(
@@ -626,6 +674,15 @@ fn center_all(text: &str) {
 
 fn center_one(client_num: c_int, text: &str) {
     send_center(client_num, text);
+}
+
+/// The centre MOTD shown for the whole ready window. `CG_CenterPrint` treats
+/// `\n` as a line break, so this is the multi-line block a client sees while it
+/// waits (refreshed every second to update the countdown and ready count).
+fn shuffle_motd(max_team: u8, ready: usize, remaining_secs: u32) -> String {
+    format!(
+        "^5TEAM SHUFFLE\n^7Type ^3/ready^7 within ^3{remaining_secs}s^7 to join a team\n^7Up to ^3{max_team}^7 per team - ^3{ready}^7 ready"
+    )
 }
 
 /// `cp "..."`: the cgame's centre print, for one client or every client.
@@ -749,6 +806,16 @@ mod tests {
     fn a_sixteen_player_shuffle_is_four_v_four() {
         assert_eq!(plan_team_sizes(16, 4, 2, 9), vec![4, 4]);
         assert_eq!(plan_team_sizes(10, 4, 2, 9), vec![3, 2]);
+    }
+
+    #[test]
+    fn the_center_motd_has_its_three_lines_and_live_values() {
+        let motd = shuffle_motd(4, 7, 23);
+        assert_eq!(
+            motd,
+            "^5TEAM SHUFFLE\n^7Type ^3/ready^7 within ^323s^7 to join a team\n^7Up to ^34^7 per team - ^37^7 ready"
+        );
+        assert_eq!(motd.lines().count(), 3);
     }
 
     #[test]

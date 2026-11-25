@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::CString;
 
 use crate::sdk::{EXEC_APPEND, EXEC_NOW};
+use crate::state::{self, CVAR_COINFLIP};
 use crate::syscall;
 
 /// What the game runs when the vote passes. Kept unique so no normal vote can
@@ -27,10 +28,21 @@ const VOTE_COMMAND: &str = "proxy_coinflip";
 /// What the vote UI shows.
 const VOTE_DISPLAY: &str = "coinflip";
 
+/// Whether the coin-flip vote is enabled (`proxy_sv_coinflip`, default `1`).
+/// The master switch is checked by the callers through `shared_api`, but the
+/// cvar is also read here so the join notice and the command agree.
+pub(crate) fn enabled() -> bool {
+    state::proxy_enabled() && state::cvar_integer(CVAR_COINFLIP) != 0
+}
+
 /// Claim `callvote coinflip` and start the vote. Returns `true` when the
 /// command is ours, in which case the caller must not forward it to the game.
 pub fn handle_client_command(client_num: c_int, command: &[u8], argument: &[u8]) -> bool {
     if !is_coinflip_vote(command, argument) {
+        return false;
+    }
+    // Disabled: let the pristine game reject the unknown vote name.
+    if !enabled() {
         return false;
     }
     start_vote(client_num);
@@ -58,6 +70,10 @@ pub fn console_command_from_ptr(exec: i32, text: *const c_char) -> bool {
 fn console_command(exec: i32, text: &[u8]) -> bool {
     if !is_coinflip_execution(exec, text) {
         return true;
+    }
+    if !enabled() {
+        crate::votes::send_print(-1, "^3Coin flip vote canceled: the feature is disabled.");
+        return false;
     }
     announce_result(flip_is_heads());
     false

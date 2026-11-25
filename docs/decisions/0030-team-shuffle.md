@@ -69,6 +69,11 @@ coinflip`):
 8. A per-frame tick runs after the game's frame body. A timelimit intermission
    wins over a placement; turning the feature or the master switch off cancels
    the window. Ten seconds before the deadline a countdown line is printed.
+   The centre display is a multi-line MOTD (title, `/ready` invitation,
+   remaining seconds, ready count and team-size limit), refreshed once per
+   second so the cgame's `cg_centertime` does not hide it; `CG_CenterPrint`
+   treats `\n` as a line break (`cg_draw.c:5110-5136`). The console keeps the
+   one-time invitation and the 10 s warning.
 9. At the deadline the game's `level.teamScores`/per-player state is reset
    again (so a player who joined a team during the window cannot stay in main)
    and the ready players are placed:
@@ -91,6 +96,9 @@ coinflip`):
     the first half of each game's slice goes RED and the second BLUE, and the
     existing assignment/`SetTeam`/`CS_PLAYERS` refresh path makes the move
     visible to every viewer.
+11. The join notice lists `/callvote shuffle <players per team>` when
+    `proxy_sv_teamShuffle` is on and the map is a team gametype, next to the
+    always-present `/callvote coinflip` line.
 
 ### Placement examples
 
@@ -136,10 +144,12 @@ that preference is confirmed.
 
 - `rust/src/shuffle.rs` tests cover the command match, strict team-size
   parsing, the placement rule (the table above, TFFA off, slot/minimum limits),
-  and the wrap-safe deadline compare.
+  the three-line centre MOTD and the wrap-safe deadline compare.
 - `rust/src/votes.rs` tests keep the shared vote-refusal order (moved from the
   coinflip module, behaviour unchanged) and the name sanitising.
-- `cargo test` 578/578 and `cargo fmt --check` are clean; the project dev image
+- `rust/src/shared_api.rs` tests pin the join notice's command list, including
+  `/callvote shuffle <players per team>` only when its feature is on.
+- `cargo test` 579/579 and `cargo fmt --check` are clean; the project dev image
   also passes `cargo clippy --all-targets -- -D warnings` and the
   `i686-unknown-linux-gnu` release build.
 - No live client/server run was done for this round: the new paths are the

@@ -154,6 +154,7 @@ set proxy_sv_enableDemoDownload 1
 set proxy_sv_enableDemoRecord 1
 set proxy_sv_demoUrl "$URL"
 set proxy_sv_demoDir /srv/jka/demos
+set proxy_sv_teamShuffle 1
 EOF
 
 # shellcheck disable=SC2086
