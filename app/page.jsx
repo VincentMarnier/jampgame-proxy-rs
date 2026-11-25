@@ -27,7 +27,7 @@ const cvars = [
   ["proxy_sv_debugLog", "0", "Crash-diagnostics trace: 0 off, 1 suspicious/blocked events, 2 every client command, userinfo and lifecycle event; writes proxy_debug.log", "diagnostics"],
   ["proxy_sv_maxCallVoteMapRestartValue", "60", "Maximum value allowed on a callvote map_restart", "votes"],
   ["proxy_sv_modelPathLength", "64", "Maximum model path length accepted from clients", "hardening"],
-  ["proxy_sv_enableNetStatus", "0", "Per-player network status: netStatus / showNet print the net status table; when 0 the feature is completely inert — no collection, no computation, no table", "observability"],
+  ["proxy_sv_enableNetStatus", "0", "Per-player network status: netStatus prints one table row per connected player to the requesting client; when 0 the feature is completely inert — no collection, no computation, no table", "observability"],
   ["proxy_sv_enableEndGameStats", "1", "Print personal / global / best-player stats tables at end of game", "stats"],
   ["proxy_sv_antiHpTeller", "0", "Prevent HP tellers usage", "gameplay"],
   ["proxy_sv_minJumpTime", "0", "Minimum time (ms) a player may jump (anti low-jump scripting)", "gameplay"],
@@ -36,6 +36,9 @@ const cvars = [
   ["proxy_parallel_tffas_enable", "0", "Run parallel self-organized TFFA matches on one GT_TEAM map: per-match world, teams, chat and scores; the pre-rename proxy_tffa_enable still works as an alias", "tffa"],
   ["proxy_parallel_tffas_maxMatches", "8", "Maximum parallel TFFA matches (alias proxy_tffa_maxMatches)", "tffa"],
   ["proxy_parallel_tffas_maxGroupSize", "12", "Maximum players per TFFA match, both teams combined (alias proxy_tffa_maxGroupSize)", "tffa"],
+  ["proxy_sv_coinflip", "1", "Allow the /callvote coinflip vote; when 0 the game rejects the unknown vote name and the join notice omits it", "votes"],
+  ["proxy_sv_teamShuffle", "0", "Allow the callvote shuffle <players per team> vote: everyone is sent to spectator for a 30 s /ready window, then the ready players are spread over equal-team games (parallel TFFA when enabled, the main game otherwise)", "teams"],
+  ["proxy_sv_teamShuffleMinTeamSize", "2", "Smallest team a shuffle may create; with the default 2 a shuffle never makes a 1v1, and too few ready players simply stay spectators", "teams"],
   ["proxy_parallel_duels_enable", "0", "Run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners climb and losers drop between rounds, first to duel_fraglimit wins", "duels"],
   ["proxy_sv_spectatorTeamOverlay", "1", "Send the team overlay's HP/armor roster to spectators following a player (TaystJK cg_drawTeamOverlay and the stock team info HUD)", "observability"],
   ["proxy_sv_enableClientPpsLimit", "0", "Per-client packet-rate limiter: the limit is an integer downscale of the client's measured FPS ± proxy_sv_clientPpsFpsMargin, capped by proxy_sv_globalMaxPps; excess packets are dropped evenly through the next second", "network"],
@@ -70,12 +73,12 @@ const cvars = [
   ["proxy_sv_enableHttp", "0", "Start the proxy's own HTTP listener; needs proxy_sv_enableDemoDownload, and with no route there is no socket", "demos"],
   ["proxy_sv_httpBind", "127.0.0.1", "Demo HTTP listener bind address", "demos"],
   ["proxy_sv_httpPort", "8090", "Demo HTTP listener port", "demos"],
-  ["proxy_sv_enableDemoDownload", "0", "Enable the demo HTTP routes, the in-game /demos command and the intermission link block", "demos"],
+  ["proxy_sv_enableDemoDownload", "0", "Enable the demo HTTP routes and the join-time download hint", "demos"],
   ["proxy_sv_demoUrl", "(empty)", "Public base used to build demo links (e.g. https://example.com); empty uses http://<bind>:<port>. Set it from a cfg: the engine treats // as a comment", "demos"],
   ["proxy_sv_demoRetentionHours", "24", "Delete matching demo files older than this at each game boundary (0 = keep forever)", "demos"],
   ["proxy_sv_demoMaxFileMB", "128", "Close a segment at this size and continue with the next segment number (0 = no cap)", "demos"],
   ["proxy_sv_demoMinFreeMB", "512", "Pause recording and close segments while the demo filesystem has less free space (0 = off)", "demos"],
-  ["proxy_sv_demoIntermissionSecs", "3", "Seconds of intermission to record after the game ends so the final scores are in the demo, before the files close and their links are sent (0 = immediate)", "demos"],
+  ["proxy_sv_demoIntermissionSecs", "3", "Seconds of intermission to record after the game ends so the final scores are in the demo, before the segments close (0 = immediate)", "demos"],
 ];
 
 const hardening = [
@@ -86,18 +89,16 @@ const hardening = [
 ];
 
 const playerCommands = [
-  "tffa",
   "tffa_create [password]",
   "tffa_join <id> [password]",
   "tffa_join 0",
   "tffa_list",
-  "/join red|blue",
   "callvote coinflip",
+  "callvote shuffle <players per team>",
+  "/ready",
   "/ignore <player>",
   "/unignore <player>",
-  "/demos",
   "netStatus",
-  "showNet",
 ];
 
 const adminCommands = [
@@ -313,6 +314,18 @@ export default function Home() {
               </p>
             </li>
             <li>
+              <b>Team shuffle</b>
+              <p>
+                <code>callvote shuffle &lt;players per team&gt;</code> on a team
+                gametype sends everyone to spectator for a 30-second{" "}
+                <code>/ready</code> window, then spreads the ready players over
+                equal-team games — parallel TFFA matches when enabled, the main
+                game otherwise. <code>proxy_sv_teamShuffle</code> enables the
+                vote; <code>proxy_sv_teamShuffleMinTeamSize</code> (default 2)
+                forbids a 1v1.
+              </p>
+            </li>
+            <li>
               <b>Chat moderation</b>
               <p>
                 <code>rcon mute</code> / <code>unmute</code> drop a player&apos;s
@@ -327,7 +340,8 @@ export default function Home() {
                 <code>/callvote coinflip</code> runs a normal 30-second vote;
                 when it passes, the server announces <code>Heads</code> or{" "}
                 <code>Tails</code> to everyone in chat, drawn from{" "}
-                <code>/dev/urandom</code>.
+                <code>/dev/urandom</code>. The vote is on by default;{" "}
+                <code>proxy_sv_coinflip 0</code> disables it.
               </p>
             </li>
             <li>
@@ -358,7 +372,8 @@ export default function Home() {
                 players&apos; inbound moves so everyone plays at the slowest
                 player&apos;s ping, up to a 250 ms cap. The delay is split
                 between the client&apos;s view clock and a command queue so
-                prediction stays smooth; only the input path is padded.
+                prediction stays smooth; only the input path is padded, and
+                each parallel match equalises its own roster.
               </p>
             </li>
             <li>
@@ -413,7 +428,8 @@ export default function Home() {
                 <code>proxy_sv_enableDemoRecord</code> writes one{" "}
                 <code>.dm_26</code> per instance from the followed player&apos;s
                 POV, and the proxy&apos;s own HTTP listener serves them at{" "}
-                <code>/demos</code>. No fake client, no player-side recording,
+                <code>/demos</code> with each file&apos;s map, gametype, final
+                scores and duration. No fake client, no player-side recording,
                 and every demo cvar defaults to off.
               </p>
             </li>
@@ -425,9 +441,10 @@ export default function Home() {
             ))}
           </div>
           <p className="note">
-            Typed in the game console; <code>tffa</code> is a shortcut for{" "}
-            <code>tffa_list</code>, and <code>/join red|blue</code> is accepted
-            while parallel TFFA is on. All player commands are listed here.
+            Typed in the game console. <code>/ready</code> only does something
+            during a team-shuffle window, and a first-time player&apos;s join
+            notice lists the commands enabled on that server. All player
+            commands are listed here.
           </p>
           <h3 className="sub">Admin commands <span className="count">rcon / console</span></h3>
           <div className="cmds">
@@ -463,7 +480,7 @@ export default function Home() {
           </div>
           <ul className="tight">
             <li><code>tffa_create [password]</code> / <code>tffa_join &lt;id&gt; [password]</code> / <code>tffa_join 0</code> / <code>tffa_list</code> work while playing: travel puts you in spectator first, then you re-pick a team with <code>/team red|blue</code>. The pre-rename <code>proxy_tffa_*</code> cvars stay registered as aliases. All player commands are listed above.</li>
-            <li>Spectating a match and then typing <code>/team red|blue</code> (or <code>/join red|blue</code>) joins <em>that</em> match, not the one you were assigned to; a protected match still answers with the <code>tffa_join &lt;id&gt; &lt;password&gt;</code> invite, and simply watching it stays open.</li>
+            <li>Spectating a match and then typing <code>/team red|blue</code> joins <em>that</em> match, not the one you were assigned to; a protected match still answers with the <code>tffa_join &lt;id&gt; &lt;password&gt;</code> invite, and simply watching it stays open.</li>
             <li>A password only gates joining a team — anyone can spectate without it, and <code>tffa_list</code> marks the match <code>[password]</code>. <code>tffa_join &lt;id&gt; &lt;password&gt;</code> unlocks a match you are already in, including one promoted to the main slot. Passwords are case-sensitive, up to 32 characters, and redacted from the log.</li>
             <li>Auto team picks balance the match being joined; team lock and team-size rules use per-match rosters, and a rule applies only when every populated match is the same <code>N vs N</code>.</li>
             <li>A match that hits the fraglimit plays one second with damage void, then moves its players to spectator and remembers its group for the next <code>map_restart</code>. A full map change drops it; the restart defers proxy pushes over frames so every client is retained.</li>
@@ -474,9 +491,9 @@ export default function Home() {
 
         {/* ---------- duels ---------- */}
         <section className="block" id="duels" aria-labelledby="duels-title">
-          <SectionHead id="duels-title" eyebrow="Parallel play" title="Duels: a ladder, side by side" lede="With proxy_parallel_duels_enable 1 (GT_DUEL only), every player and bot is shuffled into 1v1 courts on one map, each in its own world. Winners climb, losers drop, and the ladder carries across rounds until a champion is crowned." />
+          <SectionHead id="duels-title" eyebrow="Parallel play" title="Duels: a ladder, side by side" lede="With proxy_parallel_duels_enable 1 (GT_DUEL only), every player and bot is shuffled into 1v1 courts on one map, each in its own world. While one willing player waits alone, they warm up in the arena as in regular duel; winners climb, losers drop, and the ladder carries across rounds until a champion is crowned." />
           <div className="lifecycle" aria-label="Parallel duel ladder lifecycle">
-            <div><b><i>1</i>Courts</b>Willing players and bots are shuffled into 1v1 courts: court 1 in the main world, the others in their own instances.</div>
+            <div><b><i>1</i>Courts</b>Willing players and bots are shuffled into 1v1 courts: court 1 in the main world, the others in their own instances. A lone player waits in the arena until a partner joins.</div>
             <div><b><i>2</i>Round</b>Each court fights one duel to the server&apos;s <code>fraglimit</code>; the round ends when every court is decided.</div>
             <div><b><i>3</i>Bump</b>A carried <code>map_restart</code> moves winners up a court and losers down; the top winner and bottom loser stay, the surplus waits on a FIFO bench.</div>
             <div><b><i>4</i>Champion</b>The first to <code>duel_fraglimit</code> duel wins takes the ladder, then a fresh shuffle starts (<code>0</code> = endless).</div>
@@ -488,9 +505,9 @@ export default function Home() {
           </div>
           <ul className="tight">
             <li>A round&apos;s own <code>timelimit</code> (minutes) decides unfinished courts by health + shield, random on an exact tie. <code>fraglimit 0</code> removes the per-duel kill limit, <code>timelimit 0</code> the round cap and <code>duel_fraglimit 0</code> the champion threshold.</li>
-            <li>A disconnect or an explicit <code>/team spectator</code> mid-duel gives the opponent a walkover; everyone else stays in the ladder, and bots are drafted like players. When a leaver leaves an odd count, the ladder compacts: the highest-ranked survivors keep their courts and the lowest-ranked player takes the bench. <code>team free</code> cannot take a court.</li>
+            <li>A disconnect or an explicit <code>/team spectator</code> mid-duel gives the opponent a walkover; everyone else stays in the ladder, and bots are drafted like players. When a leaver leaves an odd count, the ladder compacts: the highest-ranked survivors keep their courts and the lowest-ranked player takes the bench. <code>team free</code> cannot take a court, except the lone waiting player warming up.</li>
             <li>Opted-out spectators are marked <code>(Spec)</code>, bench players <code>(Bench)</code> and court players <code>(Duel N)</code>; one round-level message replaces the repeating time-limit notice.</li>
-            <li>Setting <code>proxy_parallel_duels_enable 0</code> returns everyone to spectator and hands the map back to the stock duel tournament; its automatic pull-in, global duelist configstrings and intermission handling are suppressed while the ladder runs.</li>
+            <li>Setting <code>proxy_parallel_duels_enable 0</code> returns everyone to spectator and hands the map back to the stock duel tournament; its automatic pull-in, global duelist configstrings and intermission handling are suppressed while the ladder runs — except that the pull still spawns the one player waiting alone.</li>
           </ul>
         </section>
 
@@ -500,7 +517,7 @@ export default function Home() {
           <div className="lifecycle" aria-label="Server-side demo lifecycle">
             <div><b><i>1</i>Record</b>One <code>.dm_26</code> per instance: <code>main</code>, <code>tffaN</code> per parallel TFFA match, <code>duelN</code> per duel court. A segment rotates on map change, an empty instance, the size cap or a free-space pause.</div>
             <div><b><i>2</i>Follow</b>The POV is the lowest human player in the world, not a free camera; a player leaving or changing match switches the POV inside the same file.</div>
-            <div><b><i>3</i>Publish</b>The proxy hosts plain HTTP: <code>GET /demos</code> returns JSON, <code>GET /demos/&lt;file&gt;</code> downloads. In-game <code>/demos</code> prints the links, and an intermission block announces the finished files.</div>
+            <div><b><i>3</i>Publish</b>The proxy hosts plain HTTP: <code>GET /demos</code> returns JSON with each file&apos;s map, gametype, final players and scores, team scores and duration; <code>GET /demos/&lt;file&gt;</code> downloads. The demo page URL is mentioned once in the join notice, and per-file links live only in the listing.</div>
             <div><b><i>4</i>Keep</b>Retention deletes matching files older than 24 h at game boundaries; a 128 MB cap rotates segments, and recording pauses under 512 MB free.</div>
           </div>
           <div className="hook-grid">
@@ -513,6 +530,7 @@ export default function Home() {
             <li><code>proxy_sv_demoUrl</code> must be set from a config file, not typed at the console: the engine treats <code>//</code> as a comment. When empty, links use the listener&apos;s own <code>http://&lt;bind&gt;:&lt;port&gt;</code>.</li>
             <li>The HTTP API is plain HTTP with no built-in TLS or authentication; put a reverse proxy in front. Bind defaults to loopback, and with either download switch off the listener stops entirely — no route, no socket.</li>
             <li>Team chat, private tells and per-client prints are never recorded. RMG/terrain maps start no segment, and a player in a vehicle is skipped for those frames.</li>
+            <li>Demo file URLs are never printed in game: the in-game <code>/demos</code> command and the end-of-game link block are gone. A first-time player gets the demo page URL once on join; a reconnect after a map change does not repeat it.</li>
             <li>Only finished files with the proxy&apos;s naming pattern are served; a segment still being written is <code>404</code>, and traversal or symlink escapes are rejected. With <code>sv_maxclients 32</code> there is no spare viewer slot, so the demo is a self-view.</li>
           </ul>
         </section>
