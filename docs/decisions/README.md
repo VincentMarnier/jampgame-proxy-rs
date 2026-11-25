@@ -180,3 +180,9 @@
   from the closed demo by a bit-level `MsgReader` (the inverse of the
   Phase 1 writer) that stops before the snapshot bodies; the HTTP-side cache,
   the spectator/team filters, and the limits (segment time, no match clock).
+- `0030-team-shuffle.md` — the `callvote shuffle <players per team>` vote
+  (`proxy_sv_teamShuffle`, `proxy_sv_teamShuffleMinTeamSize`): the 30 s
+  `/ready` window, the pristine-`SetTeam` spectator reset, the balanced
+  equal-team placement rule (parallel TFFA when on, main only otherwise), the
+  realization/capacity fallback and the one studied difference from the
+  requested 19-player example.

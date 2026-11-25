@@ -58,6 +58,7 @@ mod rules;
 mod scoreboard;
 mod sdk;
 mod shared_api;
+mod shuffle;
 mod state;
 mod syscall;
 mod teamlock;
@@ -166,6 +167,9 @@ pub unsafe extern "C" fn vmMain(
             let response = forward(GAME_RUN_FRAME, &args);
             if state::proxy_enabled() {
                 tffa::on_run_frame_post();
+                // Team shuffle: its ready window ends after the game's own
+                // frame handling (so a timelimit exit wins over a placement).
+                shuffle::on_run_frame_post();
                 duel::on_run_frame_post();
                 // The pristine game only sends the team overlay's `tinfo`
                 // roster to teammates; give it to following spectators too.
@@ -222,6 +226,7 @@ pub unsafe extern "C" fn vmMain(
             if state::proxy_enabled() {
                 shared_api::client_connect(a0, a1 != 0, a2 != 0);
                 tffa::on_client_connect(a0, a1 != 0);
+                shuffle::on_client_connect(a0, a1 != 0);
                 duel::on_client_connect(a0, a1 != 0);
                 teamlock::on_client_connect(a1 != 0);
             }
@@ -250,6 +255,7 @@ pub unsafe extern "C" fn vmMain(
             teamoverlay::on_client_disconnect(a0);
             if state::proxy_enabled() {
                 tffa::on_client_disconnect(a0);
+                shuffle::on_client_disconnect(a0);
                 duel::on_client_disconnect(a0);
             }
             // A disconnecting client drops what they carry
@@ -702,6 +708,9 @@ fn update_proxy_cvars() {
         // The same applies to ping equalisation: the stub that would ramp the
         // delay out is detached with the hook layer, so clear it (D-028.6).
         pingequalize::clear_offsets();
+        // A team-shuffle ready window cannot finish while the hooks are off;
+        // drop it so a runtime re-enable does not place a stale vote's players.
+        shuffle::on_proxy_disabled();
     }
     // Phase 4 publication: the demo maintenance thread and the HTTP listener
     // are reconciled here, once per frame. Both go through the C realign shim

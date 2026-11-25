@@ -18,22 +18,8 @@ use core::ffi::{CStr, c_char, c_int};
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::CString;
 
-use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
-use crate::hooks::game::client_clean_netname;
-use crate::original;
-use crate::sdk::{
-    CS_VOTE_NO, CS_VOTE_STRING, CS_VOTE_TIME, CS_VOTE_YES, EXEC_APPEND, EXEC_NOW, GT_DUEL,
-    GT_POWERDUEL, MAX_CLIENTS, MAX_NETNAME, MAX_STRING_CHARS, MAX_VOTE_COUNT,
-    OFFSET_GCLIENT_MGAMEFLAGS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS, OFFSET_GENTITY_CLIENT,
-    OFFSET_LEVEL_CLIENTS, OFFSET_LEVEL_MAXCLIENTS, OFFSET_LEVEL_TIME,
-    OFFSET_LEVEL_VOTE_DISPLAY_STRING, OFFSET_LEVEL_VOTE_EXECUTE_TIME, OFFSET_LEVEL_VOTE_NO,
-    OFFSET_LEVEL_VOTE_STRING, OFFSET_LEVEL_VOTE_TIME, OFFSET_LEVEL_VOTE_YES,
-    OFFSET_PERS_VOTE_COUNT, OFFSET_SESS_SESSION_TEAM, PSG_VOTED, SIZEOF_GCLIENT, SIZEOF_GENTITY,
-    TEAM_SPECTATOR,
-};
-use crate::state;
+use crate::sdk::{EXEC_APPEND, EXEC_NOW};
 use crate::syscall;
-use crate::utils;
 
 /// What the game runs when the vote passes. Kept unique so no normal vote can
 /// collide with it.
@@ -85,185 +71,11 @@ fn is_coinflip_execution(exec: i32, text: &[u8]) -> bool {
             .eq_ignore_ascii_case(VOTE_COMMAND.as_bytes())
 }
 
-/// Why a coinflip vote may not start, in the same order the game's
-/// `Cmd_CallVote_f` checks them.
-#[derive(Debug, PartialEq, Eq)]
-enum Refusal {
-    Disabled,
-    InProgress,
-    TooManyVotes,
-    Spectator,
-}
-
-impl Refusal {
-    fn message(self) -> &'static str {
-        match self {
-            Refusal::Disabled => "Voting is disabled on this server.",
-            Refusal::InProgress => "A vote is already in progress.",
-            Refusal::TooManyVotes => "You have called too many votes.",
-            Refusal::Spectator => "Spectators cannot call votes.",
-        }
-    }
-}
-
-/// Gate a call exactly like `Cmd_CallVote_f` before touching the vote state.
-fn refusal(
-    allow_vote: bool,
-    in_progress: bool,
-    vote_count: i32,
-    gametype: i32,
-    session_team: i32,
-) -> Option<Refusal> {
-    if !allow_vote {
-        return Some(Refusal::Disabled);
-    }
-    if in_progress {
-        return Some(Refusal::InProgress);
-    }
-    if vote_count >= MAX_VOTE_COUNT {
-        return Some(Refusal::TooManyVotes);
-    }
-    if gametype != GT_DUEL && gametype != GT_POWERDUEL && session_team == TEAM_SPECTATOR {
-        return Some(Refusal::Spectator);
-    }
-    None
-}
-
-/// Start the vote in the game's own `level` state: the same fields and
-/// configstrings `Cmd_CallVote_f` sets after its validation.
+/// Start the vote through the shared proxy-vote machinery (`crate::votes`).
 fn start_vote(client_num: c_int) {
-    let level = original::level_address();
-    if level == 0 {
-        return;
+    if let Err(reason) = crate::votes::start_proxy_vote(client_num, VOTE_COMMAND, VOTE_DISPLAY) {
+        crate::votes::reply(client_num, reason.message());
     }
-
-    let g_entities = state::with_state(|s| s.located_game_data.g_entities);
-    if g_entities == 0 {
-        return;
-    }
-    // SAFETY: the client slot is in range (`shared_api::client_command`) and
-    // g_entities is the located game array; a client command only runs for a
-    // live player.
-    let client = unsafe {
-        read_usize(g_entities + client_num as usize * SIZEOF_GENTITY + OFFSET_GENTITY_CLIENT)
-    };
-    if client == 0 {
-        return;
-    }
-
-    // SAFETY: `level` is the original module's live `level_locals_t`; the
-    // client pointer above is a live `gclient_t`.
-    let (now, vote_time, vote_execute_time, session_team, vote_count) = unsafe {
-        (
-            read_i32(level + OFFSET_LEVEL_TIME),
-            read_i32(level + OFFSET_LEVEL_VOTE_TIME),
-            read_i32(level + OFFSET_LEVEL_VOTE_EXECUTE_TIME),
-            read_i32(client + OFFSET_GCLIENT_SESS + OFFSET_SESS_SESSION_TEAM),
-            read_i32(client + OFFSET_GCLIENT_PERS + OFFSET_PERS_VOTE_COUNT),
-        )
-    };
-
-    // SAFETY: engine syscall registered; the cvars are the game's own.
-    let allow_vote = unsafe { syscall::cvar_variable_integer_value(c"g_allowVote") } != 0;
-    // SAFETY: engine syscall registered.
-    let gametype = unsafe { syscall::cvar_variable_integer_value(c"g_gametype") };
-
-    if let Some(reason) = refusal(
-        allow_vote,
-        vote_time != 0 || vote_execute_time != 0,
-        vote_count,
-        gametype,
-        session_team,
-    ) {
-        reply(client_num, reason.message());
-        return;
-    }
-
-    // SAFETY: every address below is a field of the live `level_locals_t` or
-    // of a live `gclient_t` in `level.clients`.
-    unsafe {
-        write_i32(level + OFFSET_LEVEL_VOTE_TIME, now);
-        write_i32(level + OFFSET_LEVEL_VOTE_EXECUTE_TIME, 0);
-        // The caller automatically votes yes, as `Cmd_CallVote_f` does.
-        write_i32(level + OFFSET_LEVEL_VOTE_YES, 1);
-        write_i32(level + OFFSET_LEVEL_VOTE_NO, 0);
-        write_level_string(level + OFFSET_LEVEL_VOTE_STRING, VOTE_COMMAND.as_bytes());
-        write_level_string(
-            level + OFFSET_LEVEL_VOTE_DISPLAY_STRING,
-            VOTE_DISPLAY.as_bytes(),
-        );
-
-        let clients = read_usize(level + OFFSET_LEVEL_CLIENTS);
-        let maxclients =
-            read_i32(level + OFFSET_LEVEL_MAXCLIENTS).clamp(0, MAX_CLIENTS as i32) as usize;
-        if clients != 0 {
-            for slot in 0..maxclients {
-                let flags = clients + slot * SIZEOF_GCLIENT + OFFSET_GCLIENT_MGAMEFLAGS;
-                write_i32(flags, read_i32(flags) & !(PSG_VOTED as i32));
-            }
-        }
-        let flags = client + OFFSET_GCLIENT_MGAMEFLAGS;
-        write_i32(flags, read_i32(flags) | PSG_VOTED as i32);
-    }
-
-    set_configstring(CS_VOTE_TIME, &now.to_string());
-    set_configstring(CS_VOTE_STRING, VOTE_DISPLAY);
-    set_configstring(CS_VOTE_YES, "1");
-    set_configstring(CS_VOTE_NO, "0");
-
-    announce_vote_called(client_num);
-}
-
-/// Copy `value` into a `MAX_STRING_CHARS` string field of the game's `level`.
-///
-/// # Safety
-///
-/// `offset` must point to a writable `char[MAX_STRING_CHARS]` field of the live
-/// `level_locals_t`.
-unsafe fn write_level_string(offset: usize, value: &[u8]) {
-    // SAFETY: caller guarantees the field is a writable MAX_STRING_CHARS array.
-    let field = unsafe { core::slice::from_raw_parts_mut(offset as *mut u8, MAX_STRING_CHARS) };
-    utils::strncpyz(field, value);
-}
-
-fn set_configstring(index: i32, value: &str) {
-    let Ok(value) = CString::new(value) else {
-        return;
-    };
-    // SAFETY: engine syscall registered; `value` is NUL-terminated.
-    unsafe { syscall::set_configstring(index, &value) };
-}
-
-/// Tell everyone a vote was called, as the game does (`Cmd_CallVote_f`).
-fn announce_vote_called(client_num: c_int) {
-    let mut raw = [0u8; MAX_NETNAME];
-    client_clean_netname(client_num, &mut raw);
-    let name = String::from_utf8_lossy(&raw[..utils::c_strlen(&raw)]);
-    let name = sanitize_name(&name);
-    send_print(-1, &format!("{name}^7 called a vote."));
-}
-
-/// A name goes inside `print "..."`: drop quotes and controls.
-fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '"' => '\'',
-            ch if ch.is_control() => ' ',
-            ch => ch,
-        })
-        .collect()
-}
-
-fn reply(client_num: c_int, text: &str) {
-    send_print(client_num, &format!("^3{text}^7"));
-}
-
-fn send_print(client_num: c_int, text: &str) {
-    let Ok(message) = CString::new(format!("print \"{text}\n\"")) else {
-        return;
-    };
-    // SAFETY: engine syscall registered; `message` is NUL-terminated.
-    unsafe { syscall::send_server_command(client_num, &message) };
 }
 
 /// What `svsay` shows after a passed vote.
@@ -337,44 +149,9 @@ mod tests {
     }
 
     #[test]
-    fn refusal_matches_the_games_check_order() {
-        assert_eq!(
-            refusal(false, true, 99, GT_DUEL, TEAM_SPECTATOR),
-            Some(Refusal::Disabled)
-        );
-        assert_eq!(
-            refusal(true, true, 99, GT_DUEL, TEAM_SPECTATOR),
-            Some(Refusal::InProgress)
-        );
-        assert_eq!(
-            refusal(true, false, MAX_VOTE_COUNT, GT_DUEL, TEAM_SPECTATOR),
-            Some(Refusal::TooManyVotes)
-        );
-        assert_eq!(
-            refusal(true, false, 0, GT_DUEL, TEAM_SPECTATOR),
-            None,
-            "duel lets spectators call votes"
-        );
-        assert_eq!(refusal(true, false, 0, GT_POWERDUEL, TEAM_SPECTATOR), None);
-        assert_eq!(
-            refusal(true, false, 0, crate::sdk::GT_TEAM, TEAM_SPECTATOR),
-            Some(Refusal::Spectator)
-        );
-        assert_eq!(
-            refusal(true, false, 0, crate::sdk::GT_TEAM, crate::sdk::TEAM_RED),
-            None
-        );
-    }
-
-    #[test]
     fn svsay_names_the_result() {
         assert_eq!(svsay_command(true), "svsay ^3Coin flip: ^7Heads!\n");
         assert_eq!(svsay_command(false), "svsay ^3Coin flip: ^7Tails!\n");
-    }
-
-    #[test]
-    fn names_are_safe_inside_a_print_command() {
-        assert_eq!(sanitize_name("Darth \"Vader\"\n"), "Darth 'Vader' ");
     }
 
     #[test]

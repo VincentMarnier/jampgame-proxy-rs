@@ -47,6 +47,8 @@ Project website: <https://vincentmarnier.github.io/jampgame-proxy-rs/>.
 | `proxy_parallel_tffas_enable`         | 0       | run parallel self-organized TFFA matches on one GT_TEAM map (`tffa_create`/`tffa_join`/`tffa_list`); damage/scoreboard/visibility/sounds-and-effects/team chat isolated per match, global chat stays server-wide (see below); the pre-rename `proxy_tffa_enable` still works as an alias |
 | `proxy_parallel_tffas_maxMatches`     | 8       | maximum parallel TFFA matches (alias `proxy_tffa_maxMatches`) |
 | `proxy_parallel_tffas_maxGroupSize`   | 12      | maximum players per TFFA match, both teams combined (alias `proxy_tffa_maxGroupSize`) |
+| `proxy_sv_teamShuffle`                | 0       | allow the `callvote shuffle <players per team>` vote: it sends everyone to spectator, opens a 30 s `/ready` window, then spreads the ready players over equal-team games (parallel TFFA when enabled, the main game otherwise); see [Team shuffle](#team-shuffle) |
+| `proxy_sv_teamShuffleMinTeamSize`     | 2       | smallest team a shuffle may create; with the default `2` a shuffle never makes a 1v1, and too few ready players simply stay spectators |
 | `proxy_parallel_duels_enable`         | 0       | run a parallel duel ladder on one GT_DUEL map: several 1v1 courts at once, winners move up and losers down between rounds, first to `duel_fraglimit` wins (see [Parallel duels](#parallel-duels)) |
 | `proxy_sv_spectatorTeamOverlay`       | 1       | send the team overlay's HP/armor roster to spectators following a player (works with TaystJK's `cg_drawTeamOverlay` and the stock `team info` HUD; see [Spectator team overlay](#spectator-team-overlay)) |
 | `proxy_sv_enableClientPpsLimit`       | 0       | per-client incoming packet-rate limiter: the maximum allowed pps is an integer downscale of the client's measured FPS ± `proxy_sv_clientPpsFpsMargin`, capped by `proxy_sv_globalMaxPps`; excess packets are dropped evenly through the next second, not at its tail (see [Client packet rate](#client-packet-rate)) |
@@ -1086,7 +1088,36 @@ them) takes no parallel matches at all, and `tffa_create` is refused with a
 message when the map's remaining entity slots cannot hold another whole set —
 coverage is never traded for match count.
 
-### Parallel duels
+### Team shuffle
+
+With `proxy_sv_teamShuffle 1`, any player may call
+`callvote shuffle <players per team>` on a team gametype (`GT_TEAM` or
+`GT_CTF`). The vote is a normal yes/no vote; when it passes, everyone is sent
+to spectator and a 30-second window starts. A centre message and a console
+line invite players to type `/ready`; only the players who do (and are still
+connected) are placed.
+
+Each game gets two equally sized teams, never larger than the vote's number
+and never smaller than `proxy_sv_teamShuffleMinTeamSize` (default `2`, so no
+1v1 is created). The largest even number of ready players is placed — an odd
+one leaves exactly one spectator — using the fewest games and keeping the team
+sizes as close together as possible. For example, with a team size of `4`:
+
+| Ready | Games |
+|-------|-------|
+| 20    | 4v4, 3v3, 3v3 |
+| 15    | 4v4, 3v3 (one spectator) |
+| 12    | 3v3, 3v3 |
+| 6     | 3v3 |
+| 3     | none (minimum is 2v2), everyone spectates |
+
+With `proxy_parallel_tffas_enable 1` the games use the main slot plus as many
+created TFFA matches as needed (bounded by
+`proxy_parallel_tffas_maxMatches` and the map's per-instance world capacity);
+without it only the main game is filled, `20 ready → one 4v4`, and the rest
+stay spectators. A shuffle starts everyone from a clean slate: scores, match
+passwords and remembered rosters are dropped, and a player who joined a team
+during the ready window is put back in spectator before the placement.
 
 With `proxy_parallel_duels_enable 1` (`GT_DUEL` only), the map runs several
 1v1 duels at once. Every connected player (and bot) is willing by default and

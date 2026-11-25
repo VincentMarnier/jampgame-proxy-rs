@@ -381,6 +381,12 @@ pub fn client_command(client_num: c_int) -> bool {
         return false;
     }
 
+    // `callvote shuffle <n>` and `/ready` are the team-shuffle vote and its
+    // ready window (D-030).
+    if crate::shuffle::handle_client_command(client_num, cmd, cmd_arg1, cmd_arg2) {
+        return false;
+    }
+
     if unsafe { jampgame::q_stricmpn(cstr_ptr(cmd), c"callvote".as_ptr(), 8) } == 0 {
         let cmd_arg2_number_value = utils::atoi(cmd_arg2);
         let mut min_arg2 = 0i32;

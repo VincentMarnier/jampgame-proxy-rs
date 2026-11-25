@@ -59,12 +59,13 @@
 
 use core::ffi::{CStr, c_char, c_int};
 
-use crate::hooks::engine_sv::{read_i32, read_usize};
+use crate::hooks::engine_sv::{read_i32, read_usize, write_i32};
 use crate::sdk::{
     CON_CONNECTED, CON_DISCONNECTED, CS_PLAYERS, CS_SCORES1, CS_SCORES2, MAX_CLIENTS,
     MAX_GENTITIES, MAX_TOKEN_CHARS, OFFSET_GCLIENT_PERS, OFFSET_GCLIENT_SESS,
-    OFFSET_GENTITY_CLIENT, OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY,
-    TEAM_BLUE, TEAM_RED, TEAM_SPECTATOR,
+    OFFSET_GENTITY_CLIENT, OFFSET_LEVEL_TEAM_SCORES_BLUE, OFFSET_LEVEL_TEAM_SCORES_RED,
+    OFFSET_PERS_CONNECTED, OFFSET_SESS_SESSION_TEAM, SIZEOF_GENTITY, TEAM_BLUE, TEAM_RED,
+    TEAM_SPECTATOR,
 };
 use crate::state::{self, CVAR_TFFA_ENABLE, CVAR_TFFA_MAX_GROUP_SIZE, CVAR_TFFA_MAX_MATCHES};
 
@@ -2290,6 +2291,69 @@ pub(crate) fn set_client_spectator(client_num: c_int) -> bool {
     set_client_team(client_num, c"spectator")
 }
 
+/// Team shuffle (D-030): force every playing client to spectator, return every
+/// assignment to main and close all created matches, so the ready window starts
+/// from one clean slate. Scores, stats and remembered rosters are dropped (a
+/// shuffle is a fresh round for everyone). Called from `crate::shuffle` both
+/// when the vote passes and again when the ready window ends, so a player who
+/// joined a team meanwhile cannot keep a place in the main game.
+pub(crate) fn evacuate_to_spectator() {
+    if state::with_state(|s| s.located_game_data.g_entities) == 0 {
+        return;
+    }
+    let (connected, playing) = client_census();
+    for (cn, playing) in playing.iter().copied().enumerate() {
+        if playing {
+            set_client_spectator(cn as c_int);
+        }
+    }
+    state::with_state(|s| {
+        for cn in 0..MAX_CLIENTS {
+            s.tffa.client_match[cn] = MAIN_MATCH;
+            s.tffa.home[cn] = MAIN_MATCH;
+            s.tffa.pass_ok[cn] = MAIN_MATCH;
+            s.tffa.player_score[cn] = 0;
+            s.tffa.pending_join[cn] = REMEMBERED_NONE;
+        }
+        s.tffa.main_origin = MAIN_MATCH;
+        let main = &mut s.tffa.matches[MAIN_MATCH as usize];
+        main.active = true;
+        main.red = 0;
+        main.blue = 0;
+        main.end_queued_at = 0;
+        main.remembered = [REMEMBERED_NONE; MAX_CLIENTS];
+        main.clear_password();
+    });
+    for id in 1..TOTAL_MATCH_SLOTS {
+        let active = state::with_state(|s| s.tffa.matches[id].active);
+        if active {
+            close_instance(id as u8);
+        }
+    }
+    // The game's own tally is the one the HUD reads when parallel TFFA is off
+    // (when it is on, `on_add_score` keeps it neutralised). A shuffle starts a
+    // fresh round, so the old red/blue totals must not survive it.
+    let level = crate::original::level_address();
+    if level != 0 {
+        // SAFETY: `level` is the original module's live `level_locals_t`;
+        // `teamScores` are plain ints.
+        unsafe {
+            write_i32(level + OFFSET_LEVEL_TEAM_SCORES_RED, 0);
+            write_i32(level + OFFSET_LEVEL_TEAM_SCORES_BLUE, 0);
+        }
+    }
+    for (cn, connected) in connected.iter().copied().enumerate() {
+        if !connected {
+            continue;
+        }
+        forget_return_rosters(cn as c_int);
+        reset_slot_stats(cn as c_int);
+        broadcast_cs_players_slot(cn as c_int);
+        refresh_cs_players_for_viewer(cn as c_int);
+    }
+    on_set_cs_scores();
+}
+
 /// Force every member of a match to spectator through the pristine `SetTeam`
 /// body. Members return to the main slot so they can see it and join
 /// elsewhere.
@@ -3044,7 +3108,7 @@ fn tell(client_num: c_int, text: &str) {
     unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
 }
 
-fn max_matches() -> usize {
+pub(crate) fn max_matches() -> usize {
     let v = state::cvar_integer(CVAR_TFFA_MAX_MATCHES);
     // Clamp before the `as usize` cast: a negative admin value would
     // otherwise wrap huge and silently select the maximum.
@@ -3067,7 +3131,7 @@ fn match_size(match_id: u8) -> usize {
 /// (they can bypass the proxy's `GAME_CLIENT_BEGIN` flag when the game adds
 /// them), so the proxy's own `is_connected` mirror is only a fallback for the
 /// bootstrap window where the world is not located yet.
-fn connected_clients() -> [bool; MAX_CLIENTS] {
+pub(crate) fn connected_clients() -> [bool; MAX_CLIENTS] {
     client_census().0
 }
 
@@ -3081,7 +3145,7 @@ fn playing_clients() -> [bool; MAX_CLIENTS] {
 /// on the spectator team — the pristine `numPlayingClients` filter). The
 /// timelimit continuation asks whether a tied match still has someone who can
 /// change its score; a match left with only spectators can never untie.
-fn client_census() -> ([bool; MAX_CLIENTS], [bool; MAX_CLIENTS]) {
+pub(crate) fn client_census() -> ([bool; MAX_CLIENTS], [bool; MAX_CLIENTS]) {
     let g_entities = state::with_state(|s| s.located_game_data.g_entities);
     if g_entities == 0 {
         return (

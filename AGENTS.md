@@ -35,6 +35,8 @@ docs/ holds the reverse-engineering evidence, the architecture notes and the dec
 - docs/decisions/0026-tffa-cvar-rename.md — the `proxy_tffa_*` → `proxy_parallel_tffas_*` cvar rename, the legacy spellings kept as registered aliases, and the canonical-unless-default resolution rule.
 - docs/decisions/0027-server-demos.md — server-side demo recording (`.dm_26`), the shadow-state recorder, publication over the proxy's HTTP listener, retention and the accepted guards.
 - docs/decisions/0028-ping-equalize.md — ping equalisation (`proxy_sv_pingEqualize`): a server-side delay added to low-ping players' inbound usercmds, target = min(cap, slowest ping), 500 ms/deadband tracking, the 1 ms/command ramp, the `ps.ping` display and `eff` netStatus column, and the prediction-window cap rationale.
+- docs/decisions/0029-demo-listing-metadata.md — `/demos` metadata decoded from closed demo files, the HTTP cache and its limits.
+- docs/decisions/0030-team-shuffle.md — the `callvote shuffle <players per team>` vote (`proxy_sv_teamShuffle`, `proxy_sv_teamShuffleMinTeamSize`), the 30 s `/ready` window, the pristine-`SetTeam` spectator reset and the balanced equal-team placement rule.
 - docs/decisions/README.md — index of the decision records.
 
 Source authority (game vs engine)

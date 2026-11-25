@@ -624,6 +624,9 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                 if !crate::coinflip::console_command_from_ptr(a0, text) {
                     return 0;
                 }
+                if !crate::shuffle::console_command_from_ptr(a0, text) {
+                    return 0;
+                }
                 // D-025: classify a `map_restart` as the proxy's own round
                 // transition (armed token) or an admin/voted restart. The
                 // engine's rcon path never reaches this trap; it lands in

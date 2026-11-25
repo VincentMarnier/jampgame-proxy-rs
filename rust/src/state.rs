@@ -22,7 +22,7 @@ use crate::sdk::{MAX_CLIENTS, MAX_GENTITIES, MAX_NETNAME, VmCvar};
 /// `proxy_sv_antiWallHack` is re-added by D-023 as a new implementation that
 /// reuses the D-022 hide path. `proxy_sv_enableRconCmdCooldown` was removed with
 /// the 2026 rcon rate-limit policy (10-25 F6, S11).
-pub const PROXY_CVARS: [(&CStr, &CStr); 62] = [
+pub const PROXY_CVARS: [(&CStr, &CStr); 64] = [
     (c"proxy_sv_enable", c"1"),
     (c"proxy_sv_enableNetStatus", c"0"),
     (c"proxy_sv_maxCallVoteMapRestartValue", c"60"),
@@ -93,6 +93,10 @@ pub const PROXY_CVARS: [(&CStr, &CStr); 62] = [
     // D-028: ping equalisation.
     (c"proxy_sv_pingEqualize", c"0"),
     (c"proxy_sv_pingEqualizeLog", c"0"),
+    // `callvote shuffle <players per team>`: 0 off, non-zero allows the vote
+    // and its `/ready` window.
+    (c"proxy_sv_teamShuffle", c"0"),
+    (c"proxy_sv_teamShuffleMinTeamSize", c"2"),
 ];
 
 /// Indexes into `PROXY_CVARS` / `ProxyState::cvars` (mirror of
@@ -331,6 +335,16 @@ pub const CVAR_PING_EQUALIZE: usize = 60;
 /// `proxy_sv_pingEqualize 0` it previews what the maximum supported cap would
 /// apply (see [`crate::pingequalize`]).
 pub const CVAR_PING_EQUALIZE_LOG: usize = 61;
+
+/// `proxy_sv_teamShuffle`: allow the `callvote shuffle <players per team>` vote
+/// and its 30 s `/ready` window (`crate::shuffle`). `0` = off (the vote is left
+/// to the pristine game, which rejects the unknown name), non-zero = on. Only
+/// team gametypes (`GT_TEAM`, `GT_CTF`) accept it.
+pub const CVAR_TEAM_SHUFFLE: usize = 62;
+/// `proxy_sv_teamShuffleMinTeamSize`: smallest team a shuffle may create
+/// (default `2`, i.e. 2v2). A bigger minimum prevents the vote from forming
+/// tiny games; when fewer players are ready, they stay spectators.
+pub const CVAR_TEAM_SHUFFLE_MIN_TEAM_SIZE: usize = 63;
 
 /// The pre-rename spelling of a canonical cvar, if it has one (D-026).
 ///
@@ -1257,6 +1271,9 @@ pub struct ProxyState {
     /// snapshot currently being built, restored as soon as the engine has
     /// copied them.
     pub fov: crate::fov::FovState,
+    /// Team-shuffle vote state (`crate::shuffle`): the ready window, its
+    /// deadline and the players who typed `/ready`.
+    pub shuffle: crate::shuffle::ShuffleState,
 }
 
 static STATE: Mutex<Option<ProxyState>> = Mutex::new(None);
@@ -1505,6 +1522,7 @@ impl ProxyState {
             tffa: TffaState::default(),
             duel: DuelState::default(),
             fov: crate::fov::FovState::default(),
+            shuffle: crate::shuffle::ShuffleState::default(),
         }
     }
 }
@@ -1663,6 +1681,11 @@ mod tests {
         assert_eq!(PROXY_CVARS[CVAR_DEMO_MAX_FILE_MB].1.to_bytes(), b"128");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_MIN_FREE_MB].1.to_bytes(), b"512");
         assert_eq!(PROXY_CVARS[CVAR_DEMO_INTERMISSION_SECS].1.to_bytes(), b"3");
+        assert_eq!(PROXY_CVARS[CVAR_TEAM_SHUFFLE].1.to_bytes(), b"0");
+        assert_eq!(
+            PROXY_CVARS[CVAR_TEAM_SHUFFLE_MIN_TEAM_SIZE].1.to_bytes(),
+            b"2"
+        );
         assert_eq!(PROXY_CVARS[CVAR_ENABLE].1.to_bytes(), b"1");
     }
 
