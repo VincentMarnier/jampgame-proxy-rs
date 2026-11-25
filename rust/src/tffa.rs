@@ -1458,7 +1458,7 @@ fn restore_pristine_views(red: i32, blue: i32) {
         return;
     }
     let bases: [Option<String>; MAX_CLIENTS] =
-        core::array::from_fn(|slot| get_live_cs(CS_PLAYERS + slot as i32));
+        core::array::from_fn(|slot| get_live_cs_players(slot as i32));
     let red = red.to_string();
     let blue = blue.to_string();
     for viewer in viewers {

@@ -2920,3 +2920,91 @@ harness asserts every line above and exits 0.
   is deliberately not covered (its player field rides `s.modelindex`). Extending
   the same construction stamp to them is a mechanical follow-up if reported — the
   scope and the stamp already exist.
+
+### D-006.18 — A re-pushed `CS_PLAYERS` name stays inside `MAX_NETNAME`
+
+*Status: landed (live client report, 2026-11-25). Unit-tested and
+runtime-matched.*
+
+Reported: while playing on the proxy, clients print
+
+```text
+Com_sprintf: Output length 38 too short, require 41 bytes.
+```
+
+**Evidence.** The message is OpenJK/TaystJK's `Com_sprintf`
+(`codemp/qcommon/q_shared.c:671`, `%d` = the caller's size). In the TaystJK
+cgame the only 38-byte call is `CG_Obituary`
+(`codemp/cgame/cg_event.c:150`):
+
+```c
+char targetName[MAX_NETNAME+2];                     // MAX_NETNAME = 36 → 38
+Com_sprintf(targetName, sizeof(targetName), "%s%s", targetInfo->name, S_COLOR_WHITE);
+```
+
+The shipped `cgamex86_64.so` matches it: `call Com_sprintf` at `0x9a062` with
+`mov $0x26,%esi` and the format bytes `%s%s` (`0x140d0b`). A formatted result
+of 40 bytes (`len + 1 == 41`) is a 38-byte `targetInfo->name` plus `^7`.
+`CG_NewClientInfo` copies that name from `CS_PLAYERS` `n` into
+`clientInfo_t.name[MAX_QPATH]` (`cg_players.c:2083`), so the cgame accepts a
+long value even though the game caps `pers.netname` at `MAX_NETNAME - 1` = 35
+bytes (`g_client.c:1335-1410`).
+
+**Cause.** The proxy's `G_SET_CONFIGSTRING` interception decodes a
+`CS_PLAYERS` value with `String::from_utf8_lossy`
+(`syscall.rs`, the `CS_PLAYERS..CS_PLAYERS + MAX_CLIENTS` arm). Names are
+legacy single-byte text, not UTF-8: one invalid byte (e.g. a latin-1 `é`,
+`0xE9`) becomes the 3-byte U+FFFD replacement. A legal 33-byte name with two
+such bytes decodes to 39 bytes, and 38 bytes is exactly what the report shows.
+That longer name is harmless in `clientInfo_t.name[MAX_QPATH]`, but not in
+`CG_Obituary`'s 38-byte obituary buffer. It reaches the client whenever the
+proxy re-sends a stored base rather than the engine's own broadcast — e.g. a
+viewer following another player, a match move (the record held the prefixed
+outsider value, the desired value is the base), or the
+`forget_all_view_overrides` re-push after `proxy_sv_enable` is turned back on.
+Same-match dedup normally hides the lossy value, which is why the report is
+intermittent.
+
+**Fix (shared instancing core).** `instances::clamp_cs_players_name` caps the
+`n` value at `MAX_NETNAME - 1` bytes on a UTF-8 boundary (and drops a bare
+trailing `^`), returning the string only when it changed. It is applied:
+
+- when the game's `CS_PLAYERS` value is captured (`on_set_cs_players`), so the
+  stored base and the broadcast record are already safe;
+- in the live fallback (`get_live_cs_players`, also used by the pristine-view
+  restore now);
+- before the per-viewer dedup record and send (`push_cs_players`);
+- as a final guard on every `CS_PLAYERS` send (`send_cs_to_client`), so a
+  future caller cannot reintroduce the overflow.
+
+A 35-byte name plus `^7` is 37 characters, which fits the 38-byte
+`targetName` buffer with its NUL.
+
+**Tests.** `instances::tests::a_cs_players_name_is_kept_inside_max_netname`
+(other keys survive, a legal name is untouched) and
+`a_lossy_latin1_name_cannot_outgrow_the_obituary_buffer` (two `0xE9` bytes in
+a 33-byte name decode to 39 bytes, clamp leaves room for `^7`). `cargo test`
+556/556, `clippy --all-targets -D warnings`, `fmt --check`, the i686 release
+build and `rust/scripts/engine-test.sh` are green.
+
+**Runtime matched pair.** `tools/runtime/a11_cs_players_name.sh` runs the 2003
+engine with the proxy and two synthetic protocol clients. `Long` connects with
+a legal 34-byte latin-1 name (32 `x` + two `0xE9`) and creates a TFFA match;
+`Watcher` follows it, which turns Long from a prefixed outsider into an
+own-match player and makes the proxy re-send the stored base. The captured
+`cs CS_PLAYERS` `n` for Long's slot:
+
+```text
+pre-fix : n_bytes=38  b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\xef\xbf\xbd\xef\xbf\xbd'   FAIL
+post-fix: n_bytes=35  b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\xef\xbf\xbd'               PASS
+```
+
+38 bytes is exactly the report's `require 41` (38 + `^7` + NUL). The same run
+also shows the engine's own broadcast (34 raw bytes) and the 35-byte
+`(TFFA 1) ` prefixed outsider value untouched.
+
+**Residual.** The length is fixed, but the same lossy decode still turns
+non-UTF-8 name bytes into U+FFFD (mojibake) whenever the proxy re-sends a
+`CS_PLAYERS` base. Keeping `CS_PLAYERS` as raw bytes end to end is the complete
+fix; it is a larger change than the obituary overflow warranted and is left as
+a separate follow-up.

@@ -21,6 +21,7 @@
 //! server runs exactly one of them (the gametypes are mutually exclusive).
 
 use core::ffi::c_int;
+use std::borrow::Cow;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -332,6 +333,38 @@ pub fn info_set(info: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// Keep a `CS_PLAYERS` info string's `n` value inside the game's own
+/// `MAX_NETNAME` cap (`MAX_NETNAME - 1` bytes).
+///
+/// The game already caps `client->pers.netname` this way, so a base string that
+/// came straight from it needs nothing. The guard exists because the proxy
+/// decodes configstrings as UTF-8: `String::from_utf8_lossy` replaces each
+/// invalid byte of a legacy single-byte name with U+FFFD (3 bytes), so a legal
+/// 34-byte Latin-1 name can become 38 bytes. That longer name is fine for
+/// cgame's `clientInfo_t.name[MAX_QPATH]`, but its stock obituary path formats
+/// it into `char targetName[MAX_NETNAME + 2]` (`CG_Obituary`,
+/// `cg_event.c:150`), and the client then prints
+/// `Com_sprintf: Output length 38 too short, require 41 bytes.`
+///
+/// Returns the rewritten string only when the name had to be cut.
+pub(crate) fn clamp_cs_players_name(info: &str) -> Option<String> {
+    let name = info_value(info, "n")?;
+    let max = MAX_NETNAME.saturating_sub(1);
+    if name.len() <= max {
+        return None;
+    }
+    let mut cut = max;
+    while cut > 0 && !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Avoid leaving a bare `^` (color escape) at the cut, as
+    // `prefixed_name_with` does.
+    if cut > 0 && name.as_bytes()[cut - 1] == b'^' {
+        cut -= 1;
+    }
+    Some(info_set(info, "n", &name[..cut]))
+}
+
 /// `(TFFA N) ` prefix length for single-digit matches (0..=8): 9 bytes.
 pub(crate) fn prefix_for(player_match: u8) -> String {
     format!("(TFFA {player_match}) ")
@@ -498,6 +531,18 @@ pub(crate) fn reliable_pressure(client_num: c_int) -> bool {
 /// now is what overflowed the buffer, dropped clients and made real clients
 /// print `CL_GetServerCommand: a reliable command was cycled out` (D-006.12).
 pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
+    // A `CS_PLAYERS` value may come from a lossy UTF-8 decode of a single-byte
+    // name (see [`clamp_cs_players_name`]); keep every send inside the length
+    // the game itself guarantees, whatever the caller passed.
+    let value = if cs_players_slot(index).is_some() {
+        match clamp_cs_players_name(value) {
+            Some(clamped) => Cow::Owned(clamped),
+            None => Cow::Borrowed(value),
+        }
+    } else {
+        Cow::Borrowed(value)
+    };
+    let value: &str = value.as_ref();
     // Never add to the `map_restart` reconnect burst: the engine queues a
     // reliable command per reconnecting client for every client, and a
     // populated server is already close to the 128-slot limit before the proxy
@@ -717,6 +762,16 @@ pub(crate) fn push_cs_players(client_num: c_int, slot: usize, value: &str) -> bo
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) || slot >= MAX_CLIENTS {
         return false;
     }
+    // Clamp before the dedup record so the record matches what goes on the
+    // wire (and a later identical value is not re-sent).
+    let clamped;
+    let value = match clamp_cs_players_name(value) {
+        Some(clamped_value) => {
+            clamped = clamped_value;
+            clamped.as_str()
+        }
+        None => value,
+    };
     let viewer = client_num as usize;
     let index = CS_PLAYERS + slot as i32;
     if state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] == value) {
@@ -835,7 +890,8 @@ pub(crate) fn get_live_cs(index: i32) -> Option<String> {
 /// Live server configstring for a player slot (fallback when the proxy base
 /// is empty, e.g. the slot was assigned while the feature was off).
 pub(crate) fn get_live_cs_players(slot: i32) -> Option<String> {
-    get_live_cs(CS_PLAYERS + slot)
+    let value = get_live_cs(CS_PLAYERS + slot)?;
+    Some(clamp_cs_players_name(&value).unwrap_or(value))
 }
 
 /// Push every current per-viewer override to one client (fresh connects get
@@ -2484,6 +2540,17 @@ pub fn on_set_cs_players(slot: i32, value: &str) {
     if !(0..MAX_CLIENTS as i32).contains(&slot) {
         return;
     }
+    // The decoded `value` is what later per-viewer re-pushes carry. A name
+    // that the lossy decode pushed past `MAX_NETNAME` must not enter the base
+    // (see [`clamp_cs_players_name`]).
+    let clamped;
+    let value = match clamp_cs_players_name(value) {
+        Some(clamped_value) => {
+            clamped = clamped_value;
+            clamped.as_str()
+        }
+        None => value,
+    };
     state::with_state(|s| {
         s.tffa.cs_players_base[slot as usize] = value.to_owned();
     });
@@ -2557,5 +2624,50 @@ pub fn broadcast_cs_players_slot(slot: i32) {
         let value = rewrite_cs_players_for_slot(&base, slot as usize, table, viewer_match)
             .unwrap_or_else(|| base.clone());
         push_cs_players(viewer, slot as usize, &value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cs_players_name_is_kept_inside_max_netname() {
+        let long = "x".repeat(MAX_NETNAME + 2);
+        let info = format!("n\\{long}\\t\\2\\model\\kyle");
+        let out = clamp_cs_players_name(&info).expect("the overlong name is cut");
+        assert_eq!(
+            info_value(&out, "n").as_deref().map(str::len),
+            Some(MAX_NETNAME - 1)
+        );
+        assert_eq!(info_value(&out, "t").as_deref(), Some("2"));
+        assert_eq!(info_value(&out, "model").as_deref(), Some("kyle"));
+
+        // At the game's own cap the value is already safe and is not rewritten.
+        let legal = format!("n\\{}\\t\\2", "y".repeat(MAX_NETNAME - 1));
+        assert!(clamp_cs_players_name(&legal).is_none());
+        // A missing `n` is left alone too.
+        assert!(clamp_cs_players_name("t\\2\\model\\kyle").is_none());
+    }
+
+    #[test]
+    fn a_lossy_latin1_name_cannot_outgrow_the_obituary_buffer() {
+        // Two 0xE9 bytes (a latin-1 accented letter) are not valid UTF-8, so
+        // the proxy's lossy decode turns each into a 3-byte U+FFFD. A legal
+        // 33-byte name therefore becomes 39 bytes before the clamp.
+        let mut raw = vec![b'x'; MAX_NETNAME - 3];
+        raw.extend_from_slice(&[0xE9, 0xE9]);
+        let lossy = String::from_utf8_lossy(&raw);
+        assert!(lossy.len() > MAX_NETNAME - 1);
+        let info = format!("n\\{lossy}\\t\\1");
+
+        let out = clamp_cs_players_name(&info).expect("the expanded name is cut");
+        let name = info_value(&out, "n").expect("n survives");
+        // The cut backs up to the previous UTF-8 boundary, so it can be a
+        // little shorter than the cap but never longer.
+        assert!(name.len() < MAX_NETNAME, "name {} bytes", name.len());
+        // TaystJK's `CG_Obituary` appends S_COLOR_WHITE ("^7") into
+        // `char targetName[MAX_NETNAME + 2]`; the cut name leaves room for it.
+        assert!(name.len() + "^7".len() < MAX_NETNAME + 2);
     }
 }
