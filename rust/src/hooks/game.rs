@@ -901,7 +901,8 @@ pub fn print_tffa_match_stats(members: &[c_int]) {
                     return false;
                 }
                 let base = &s.tffa.cs_players_base[*cn as usize];
-                crate::tffa::info_value(base, "t").and_then(|t| t.parse::<i32>().ok())
+                crate::tffa::info_value_bytes(base, b"t")
+                    .and_then(|t| core::str::from_utf8(t).ok()?.parse::<i32>().ok())
                     == Some(TEAM_SPECTATOR)
             })
             .collect()

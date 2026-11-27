@@ -1,12 +1,14 @@
 #!/bin/sh
-# A11: a re-pushed CS_PLAYERS name stays inside MAX_NETNAME.
+# A11: a re-pushed CS_PLAYERS name keeps its raw bytes and the MAX_NETNAME cap.
 #
 # Runs linuxjampded + the Rust proxy in the i386 runtime container with two
 # synthetic JA MP clients. `Long` has a legal 34-byte latin-1 name (32 ASCII
 # bytes + two 0xE9). It creates a TFFA match; `Watcher` follows it, so the
 # proxy re-sends Long's stored CS_PLAYERS base to the Watcher. The harness
-# requires every re-sent `n` to be at most MAX_NETNAME-1 (35) bytes. Pre-fix the
-# lossy UTF-8 decode sends 38 bytes and fails, matching the client's
+# requires the re-sent base to be byte-identical to the 34 raw bytes (no
+# U+FFFD from a lossy UTF-8 decode) and every re-sent `n` to be at most
+# MAX_NETNAME-1 (35) bytes. Pre-fix the base went out as 38 bytes containing
+# EF BF BD and failed, matching the client's
 # `Com_sprintf: Output length 38 too short, require 41 bytes.` report.
 #
 # Usage:

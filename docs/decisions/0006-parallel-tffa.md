@@ -3011,3 +3011,43 @@ non-UTF-8 name bytes into U+FFFD (mojibake) whenever the proxy re-sends a
 `CS_PLAYERS` base. Keeping `CS_PLAYERS` as raw bytes end to end is the complete
 fix; it is a larger change than the obituary overflow warranted and is left as
 a separate follow-up.
+
+**Correction (2026-11-27) — `CS_PLAYERS` is raw bytes end to end.** A user
+report (“some player names are not rendered as the original game”) is that
+residual: in parallel TFFA an outsider's re-sent base, and on the duel ladder
+every player's entry (the W/L injection always rewrites the string), carried
+U+FFFD instead of the legacy single-byte name, so the scoreboard and team
+overlay showed mojibake. The shared instancing core now keeps every
+`CS_PLAYERS` value as `Vec<u8>`:
+
+- `state::TffaState::cs_players_base`/`cs_players_sent` are `Vec<u8>`;
+- `instances::info_value_bytes`/`info_set_bytes`/`info_pairs_bytes` parse the
+  info string without decoding it, and `clamp_cs_players_name`,
+  `prefixed_name(_with)` and both rewrite paths work on bytes;
+- the `G_SET_CONFIGSTRING` interception passes `CStr::to_bytes()` straight
+  through (no `to_string_lossy`), and `send_cs_to_client_bytes`/`send_cs_now`
+  write the bytes into the `cs <index> "<value>"` command unchanged (only `"`
+  and CR/LF are still neutralised);
+- `get_live_cs`/`get_live_cs_players` fallbacks are bytes too, as is the demo
+  recorder's instance rewrite (which previously skipped a non-UTF-8 base with
+  `str::from_utf8(..).is_err()`).
+
+Announcement/chat text still renders a name through `String::from_utf8_lossy`
+(the `print`/`chat` builders are UTF-8 `String`s), so U+FFFD can still appear
+in a proxy message that embeds a legacy name; the game's own scoreboard,
+obituary and team overlay — the surfaces the report named — get the raw bytes.
+Making the proxy's text commands byte strings as well is a separate change.
+The `/demos` listing does decode recorded names (D-029): it now uses UTF-8 when
+the recorded value is valid UTF-8 and latin-1 otherwise, so a legacy name shows
+as `é` rather than U+FFFD in the metadata.
+
+**Tests.** `instances::tests::a_legacy_single_byte_name_keeps_its_raw_bytes`
+(a legal `0xE9`/`0xF4` name is not rewritten and survives `prefixed_name`) and
+`a_raw_name_survives_the_outsider_rewrite` (the demotion keeps the bytes);
+`tffa.rs`'s pure rewrite tests now compare bytes. Runtime:
+`tools/runtime/a11_cs_players_name.sh` now requires the re-sent base to be
+byte-identical to the 34-byte latin-1 name and no captured `n` to contain
+`EF BF BD`, in addition to the `MAX_NETNAME - 1` cap. `cargo test` 580/580,
+`cargo fmt --check`, the i686 release build and `rust/scripts/engine-test.sh`
+are green; the runtime run reports
+`n=b'xxxx...\xe9\xe9'` (34 bytes) and `(TFFA 1) ` (35 bytes).

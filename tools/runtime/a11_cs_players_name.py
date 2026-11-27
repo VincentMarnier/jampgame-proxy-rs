@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""A11: a re-pushed `CS_PLAYERS` name never exceeds `MAX_NETNAME`.
+"""A11: a re-pushed `CS_PLAYERS` name keeps its raw bytes and stays in the cap.
 
-The proxy decodes configstrings as UTF-8 and stores `CS_PLAYERS` bases as
-`String`s. A legacy single-byte name is not UTF-8, so `from_utf8_lossy` can
-inflate it: two latin-1 `0xE9` bytes become two 3-byte U+FFFD replacements.
-This harness reproduces the report
+A configstring is a byte string: a player name is legacy single-byte text
+(`'é'` = `0xE9`), not UTF-8. The proxy used to decode `CS_PLAYERS` with
+`String::from_utf8_lossy`, so every non-UTF-8 byte became a 3-byte U+FFFD.
+That both rendered the name as mojibake in the viewer's scoreboard/team
+overlay and, for a long name, inflated it past `MAX_NETNAME`, producing the
+client warning
 
     Com_sprintf: Output length 38 too short, require 41 bytes.
 
-which TaystJK's `CG_Obituary` emits when `targetInfo->name` is 38 bytes (its
-destination is `char targetName[MAX_NETNAME+2]`, and it appends `^7`).
+from TaystJK's `CG_Obituary` (`targetName[MAX_NETNAME+2]`, which appends
+`^7`).
 
 `Long` connects with a legal 34-byte name (32 `x` + two `0xE9`) and creates a
 TFFA match. `Watcher` follows Long, which changes Long from a prefixed outsider
 to the Watcher's own match player; the per-viewer `CS_PLAYERS` repair therefore
-re-sends the stored base, not just the prefixed value. The harness then reads
-every `CS_PLAYERS` `n` the Watcher received for Long's slot and requires the
-largest latin-1 byte length to be at most `MAX_NETNAME-1` (35).
+re-sends the stored base, not just the prefixed value. The harness reads every
+`CS_PLAYERS` `n` the Watcher received for Long's slot and requires:
 
-Pre-fix this prints `max n bytes: 38` and fails; post-fix it prints 35 and
-passes. A pass covers the wire value, not the client's cgame itself (the
-displayed warning is the client-side symptom of that byte length).
+- no value contains the UTF-8 replacement byte sequence `EF BF BD` (the lossy
+  decode's fingerprint), and
+- the re-sent base is byte-identical to the 34-byte latin-1 name, and
+- every value is at most `MAX_NETNAME - 1` (35) bytes.
+
+Pre-fix this prints `n_bytes=38 n=b'...\\xef\\xbf\\xbd...'` and fails; post-fix
+the base is the original 34 raw bytes and the only 35-byte value is the
+`(TFFA 1) ` prefix. A pass covers the wire value, not the client's cgame itself.
 """
 
 from __future__ import annotations
@@ -40,7 +46,10 @@ MAX_NETNAME = 36
 MAX_NAME_BYTES = MAX_NETNAME - 1
 # 32 ASCII + two latin-1 accented bytes = 34 bytes, legal for ClientCleanName.
 LONG = "x" * 32 + "\u00e9\u00e9"
-assert len(LONG.encode("latin-1")) == 34
+LONG_BYTES = LONG.encode("latin-1")
+assert len(LONG_BYTES) == 34
+# What the old lossy UTF-8 decode left in the name.
+REPLACEMENT = b"\xef\xbf\xbd"
 
 
 def run(*, port: int, engine: str, gamedata: str, artifacts: str, duration: float) -> int:
@@ -119,9 +128,21 @@ def run(*, port: int, engine: str, gamedata: str, artifacts: str, duration: floa
         if not rows:
             print("FAIL: Watcher received no CS_PLAYERS entry for Long")
             return 1
+        if any(REPLACEMENT in raw for _, _, raw in rows):
+            print(
+                "FAIL: a re-sent CS_PLAYERS name contains U+FFFD "
+                "(the lossy UTF-8 decode's replacement)"
+            )
+            return 1
+        if not any(raw == LONG_BYTES for _, _, raw in rows):
+            print(
+                "FAIL: no re-sent CS_PLAYERS base kept the latin-1 name bytes; "
+                f"expected {LONG_BYTES!r}"
+            )
+            return 1
         longest = max(size for _, size, _ in rows)
         print(
-            f"long latin-1 name: {len(LONG.encode('latin-1'))} bytes; "
+            f"long latin-1 name: {len(LONG_BYTES)} bytes; "
             f"largest re-sent n: {longest} bytes (cap {MAX_NAME_BYTES})"
         )
         if longest > MAX_NAME_BYTES:
@@ -130,7 +151,7 @@ def run(*, port: int, engine: str, gamedata: str, artifacts: str, duration: floa
                 "TaystJK's CG_Obituary targetName[MAX_NETNAME+2] overflows"
             )
             return 1
-        print("PASS: every re-sent CS_PLAYERS name fits MAX_NETNAME-1")
+        print("PASS: re-sent CS_PLAYERS names keep their raw bytes and fit MAX_NETNAME-1")
         return 0
     finally:
         server.stop()

@@ -805,7 +805,12 @@ pub struct TffaState {
     /// The `G_Sound` → `G_SoundTempEntity` handshake: source match of the
     /// temp entity currently being constructed (`SOURCE_WORLD` when none).
     pub pending_sound_source: u8,
-    pub cs_players_base: [String; MAX_CLIENTS],
+    /// Raw bytes of the last `CS_PLAYERS + n` info string the game set. A
+    /// configstring is a byte string: names are legacy single-byte text (a
+    /// Latin-1 `é`, a CP1251 Cyrillic letter), not UTF-8. Keeping the bytes
+    /// lets the per-viewer overrides (prefixed names, outsiders forced to
+    /// spectator) go back on the wire exactly as the game wrote them.
+    pub cs_players_base: [Vec<u8>; MAX_CLIENTS],
     /// Last `cs CS_PLAYERS + slot` value queued **to each viewer**
     /// (`[viewer][slot]`, empty = nothing sent yet): the per-viewer demotions
     /// are pushed again before every `scores` message so a lost override cannot
@@ -818,7 +823,7 @@ pub struct TffaState {
     /// engine's own `CS_PLAYERS` broadcasts and the proxy's sends keep it in
     /// step; a client that gets a fresh gamestate (connect, resend, restart)
     /// has its row dropped (`tffa::forget_view_overrides`).
-    pub cs_players_sent: [[String; MAX_CLIENTS]; MAX_CLIENTS],
+    pub cs_players_sent: [[Vec<u8>; MAX_CLIENTS]; MAX_CLIENTS],
     /// Whether each viewer's `cs_players_sent` row must be rebuilt from the
     /// server's **base** strings because its client just received a gamestate
     /// (`SV_SendClientGameState` → `tffa::forget_view_overrides`). The gamestate
@@ -1002,8 +1007,8 @@ impl Default for TffaState {
             owned_count: 0,
             sound_source: [crate::tffa::SOURCE_WORLD; MAX_GENTITIES],
             pending_sound_source: crate::tffa::SOURCE_WORLD,
-            cs_players_base: core::array::from_fn(|_| String::new()),
-            cs_players_sent: core::array::from_fn(|_| core::array::from_fn(|_| String::new())),
+            cs_players_base: core::array::from_fn(|_| Vec::new()),
+            cs_players_sent: core::array::from_fn(|_| core::array::from_fn(|_| Vec::new())),
             view_bases_from_gamestate: [false; MAX_CLIENTS],
             cs_scores_sent: [(i32::MIN, i32::MIN); MAX_CLIENTS],
             score_requested: [false; MAX_CLIENTS],

@@ -472,7 +472,7 @@ pub fn refresh_cs_players_for_scores(viewer: c_int) {
     // Same board match the `scores` rewrite uses (follow-aware, and the
     // pre-intermission capture while the final board is built).
     let viewer_match = viewer_board_match(viewer);
-    let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
+    let (table, mut bases): ([u8; MAX_CLIENTS], [Vec<u8>; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
     // Fall back to the live configstring for a slot whose base was assigned
     // while the feature was off (they are clientinfo sources too).
@@ -902,7 +902,7 @@ fn reset_round_state(t: &mut state::TffaState, keep: bool, max: usize) -> bool {
     // re-sends them as each client connects (and `send_all_overrides_to_client`
     // falls back to the live configstring meanwhile), so the old round's copies
     // must not be pushed as if they were current.
-    t.cs_players_base = core::array::from_fn(|_| String::new());
+    t.cs_players_base = core::array::from_fn(|_| Vec::new());
     // The record of what each viewer holds is about the old gamestates: every
     // client reconnects into a fresh one after the restart.
     for viewer in t.cs_players_sent.iter_mut() {
@@ -1074,7 +1074,7 @@ pub fn on_client_disconnect(client_num: c_int) {
                 .collect()
         });
         for viewer in viewers {
-            push_cs_players(viewer, client_num as usize, "");
+            push_cs_players(viewer, client_num as usize, b"");
         }
     }
 }
@@ -1275,7 +1275,7 @@ fn disable_parallel_tffa() {
         // The stored bases and caches belong to the overlay that just ended: a
         // later re-enable falls back to the live server strings and starts with
         // a clean dedup.
-        s.tffa.cs_players_base = core::array::from_fn(|_| String::new());
+        s.tffa.cs_players_base = core::array::from_fn(|_| Vec::new());
         for viewer in s.tffa.cs_players_sent.iter_mut() {
             for slot in viewer.iter_mut() {
                 slot.clear();
@@ -1458,14 +1458,14 @@ fn restore_pristine_views(red: i32, blue: i32) {
     if viewers.is_empty() {
         return;
     }
-    let bases: [Option<String>; MAX_CLIENTS] =
+    let bases: [Option<Vec<u8>>; MAX_CLIENTS] =
         core::array::from_fn(|slot| get_live_cs_players(slot as i32));
     let red = red.to_string();
     let blue = blue.to_string();
     for viewer in viewers {
         for (slot, base) in bases.iter().enumerate() {
             if let Some(base) = base {
-                send_cs_to_client(viewer, CS_PLAYERS + slot as i32, base);
+                send_cs_to_client_bytes(viewer, CS_PLAYERS + slot as i32, base);
             }
         }
         send_cs_to_client(viewer, CS_SCORES1, &red);
@@ -1728,14 +1728,21 @@ fn collect_result(
             _ => REMEMBERED_NONE,
         });
         let base = &state.tffa.cs_players_base[*cn as usize];
-        let team = base
-            .is_empty()
-            .then_some(None)
-            .unwrap_or_else(|| info_value(base, "t").and_then(|t| t.parse::<i32>().ok()));
+        let team = if base.is_empty() {
+            None
+        } else {
+            info_value_bytes(base, b"t")
+                .and_then(|t| core::str::from_utf8(t).ok()?.parse::<i32>().ok())
+        };
         let name = if base.is_empty() {
             format!("player{cn}")
         } else {
-            announce_name(&info_value(base, "n").unwrap_or_else(|| format!("player{cn}")))
+            // The announcement text is a `String`; the stored base is raw
+            // bytes. Announcements keep the previous lossy rendering (a
+            // legacy byte shows as U+FFFD there); the scoreboard itself gets
+            // the raw value through the `cs` path.
+            let raw = String::from_utf8_lossy(info_value_bytes(base, b"n").unwrap_or_default());
+            announce_name(&raw)
         };
         match team {
             Some(TEAM_RED) => red_names.push(name),
@@ -5066,28 +5073,28 @@ mod tests {
         // Fix A: same-match slots are not re-sent at connect (they already hold
         // the base string from the gamestate / the game's own broadcast), so a
         // main-only server queues no `cs` per slot during the reconnect burst.
-        let base = "n\\Bob\\t\\2\\model\\kyle";
-        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases[0] = base.to_owned();
-        bases[1] = base.to_owned();
+        let base = b"n\\Bob\\t\\2\\model\\kyle";
+        let mut bases: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases[0] = base.to_vec();
+        bases[1] = base.to_vec();
         let table = [MAIN_MATCH; MAX_CLIENTS];
         assert!(demotions_for_viewer(MAIN_MATCH, &table, &bases).is_empty());
         // A real spectator watching main is own too.
-        let mut bases2: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases2[0] = "n\\Spec\\t\\3\\model\\kyle".to_owned();
+        let mut bases2: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases2[0] = b"n\\Spec\\t\\3\\model\\kyle".to_vec();
         assert!(demotions_for_viewer(MAIN_MATCH, &table, &bases2).is_empty());
     }
 
     #[test]
     fn scoreboard_demotions_cover_exactly_the_playing_outsiders() {
         // Real CS_PLAYERS shape captured from a running GT_TEAM server.
-        let blue_main = "n\\TIE Pilot\\t\\2\\model\\stormpilot\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_2\\st2\\none\\dt\\0\\sdt\\0";
-        let red_instance = "n\\Alora\\t\\1\\model\\alora\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_4\\st2\\single_4\\dt\\0\\sdt\\0";
-        let real_spectator = "n\\Spec\\t\\3\\model\\kyle\\c1\\0\\c2\\0";
-        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases[0] = blue_main.to_owned(); // plays main, blue
-        bases[1] = red_instance.to_owned(); // plays instance 1, red
-        bases[2] = real_spectator.to_owned(); // spectator in main
+        let blue_main = b"n\\TIE Pilot\\t\\2\\model\\stormpilot\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_2\\st2\\none\\dt\\0\\sdt\\0";
+        let red_instance = b"n\\Alora\\t\\1\\model\\alora\\c1\\0\\c2\\0\\hc\\100\\w\\0\\l\\0\\skill\\ 0.00\\tt\\0\\tl\\0\\siegeclass\\none\\st\\single_4\\st2\\single_4\\dt\\0\\sdt\\0";
+        let real_spectator = b"n\\Spec\\t\\3\\model\\kyle\\c1\\0\\c2\\0";
+        let mut bases: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases[0] = blue_main.to_vec(); // plays main, blue
+        bases[1] = red_instance.to_vec(); // plays instance 1, red
+        bases[2] = real_spectator.to_vec(); // spectator in main
         let mut table = [MAIN_MATCH; MAX_CLIENTS];
         table[1] = 1;
 
@@ -5098,26 +5105,26 @@ mod tests {
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].0, 0);
         assert_eq!(
-            info_value(&out[0].1, "n").as_deref(),
-            Some("(TFFA 0) TIE Pilot")
+            info_value_bytes(&out[0].1, b"n"),
+            Some(&b"(TFFA 0) TIE Pilot"[..])
         );
-        assert_eq!(info_value(&out[0].1, "t").as_deref(), Some("3"));
+        assert_eq!(info_value_bytes(&out[0].1, b"t"), Some(&b"3"[..]));
         // The rest of the info string survives (model/colors/team task ...).
         assert_eq!(
-            info_value(&out[0].1, "model").as_deref(),
-            Some("stormpilot")
+            info_value_bytes(&out[0].1, b"model"),
+            Some(&b"stormpilot"[..])
         );
-        assert_eq!(info_value(&out[0].1, "st2").as_deref(), Some("none"));
+        assert_eq!(info_value_bytes(&out[0].1, b"st2"), Some(&b"none"[..]));
 
         // Main viewer: only instance-1's player is an outsider.
         let out = demotions_for_viewer(MAIN_MATCH, &table, &bases);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].0, 1);
         assert_eq!(
-            info_value(&out[0].1, "n").as_deref(),
-            Some("(TFFA 1) Alora")
+            info_value_bytes(&out[0].1, b"n"),
+            Some(&b"(TFFA 1) Alora"[..])
         );
-        assert_eq!(info_value(&out[0].1, "t").as_deref(), Some("3"));
+        assert_eq!(info_value_bytes(&out[0].1, b"t"), Some(&b"3"[..]));
     }
 
     #[test]
@@ -5125,33 +5132,36 @@ mod tests {
         // The refresh must carry every known slot, not only the demotions: a
         // slot that moved into the viewer's match needs its base string back.
         // (The per-viewer dedup turns the unchanged entries into no-ops.)
-        let own = "n\\Bob\\t\\1\\model\\kyle";
-        let outsider = "n\\Alora\\t\\2\\model\\alora";
-        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases[0] = own.to_owned();
-        bases[1] = outsider.to_owned();
+        let own = b"n\\Bob\\t\\1\\model\\kyle";
+        let outsider = b"n\\Alora\\t\\2\\model\\alora";
+        let mut bases: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases[0] = own.to_vec();
+        bases[1] = outsider.to_vec();
         let mut table = [MAIN_MATCH; MAX_CLIENTS];
         table[1] = 1;
 
         let out = desired_cs_players(MAIN_MATCH, &table, &bases);
         assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[0], (0, own.to_owned()));
+        assert_eq!(out[0], (0, own.to_vec()));
         assert_eq!(out[1].0, 1);
         assert_eq!(
-            info_value(&out[1].1, "n").as_deref(),
-            Some("(TFFA 1) Alora")
+            info_value_bytes(&out[1].1, b"n"),
+            Some(&b"(TFFA 1) Alora"[..])
         );
-        assert_eq!(info_value(&out[1].1, "t").as_deref(), Some("3"));
+        assert_eq!(info_value_bytes(&out[1].1, b"t"), Some(&b"3"[..]));
 
         // Instance-1's viewer: its own slot keeps the base, main's is demoted.
         let out = desired_cs_players(1, &table, &bases);
         assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(info_value(&out[0].1, "n").as_deref(), Some("(TFFA 0) Bob"));
-        assert_eq!(out[1], (1, outsider.to_owned()));
+        assert_eq!(
+            info_value_bytes(&out[0].1, b"n"),
+            Some(&b"(TFFA 0) Bob"[..])
+        );
+        assert_eq!(out[1], (1, outsider.to_vec()));
 
         // Unknown (empty) bases are skipped, never pushed as empty strings.
-        let mut empty: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        empty[3] = "n\\Spec\\t\\3".to_owned();
+        let mut empty: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        empty[3] = b"n\\Spec\\t\\3".to_vec();
         let out = desired_cs_players(MAIN_MATCH, &table, &empty);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, 3);
@@ -5164,19 +5174,19 @@ mod tests {
         // nothing (this is the traffic the "spike when watching scores" came
         // from), while a slot moving into the viewer's match flips back to its
         // base string.
-        let own = "n\\Bob\\t\\1\\model\\kyle";
-        let outsider = "n\\Alora\\t\\2\\model\\alora";
-        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases[0] = own.to_owned();
-        bases[1] = outsider.to_owned();
+        let own = b"n\\Bob\\t\\1\\model\\kyle";
+        let outsider = b"n\\Alora\\t\\2\\model\\alora";
+        let mut bases: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases[0] = own.to_vec();
+        bases[1] = outsider.to_vec();
         let mut table = [MAIN_MATCH; MAX_CLIENTS];
         table[1] = 1;
 
         // The record the production code keeps (`cs_players_sent[viewer]`).
-        let mut sent: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        let mut sent: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
         let queued = |table: &[u8; MAX_CLIENTS],
-                      bases: &[String; MAX_CLIENTS],
-                      sent: &mut [String; MAX_CLIENTS]| {
+                      bases: &[Vec<u8>; MAX_CLIENTS],
+                      sent: &mut [Vec<u8>; MAX_CLIENTS]| {
             let mut n = 0;
             for (slot, value) in desired_cs_players(MAIN_MATCH, table, bases) {
                 let slot = slot as usize;
@@ -5210,10 +5220,10 @@ mod tests {
     /// from the viewer's team rows).
     #[test]
     fn a_deferred_base_push_is_replayed_by_the_next_plain_resync() {
-        let base = "n\\Alora\\t\\1\\model\\alora";
+        let base = b"n\\Alora\\t\\1\\model\\alora";
         let demoted = rewrite_cs_players_for_viewer(base, 1, MAIN_MATCH).expect("playing outsider");
-        let mut bases: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
-        bases[1] = base.to_owned();
+        let mut bases: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
+        bases[1] = base.to_vec();
         // The viewer is in the same match as slot 1 now, so the desired value
         // is the base string.
         let table = [MAIN_MATCH; MAX_CLIENTS];
@@ -5221,17 +5231,17 @@ mod tests {
         // What the viewer holds: the demotion, because the base push was
         // deferred (the record is left as the demotion too, `push_cs_players`
         // only records what it sent).
-        let mut sent: [String; MAX_CLIENTS] = core::array::from_fn(|_| String::new());
+        let mut sent: [Vec<u8>; MAX_CLIENTS] = core::array::from_fn(|_| Vec::new());
         sent[1] = demoted;
 
         // A plain resync compares every desired value against the record, so
         // the owed base is queued.
         let plan = override_push_plan(false, MAIN_MATCH, &table, &bases);
-        let owed: Vec<&(i32, String)> = plan
+        let owed: Vec<&(i32, Vec<u8>)> = plan
             .iter()
             .filter(|(slot, value)| sent[*slot as usize] != *value)
             .collect();
-        assert_eq!(owed, vec![&(1, base.to_owned())]);
+        assert_eq!(owed, vec![&(1, base.to_vec())]);
 
         // A gamestate delivered the base strings, so its resync owes only the
         // demotions of the viewers' outsiders and records the bases as held.
@@ -5244,16 +5254,16 @@ mod tests {
 
     #[test]
     fn info_value_and_set_round_trip() {
-        let base = "n\\Bob\\t\\1\\model\\kyle";
-        assert_eq!(info_value(base, "n").as_deref(), Some("Bob"));
-        assert_eq!(info_value(base, "t").as_deref(), Some("1"));
-        assert_eq!(info_value(base, "missing"), None);
-        let out = info_set(base, "n", "(TFFA 1) Bob");
-        assert_eq!(info_value(&out, "n").as_deref(), Some("(TFFA 1) Bob"));
-        assert_eq!(info_value(&out, "t").as_deref(), Some("1"));
+        let base = b"n\\Bob\\t\\1\\model\\kyle";
+        assert_eq!(info_value_bytes(base, b"n"), Some(&b"Bob"[..]));
+        assert_eq!(info_value_bytes(base, b"t"), Some(&b"1"[..]));
+        assert_eq!(info_value_bytes(base, b"missing"), None);
+        let out = info_set_bytes(base, b"n", b"(TFFA 1) Bob");
+        assert_eq!(info_value_bytes(&out, b"n"), Some(&b"(TFFA 1) Bob"[..]));
+        assert_eq!(info_value_bytes(&out, b"t"), Some(&b"1"[..]));
         // Appends missing keys, keeps leading-backslash style.
-        let out2 = info_set("\\n\\Bob", "t", "3");
-        assert_eq!(info_value(&out2, "t").as_deref(), Some("3"));
+        let out2 = info_set_bytes(b"\\n\\Bob", b"t", b"3");
+        assert_eq!(info_value_bytes(&out2, b"t"), Some(&b"3"[..]));
     }
 
     #[test]
@@ -5273,25 +5283,25 @@ mod tests {
 
     #[test]
     fn prefixed_name_fits_max_netname() {
-        let long = "A".repeat(100);
+        let long = b"A".repeat(100);
         let out = prefixed_name(&long, 1);
         assert!(out.len() < MAX_NETNAME);
-        assert!(out.starts_with("(TFFA 1) "));
-        assert_eq!(prefixed_name("Bob", 0), "(TFFA 0) Bob");
+        assert!(out.starts_with(b"(TFFA 1) "));
+        assert_eq!(prefixed_name(b"Bob", 0), b"(TFFA 0) Bob");
     }
 
     #[test]
     fn rewrite_cs_players_prefixes_only_playing_outsiders() {
         // Own match: untouched.
-        assert_eq!(rewrite_cs_players_for_viewer("n\\Bob\\t\\1", 1, 1), None);
+        assert_eq!(rewrite_cs_players_for_viewer(b"n\\Bob\\t\\1", 1, 1), None);
         // Real spectator: untouched even across matches.
-        assert_eq!(rewrite_cs_players_for_viewer("n\\Spec\\t\\3", 0, 1), None);
+        assert_eq!(rewrite_cs_players_for_viewer(b"n\\Spec\\t\\3", 0, 1), None);
         // Playing outsider: prefixed + forced to spectator.
-        let out = rewrite_cs_players_for_viewer("n\\Bob\\t\\1", 1, 0).expect("outsider rewritten");
-        assert_eq!(info_value(&out, "n").as_deref(), Some("(TFFA 1) Bob"));
-        assert_eq!(info_value(&out, "t").as_deref(), Some("3"));
+        let out = rewrite_cs_players_for_viewer(b"n\\Bob\\t\\1", 1, 0).expect("outsider rewritten");
+        assert_eq!(info_value_bytes(&out, b"n"), Some(&b"(TFFA 1) Bob"[..]));
+        assert_eq!(info_value_bytes(&out, b"t"), Some(&b"3"[..]));
         // Empty base: no change.
-        assert_eq!(rewrite_cs_players_for_viewer("", 1, 0), None);
+        assert_eq!(rewrite_cs_players_for_viewer(b"", 1, 0), None);
     }
 
     /// Only a `CS_PLAYERS` configstring index names a player slot; scores and
@@ -6320,7 +6330,7 @@ mod tests {
         t.home[2] = 1;
         t.home[5] = 3;
         t.player_score[2] = 6;
-        t.cs_players_base[2] = r"\n\Bob\t\1".to_owned();
+        t.cs_players_base[2] = b"\\n\\Bob\\t\\1".to_vec();
 
         let kept = reset_round_state(&mut t, true, MAX_MATCHES);
         assert!(kept);

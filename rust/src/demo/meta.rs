@@ -149,8 +149,17 @@ impl Scan {
     }
 
     fn configstring_string(&self, index: u16) -> Option<String> {
-        self.configstring(index)
-            .map(|value| String::from_utf8_lossy(value).into_owned())
+        self.configstring(index).map(|value| {
+            // Configstrings are byte strings. A recorded `CS_PLAYERS` name may
+            // be legacy single-byte text (a latin-1 `é` = `0xE9`), so fall back
+            // to latin-1 instead of replacing every such byte with U+FFFD.
+            // Valid UTF-8 (a UTF-8 name, and every numeric/ASCII value) is used
+            // as is.
+            match core::str::from_utf8(value) {
+                Ok(text) => text.to_owned(),
+                Err(_) => value.iter().map(|&byte| byte as char).collect(),
+            }
+        })
     }
 
     fn apply_command(&mut self, text: &str) {
@@ -690,6 +699,28 @@ mod tests {
         assert_eq!(
             scan.configstring_string(1133).as_deref(),
             Some("n\\LongName\\t\\1")
+        );
+    }
+
+    #[test]
+    fn a_legacy_single_byte_name_decodes_as_latin1_not_ufffd() {
+        // The demo payload keeps the name's raw bytes; the listing decodes it.
+        // A byte above 0x7F that is not valid UTF-8 is latin-1 text, not a
+        // decode error, so the JSON listing shows the player's name.
+        let mut scan = Scan::new();
+        scan.set_configstring(CS_PLAYERS as u16, b"n\\J\xE9r\xF4me\\t\\1".to_vec());
+        let info = scan.configstring_string(CS_PLAYERS as u16).unwrap();
+        assert_eq!(info_value(&info, "n").as_deref(), Some("Jérôme"));
+        assert!(!info.contains('\u{FFFD}'));
+        // Valid UTF-8 is not reinterpreted as latin-1.
+        scan.set_configstring(CS_PLAYERS as u16 + 1, "n\\Жора\\t\\1".as_bytes().to_vec());
+        assert_eq!(
+            info_value(
+                &scan.configstring_string(CS_PLAYERS as u16 + 1).unwrap(),
+                "n"
+            )
+            .as_deref(),
+            Some("Жора")
         );
     }
 

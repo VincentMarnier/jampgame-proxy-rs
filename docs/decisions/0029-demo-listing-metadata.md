@@ -106,7 +106,8 @@ full) and lives in the HTTP process only; the game thread never calls it.
   `encode_gamestate`/`DemoWriter`, then checks map, gametype, final scores,
   a later `cs` rename, spectator exclusion, duration and `teamScores`;
   separate tests cover a non-team FFA, `bcs0/1/2` chunk reassembly,
-  malformed input and the real Phase 0 fixture
+  a legacy latin-1 name (`0xE9`/`0xF4` → `Jérôme`, no U+FFFD) alongside a
+  valid UTF-8 name, malformed input and the real Phase 0 fixture
   (`tests/fixtures/demo/server-ffa3-phase0.dm_26` → `mp/ffa3`, gametype 0).
 - **TESTED** — `MsgReader` round-trips `MsgWriter` values and decodes every
   one of the 256 symbols.
@@ -126,8 +127,10 @@ full) and lives in the HTTP process only; the game thread never calls it.
   size-capped rotation starts a new file. The base 1.01 game module does not
   put `CS_LEVEL_START_TIME` in these demos, so the match clock cannot be
   reconstructed from the recording alone.
-- Names are the recorded bytes (colour codes included), not the client's
-  rendered text.
+- Names are the recorded bytes (colour codes included), decoded as UTF-8 when
+  the value is valid UTF-8 and otherwise as latin-1, so a legacy single-byte
+  name shows its character (`é` for `0xE9`) instead of U+FFFD. They are not
+  the client's rendered text (colour escapes are kept).
 - A file's final board is the last `scores` command. If a segment was closed
   before the recorder queued a board (for example immediately after the
   first snapshot), `players` is empty even though `CS_PLAYERS` may be

@@ -575,12 +575,15 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                     || (CS_PLAYERS..CS_PLAYERS + MAX_CLIENTS as c_int).contains(&a0))
             {
                 let ptr = a1 as usize as *const core::ffi::c_char;
-                let value: Option<String> = if ptr.is_null() {
-                    Some(String::new())
+                // Raw bytes: a `CS_PLAYERS` name is legacy single-byte text,
+                // so decoding it as UTF-8 (lossily or not) would replace every
+                // byte above 0x7F that is not part of a valid UTF-8 sequence.
+                let value: Option<Vec<u8>> = if ptr.is_null() {
+                    Some(Vec::new())
                 } else {
                     // SAFETY: game passes a NUL-terminated configstring.
                     let cstr = unsafe { CStr::from_ptr(ptr) };
-                    Some(cstr.to_string_lossy().into_owned())
+                    Some(cstr.to_bytes().to_vec())
                 };
                 // SAFETY: engine syscall registered; words forwarded.
                 let response = unsafe {
@@ -598,7 +601,10 @@ pub unsafe extern "C" fn jampgame_syscall_forward(
                         // (plain `on_set_cs_scores()` would dedup-skip the
                         // bystanders whose own tally did not move, leaving
                         // them stuck on the killer's bump).
-                        crate::tffa::on_set_cs_scores_broadcast(a0, &value);
+                        crate::tffa::on_set_cs_scores_broadcast(
+                            a0,
+                            &String::from_utf8_lossy(&value),
+                        );
                     } else {
                         crate::tffa::on_set_cs_players(a0 - CS_PLAYERS, &value);
                     }

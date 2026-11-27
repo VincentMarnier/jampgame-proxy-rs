@@ -719,18 +719,13 @@ fn cs_players_value(
     matches: &[u8; MAX_CLIENTS],
     instance: DemoInstance,
 ) -> Vec<u8> {
-    let Ok(text) = core::str::from_utf8(base) else {
-        return base.to_vec();
-    };
-    match crate::instances::rewrite_cs_players_for_slot(
-        text,
+    crate::instances::rewrite_cs_players_for_slot(
+        base,
         slot,
         matches[slot],
         instance.viewer_match(),
-    ) {
-        Some(value) => value.into_bytes(),
-        None => base.to_vec(),
-    }
+    )
+    .unwrap_or_else(|| base.to_vec())
 }
 
 /// A configstring as this instance's demo carries it.

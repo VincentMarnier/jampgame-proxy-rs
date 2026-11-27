@@ -735,8 +735,11 @@ fn is_bot(client_num: c_int) -> bool {
 fn client_name(client_num: u8) -> String {
     let slot = client_num as usize;
     if slot < MAX_CLIENTS {
-        let from_cs =
-            state::with_state(|s| crate::instances::info_value(&s.tffa.cs_players_base[slot], "n"));
+        let from_cs = state::with_state(|s| {
+            let base = &s.tffa.cs_players_base[slot];
+            crate::instances::info_value_bytes(base, b"n")
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+        });
         if let Some(name) = from_cs.filter(|n| !n.is_empty()) {
             return name;
         }
@@ -2433,7 +2436,7 @@ fn board_label(court: Option<usize>, queued: bool, willing: bool) -> Option<Stri
 /// draws instead of frags on `GT_DUEL` (`cg_scoreboard.c:170,229`). Court
 /// players stay in the arena (the board lists every court, unike TFFA's
 /// cross-match demotion).
-pub fn rewrite_cs_players(base: &str, slot: usize) -> Option<String> {
+pub fn rewrite_cs_players(base: &[u8], slot: usize) -> Option<Vec<u8>> {
     if !mode_on() || base.is_empty() || slot >= MAX_CLIENTS {
         return None;
     }
@@ -2446,12 +2449,12 @@ pub fn rewrite_cs_players(base: &str, slot: usize) -> Option<String> {
         )
     });
     let label = board_label(court, queued, willing)?;
-    let original = crate::instances::info_value(base, "n").unwrap_or_default();
-    let named = crate::instances::prefixed_name_with(&label, &original);
-    let mut out = crate::instances::info_set(base, "n", &named);
+    let original = crate::instances::info_value_bytes(base, b"n").unwrap_or_default();
+    let named = crate::instances::prefixed_name_with(label.as_bytes(), original);
+    let mut out = crate::instances::info_set_bytes(base, b"n", &named);
     let (wins, losses) = standings(id);
-    out = crate::instances::info_set(&out, "w", &wins.to_string());
-    out = crate::instances::info_set(&out, "l", &losses.to_string());
+    out = crate::instances::info_set_bytes(&out, b"w", wins.to_string().as_bytes());
+    out = crate::instances::info_set_bytes(&out, b"l", losses.to_string().as_bytes());
     (out != base).then_some(out)
 }
 

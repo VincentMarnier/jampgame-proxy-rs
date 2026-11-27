@@ -21,7 +21,6 @@
 //! server runs exactly one of them (the gametypes are mutually exclusive).
 
 use core::ffi::c_int;
-use std::borrow::Cow;
 
 use crate::hooks::engine_sv::{read_i32, read_usize, write_i32, write_usize};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -306,29 +305,63 @@ pub fn info_value(info: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Set one key in an info string, preserving the other pairs and the
+/// Parse a Quake info string as raw bytes (the `CS_PLAYERS` form of
+/// [`info_pairs`]).
+///
+/// A configstring is a byte string: a player name is legacy single-byte text
+/// (`'é'` = `0xE9`), not UTF-8. The proxy keeps `CS_PLAYERS` values in this
+/// form end to end and writes them straight back to the wire, so no name byte
+/// is ever replaced by a U+FFFD.
+pub(crate) fn info_pairs_bytes(info: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut parts: Vec<&[u8]> = info.split(|&b| b == b'\\').collect();
+    // Drop a leading empty part from a leading backslash.
+    if parts.first().is_some_and(|part| part.is_empty()) {
+        parts.remove(0);
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < parts.len() {
+        out.push((parts[i], parts[i + 1]));
+        i += 2;
+    }
+    out
+}
+
+/// Read one key from a raw info string ([`info_value`] for `CS_PLAYERS`).
+pub fn info_value_bytes<'a>(info: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    info_pairs_bytes(info)
+        .into_iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// Set one key in a raw info string, preserving the other pairs and the
 /// leading-backslash style of the input. Appends when missing.
-pub fn info_set(info: &str, key: &str, value: &str) -> String {
-    let leading = info.starts_with('\\');
-    let mut pairs = info_pairs(info);
+pub fn info_set_bytes(info: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+    let leading = info.first() == Some(&b'\\');
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = info_pairs_bytes(info)
+        .into_iter()
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect();
     let mut found = false;
     for (k, v) in pairs.iter_mut() {
-        if k == key {
-            *v = value.to_owned();
+        if k.as_slice() == key {
+            *v = value.to_vec();
             found = true;
             break;
         }
     }
     if !found {
-        pairs.push((key.to_owned(), value.to_owned()));
+        pairs.push((key.to_vec(), value.to_vec()));
     }
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (i, (k, v)) in pairs.iter().enumerate() {
-        if i == 0 && !leading {
-            out.push_str(&format!("{k}\\{v}"));
-        } else {
-            out.push_str(&format!("\\{k}\\{v}"));
+        if i != 0 || leading {
+            out.push(b'\\');
         }
+        out.extend_from_slice(k);
+        out.push(b'\\');
+        out.extend_from_slice(v);
     }
     out
 }
@@ -337,32 +370,24 @@ pub fn info_set(info: &str, key: &str, value: &str) -> String {
 /// `MAX_NETNAME` cap (`MAX_NETNAME - 1` bytes).
 ///
 /// The game already caps `client->pers.netname` this way, so a base string that
-/// came straight from it needs nothing. The guard exists because the proxy
-/// decodes configstrings as UTF-8: `String::from_utf8_lossy` replaces each
-/// invalid byte of a legacy single-byte name with U+FFFD (3 bytes), so a legal
-/// 34-byte Latin-1 name can become 38 bytes. That longer name is fine for
-/// cgame's `clientInfo_t.name[MAX_QPATH]`, but its stock obituary path formats
-/// it into `char targetName[MAX_NETNAME + 2]` (`CG_Obituary`,
-/// `cg_event.c:150`), and the client then prints
-/// `Com_sprintf: Output length 38 too short, require 41 bytes.`
+/// came straight from it needs nothing. The guard is for values the proxy
+/// builds itself (prefixes) and for hostile/overlong input: it cuts on a raw
+/// byte boundary, so a legacy single-byte name keeps every byte it can.
 ///
-/// Returns the rewritten string only when the name had to be cut.
-pub(crate) fn clamp_cs_players_name(info: &str) -> Option<String> {
-    let name = info_value(info, "n")?;
+/// Returns the rewritten value only when the name had to be cut.
+pub(crate) fn clamp_cs_players_name(info: &[u8]) -> Option<Vec<u8>> {
+    let name = info_value_bytes(info, b"n")?;
     let max = MAX_NETNAME.saturating_sub(1);
     if name.len() <= max {
         return None;
     }
     let mut cut = max;
-    while cut > 0 && !name.is_char_boundary(cut) {
-        cut -= 1;
-    }
     // Avoid leaving a bare `^` (color escape) at the cut, as
     // `prefixed_name_with` does.
-    if cut > 0 && name.as_bytes()[cut - 1] == b'^' {
+    if cut > 0 && name[cut - 1] == b'^' {
         cut -= 1;
     }
-    Some(info_set(info, "n", &name[..cut]))
+    Some(info_set_bytes(info, b"n", &name[..cut]))
 }
 
 /// `(TFFA N) ` prefix length for single-digit matches (0..=8): 9 bytes.
@@ -371,27 +396,26 @@ pub(crate) fn prefix_for(player_match: u8) -> String {
 }
 
 /// Prefixed display name, truncated so the whole thing fits `MAX_NETNAME`
-/// (36 inc NUL → 35 bytes max). Truncation respects UTF-8 boundaries; color
-/// escapes may be cut mid-code in pathological cases, same as the game's own
-/// `Q_strncpyz` behaviour.
-pub fn prefixed_name(orig: &str, player_match: u8) -> String {
-    prefixed_name_with(&prefix_for(player_match), orig)
+/// (36 inc NUL → 35 bytes max). Operates on raw name bytes, so a legacy
+/// single-byte character is counted once, not as its UTF-8 expansion.
+pub fn prefixed_name(orig: &[u8], player_match: u8) -> Vec<u8> {
+    prefixed_name_with(prefix_for(player_match).as_bytes(), orig)
 }
 
-/// Prefix a display name with an already-built instance label, truncated so
-/// the whole thing fits `MAX_NETNAME` (36 inc NUL → 35 bytes max).
-pub(crate) fn prefixed_name_with(prefix: &str, orig: &str) -> String {
+/// Prefix a raw display name with an already-built instance label, truncated
+/// so the whole thing fits `MAX_NETNAME` (36 inc NUL → 35 bytes max).
+pub(crate) fn prefixed_name_with(prefix: &[u8], orig: &[u8]) -> Vec<u8> {
     let max_total = MAX_NETNAME.saturating_sub(1);
     let budget = max_total.saturating_sub(prefix.len());
     let mut cut = orig.len().min(budget);
-    while cut > 0 && !orig.is_char_boundary(cut) {
-        cut -= 1;
-    }
     // Avoid leaving a bare `^` (color escape) at the cut.
-    if cut > 0 && orig.as_bytes()[cut - 1] == b'^' {
+    if cut > 0 && orig[cut - 1] == b'^' {
         cut -= 1;
     }
-    format!("{prefix}{}", &orig[..cut])
+    let mut out = Vec::with_capacity(prefix.len() + cut);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(&orig[..cut]);
+    out
 }
 
 /// The label an outsider's name carries in a viewer's clientinfo: the TFFA
@@ -411,28 +435,35 @@ fn instance_prefix(instance: u8) -> String {
 /// any other client-side surface shows them). Everyone else (own match, real
 /// spectators) is left untouched. Returns `None` when no change.
 pub fn rewrite_cs_players_for_viewer(
-    base: &str,
+    base: &[u8],
     player_match: u8,
     viewer_match: u8,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     if base.is_empty() {
         return None;
     }
     if player_match == viewer_match {
         return None;
     }
-    let team = info_value(base, "t")?.parse::<i32>().ok()?;
+    let team = core::str::from_utf8(info_value_bytes(base, b"t")?)
+        .ok()?
+        .parse::<i32>()
+        .ok()?;
     if team != TEAM_RED && team != TEAM_BLUE {
         return None;
     }
-    let orig = info_value(base, "n").unwrap_or_default();
+    let orig = info_value_bytes(base, b"n").unwrap_or_default();
     let named = if state::instance_mode() == state::InstanceMode::Duel {
-        prefixed_name_with(&instance_prefix(player_match), &orig)
+        prefixed_name_with(instance_prefix(player_match).as_bytes(), orig)
     } else {
-        prefixed_name(&orig, player_match)
+        prefixed_name(orig, player_match)
     };
-    let out = info_set(base, "n", &named);
-    Some(info_set(&out, "t", &TEAM_SPECTATOR.to_string()))
+    let out = info_set_bytes(base, b"n", &named);
+    Some(info_set_bytes(
+        &out,
+        b"t",
+        TEAM_SPECTATOR.to_string().as_bytes(),
+    ))
 }
 
 /// Per-viewer `CS_PLAYERS` rewrite for one slot. TFFA demotes a playing
@@ -440,11 +471,11 @@ pub fn rewrite_cs_players_for_viewer(
 /// court player in the arena (the board lists the whole ladder in court
 /// order), prefixes the court or bench label and injects the ladder W/L.
 pub(crate) fn rewrite_cs_players_for_slot(
-    base: &str,
+    base: &[u8],
     slot: usize,
     player_match: u8,
     viewer_match: u8,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     if state::instance_mode() == state::InstanceMode::Duel {
         return crate::duel::rewrite_cs_players(base, slot);
     }
@@ -531,18 +562,31 @@ pub(crate) fn reliable_pressure(client_num: c_int) -> bool {
 /// now is what overflowed the buffer, dropped clients and made real clients
 /// print `CL_GetServerCommand: a reliable command was cycled out` (D-006.12).
 pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> bool {
-    // A `CS_PLAYERS` value may come from a lossy UTF-8 decode of a single-byte
-    // name (see [`clamp_cs_players_name`]); keep every send inside the length
-    // the game itself guarantees, whatever the caller passed.
-    let value = if cs_players_slot(index).is_some() {
+    send_cs_to_client_bytes(client_num, index, value.as_bytes())
+}
+
+/// Byte form of [`send_cs_to_client`].
+///
+/// A `CS_PLAYERS` value is a raw single-byte string (a legacy name may carry
+/// `0xE9`, a CP1251 Cyrillic byte, ...), so it is written to the wire byte for
+/// byte. Decoding it as UTF-8 first would replace every non-UTF-8 byte with
+/// the 3-byte U+FFFD and render the name as mojibake in the viewer's
+/// scoreboard and team overlay.
+pub(crate) fn send_cs_to_client_bytes(client_num: c_int, index: i32, value: &[u8]) -> bool {
+    // Keep every `CS_PLAYERS` send inside the length the game itself
+    // guarantees, whatever the caller passed.
+    let clamped;
+    let value: &[u8] = if cs_players_slot(index).is_some() {
         match clamp_cs_players_name(value) {
-            Some(clamped) => Cow::Owned(clamped),
-            None => Cow::Borrowed(value),
+            Some(clamped_value) => {
+                clamped = clamped_value;
+                &clamped
+            }
+            None => value,
         }
     } else {
-        Cow::Borrowed(value)
+        value
     };
-    let value: &str = value.as_ref();
     // Never add to the `map_restart` reconnect burst: the engine queues a
     // reliable command per reconnecting client for every client, and a
     // populated server is already close to the 128-slot limit before the proxy
@@ -557,7 +601,8 @@ pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> b
                 let (slot, base, player_match) = state::with_state(|s| {
                     s.tffa.pending_view_refresh[client_num as usize] = true;
                     let slot = cs_players_slot(index);
-                    let base = slot.is_some_and(|slot| s.tffa.cs_players_base[slot] == value);
+                    let base =
+                        slot.is_some_and(|slot| s.tffa.cs_players_base[slot].as_slice() == value);
                     let player_match = slot.map(|slot| s.tffa.client_match[slot]);
                     (slot, base, player_match)
                 });
@@ -577,15 +622,16 @@ pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> b
         }
         return false;
     }
-    let mut safe = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '"' => safe.push('\''),
-            '\n' | '\r' => safe.push(' '),
-            c => safe.push(c),
-        }
+    let mut msg = Vec::with_capacity(value.len() + 16);
+    msg.extend_from_slice(format!("cs {index} \"").as_bytes());
+    for &byte in value {
+        msg.push(match byte {
+            b'"' => b'\'',
+            b'\n' | b'\r' => b' ',
+            byte => byte,
+        });
     }
-    let msg = format!("cs {index} \"{safe}\"\n");
+    msg.extend_from_slice(b"\"\n");
     let Ok(cmsg) = std::ffi::CString::new(msg) else {
         return false;
     };
@@ -620,22 +666,29 @@ pub(crate) fn send_cs_to_client(client_num: c_int, index: i32, value: &str) -> b
 /// deferred `pending_view_refresh` would never run, and the caller has already
 /// deduped the values it sends.
 fn send_cs_now(client_num: c_int, index: i32, value: &str) -> bool {
+    send_cs_now_bytes(client_num, index, value.as_bytes())
+}
+
+/// Byte form of [`send_cs_now`] (a `CS_PLAYERS` base is raw single-byte text).
+fn send_cs_now_bytes(client_num: c_int, index: i32, value: &[u8]) -> bool {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) {
         return false;
     }
-    let mut safe = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '"' => safe.push('\''),
-            '\n' | '\r' => safe.push(' '),
-            c => safe.push(c),
-        }
+    let mut msg = Vec::with_capacity(value.len() + 16);
+    msg.extend_from_slice(format!("cs {index} \"").as_bytes());
+    for &byte in value {
+        msg.push(match byte {
+            b'"' => b'\'',
+            b'\n' | b'\r' => b' ',
+            byte => byte,
+        });
     }
-    let Ok(msg) = std::ffi::CString::new(format!("cs {index} \"{safe}\"\n")) else {
+    msg.extend_from_slice(b"\"\n");
+    let Ok(cmsg) = std::ffi::CString::new(msg) else {
         return false;
     };
     // SAFETY: engine syscall registered; msg NUL-terminated.
-    unsafe { crate::syscall::send_server_command(client_num, &msg) };
+    unsafe { crate::syscall::send_server_command(client_num, &cmsg) };
     true
 }
 
@@ -758,52 +811,52 @@ pub fn view_scores(instance: u8) -> (i32, i32) {
     })
 }
 
-pub(crate) fn push_cs_players(client_num: c_int, slot: usize, value: &str) -> bool {
+pub(crate) fn push_cs_players(client_num: c_int, slot: usize, value: &[u8]) -> bool {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) || slot >= MAX_CLIENTS {
         return false;
     }
     // Clamp before the dedup record so the record matches what goes on the
     // wire (and a later identical value is not re-sent).
     let clamped;
-    let value = match clamp_cs_players_name(value) {
+    let value: &[u8] = match clamp_cs_players_name(value) {
         Some(clamped_value) => {
             clamped = clamped_value;
-            clamped.as_str()
+            &clamped
         }
         None => value,
     };
     let viewer = client_num as usize;
     let index = CS_PLAYERS + slot as i32;
-    if state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] == value) {
+    if state::with_state(|s| s.tffa.cs_players_sent[viewer][slot].as_slice() == value) {
         return false;
     }
-    if !send_cs_to_client(client_num, index, value) {
+    if !send_cs_to_client_bytes(client_num, index, value) {
         return false;
     }
-    state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] = value.to_owned());
+    state::with_state(|s| s.tffa.cs_players_sent[viewer][slot] = value.to_vec());
     true
 }
 
 /// Record a `CS_PLAYERS + slot` value this viewer is known to hold without
 /// queueing anything (the engine broadcast it, or it came in a gamestate).
-pub(crate) fn record_cs_players_sent(client_num: c_int, slot: usize, value: &str) {
+pub(crate) fn record_cs_players_sent(client_num: c_int, slot: usize, value: &[u8]) {
     if !(0..MAX_CLIENTS as c_int).contains(&client_num) || slot >= MAX_CLIENTS {
         return;
     }
-    state::with_state(|s| s.tffa.cs_players_sent[client_num as usize][slot] = value.to_owned());
+    state::with_state(|s| s.tffa.cs_players_sent[client_num as usize][slot] = value.to_vec());
 }
 
 /// Record that the engine itself just broadcast `value` for `slot` to every
 /// connected client (`G_SET_CONFIGSTRING` forwarding), so the next per-viewer
 /// refresh does not re-send the base string to same-match viewers.
-pub(crate) fn record_cs_players_broadcast(slot: usize, value: &str) {
+pub(crate) fn record_cs_players_broadcast(slot: usize, value: &[u8]) {
     if slot >= MAX_CLIENTS {
         return;
     }
     state::with_state(|s| {
         for viewer in 0..MAX_CLIENTS {
             if s.clients[viewer].is_connected {
-                s.tffa.cs_players_sent[viewer][slot] = value.to_owned();
+                s.tffa.cs_players_sent[viewer][slot] = value.to_vec();
             }
         }
     });
@@ -876,7 +929,11 @@ pub(crate) fn send_single_cs_score(viewer: c_int, index: i32, value: i32) {
 }
 
 /// Live server configstring `index` (`None` when the server holds no string).
-pub(crate) fn get_live_cs(index: i32) -> Option<String> {
+///
+/// The value is returned as raw bytes: configstrings are byte strings, and a
+/// `CS_PLAYERS` name must not be decoded as UTF-8 (see
+/// [`send_cs_to_client_bytes`]).
+pub(crate) fn get_live_cs(index: i32) -> Option<Vec<u8>> {
     let mut buf = [0u8; 1024];
     // SAFETY: engine syscall registered; buffer writable.
     unsafe { crate::syscall::get_configstring(index, &mut buf) };
@@ -884,12 +941,12 @@ pub(crate) fn get_live_cs(index: i32) -> Option<String> {
     if n == 0 {
         return None;
     }
-    String::from_utf8(buf[..n].to_vec()).ok()
+    Some(buf[..n].to_vec())
 }
 
 /// Live server configstring for a player slot (fallback when the proxy base
 /// is empty, e.g. the slot was assigned while the feature was off).
-pub(crate) fn get_live_cs_players(slot: i32) -> Option<String> {
+pub(crate) fn get_live_cs_players(slot: i32) -> Option<Vec<u8>> {
     let value = get_live_cs(CS_PLAYERS + slot)?;
     Some(clamp_cs_players_name(&value).unwrap_or(value))
 }
@@ -935,7 +992,7 @@ pub fn send_all_overrides_to_client(client_num: c_int) {
     let from_gamestate = state::with_state(|s| {
         core::mem::take(&mut s.tffa.view_bases_from_gamestate[client_num as usize])
     });
-    let (table, mut bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
+    let (table, mut bases): ([u8; MAX_CLIENTS], [Vec<u8>; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
     for (slot, base) in bases.iter_mut().enumerate() {
         if base.is_empty() {
@@ -977,8 +1034,8 @@ pub(crate) fn override_push_plan(
     from_gamestate: bool,
     viewer_match: u8,
     table: &[u8; MAX_CLIENTS],
-    bases: &[String; MAX_CLIENTS],
-) -> Vec<(i32, String)> {
+    bases: &[Vec<u8>; MAX_CLIENTS],
+) -> Vec<(i32, Vec<u8>)> {
     if from_gamestate && state::instance_mode() != state::InstanceMode::Duel {
         demotions_for_viewer(viewer_match, table, bases)
     } else {
@@ -996,7 +1053,7 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
         return;
     }
     let viewer_match = effective_match(client_num);
-    let (table, bases): ([u8; MAX_CLIENTS], [String; MAX_CLIENTS]) =
+    let (table, bases): ([u8; MAX_CLIENTS], [Vec<u8>; MAX_CLIENTS]) =
         state::with_state(|s| (s.tffa.client_match, s.tffa.cs_players_base.clone()));
     for slot in 0..MAX_CLIENTS as i32 {
         let mut base = bases[slot as usize].clone();
@@ -1041,8 +1098,8 @@ pub fn refresh_cs_players_for_viewer(client_num: c_int) {
 pub(crate) fn desired_cs_players(
     viewer_match: u8,
     table: &[u8; MAX_CLIENTS],
-    bases: &[String; MAX_CLIENTS],
-) -> Vec<(i32, String)> {
+    bases: &[Vec<u8>; MAX_CLIENTS],
+) -> Vec<(i32, Vec<u8>)> {
     let mut out = Vec::new();
     for (slot, base) in bases.iter().enumerate() {
         if base.is_empty() {
@@ -1062,8 +1119,8 @@ pub(crate) fn desired_cs_players(
 pub(crate) fn demotions_for_viewer(
     viewer_match: u8,
     table: &[u8; MAX_CLIENTS],
-    bases: &[String; MAX_CLIENTS],
-) -> Vec<(i32, String)> {
+    bases: &[Vec<u8>; MAX_CLIENTS],
+) -> Vec<(i32, Vec<u8>)> {
     let mut out = Vec::new();
     for (slot, base) in bases.iter().enumerate() {
         if table[slot] == viewer_match || base.is_empty() {
@@ -2488,13 +2545,15 @@ pub(crate) fn restore_pristine_views() {
             .filter(|v| s.clients[*v as usize].is_connected)
             .collect()
     });
-    let (bases, sent): ([String; MAX_CLIENTS], [[String; MAX_CLIENTS]; MAX_CLIENTS]) =
-        state::with_state(|s| {
-            (
-                s.tffa.cs_players_base.clone(),
-                s.tffa.cs_players_sent.clone(),
-            )
-        });
+    let (bases, sent): (
+        [Vec<u8>; MAX_CLIENTS],
+        [[Vec<u8>; MAX_CLIENTS]; MAX_CLIENTS],
+    ) = state::with_state(|s| {
+        (
+            s.tffa.cs_players_base.clone(),
+            s.tffa.cs_players_sent.clone(),
+        )
+    });
     let mut restored = 0usize;
     let viewer_count = viewers.len();
     for viewer in viewers {
@@ -2506,7 +2565,7 @@ pub(crate) fn restore_pristine_views() {
                 stored.clone()
             };
             if sent[v][slot] != base {
-                send_cs_now(viewer, CS_PLAYERS + slot as i32, &base);
+                send_cs_now_bytes(viewer, CS_PLAYERS + slot as i32, &base);
                 restored += 1;
             }
         }
@@ -2533,26 +2592,26 @@ pub(crate) fn restore_pristine_views() {
 /// per-viewer variants (prefixed outsiders forced to spectator) to every
 /// connected client. Call after the trap has been forwarded so the engine
 /// broadcast lands first and our per-viewer corrections win.
-pub fn on_set_cs_players(slot: i32, value: &str) {
+pub fn on_set_cs_players(slot: i32, value: &[u8]) {
     if !state::instances_enabled() {
         return;
     }
     if !(0..MAX_CLIENTS as i32).contains(&slot) {
         return;
     }
-    // The decoded `value` is what later per-viewer re-pushes carry. A name
-    // that the lossy decode pushed past `MAX_NETNAME` must not enter the base
-    // (see [`clamp_cs_players_name`]).
+    // The raw `value` is what later per-viewer re-pushes carry. A name that
+    // would exceed `MAX_NETNAME` must not enter the base (see
+    // [`clamp_cs_players_name`]).
     let clamped;
-    let value = match clamp_cs_players_name(value) {
+    let value: &[u8] = match clamp_cs_players_name(value) {
         Some(clamped_value) => {
             clamped = clamped_value;
-            clamped.as_str()
+            &clamped
         }
         None => value,
     };
     state::with_state(|s| {
-        s.tffa.cs_players_base[slot as usize] = value.to_owned();
+        s.tffa.cs_players_base[slot as usize] = value.to_vec();
     });
     // The engine broadcast this value to every client before the handler ran
     // (the trap was forwarded first), so every connected viewer holds it now —
@@ -2560,7 +2619,7 @@ pub fn on_set_cs_players(slot: i32, value: &str) {
     record_cs_players_broadcast(slot as usize, value);
     // Follow-aware viewer matches (spectating adopts the target's instance).
     // State snapshot first (no nesting: effective_match locks per viewer).
-    let (table, base): (u8, String) = state::with_state(|s| {
+    let (table, base): (u8, Vec<u8>) = state::with_state(|s| {
         (
             s.tffa.client_match[slot as usize],
             s.tffa.cs_players_base[slot as usize].clone(),
@@ -2597,7 +2656,7 @@ pub fn broadcast_cs_players_slot(slot: i32) {
     if !(0..MAX_CLIENTS as i32).contains(&slot) {
         return;
     }
-    let (table, base): (u8, String) = state::with_state(|s| {
+    let (table, base): (u8, Vec<u8>) = state::with_state(|s| {
         (
             s.tffa.client_match[slot as usize],
             s.tffa.cs_players_base[slot as usize].clone(),
@@ -2633,41 +2692,57 @@ mod tests {
 
     #[test]
     fn a_cs_players_name_is_kept_inside_max_netname() {
-        let long = "x".repeat(MAX_NETNAME + 2);
-        let info = format!("n\\{long}\\t\\2\\model\\kyle");
+        let long = b"x".repeat(MAX_NETNAME + 2);
+        let mut info = b"n\\".to_vec();
+        info.extend_from_slice(&long);
+        info.extend_from_slice(b"\\t\\2\\model\\kyle");
         let out = clamp_cs_players_name(&info).expect("the overlong name is cut");
         assert_eq!(
-            info_value(&out, "n").as_deref().map(str::len),
+            info_value_bytes(&out, b"n").map(<[u8]>::len),
             Some(MAX_NETNAME - 1)
         );
-        assert_eq!(info_value(&out, "t").as_deref(), Some("2"));
-        assert_eq!(info_value(&out, "model").as_deref(), Some("kyle"));
+        assert_eq!(info_value_bytes(&out, b"t"), Some(&b"2"[..]));
+        assert_eq!(info_value_bytes(&out, b"model"), Some(&b"kyle"[..]));
 
         // At the game's own cap the value is already safe and is not rewritten.
-        let legal = format!("n\\{}\\t\\2", "y".repeat(MAX_NETNAME - 1));
+        let mut legal = b"n\\".to_vec();
+        legal.extend_from_slice(&b"y".repeat(MAX_NETNAME - 1));
+        legal.extend_from_slice(b"\\t\\2");
         assert!(clamp_cs_players_name(&legal).is_none());
         // A missing `n` is left alone too.
-        assert!(clamp_cs_players_name("t\\2\\model\\kyle").is_none());
+        assert!(clamp_cs_players_name(b"t\\2\\model\\kyle").is_none());
     }
 
     #[test]
-    fn a_lossy_latin1_name_cannot_outgrow_the_obituary_buffer() {
-        // Two 0xE9 bytes (a latin-1 accented letter) are not valid UTF-8, so
-        // the proxy's lossy decode turns each into a 3-byte U+FFFD. A legal
-        // 33-byte name therefore becomes 39 bytes before the clamp.
-        let mut raw = vec![b'x'; MAX_NETNAME - 3];
-        raw.extend_from_slice(&[0xE9, 0xE9]);
-        let lossy = String::from_utf8_lossy(&raw);
-        assert!(lossy.len() > MAX_NETNAME - 1);
-        let info = format!("n\\{lossy}\\t\\1");
+    fn a_legacy_single_byte_name_keeps_its_raw_bytes() {
+        // `0xE9`/`0xF4` are latin-1 letters and invalid UTF-8. They are legal
+        // `CS_PLAYERS` name bytes and must reach the client unchanged: the
+        // old lossy UTF-8 decode turned each into a 3-byte U+FFFD, so the
+        // scoreboard/team overlay showed mojibake instead of the name.
+        let mut info = b"n\\J".to_vec();
+        info.push(0xE9);
+        info.push(b'r');
+        info.push(0xF4);
+        info.extend_from_slice(b"me\\t\\1\\model\\kyle");
+        assert!(
+            clamp_cs_players_name(&info).is_none(),
+            "a legal raw name must not be rewritten"
+        );
+        assert_eq!(info_value_bytes(&info, b"n"), Some(&b"J\xE9r\xF4me"[..]));
 
-        let out = clamp_cs_players_name(&info).expect("the expanded name is cut");
-        let name = info_value(&out, "n").expect("n survives");
-        // The cut backs up to the previous UTF-8 boundary, so it can be a
-        // little shorter than the cap but never longer.
-        assert!(name.len() < MAX_NETNAME, "name {} bytes", name.len());
-        // TaystJK's `CG_Obituary` appends S_COLOR_WHITE ("^7") into
-        // `char targetName[MAX_NETNAME + 2]`; the cut name leaves room for it.
-        assert!(name.len() + "^7".len() < MAX_NETNAME + 2);
+        // A prefixed re-send keeps the bytes and counts each one once.
+        let named = prefixed_name(info_value_bytes(&info, b"n").unwrap(), 1);
+        assert_eq!(named, b"(TFFA 1) J\xE9r\xF4me");
+    }
+
+    #[test]
+    fn a_raw_name_survives_the_outsider_rewrite() {
+        let mut base = b"n\\J".to_vec();
+        base.push(0xE9);
+        base.extend_from_slice(b"r\\t\\1\\model\\kyle");
+        let out = rewrite_cs_players_for_viewer(&base, 1, MAIN_MATCH).expect("outsider");
+        assert_eq!(info_value_bytes(&out, b"n"), Some(&b"(TFFA 1) J\xE9r"[..]));
+        assert_eq!(info_value_bytes(&out, b"t"), Some(&b"3"[..]));
+        assert_eq!(info_value_bytes(&out, b"model"), Some(&b"kyle"[..]));
     }
 }
